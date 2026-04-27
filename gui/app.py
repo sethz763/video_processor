@@ -24,7 +24,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -34,11 +37,24 @@ FRAME_H = 1080
 UYVY_FRAME_BYTES = FRAME_W * FRAME_H * 2
 INPUT_MODE_QUERY_DEFAULT = "1080i59.94"
 OUTPUT_MODE_QUERY_DEFAULT = "1080i59.94"
+WINDOWED_PREVIEW_MAX_W = 640
+WINDOWED_PREVIEW_MAX_H = 360
+FULLSCREEN_PREVIEW_MAX_W = 1280
+FULLSCREEN_PREVIEW_MAX_H = 720
 
 try:
     import decklink_wrapper as d
 except Exception:
     d = None
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+
+_CV2_RGB_RING: list[np.ndarray] = []
+_CV2_RGB_RING_INDEX = 0
 
 
 def setup_logger() -> logging.Logger:
@@ -70,6 +86,8 @@ def setup_logger() -> logging.Logger:
 
 
 LOGGER = setup_logger()
+
+_OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 
 
 def initialize_com_for_decklink() -> None:
@@ -150,39 +168,74 @@ def roi_from_scale(scale: float, center_x: float, center_y: float) -> Roi:
     return clamp_roi(Roi(x, y, w, h))
 
 
-def uyvy_to_qimage(frame_bytes: bytes) -> QImage:
+def uyvy_to_qimage(
+    frame_bytes: bytes,
+    preview_max_w: int | None = None,
+    preview_max_h: int | None = None,
+) -> tuple[QImage, np.ndarray | None]:
     if len(frame_bytes) != UYVY_FRAME_BYTES:
         raise ValueError("Invalid UYVY frame byte length.")
+
+    if cv2 is not None:
+        global _CV2_RGB_RING_INDEX
+        if not _CV2_RGB_RING:
+            # Two buffers avoid input/output previews aliasing each other within one tick.
+            _CV2_RGB_RING.extend(
+                [
+                    np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8),
+                    np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8),
+                ]
+            )
+
+        rgb = _CV2_RGB_RING[_CV2_RGB_RING_INDEX]
+        _CV2_RGB_RING_INDEX = (_CV2_RGB_RING_INDEX + 1) % len(_CV2_RGB_RING)
+
+        yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+        cv2.cvtColor(yuv422, cv2.COLOR_YUV2RGB_UYVY, dst=rgb)
+        image = QImage(rgb.data, FRAME_W, FRAME_H, FRAME_W * 3, QImage.Format_RGB888)
+        if preview_max_w is not None and preview_max_h is not None:
+            target_w = max(1, min(int(preview_max_w), FRAME_W))
+            target_h = max(1, min(int(preview_max_h), FRAME_H))
+            if target_w < FRAME_W or target_h < FRAME_H:
+                return image.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation), None
+        return image, rgb
 
     data = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W // 2, 4)
 
     # UYVY packing: U, Y0, V, Y1 per 2 pixels.
-    u = data[:, :, 0].astype(np.int16)
-    y0 = data[:, :, 1].astype(np.int16)
-    v = data[:, :, 2].astype(np.int16)
-    y1 = data[:, :, 3].astype(np.int16)
+    u = data[:, :, 0].astype(np.float32)
+    y0 = data[:, :, 1].astype(np.float32)
+    v = data[:, :, 2].astype(np.float32)
+    y1 = data[:, :, 3].astype(np.float32)
 
-    y = np.empty((FRAME_H, FRAME_W), dtype=np.int16)
+    y = np.empty((FRAME_H, FRAME_W), dtype=np.float32)
     y[:, 0::2] = y0
     y[:, 1::2] = y1
 
     u_full = np.repeat(u, 2, axis=1)
     v_full = np.repeat(v, 2, axis=1)
 
+    # BT.709 limited-range YUV->RGB conversion for HD video signals.
     c = y - 16
     d = u_full - 128
     e = v_full - 128
 
-    r = np.clip((298 * c + 409 * e + 128) >> 8, 0, 255).astype(np.uint8)
-    g = np.clip((298 * c - 100 * d - 208 * e + 128) >> 8, 0, 255).astype(np.uint8)
-    b = np.clip((298 * c + 516 * d + 128) >> 8, 0, 255).astype(np.uint8)
+    r = np.clip(1.164383 * c + 1.792741 * e, 0, 255).astype(np.uint8)
+    g = np.clip(1.164383 * c - 0.213249 * d - 0.532909 * e, 0, 255).astype(np.uint8)
+    b = np.clip(1.164383 * c + 2.112402 * d, 0, 255).astype(np.uint8)
 
     rgb = np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8)
     rgb[:, :, 0] = r
     rgb[:, :, 1] = g
     rgb[:, :, 2] = b
 
-    return QImage(rgb.data, FRAME_W, FRAME_H, FRAME_W * 3, QImage.Format_RGB888).copy()
+    image = QImage(rgb.data, FRAME_W, FRAME_H, FRAME_W * 3, QImage.Format_RGB888)
+    if preview_max_w is not None and preview_max_h is not None:
+        target_w = max(1, min(int(preview_max_w), FRAME_W))
+        target_h = max(1, min(int(preview_max_h), FRAME_H))
+        if target_w < FRAME_W or target_h < FRAME_H:
+            return image.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation), None
+    return image, rgb
 
 
 def tight_uyvy_bytes(frame: object) -> bytes:
@@ -195,32 +248,85 @@ def tight_uyvy_bytes(frame: object) -> bytes:
     if row_bytes == expected_row_bytes:
         return raw.tobytes()
 
-    out = bytearray(UYVY_FRAME_BYTES)
-    for y in range(FRAME_H):
-        src_start = y * row_bytes
-        src_end = src_start + expected_row_bytes
-        dst_start = y * expected_row_bytes
-        out[dst_start : dst_start + expected_row_bytes] = raw[src_start:src_end]
-    return bytes(out)
+    raw_np = np.frombuffer(raw, dtype=np.uint8)
+    expected_total = row_bytes * FRAME_H
+    if raw_np.size < expected_total:
+        raise RuntimeError(f"Captured frame buffer is smaller than expected ({raw_np.size} < {expected_total})")
+    return raw_np[:expected_total].reshape(FRAME_H, row_bytes)[:, :expected_row_bytes].tobytes()
 
 
 def write_frame_to_output(out: object, frame_bytes: bytes) -> None:
     expected_row_bytes = FRAME_W * 2
-    if out.row_bytes == expected_row_bytes:
-        out.display_frame_sync(frame_bytes)
-        return
-
     if out.row_bytes < expected_row_bytes:
         raise RuntimeError(f"Output row_bytes {out.row_bytes} is smaller than expected {expected_row_bytes}")
 
-    padded = bytearray(out.row_bytes * out.height)
-    for y in range(FRAME_H):
-        src_start = y * expected_row_bytes
-        src_end = src_start + expected_row_bytes
-        dst_start = y * out.row_bytes
-        padded[dst_start : dst_start + expected_row_bytes] = frame_bytes[src_start:src_end]
+    if out.row_bytes == expected_row_bytes:
+        payload = frame_bytes
+    else:
+        src = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, expected_row_bytes)
+        padded = np.zeros((FRAME_H, out.row_bytes), dtype=np.uint8)
+        padded[:, :expected_row_bytes] = src
+        payload = padded.tobytes()
 
-    out.display_frame_sync(padded)
+    out_id = id(out)
+    state = _OUTPUT_SCHEDULE_STATE.get(out_id)
+    if state is None:
+        schedule_fn = getattr(out, "schedule_frame_copy", None)
+        start_fn = getattr(out, "start_scheduled_playback", None)
+        buffered_fn = getattr(out, "buffered_video_frame_count", None)
+        state = {
+            "enabled": callable(schedule_fn) and callable(start_fn),
+            "can_query_buffered": callable(buffered_fn),
+            "started": False,
+            "display_time": 0,
+            "frame_duration": int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0,
+            "time_scale": int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0,
+        }
+        _OUTPUT_SCHEDULE_STATE[out_id] = state
+
+    if state["enabled"]:
+        frame_duration = int(state["frame_duration"])
+        time_scale = int(state["time_scale"])
+        if frame_duration > 0 and time_scale > 0:
+            try:
+                out.schedule_frame_copy(
+                    payload,
+                    int(state["display_time"]),
+                    frame_duration,
+                    time_scale,
+                )
+                state["display_time"] = int(state["display_time"]) + frame_duration
+
+                if not bool(state["started"]):
+                    should_start = False
+                    if bool(state.get("can_query_buffered", False)):
+                        try:
+                            buffered_count = int(out.buffered_video_frame_count())
+                            # Small preroll prevents startup underflow while keeping latency low.
+                            should_start = buffered_count >= 2
+                        except Exception:
+                            # Wrapper does not reliably expose buffered count; start without preroll.
+                            state["can_query_buffered"] = False
+                            should_start = True
+                    else:
+                        # No buffered count support in wrapper; start immediately.
+                        should_start = True
+
+                    if should_start:
+                        out.start_scheduled_playback(0, time_scale, 1.0)
+                        state["started"] = True
+                return
+            except Exception:
+                LOGGER.exception("Scheduled DeckLink output failed; falling back to sync output")
+                state["enabled"] = False
+
+    out.display_frame_sync(payload)
+
+
+def clear_output_schedule_state(out: object | None) -> None:
+    if out is None:
+        return
+    _OUTPUT_SCHEDULE_STATE.pop(id(out), None)
 
 
 class SyntheticUyvySource:
@@ -250,14 +356,18 @@ class SyntheticUyvySource:
 class RoiCanvas(QWidget):
     roiChanged = Signal(int, int, int, int)
     scaleChanged = Signal(float)
+    fullscreenRequested = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, view_name: str = "input") -> None:
         super().__init__()
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
-        self.setMinimumSize(960, 540)
+        self.setMinimumSize(160, 90)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._view_name = view_name
 
         self._image: QImage | None = None
+        self._image_backing: np.ndarray | None = None
         self._roi = Roi(480, 270, 960, 540)
 
         self._drag_mode = "none"
@@ -267,8 +377,9 @@ class RoiCanvas(QWidget):
         self._last_touch_center: QPointF | None = None
         self._last_touch_dist: float | None = None
 
-    def set_image(self, image: QImage) -> None:
+    def set_image(self, image: QImage, backing: np.ndarray | None = None) -> None:
         self._image = image
+        self._image_backing = backing
         self.update()
 
     def set_roi(self, roi: Roi) -> None:
@@ -406,6 +517,13 @@ class RoiCanvas(QWidget):
         del event
         self._drag_mode = "none"
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.fullscreenRequested.emit(self._view_name)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
         if delta == 0:
@@ -484,20 +602,7 @@ class RoiCanvas(QWidget):
     def _image_rect(self) -> QRectF:
         if self.width() <= 1 or self.height() <= 1:
             return QRectF(0, 0, 1, 1)
-
-        source_ratio = FRAME_W / FRAME_H
-        canvas_ratio = self.width() / self.height()
-
-        if canvas_ratio >= source_ratio:
-            h = float(self.height())
-            w = h * source_ratio
-            x = (self.width() - w) / 2.0
-            return QRectF(x, 0.0, w, h)
-
-        w = float(self.width())
-        h = w / source_ratio
-        y = (self.height() - h) / 2.0
-        return QRectF(0.0, y, w, h)
+        return QRectF(0.0, 0.0, float(self.width()), float(self.height()))
 
     def _widget_to_frame(self, point: QPointF) -> QPointF:
         image_rect = self._image_rect()
@@ -523,13 +628,19 @@ class RoiCanvas(QWidget):
 
 
 class ImageCanvas(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setMinimumSize(960, 540)
-        self._image: QImage | None = None
+    fullscreenRequested = Signal(str)
 
-    def set_image(self, image: QImage) -> None:
+    def __init__(self, view_name: str = "output") -> None:
+        super().__init__()
+        self.setMinimumSize(160, 90)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._image: QImage | None = None
+        self._image_backing: np.ndarray | None = None
+        self._view_name = view_name
+
+    def set_image(self, image: QImage, backing: np.ndarray | None = None) -> None:
         self._image = image
+        self._image_backing = backing
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -543,26 +654,22 @@ class ImageCanvas(QWidget):
     def _image_rect(self) -> QRectF:
         if self.width() <= 1 or self.height() <= 1:
             return QRectF(0, 0, 1, 1)
+        return QRectF(0.0, 0.0, float(self.width()), float(self.height()))
 
-        source_ratio = FRAME_W / FRAME_H
-        canvas_ratio = self.width() / self.height()
-
-        if canvas_ratio >= source_ratio:
-            h = float(self.height())
-            w = h * source_ratio
-            x = (self.width() - w) / 2.0
-            return QRectF(x, 0.0, w, h)
-
-        w = float(self.width())
-        h = w / source_ratio
-        y = (self.height() - h) / 2.0
-        return QRectF(0.0, y, w, h)
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.fullscreenRequested.emit(self._view_name)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class VideoProcessorController:
     def __init__(self, module) -> None:
         self._module = module
         self.enable_placeholder_sr = True
+        self.deinterlace_enabled = True
+        self.max_auto_sr_scale = 4
         self.sr_manual_scale = 4
         self.sr_auto_mode = True
         self.processor = None
@@ -579,6 +686,8 @@ class VideoProcessorController:
             enable_placeholder_sr=self.enable_placeholder_sr,
             sr_scale=sr_scale,
         )
+        self.processor.set_max_auto_sr_scale(self.max_auto_sr_scale)
+        self.processor.set_deinterlace_enabled(self.deinterlace_enabled)
 
     def set_roi(self, roi: Roi) -> None:
         if self.processor is not None:
@@ -600,6 +709,16 @@ class VideoProcessorController:
             return 1
         return int(self.processor.get_effective_sr_scale())
 
+    def set_deinterlace_enabled(self, enabled: bool) -> None:
+        self.deinterlace_enabled = enabled
+        if self.processor is not None:
+            self.processor.set_deinterlace_enabled(enabled)
+
+    def set_max_auto_sr_scale(self, scale: int) -> None:
+        self.max_auto_sr_scale = scale
+        if self.processor is not None:
+            self.processor.set_max_auto_sr_scale(scale)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, module) -> None:
@@ -608,8 +727,8 @@ class MainWindow(QMainWindow):
 
         self._module = module
         self._source = SyntheticUyvySource()
-        self._input_canvas = RoiCanvas()
-        self._output_canvas = ImageCanvas()
+        self._input_canvas = RoiCanvas(view_name="input")
+        self._output_canvas = ImageCanvas(view_name="output")
         self._controller = VideoProcessorController(module)
         self._roi = Roi(480, 270, 960, 540)
         self._controller.create(self._roi)
@@ -621,25 +740,88 @@ class MainWindow(QMainWindow):
 
         self._last_stat_time = time.perf_counter()
         self._frame_count = 0
+        self._perf_stage_sums_ms = {
+            "acquire": 0.0,
+            "process": 0.0,
+            "output": 0.0,
+            "convert_in": 0.0,
+            "convert_out": 0.0,
+            "tick": 0.0,
+        }
+        self._perf_stage_counts = {
+            "acquire": 0,
+            "process": 0,
+            "output": 0,
+            "convert_in": 0,
+            "convert_out": 0,
+            "tick": 0,
+        }
+        self._perf_stage_peaks_ms = {
+            "acquire": 0.0,
+            "process": 0.0,
+            "output": 0.0,
+            "convert_in": 0.0,
+            "convert_out": 0.0,
+            "tick": 0.0,
+        }
+        self._perf_guard_enabled = False
+        self._perf_guard_low_fps_seconds = 0
+        self._perf_guard_last_action = ""
         self._updating_controls = False
+        self._fullscreen_view_name: str | None = None
+        self._splitter_initialized = False
 
         central = QWidget()
         self.setCentralWidget(central)
 
         root = QHBoxLayout(central)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
         viewers = QWidget()
         viewers_layout = QVBoxLayout(viewers)
-        viewers_layout.addWidget(QLabel("Input View (ROI controls are locked to this view)"))
-        viewers_layout.addWidget(self._input_canvas, 3)
-        viewers_layout.addWidget(QLabel("Output View (processed result only)"))
-        viewers_layout.addWidget(self._output_canvas, 3)
+        viewers_layout.setContentsMargins(0, 0, 0, 0)
+        viewers_layout.setSpacing(4)
+
+        self._input_panel = QWidget()
+        input_layout = QVBoxLayout(self._input_panel)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(2)
+        self._input_title_label = QLabel("Input View (ROI controls are locked to this view)")
+        input_layout.addWidget(self._input_title_label)
+        input_layout.addWidget(self._input_canvas, 1, alignment=Qt.AlignCenter)
+
+        self._output_panel = QWidget()
+        output_layout = QVBoxLayout(self._output_panel)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.setSpacing(2)
+        self._output_title_label = QLabel("Output View (processed result only)")
+        output_layout.addWidget(self._output_title_label)
+        output_layout.addWidget(self._output_canvas, 1, alignment=Qt.AlignCenter)
+
+        self._display_splitter = QSplitter(Qt.Vertical)
+        self._display_splitter.setChildrenCollapsible(False)
+        self._display_splitter.addWidget(self._input_panel)
+        self._display_splitter.addWidget(self._output_panel)
+        self._display_splitter.setStretchFactor(0, 1)
+        self._display_splitter.setStretchFactor(1, 1)
+        self._display_splitter.splitterMoved.connect(lambda _pos, _index: self._fit_viewers_to_video_aspect())
+        viewers_layout.addWidget(self._display_splitter, 1)
 
         root.addWidget(viewers, 4)
-        root.addWidget(self._build_controls(), 1)
+        self._controls_panel = self._build_controls()
+        self._controls_scroll = QScrollArea()
+        self._controls_scroll.setWidgetResizable(True)
+        self._controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._controls_scroll.setWidget(self._controls_panel)
+        self._controls_scroll.setMinimumWidth(320)
+        self._controls_scroll.setMaximumWidth(520)
+        root.addWidget(self._controls_scroll, 1)
 
         self._input_canvas.set_roi(self._roi)
         self._input_canvas.roiChanged.connect(self._on_roi_from_canvas)
         self._input_canvas.scaleChanged.connect(self._on_scale_from_canvas)
+        self._input_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
+        self._output_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -654,6 +836,7 @@ class MainWindow(QMainWindow):
         self._on_source_mode_changed()
         self._update_status("Ready")
         LOGGER.info("GUI initialized; default source mode=%s", self._source_mode)
+        QTimer.singleShot(0, self._apply_initial_viewer_layout)
 
     def _build_controls(self) -> QWidget:
         panel = QWidget()
@@ -684,10 +867,26 @@ class MainWindow(QMainWindow):
         self.sr_manual_combo.currentIndexChanged.connect(self._on_sr_manual_changed)
         settings_form.addRow("Manual SR", self.sr_manual_combo)
 
+        self.auto_sr_max_combo = QComboBox()
+        self.auto_sr_max_combo.addItems(["2", "4", "8", "16"])
+        self.auto_sr_max_combo.setCurrentText("4")
+        self.auto_sr_max_combo.currentIndexChanged.connect(self._on_auto_sr_max_changed)
+        settings_form.addRow("Auto SR max", self.auto_sr_max_combo)
+
         self.enable_sr_checkbox = QCheckBox("Enable placeholder SR")
         self.enable_sr_checkbox.setChecked(True)
         self.enable_sr_checkbox.toggled.connect(self._on_enable_sr_toggled)
         settings_form.addRow(self.enable_sr_checkbox)
+
+        self.deinterlace_checkbox = QCheckBox("Enable Bob deinterlace")
+        self.deinterlace_checkbox.setChecked(True)
+        self.deinterlace_checkbox.toggled.connect(self._on_deinterlace_toggled)
+        settings_form.addRow(self.deinterlace_checkbox)
+
+        self.perf_guard_checkbox = QCheckBox("Auto performance guard (reduce SR when overloaded)")
+        self.perf_guard_checkbox.setChecked(False)
+        self.perf_guard_checkbox.toggled.connect(self._on_perf_guard_toggled)
+        settings_form.addRow(self.perf_guard_checkbox)
 
         decklink_box = QGroupBox("Blackmagic Video Format")
         decklink_form = QFormLayout(decklink_box)
@@ -796,33 +995,104 @@ class MainWindow(QMainWindow):
         reset_action.triggered.connect(self._reset_roi)
         self.addAction(reset_action)
 
+    def _perf_add(self, stage_name: str, elapsed_ms: float) -> None:
+        if stage_name not in self._perf_stage_sums_ms:
+            return
+        self._perf_stage_sums_ms[stage_name] += elapsed_ms
+        self._perf_stage_counts[stage_name] += 1
+        if elapsed_ms > self._perf_stage_peaks_ms[stage_name]:
+            self._perf_stage_peaks_ms[stage_name] = elapsed_ms
+
+    def _perf_snapshot_and_reset(self) -> dict[str, tuple[float, float]]:
+        snapshot: dict[str, tuple[float, float]] = {}
+        for stage_name in self._perf_stage_sums_ms:
+            count = self._perf_stage_counts[stage_name]
+            avg_ms = self._perf_stage_sums_ms[stage_name] / count if count > 0 else 0.0
+            peak_ms = self._perf_stage_peaks_ms[stage_name]
+            snapshot[stage_name] = (avg_ms, peak_ms)
+            self._perf_stage_sums_ms[stage_name] = 0.0
+            self._perf_stage_counts[stage_name] = 0
+            self._perf_stage_peaks_ms[stage_name] = 0.0
+        return snapshot
+
     def _tick(self) -> None:
         try:
+            tick_start = time.perf_counter()
+
+            t0 = time.perf_counter()
             input_frame = self._next_input_frame()
+            self._perf_add("acquire", (time.perf_counter() - t0) * 1000.0)
             if input_frame is None:
                 return
 
+            t0 = time.perf_counter()
             output_frame = self._controller.processor.process_frame(input_frame)
+            self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
 
             if self._source_mode == "Blackmagic DeckLink" and self._output_session is not None:
+                t0 = time.perf_counter()
                 write_frame_to_output(self._output_session, output_frame)
+                self._perf_add("output", (time.perf_counter() - t0) * 1000.0)
 
-            self._input_canvas.set_image(uyvy_to_qimage(input_frame))
-            self._output_canvas.set_image(uyvy_to_qimage(output_frame))
+            input_preview_size = self._preview_target_for_view("input")
+            if input_preview_size is not None:
+                t0 = time.perf_counter()
+                input_image, input_backing = uyvy_to_qimage(
+                    input_frame,
+                    preview_max_w=input_preview_size[0],
+                    preview_max_h=input_preview_size[1],
+                )
+                self._input_canvas.set_image(input_image, input_backing)
+                self._perf_add("convert_in", (time.perf_counter() - t0) * 1000.0)
+
+            output_preview_size = self._preview_target_for_view("output")
+            if output_preview_size is not None:
+                t0 = time.perf_counter()
+                output_image, output_backing = uyvy_to_qimage(
+                    output_frame,
+                    preview_max_w=output_preview_size[0],
+                    preview_max_h=output_preview_size[1],
+                )
+                self._output_canvas.set_image(output_image, output_backing)
+                self._perf_add("convert_out", (time.perf_counter() - t0) * 1000.0)
+
+            self._perf_add("tick", (time.perf_counter() - tick_start) * 1000.0)
             self._frame_count += 1
 
             now = time.perf_counter()
             dt = now - self._last_stat_time
             if dt >= 1.0:
                 fps = self._frame_count / dt
+                perf = self._perf_snapshot_and_reset()
                 self._frame_count = 0
                 self._last_stat_time = now
                 mode_text = "Auto" if self._controller.sr_auto_mode else "Manual"
                 self._update_status(
                     f"Running | FPS={fps:.1f} | SR mode={mode_text} | effective SR={self._controller.effective_scale()}"
                 )
+                LOGGER.info(
+                    (
+                        "PERF | fps=%.1f | acquire=%.2f/%.2fms | process=%.2f/%.2fms | "
+                        "output=%.2f/%.2fms | conv_in=%.2f/%.2fms | conv_out=%.2f/%.2fms | tick=%.2f/%.2fms"
+                    ),
+                    fps,
+                    perf["acquire"][0],
+                    perf["acquire"][1],
+                    perf["process"][0],
+                    perf["process"][1],
+                    perf["output"][0],
+                    perf["output"][1],
+                    perf["convert_in"][0],
+                    perf["convert_in"][1],
+                    perf["convert_out"][0],
+                    perf["convert_out"][1],
+                    perf["tick"][0],
+                    perf["tick"][1],
+                )
                 if self._source_mode == "Blackmagic DeckLink":
                     self.decklink_status_label.setText("DeckLink streaming")
+
+                self._apply_performance_guard(fps)
         except Exception as exc:
             self._timer.stop()
             self._update_status(f"Runtime error: {exc}")
@@ -830,6 +1100,132 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._stop_decklink_sessions()
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_initial_viewer_layout()
+        self._fit_viewers_to_video_aspect()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_viewers_to_video_aspect()
+
+    def _apply_initial_viewer_layout(self) -> None:
+        if self._splitter_initialized:
+            return
+        if not self.isVisible():
+            return
+
+        total_h = self._display_splitter.size().height()
+        if total_h <= 2:
+            return
+
+        half = max(1, total_h // 2)
+        self._display_splitter.setSizes([half, max(1, total_h - half)])
+        self._splitter_initialized = True
+        self._fit_viewers_to_video_aspect()
+
+    def _fit_viewers_to_video_aspect(self) -> None:
+        self._fit_canvas_in_panel(
+            panel=self._input_panel,
+            title_label=self._input_title_label,
+            canvas=self._input_canvas,
+        )
+        self._fit_canvas_in_panel(
+            panel=self._output_panel,
+            title_label=self._output_title_label,
+            canvas=self._output_canvas,
+        )
+
+    def _fit_canvas_in_panel(self, panel: QWidget, title_label: QLabel, canvas: QWidget) -> None:
+        if not panel.isVisible() or panel.width() <= 0 or panel.height() <= 0:
+            return
+
+        layout = panel.layout()
+        if layout is None:
+            return
+
+        margins = layout.contentsMargins()
+        spacing = max(0, layout.spacing())
+        label_h = title_label.sizeHint().height() if title_label.isVisible() else 0
+
+        avail_w = panel.width() - margins.left() - margins.right()
+        avail_h = panel.height() - margins.top() - margins.bottom() - label_h - spacing
+
+        # Keep both stacked viewers within the window height budget.
+        if self._fullscreen_view_name is None:
+            window_half_h = max(1, int(self.height() / 2) - 10)
+            avail_h = min(avail_h, window_half_h)
+
+        if avail_w <= 10 or avail_h <= 10:
+            return
+
+        target_w = avail_w
+        target_h = int(round(target_w * 9.0 / 16.0))
+        if target_h > avail_h:
+            target_h = avail_h
+            target_w = int(round(target_h * 16.0 / 9.0))
+
+        target_w = max(1, min(target_w, avail_w))
+        target_h = max(1, min(target_h, avail_h))
+
+        if canvas.width() == target_w and canvas.height() == target_h:
+            return
+
+        canvas.setFixedSize(target_w, target_h)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key_Escape and self._fullscreen_view_name is not None:
+            self._set_fullscreen_view(None)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _on_canvas_fullscreen_requested(self, view_name: str) -> None:
+        if self._fullscreen_view_name == view_name:
+            self._set_fullscreen_view(None)
+            return
+        self._set_fullscreen_view(view_name)
+
+    def _set_fullscreen_view(self, view_name: str | None) -> None:
+        self._fullscreen_view_name = view_name
+        if view_name is None:
+            self._controls_scroll.setVisible(True)
+            self._input_panel.setVisible(True)
+            self._output_panel.setVisible(True)
+            self._input_canvas.setEnabled(True)
+            self._output_canvas.setEnabled(True)
+            self.showNormal()
+            self._splitter_initialized = False
+            QTimer.singleShot(0, self._apply_initial_viewer_layout)
+            return
+
+        self._controls_scroll.setVisible(False)
+        self._input_panel.setVisible(view_name == "input")
+        self._output_panel.setVisible(view_name == "output")
+        self._input_canvas.setEnabled(view_name == "input")
+        self._output_canvas.setEnabled(view_name == "output")
+        self.showFullScreen()
+        QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
+
+    def _preview_target_for_view(self, view_name: str) -> tuple[int, int] | None:
+        if self._fullscreen_view_name is not None and self._fullscreen_view_name != view_name:
+            return None
+
+        canvas = self._input_canvas if view_name == "input" else self._output_canvas
+        if not canvas.isVisible():
+            return None
+
+        canvas_w = max(1, canvas.width())
+        canvas_h = max(1, canvas.height())
+        if self._fullscreen_view_name is None:
+            cap_w = WINDOWED_PREVIEW_MAX_W
+            cap_h = WINDOWED_PREVIEW_MAX_H
+        else:
+            cap_w = FULLSCREEN_PREVIEW_MAX_W
+            cap_h = FULLSCREEN_PREVIEW_MAX_H
+
+        return (min(canvas_w, cap_w), min(canvas_h, cap_h))
 
     def _update_timer_interval(self) -> None:
         fps = max(1, self.fps_spin.value())
@@ -903,6 +1299,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._update_status(f"Manual SR change failed: {exc}")
 
+    def _on_auto_sr_max_changed(self) -> None:
+        try:
+            max_scale = int(self.auto_sr_max_combo.currentText())
+            self._controller.set_max_auto_sr_scale(max_scale)
+            if self.sr_mode_combo.currentText() == "Auto":
+                self._controller.set_auto_sr()
+            self._update_status(f"Auto SR max set to {max_scale}")
+        except Exception as exc:
+            self._update_status(f"Auto SR max change failed: {exc}")
+
     def _on_enable_sr_toggled(self, checked: bool) -> None:
         self._controller.enable_placeholder_sr = checked
         try:
@@ -910,6 +1316,76 @@ class MainWindow(QMainWindow):
             self._update_status("Recreated processor after placeholder SR toggle")
         except Exception as exc:
             self._update_status(f"Processor recreate failed: {exc}")
+
+    def _on_deinterlace_toggled(self, checked: bool) -> None:
+        try:
+            self._controller.set_deinterlace_enabled(checked)
+            mode_text = "enabled" if checked else "disabled"
+            self._update_status(f"Bob deinterlace {mode_text}")
+        except Exception as exc:
+            self._update_status(f"Deinterlace toggle failed: {exc}")
+
+    def _on_perf_guard_toggled(self, checked: bool) -> None:
+        self._perf_guard_enabled = checked
+        self._perf_guard_low_fps_seconds = 0
+        self._perf_guard_last_action = ""
+
+    def _target_fps(self) -> float:
+        return float(max(1, self.fps_spin.value()))
+
+    def _apply_performance_guard(self, measured_fps: float) -> None:
+        if not self._perf_guard_enabled:
+            return
+
+        target_fps = self._target_fps()
+        if target_fps <= 0:
+            return
+
+        low_threshold = target_fps * 0.80
+        severe_threshold = target_fps * 0.65
+
+        if measured_fps >= low_threshold:
+            self._perf_guard_low_fps_seconds = 0
+            return
+
+        self._perf_guard_low_fps_seconds += 1
+        if self._perf_guard_low_fps_seconds < 2:
+            return
+
+        # First mitigation: clamp SR cost by switching to manual x2.
+        if self._controller.enable_placeholder_sr and (
+            self._controller.sr_auto_mode or self._controller.sr_manual_scale > 2 or self._controller.effective_scale() > 2
+        ):
+            self._controller.set_manual_sr(2)
+            self._updating_controls = True
+            self.sr_mode_combo.setCurrentText("Manual")
+            self.sr_manual_combo.setCurrentText("2")
+            self._updating_controls = False
+            self._perf_guard_last_action = "manual_x2"
+            self._perf_guard_low_fps_seconds = 0
+            LOGGER.warning(
+                "PERF_GUARD | fps=%.1f target=%.1f | action=force_manual_sr_2",
+                measured_fps,
+                target_fps,
+            )
+            self._update_status("Performance guard: forced Manual SR=2 to improve FPS")
+            return
+
+        # Second mitigation: disable placeholder SR if still significantly below target.
+        if (
+            self._controller.enable_placeholder_sr
+            and self._controller.sr_manual_scale == 2
+            and measured_fps < severe_threshold
+            and self._perf_guard_last_action != "disable_sr"
+        ):
+            self.enable_sr_checkbox.setChecked(False)
+            self._perf_guard_last_action = "disable_sr"
+            self._perf_guard_low_fps_seconds = 0
+            LOGGER.warning(
+                "PERF_GUARD | fps=%.1f target=%.1f | action=disable_placeholder_sr",
+                measured_fps,
+                target_fps,
+            )
 
     def _on_source_mode_changed(self) -> None:
         self._source_mode = self.source_mode_combo.currentText()
@@ -1184,6 +1660,7 @@ class MainWindow(QMainWindow):
                 self._output_session.stop()
             except Exception:
                 pass
+            clear_output_schedule_state(self._output_session)
             self._output_session = None
 
         if self._capture_session is not None:
@@ -1214,10 +1691,11 @@ class MainWindow(QMainWindow):
                 self._last_frame_error = "No input signal frames received"
                 self._update_status("DeckLink connected but no input frames yet; check source signal and input mode")
             return None
+        frame_bytes = tight_uyvy_bytes(frame)
 
         self._no_frame_counter = 0
         self._last_frame_error = None
-        return tight_uyvy_bytes(frame)
+        return frame_bytes
 
     def _reset_roi(self) -> None:
         self._roi = Roi(480, 270, 960, 540)
@@ -1246,15 +1724,18 @@ def load_video_processor_module():
     if venv_site.exists():
         site.addsitedir(str(venv_site))
 
-    for candidate in [
+    # Keep Release highest priority and Debug last to avoid accidental slow debug imports.
+    preferred_paths = [
         project_root / "build" / "src" / "Release",
         project_root / "build" / "src" / "RelWithDebInfo",
         project_root / "build" / "src" / "Debug",
-    ]:
+    ]
+    for candidate in reversed(preferred_paths):
         if candidate.exists() and str(candidate) not in sys.path:
             sys.path.insert(0, str(candidate))
 
     import video_processor
+    LOGGER.info("Loaded video_processor from %s", getattr(video_processor, "__file__", "<unknown>"))
 
     return video_processor
 
@@ -1270,7 +1751,15 @@ def main() -> int:
         return 1
 
     window = MainWindow(module)
-    window.resize(1500, 900)
+    screen = app.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        target_w = min(int(available.width()), max(900, int(available.width() * 0.92)))
+        target_h = min(int(available.height()), max(520, int(available.height() * 0.92)))
+        window.resize(target_w, target_h)
+        window.setMaximumSize(available.size())
+    else:
+        window.resize(1400, 860)
     window.show()
     return app.exec()
 

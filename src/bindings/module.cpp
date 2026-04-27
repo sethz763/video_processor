@@ -78,9 +78,33 @@ PYBIND11_MODULE(video_processor, m) {
             &vp::VideoProcessor::GetEffectiveSrScale,
             "Get the currently active SR scale after any fallback."
         )
+        .def(
+            "set_max_auto_sr_scale",
+            &vp::VideoProcessor::SetMaxAutoSrScale,
+            py::arg("sr_scale"),
+            "Set the maximum allowed auto SR scale to one of [2, 4, 8, 16]."
+        )
+        .def(
+            "get_max_auto_sr_scale",
+            &vp::VideoProcessor::GetMaxAutoSrScale,
+            "Get the configured maximum auto SR scale."
+        )
+        .def(
+            "set_deinterlace_enabled",
+            &vp::VideoProcessor::SetDeinterlaceEnabled,
+            py::arg("enabled"),
+            "Enable or disable Bob deinterlacing before ROI/crop processing."
+        )
+        .def(
+            "is_deinterlace_enabled",
+            &vp::VideoProcessor::IsDeinterlaceEnabled,
+            "Return whether Bob deinterlacing is currently enabled."
+        )
         .def_property_readonly("width", &vp::VideoProcessor::width)
         .def_property_readonly("height", &vp::VideoProcessor::height)
         .def_property_readonly("sr_scale", &vp::VideoProcessor::sr_scale)
         .def_property_readonly("sr_auto_mode", &vp::VideoProcessor::IsSrAutoMode)
-        .def_property_readonly("effective_sr_scale", &vp::VideoProcessor::GetEffectiveSrScale);
+        .def_property_readonly("effective_sr_scale", &vp::VideoProcessor::GetEffectiveSrScale)
+        .def_property("max_auto_sr_scale", &vp::VideoProcessor::GetMaxAutoSrScale, &vp::VideoProcessor::SetMaxAutoSrScale)
+        .def_property("deinterlace_enabled", &vp::VideoProcessor::IsDeinterlaceEnabled, &vp::VideoProcessor::SetDeinterlaceEnabled);
 }

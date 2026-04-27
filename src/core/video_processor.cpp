@@ -29,21 +29,39 @@ inline bool IsSupportedSrScale(int sr_scale) {
     return false;
 }
 
-inline int SelectAutoSrScale(int width, int height, int roi_w, int roi_h) {
+inline int ClampToSupportedSrScale(int sr_scale) {
+    for (const int value : kSupportedSrScales) {
+        if (sr_scale >= value) {
+            return value;
+        }
+    }
+    return 2;
+}
+
+inline int SelectAutoSrScale(int width, int height, int roi_w, int roi_h, int max_auto_sr_scale) {
     const float rw = static_cast<float>(roi_w) / static_cast<float>(width);
     const float rh = static_cast<float>(roi_h) / static_cast<float>(height);
     const float ratio = std::max(rw, rh);
 
+    const int capped_max = ClampToSupportedSrScale(max_auto_sr_scale);
+
+    // For large ROIs, placeholder SR adds significant cost with limited benefit,
+    // so auto mode can bypass SR entirely to preserve real-time throughput.
+    if (ratio > 0.66f) {
+        return 1;
+    }
+
+    int selected = 16;
     if (ratio > 0.5f) {
-        return 2;
+        selected = 2;
+    } else if (ratio > 0.25f) {
+        selected = 4;
+    } else if (ratio > 0.125f) {
+        selected = 8;
     }
-    if (ratio > 0.25f) {
-        return 4;
-    }
-    if (ratio > 0.125f) {
-        return 8;
-    }
-    return 16;
+
+    selected = std::min(selected, capped_max);
+    return ClampToSupportedSrScale(selected);
 }
 
 } // namespace
@@ -65,7 +83,9 @@ VideoProcessor::VideoProcessor(
       roi_w_(roi_w),
       roi_h_(roi_h),
       enable_placeholder_sr_(enable_placeholder_sr),
+        enable_deinterlace_(true),
             auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
+        max_auto_sr_scale_(8),
             sr_requested_scale_(sr_scale),
       sr_scale_(sr_scale),
       sr_width_(width),
@@ -174,6 +194,25 @@ void VideoProcessor::SetSrModeAuto() {
     ConfigureSrScaleLocked(0, true);
 }
 
+void VideoProcessor::SetMaxAutoSrScale(int sr_scale) {
+    if (!IsSupportedSrScale(sr_scale)) {
+        throw std::invalid_argument("Max auto SR scale must be one of [2, 4, 8, 16].");
+    }
+
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    max_auto_sr_scale_ = sr_scale;
+    if (enable_placeholder_sr_ && auto_sr_scale_) {
+        CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize SetMaxAutoSrScale");
+        ConfigureSrScaleLocked(0, true);
+    }
+}
+
+int VideoProcessor::GetMaxAutoSrScale() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return max_auto_sr_scale_;
+}
+
 void VideoProcessor::SetSrScaleManual(int sr_scale) {
     if (!enable_placeholder_sr_) {
         throw std::runtime_error("Placeholder SR is disabled.");
@@ -196,6 +235,16 @@ int VideoProcessor::GetEffectiveSrScale() const {
 bool VideoProcessor::IsSrAutoMode() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return auto_sr_scale_;
+}
+
+void VideoProcessor::SetDeinterlaceEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    enable_deinterlace_ = enabled;
+}
+
+bool VideoProcessor::IsDeinterlaceEnabled() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return enable_deinterlace_;
 }
 
 int VideoProcessor::sr_scale() const {
@@ -231,7 +280,16 @@ bool VideoProcessor::EnsureSrBufferCapacityLocked(int target_scale, cudaError_t&
 void VideoProcessor::ConfigureSrScaleLocked(int requested_scale, bool auto_mode) {
     int effective_requested_scale = requested_scale;
     if (auto_mode) {
-        effective_requested_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_);
+        effective_requested_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_, max_auto_sr_scale_);
+    }
+
+    if (effective_requested_scale == 1) {
+        auto_sr_scale_ = auto_mode;
+        sr_requested_scale_ = auto_mode ? 0 : requested_scale;
+        sr_scale_ = 1;
+        sr_width_ = width_;
+        sr_height_ = height_;
+        return;
     }
 
     if (!IsSupportedSrScale(effective_requested_scale)) {
@@ -293,10 +351,11 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
     int sr_scale = 1;
     int sr_width = width_;
     int sr_height = height_;
+    bool deinterlace_enabled = true;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (enable_placeholder_sr_ && auto_sr_scale_) {
-            const int desired_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_);
+            const int desired_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_, max_auto_sr_scale_);
             if (desired_scale != sr_scale_) {
                 ConfigureSrScaleLocked(0, true);
             }
@@ -309,6 +368,7 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
         sr_scale = sr_scale_;
         sr_width = sr_width_;
         sr_height = sr_height_;
+        deinterlace_enabled = enable_deinterlace_;
     }
 
     CheckCuda(
@@ -317,9 +377,8 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
     );
 
     cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, stream_);
-    cuda_kernels::LaunchBobDeinterlace(d_rgb_full_, d_rgb_bob_, width_, height_, stream_);
 
-    const uchar3* crop_input = d_rgb_bob_;
+    const uchar3* crop_input = d_rgb_full_;
     int crop_src_w = width_;
     int crop_src_h = height_;
     int crop_roi_x = roi_x;
@@ -327,25 +386,46 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
     int crop_roi_w = roi_w;
     int crop_roi_h = roi_h;
 
-    if (enable_placeholder_sr_) {
-        cuda_kernels::LaunchUpscaleBicubic(
-            d_rgb_bob_,
-            width_,
-            height_,
-            d_rgb_sr_,
-            sr_width,
-            sr_height,
-            stream_
-        );
+    if (deinterlace_enabled) {
+        cuda_kernels::LaunchBobDeinterlace(d_rgb_full_, d_rgb_bob_, width_, height_, stream_);
+        crop_input = d_rgb_bob_;
+    }
 
-        crop_input = d_rgb_sr_;
-        crop_src_w = sr_width;
-        crop_src_h = sr_height;
-        // Keep the same scene framing while sampling from higher-resolution SR buffer.
-        crop_roi_x = roi_x * sr_scale;
-        crop_roi_y = roi_y * sr_scale;
-        crop_roi_w = roi_w * sr_scale;
-        crop_roi_h = roi_h * sr_scale;
+    if (enable_placeholder_sr_ && sr_scale > 1) {
+        int sr_roi_w = std::max(2, roi_w * sr_scale);
+        int sr_roi_h = std::max(2, roi_h * sr_scale);
+
+        // Avoid building very large intermediates that are immediately downscaled
+        // back to output resolution; this is a major cost on mobile GPUs.
+        sr_roi_w = std::min(sr_roi_w, width_);
+        sr_roi_h = std::min(sr_roi_h, height_);
+
+        const bool sr_pass_is_redundant = (sr_roi_w <= roi_w) && (sr_roi_h <= roi_h);
+        if (!sr_pass_is_redundant) {
+
+            // Upscale only the selected ROI region rather than the full frame.
+            cuda_kernels::LaunchCropZoomBilinear(
+                crop_input,
+                width_,
+                height_,
+                d_rgb_sr_,
+                sr_roi_w,
+                sr_roi_h,
+                roi_x,
+                roi_y,
+                roi_w,
+                roi_h,
+                stream_
+            );
+
+            crop_input = d_rgb_sr_;
+            crop_src_w = sr_roi_w;
+            crop_src_h = sr_roi_h;
+            crop_roi_x = 0;
+            crop_roi_y = 0;
+            crop_roi_w = sr_roi_w;
+            crop_roi_h = sr_roi_h;
+        }
     }
 
     cuda_kernels::LaunchCropZoomBilinear(

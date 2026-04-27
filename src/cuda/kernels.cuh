@@ -32,6 +32,16 @@ void LaunchUpscaleBicubic(
     cudaStream_t stream
 );
 
+void LaunchUpscaleBilinear(
+    const uchar3* d_rgb_in,
+    int in_width,
+    int in_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    cudaStream_t stream
+);
+
 void LaunchCropZoomBilinear(
     const uchar3* d_rgb_in,
     int src_width,

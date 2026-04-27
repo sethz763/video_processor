@@ -39,6 +39,10 @@ public:
     void SetSrScaleManual(int sr_scale);
     int GetEffectiveSrScale() const;
     bool IsSrAutoMode() const;
+    void SetMaxAutoSrScale(int sr_scale);
+    int GetMaxAutoSrScale() const;
+    void SetDeinterlaceEnabled(bool enabled);
+    bool IsDeinterlaceEnabled() const;
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -63,7 +67,9 @@ private:
     std::mutex process_mutex_;
 
     bool enable_placeholder_sr_;
+    bool enable_deinterlace_;
     bool auto_sr_scale_;
+    int max_auto_sr_scale_;
     int sr_requested_scale_;
     int sr_scale_;
     int sr_width_;

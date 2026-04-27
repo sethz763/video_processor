@@ -210,6 +210,29 @@ __global__ void CropZoomBilinearKernel(
     rgb_out[y * out_width + x] = SampleBilinear(rgb_in, src_width, src_height, src_x, src_y);
 }
 
+__global__ void UpscaleBilinearKernel(
+    const uchar3* rgb_in,
+    int in_width,
+    int in_height,
+    uchar3* rgb_out,
+    int out_width,
+    int out_height
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= out_width || y >= out_height) {
+        return;
+    }
+
+    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(out_width);
+    const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(out_height);
+    const float src_x = u * static_cast<float>(in_width - 1);
+    const float src_y = v * static_cast<float>(in_height - 1);
+
+    rgb_out[y * out_width + x] = SampleBilinear(rgb_in, in_width, in_height, src_x, src_y);
+}
+
 __global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int height) {
     const int pair_x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -282,6 +305,27 @@ void LaunchUpscaleBicubic(
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     UpscaleBicubicKernel<<<Grid2D(out_width, out_height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        in_width,
+        in_height,
+        d_rgb_out,
+        out_width,
+        out_height
+    );
+}
+
+void LaunchUpscaleBilinear(
+    const uchar3* d_rgb_in,
+    int in_width,
+    int in_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    UpscaleBilinearKernel<<<Grid2D(out_width, out_height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_rgb_in,
         in_width,
         in_height,
