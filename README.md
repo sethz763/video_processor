@@ -94,6 +94,30 @@ processor = video_processor.VideoProcessor(
 
 output_bytes = processor.process_frame(input_uyvy_bytes)
 
+Live SR toggling at runtime (no processor recreation):
+
+processor.set_sr_mode_auto()
+processor.set_sr_scale_manual(4)
+effective = processor.get_effective_sr_scale()
+is_auto = processor.sr_auto_mode
+
+Run backend smoke test for live SR toggle:
+
+python examples/smoke_live_sr_toggle.py
+
+## GUI test harness
+
+PySide6 GUI is available for interactive ROI/scale testing without DeckLink hardware:
+
+python gui/app.py
+
+GUI capabilities:
+- live processed preview from synthetic 1920x1080 UYVY frames
+- optional Blackmagic DeckLink capture/output path with format settings
+- ROI/scale control from mouse, keyboard, wheel/touchpad, and touchscreen gestures
+- SR mode toggle (Auto/Manual) using runtime backend APIs
+- manual SR value selection [2, 4, 8, 16]
+
 ## Zero allocations per frame notes
 
 Native side is allocation-free inside process_frame:

@@ -65,10 +65,12 @@ VideoProcessor::VideoProcessor(
       roi_w_(roi_w),
       roi_h_(roi_h),
       enable_placeholder_sr_(enable_placeholder_sr),
-    auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
+            auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
+            sr_requested_scale_(sr_scale),
       sr_scale_(sr_scale),
       sr_width_(width),
       sr_height_(height),
+            sr_buffer_scale_capacity_(0),
       uyvy_bytes_(static_cast<size_t>(width) * static_cast<size_t>(height) * kUyvyBytesPerPixel),
       rgb_pixels_(static_cast<size_t>(width) * static_cast<size_t>(height)),
       stream_(nullptr),
@@ -79,14 +81,9 @@ VideoProcessor::VideoProcessor(
       d_rgb_sr_(nullptr),
       d_rgb_zoom_(nullptr) {
     ValidateConfiguration();
-    ClampRoi();
-
-    if (enable_placeholder_sr_) {
-        if (auto_sr_scale_) {
-            sr_scale_ = SelectAutoSrScale(width_, height_, roi_w_, roi_h_);
-        }
-        sr_width_ = width_ * sr_scale_;
-        sr_height_ = height_ * sr_scale_;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        ClampRoi();
     }
 
     host_output_.resize(uyvy_bytes_);
@@ -135,6 +132,139 @@ void VideoProcessor::ClampRoi() {
     }
 }
 
+void VideoProcessor::SetRoi(int roi_x, int roi_y, int roi_w, int roi_h) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    roi_x_ = roi_x;
+    roi_y_ = roi_y;
+    roi_w_ = roi_w;
+    roi_h_ = roi_h;
+    ClampRoi();
+}
+
+void VideoProcessor::SetRoiPosition(int roi_x, int roi_y) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    roi_x_ = roi_x;
+    roi_y_ = roi_y;
+    ClampRoi();
+}
+
+void VideoProcessor::SetRoiSize(int roi_w, int roi_h) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    roi_w_ = roi_w;
+    roi_h_ = roi_h;
+    ClampRoi();
+}
+
+void VideoProcessor::GetRoi(int& roi_x, int& roi_y, int& roi_w, int& roi_h) const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    roi_x = roi_x_;
+    roi_y = roi_y_;
+    roi_w = roi_w_;
+    roi_h = roi_h_;
+}
+
+void VideoProcessor::SetSrModeAuto() {
+    if (!enable_placeholder_sr_) {
+        throw std::runtime_error("Placeholder SR is disabled.");
+    }
+
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize SetSrModeAuto");
+    ConfigureSrScaleLocked(0, true);
+}
+
+void VideoProcessor::SetSrScaleManual(int sr_scale) {
+    if (!enable_placeholder_sr_) {
+        throw std::runtime_error("Placeholder SR is disabled.");
+    }
+    if (!IsSupportedSrScale(sr_scale)) {
+        throw std::invalid_argument("Manual SR scale must be one of [2, 4, 8, 16].");
+    }
+
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize SetSrScaleManual");
+    ConfigureSrScaleLocked(sr_scale, false);
+}
+
+int VideoProcessor::GetEffectiveSrScale() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return sr_scale_;
+}
+
+bool VideoProcessor::IsSrAutoMode() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return auto_sr_scale_;
+}
+
+int VideoProcessor::sr_scale() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return sr_scale_;
+}
+
+bool VideoProcessor::EnsureSrBufferCapacityLocked(int target_scale, cudaError_t& last_error) {
+    if (d_rgb_sr_ != nullptr && sr_buffer_scale_capacity_ >= target_scale) {
+        return true;
+    }
+
+    const int candidate_w = width_ * target_scale;
+    const int candidate_h = height_ * target_scale;
+    const size_t sr_pixels = static_cast<size_t>(candidate_w) * static_cast<size_t>(candidate_h);
+
+    uchar3* new_buffer = nullptr;
+    const cudaError_t err = cudaMalloc(&new_buffer, sr_pixels * sizeof(uchar3));
+    if (err != cudaSuccess) {
+        last_error = err;
+        return false;
+    }
+
+    if (d_rgb_sr_ != nullptr) {
+        cudaFree(d_rgb_sr_);
+    }
+
+    d_rgb_sr_ = new_buffer;
+    sr_buffer_scale_capacity_ = target_scale;
+    return true;
+}
+
+void VideoProcessor::ConfigureSrScaleLocked(int requested_scale, bool auto_mode) {
+    int effective_requested_scale = requested_scale;
+    if (auto_mode) {
+        effective_requested_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_);
+    }
+
+    if (!IsSupportedSrScale(effective_requested_scale)) {
+        throw std::invalid_argument("SR scale must resolve to one of [2, 4, 8, 16].");
+    }
+
+    cudaError_t last_error = cudaSuccess;
+
+    for (const int candidate_scale : kSupportedSrScales) {
+        if (candidate_scale > effective_requested_scale) {
+            continue;
+        }
+
+        if (EnsureSrBufferCapacityLocked(candidate_scale, last_error)) {
+            auto_sr_scale_ = auto_mode;
+            sr_requested_scale_ = auto_mode ? 0 : requested_scale;
+            sr_scale_ = candidate_scale;
+            sr_width_ = width_ * candidate_scale;
+            sr_height_ = height_ * candidate_scale;
+            return;
+        }
+
+        // Continue fallback ladder only for allocation pressure.
+        if (last_error != cudaErrorMemoryAllocation) {
+            break;
+        }
+    }
+
+    throw std::runtime_error(
+        std::string("cudaMalloc d_rgb_sr_ failed: ") + cudaGetErrorString(last_error)
+    );
+}
+
 void VideoProcessor::InitializeBuffers() {
     CheckCuda(cudaMalloc(&d_uyvy_in_, uyvy_bytes_), "cudaMalloc d_uyvy_in_");
     CheckCuda(cudaMalloc(&d_uyvy_out_, uyvy_bytes_), "cudaMalloc d_uyvy_out_");
@@ -144,43 +274,41 @@ void VideoProcessor::InitializeBuffers() {
     CheckCuda(cudaMalloc(&d_rgb_zoom_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_zoom_");
 
     if (enable_placeholder_sr_) {
-        cudaError_t last_error = cudaSuccess;
-
-        for (const int candidate_scale : kSupportedSrScales) {
-            if (candidate_scale > sr_scale_) {
-                continue;
-            }
-
-            const int candidate_w = width_ * candidate_scale;
-            const int candidate_h = height_ * candidate_scale;
-            const size_t sr_pixels = static_cast<size_t>(candidate_w) * static_cast<size_t>(candidate_h);
-
-            const cudaError_t err = cudaMalloc(&d_rgb_sr_, sr_pixels * sizeof(uchar3));
-            if (err == cudaSuccess) {
-                sr_scale_ = candidate_scale;
-                sr_width_ = candidate_w;
-                sr_height_ = candidate_h;
-                return;
-            }
-
-            d_rgb_sr_ = nullptr;
-            last_error = err;
-
-            // For explicit scale, fail fast. For auto, keep trying lower scales.
-            if (!auto_sr_scale_ || err != cudaErrorMemoryAllocation) {
-                break;
-            }
-        }
-
-        throw std::runtime_error(
-            std::string("cudaMalloc d_rgb_sr_ failed: ") + cudaGetErrorString(last_error)
-        );
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        ConfigureSrScaleLocked(sr_requested_scale_, auto_sr_scale_);
     }
 }
 
 std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+
     if (input_frame.size() != uyvy_bytes_) {
         throw std::invalid_argument("Invalid frame size; expected 1920*1080*2 bytes in UYVY.");
+    }
+
+    int roi_x = 0;
+    int roi_y = 0;
+    int roi_w = 0;
+    int roi_h = 0;
+    int sr_scale = 1;
+    int sr_width = width_;
+    int sr_height = height_;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (enable_placeholder_sr_ && auto_sr_scale_) {
+            const int desired_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_);
+            if (desired_scale != sr_scale_) {
+                ConfigureSrScaleLocked(0, true);
+            }
+        }
+
+        roi_x = roi_x_;
+        roi_y = roi_y_;
+        roi_w = roi_w_;
+        roi_h = roi_h_;
+        sr_scale = sr_scale_;
+        sr_width = sr_width_;
+        sr_height = sr_height_;
     }
 
     CheckCuda(
@@ -194,10 +322,10 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
     const uchar3* crop_input = d_rgb_bob_;
     int crop_src_w = width_;
     int crop_src_h = height_;
-    int crop_roi_x = roi_x_;
-    int crop_roi_y = roi_y_;
-    int crop_roi_w = roi_w_;
-    int crop_roi_h = roi_h_;
+    int crop_roi_x = roi_x;
+    int crop_roi_y = roi_y;
+    int crop_roi_w = roi_w;
+    int crop_roi_h = roi_h;
 
     if (enable_placeholder_sr_) {
         cuda_kernels::LaunchUpscaleBicubic(
@@ -205,19 +333,19 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
             width_,
             height_,
             d_rgb_sr_,
-            sr_width_,
-            sr_height_,
+            sr_width,
+            sr_height,
             stream_
         );
 
         crop_input = d_rgb_sr_;
-        crop_src_w = sr_width_;
-        crop_src_h = sr_height_;
+        crop_src_w = sr_width;
+        crop_src_h = sr_height;
         // Keep the same scene framing while sampling from higher-resolution SR buffer.
-        crop_roi_x = roi_x_ * sr_scale_;
-        crop_roi_y = roi_y_ * sr_scale_;
-        crop_roi_w = roi_w_ * sr_scale_;
-        crop_roi_h = roi_h_ * sr_scale_;
+        crop_roi_x = roi_x * sr_scale;
+        crop_roi_y = roi_y * sr_scale;
+        crop_roi_w = roi_w * sr_scale;
+        crop_roi_h = roi_h * sr_scale;
     }
 
     cuda_kernels::LaunchCropZoomBilinear(

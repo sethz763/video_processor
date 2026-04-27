@@ -31,7 +31,56 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("frame"),
             "Process one 1920x1080 interlaced UYVY frame and return UYVY bytes."
         )
+        .def(
+            "set_roi",
+            &vp::VideoProcessor::SetRoi,
+            py::arg("roi_x"),
+            py::arg("roi_y"),
+            py::arg("roi_w"),
+            py::arg("roi_h"),
+            "Set ROI rectangle; values are clamped to valid frame bounds."
+        )
+        .def(
+            "set_roi_position",
+            &vp::VideoProcessor::SetRoiPosition,
+            py::arg("roi_x"),
+            py::arg("roi_y"),
+            "Set ROI position; size is preserved and full ROI is clamped."
+        )
+        .def(
+            "set_roi_size",
+            &vp::VideoProcessor::SetRoiSize,
+            py::arg("roi_w"),
+            py::arg("roi_h"),
+            "Set ROI size; position is preserved and full ROI is clamped."
+        )
+        .def(
+            "get_roi",
+            [](const vp::VideoProcessor& self) {
+                int roi_x = 0;
+                int roi_y = 0;
+                int roi_w = 0;
+                int roi_h = 0;
+                self.GetRoi(roi_x, roi_y, roi_w, roi_h);
+                return py::make_tuple(roi_x, roi_y, roi_w, roi_h);
+            },
+            "Get current ROI as (roi_x, roi_y, roi_w, roi_h)."
+        )
+        .def("set_sr_mode_auto", &vp::VideoProcessor::SetSrModeAuto, "Enable auto SR scale mode.")
+        .def(
+            "set_sr_scale_manual",
+            &vp::VideoProcessor::SetSrScaleManual,
+            py::arg("sr_scale"),
+            "Set manual SR scale to one of [2, 4, 8, 16]; may fall back on low memory."
+        )
+        .def(
+            "get_effective_sr_scale",
+            &vp::VideoProcessor::GetEffectiveSrScale,
+            "Get the currently active SR scale after any fallback."
+        )
         .def_property_readonly("width", &vp::VideoProcessor::width)
         .def_property_readonly("height", &vp::VideoProcessor::height)
-        .def_property_readonly("sr_scale", &vp::VideoProcessor::sr_scale);
+        .def_property_readonly("sr_scale", &vp::VideoProcessor::sr_scale)
+        .def_property_readonly("sr_auto_mode", &vp::VideoProcessor::IsSrAutoMode)
+        .def_property_readonly("effective_sr_scale", &vp::VideoProcessor::GetEffectiveSrScale);
 }
