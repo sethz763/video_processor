@@ -19,7 +19,7 @@ public:
         int roi_w,
         int roi_h,
         bool enable_placeholder_sr = true,
-        int sr_scale = 2
+        int sr_scale = 0
     );
 
     ~VideoProcessor();
@@ -31,6 +31,7 @@ public:
 
     int width() const { return width_; }
     int height() const { return height_; }
+    int sr_scale() const { return sr_scale_; }
 
 private:
     void InitializeBuffers();
@@ -47,6 +48,7 @@ private:
     int roi_h_;
 
     bool enable_placeholder_sr_;
+    bool auto_sr_scale_;
     int sr_scale_;
     int sr_width_;
     int sr_height_;

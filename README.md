@@ -7,7 +7,7 @@ Windows-first C++/CUDA/pybind11 proof-of-concept Python extension.
 1. Input: 1920x1080 interlaced UYVY bytes
 2. Upload to GPU
 3. Bob deinterlace to progressive frame
-4. Optional placeholder SR: bicubic internal upscale (default 2x)
+4. Optional placeholder SR: bicubic internal upscale (default auto)
 5. Crop + zoom back to 1920x1080
 6. Convert RGB back to UYVY
 7. Return bytes to Python
@@ -55,6 +55,24 @@ Run example with local PC preview window:
 pip install opencv-python numpy
 python examples/live_pipeline_example.py --viewer
 
+Run without placeholder SR (A/B test path):
+
+python examples/live_pipeline_example.py --disable-sr
+
+Run with explicit SR scale override:
+
+python examples/live_pipeline_example.py --sr-scale 4
+
+Use auto SR scale selection (default):
+
+python examples/live_pipeline_example.py --sr-scale 0
+
+Auto SR thresholds (based on max of ROI width ratio and ROI height ratio):
+- ratio > 0.5 -> SR 2
+- 0.25 < ratio <= 0.5 -> SR 4
+- 0.125 < ratio <= 0.25 -> SR 8
+- ratio <= 0.125 -> SR 16 (falls back to lower scale if GPU memory is insufficient)
+
 If no viewer window appears:
 - Ensure you are running in an interactive desktop session (not headless/remote service context).
 - Ensure you installed `opencv-python`, not `opencv-python-headless`.
@@ -71,7 +89,7 @@ processor = video_processor.VideoProcessor(
     roi_w=960,
     roi_h=540,
     enable_placeholder_sr=True,
-    sr_scale=2,
+    sr_scale=0,
 )
 
 output_bytes = processor.process_frame(input_uyvy_bytes)

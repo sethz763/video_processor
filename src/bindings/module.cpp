@@ -19,7 +19,7 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("roi_w") = 1920,
             py::arg("roi_h") = 1080,
             py::arg("enable_placeholder_sr") = true,
-            py::arg("sr_scale") = 4
+            py::arg("sr_scale") = 0
         )
         .def(
             "process_frame",
@@ -32,5 +32,6 @@ PYBIND11_MODULE(video_processor, m) {
             "Process one 1920x1080 interlaced UYVY frame and return UYVY bytes."
         )
         .def_property_readonly("width", &vp::VideoProcessor::width)
-        .def_property_readonly("height", &vp::VideoProcessor::height);
+        .def_property_readonly("height", &vp::VideoProcessor::height)
+        .def_property_readonly("sr_scale", &vp::VideoProcessor::sr_scale);
 }

@@ -1,6 +1,7 @@
 #include "core/video_processor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 #include "cuda/kernels.cuh"
@@ -11,11 +12,38 @@ namespace {
 constexpr int kExpectedWidth = 1920;
 constexpr int kExpectedHeight = 1080;
 constexpr int kUyvyBytesPerPixel = 2;
+constexpr std::array<int, 4> kSupportedSrScales = {16, 8, 4, 2};
 
 inline void CheckCuda(cudaError_t err, const char* operation) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string(operation) + " failed: " + cudaGetErrorString(err));
     }
+}
+
+inline bool IsSupportedSrScale(int sr_scale) {
+    for (const int value : kSupportedSrScales) {
+        if (value == sr_scale) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline int SelectAutoSrScale(int width, int height, int roi_w, int roi_h) {
+    const float rw = static_cast<float>(roi_w) / static_cast<float>(width);
+    const float rh = static_cast<float>(roi_h) / static_cast<float>(height);
+    const float ratio = std::max(rw, rh);
+
+    if (ratio > 0.5f) {
+        return 2;
+    }
+    if (ratio > 0.25f) {
+        return 4;
+    }
+    if (ratio > 0.125f) {
+        return 8;
+    }
+    return 16;
 }
 
 } // namespace
@@ -37,6 +65,7 @@ VideoProcessor::VideoProcessor(
       roi_w_(roi_w),
       roi_h_(roi_h),
       enable_placeholder_sr_(enable_placeholder_sr),
+    auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
       sr_scale_(sr_scale),
       sr_width_(width),
       sr_height_(height),
@@ -53,6 +82,9 @@ VideoProcessor::VideoProcessor(
     ClampRoi();
 
     if (enable_placeholder_sr_) {
+        if (auto_sr_scale_) {
+            sr_scale_ = SelectAutoSrScale(width_, height_, roi_w_, roi_h_);
+        }
         sr_width_ = width_ * sr_scale_;
         sr_height_ = height_ * sr_scale_;
     }
@@ -76,8 +108,8 @@ void VideoProcessor::ValidateConfiguration() const {
         throw std::invalid_argument("Invalid frame dimensions.");
     }
 
-    if (enable_placeholder_sr_ && (sr_scale_ < 2 || sr_scale_ > 4)) {
-        throw std::invalid_argument("Placeholder SR scale must be in [2, 4].");
+    if (enable_placeholder_sr_ && sr_scale_ != 0 && !IsSupportedSrScale(sr_scale_)) {
+        throw std::invalid_argument("Placeholder SR scale must be 0(auto) or one of [2, 4, 8, 16].");
     }
 }
 
@@ -112,8 +144,37 @@ void VideoProcessor::InitializeBuffers() {
     CheckCuda(cudaMalloc(&d_rgb_zoom_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_zoom_");
 
     if (enable_placeholder_sr_) {
-        const size_t sr_pixels = static_cast<size_t>(sr_width_) * static_cast<size_t>(sr_height_);
-        CheckCuda(cudaMalloc(&d_rgb_sr_, sr_pixels * sizeof(uchar3)), "cudaMalloc d_rgb_sr_");
+        cudaError_t last_error = cudaSuccess;
+
+        for (const int candidate_scale : kSupportedSrScales) {
+            if (candidate_scale > sr_scale_) {
+                continue;
+            }
+
+            const int candidate_w = width_ * candidate_scale;
+            const int candidate_h = height_ * candidate_scale;
+            const size_t sr_pixels = static_cast<size_t>(candidate_w) * static_cast<size_t>(candidate_h);
+
+            const cudaError_t err = cudaMalloc(&d_rgb_sr_, sr_pixels * sizeof(uchar3));
+            if (err == cudaSuccess) {
+                sr_scale_ = candidate_scale;
+                sr_width_ = candidate_w;
+                sr_height_ = candidate_h;
+                return;
+            }
+
+            d_rgb_sr_ = nullptr;
+            last_error = err;
+
+            // For explicit scale, fail fast. For auto, keep trying lower scales.
+            if (!auto_sr_scale_ || err != cudaErrorMemoryAllocation) {
+                break;
+            }
+        }
+
+        throw std::runtime_error(
+            std::string("cudaMalloc d_rgb_sr_ failed: ") + cudaGetErrorString(last_error)
+        );
     }
 }
 
@@ -152,6 +213,7 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
         crop_input = d_rgb_sr_;
         crop_src_w = sr_width_;
         crop_src_h = sr_height_;
+        // Keep the same scene framing while sampling from higher-resolution SR buffer.
         crop_roi_x = roi_x_ * sr_scale_;
         crop_roi_y = roi_y_ * sr_scale_;
         crop_roi_w = roi_w_ * sr_scale_;
