@@ -1,0 +1,366 @@
+2026-04-27 13:47:41,273 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:47:41,275 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 875, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 890, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 13:47:41,294 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 13:47:41,294 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:47:41,295 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 875, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 890, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 13:47:41,296 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 13:47:41,296 INFO video_processor_gui | STATUS: Ready
+2026-04-27 13:47:41,297 INFO video_processor_gui | GUI initialized; default source mode=Blackmagic DeckLink
+2026-04-27 13:47:41,699 INFO video_processor_gui | STATUS: DeckLink selected but session not started
+2026-04-27 13:47:52,122 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:48:00,911 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:48:00,911 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 875, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 890, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 13:48:00,916 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 13:48:00,918 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:48:00,922 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 875, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 890, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 13:48:00,924 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 13:48:00,928 INFO video_processor_gui | STATUS: Ready
+2026-04-27 13:48:00,933 INFO video_processor_gui | GUI initialized; default source mode=Blackmagic DeckLink
+2026-04-27 13:48:02,020 INFO video_processor_gui | STATUS: DeckLink selected but session not started
+2026-04-27 13:48:20,726 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:53:38,980 INFO video_processor_gui | COM initialized for DeckLink (hr=0x00000000)
+2026-04-27 13:53:40,678 ERROR video_processor_gui | DeckLink catalog refresh failed while listing devices
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 1006, in _refresh_decklink_catalog
+    devices = d.list_devices()
+              ^^^^^^^^^^^^^^^^
+RuntimeError: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:40,680 INFO video_processor_gui | STATUS: DeckLink refresh failed: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:40,684 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:53:40,684 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 898, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 913, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 13:53:40,689 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 13:53:40,690 ERROR video_processor_gui | DeckLink catalog refresh failed while listing devices
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 1006, in _refresh_decklink_catalog
+    devices = d.list_devices()
+              ^^^^^^^^^^^^^^^^
+RuntimeError: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:40,692 INFO video_processor_gui | STATUS: DeckLink refresh failed: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:40,694 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:53:40,694 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 898, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 913, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 13:53:40,696 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 13:53:40,698 INFO video_processor_gui | STATUS: Ready
+2026-04-27 13:53:40,699 INFO video_processor_gui | GUI initialized; default source mode=Blackmagic DeckLink
+2026-04-27 13:53:41,541 INFO video_processor_gui | STATUS: DeckLink selected but session not started
+2026-04-27 13:53:48,680 ERROR video_processor_gui | DeckLink catalog refresh failed while listing devices
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 1006, in _refresh_decklink_catalog
+    devices = d.list_devices()
+              ^^^^^^^^^^^^^^^^
+RuntimeError: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:48,682 INFO video_processor_gui | STATUS: DeckLink refresh failed: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:52,238 ERROR video_processor_gui | DeckLink catalog refresh failed while listing devices
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 1006, in _refresh_decklink_catalog
+    devices = d.list_devices()
+              ^^^^^^^^^^^^^^^^
+RuntimeError: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:52,240 INFO video_processor_gui | STATUS: DeckLink refresh failed: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:53,416 ERROR video_processor_gui | DeckLink catalog refresh failed while listing devices
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 1006, in _refresh_decklink_catalog
+    devices = d.list_devices()
+              ^^^^^^^^^^^^^^^^
+RuntimeError: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:53,421 INFO video_processor_gui | STATUS: DeckLink refresh failed: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:54,332 ERROR video_processor_gui | DeckLink catalog refresh failed while listing devices
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 1006, in _refresh_decklink_catalog
+    devices = d.list_devices()
+              ^^^^^^^^^^^^^^^^
+RuntimeError: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:53:54,340 INFO video_processor_gui | STATUS: DeckLink refresh failed: CoInitializeEx failed with HRESULT=0x80010106
+2026-04-27 13:54:24,896 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:58:18,664 INFO video_processor_gui | COM initialized for DeckLink (hr=0x00000000)
+2026-04-27 13:58:20,054 INFO video_processor_gui | DeckLink refresh: detected 2 device(s)
+2026-04-27 13:58:20,057 INFO video_processor_gui | DeckLink refresh: input devices=1 output devices=1
+2026-04-27 13:58:20,074 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:58:20,122 INFO video_processor_gui | DeckLink started: input=UltraStudio Recorder 3G (0) mode=1080i59.94 (1920x1080, 29.97fps) output=UltraStudio Monitor 3G (1) mode=1080i59.94 (1920x1080, 29.97fps) fps=in=29.97, out=29.97, selected=29.97
+2026-04-27 13:58:20,133 INFO video_processor_gui | DeckLink refresh: detected 2 device(s)
+2026-04-27 13:58:20,135 INFO video_processor_gui | DeckLink refresh: input devices=1 output devices=1
+2026-04-27 13:58:20,163 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 13:58:20,214 INFO video_processor_gui | DeckLink started: input=UltraStudio Recorder 3G (0) mode=1080i59.94 (1920x1080, 29.97fps) output=UltraStudio Monitor 3G (1) mode=1080i59.94 (1920x1080, 29.97fps) fps=in=29.97, out=29.97, selected=29.97
+2026-04-27 13:58:20,217 INFO video_processor_gui | STATUS: Ready
+2026-04-27 13:58:20,217 INFO video_processor_gui | GUI initialized; default source mode=Blackmagic DeckLink
+2026-04-27 13:58:20,900 INFO video_processor_gui | STATUS: DeckLink connected but no input frames yet; check source signal and input mode
+2026-04-27 13:58:21,119 INFO video_processor_gui | STATUS: Running | FPS=0.9 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:22,132 INFO video_processor_gui | STATUS: Running | FPS=14.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:23,215 INFO video_processor_gui | STATUS: Running | FPS=12.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:24,289 INFO video_processor_gui | STATUS: Running | FPS=11.2 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:25,352 INFO video_processor_gui | STATUS: Running | FPS=10.3 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:26,375 INFO video_processor_gui | STATUS: Running | FPS=10.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:27,431 INFO video_processor_gui | STATUS: Running | FPS=10.3 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:28,449 INFO video_processor_gui | STATUS: Running | FPS=9.9 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:29,499 INFO video_processor_gui | STATUS: Running | FPS=9.5 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:30,531 INFO video_processor_gui | STATUS: Running | FPS=8.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:31,599 INFO video_processor_gui | STATUS: Running | FPS=10.4 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:32,660 INFO video_processor_gui | STATUS: Running | FPS=10.4 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:33,662 INFO video_processor_gui | STATUS: Running | FPS=8.0 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:34,826 INFO video_processor_gui | STATUS: Running | FPS=5.2 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:35,868 INFO video_processor_gui | STATUS: Running | FPS=3.8 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:36,974 INFO video_processor_gui | STATUS: Running | FPS=5.4 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:38,245 INFO video_processor_gui | STATUS: Running | FPS=3.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:39,341 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:40,365 INFO video_processor_gui | STATUS: Running | FPS=5.9 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:41,406 INFO video_processor_gui | STATUS: Running | FPS=6.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:42,466 INFO video_processor_gui | STATUS: Running | FPS=7.5 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:43,559 INFO video_processor_gui | STATUS: Running | FPS=10.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:44,596 INFO video_processor_gui | STATUS: Running | FPS=10.6 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:45,631 INFO video_processor_gui | STATUS: Running | FPS=10.6 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:46,718 INFO video_processor_gui | STATUS: Running | FPS=10.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:47,782 INFO video_processor_gui | STATUS: Running | FPS=10.4 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:48,791 INFO video_processor_gui | STATUS: Running | FPS=8.0 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:49,849 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:51,179 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:52,538 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:53,952 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:55,287 INFO video_processor_gui | STATUS: Running | FPS=4.5 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:56,348 INFO video_processor_gui | STATUS: Running | FPS=4.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:57,349 INFO video_processor_gui | STATUS: Running | FPS=6.9 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:58,432 INFO video_processor_gui | STATUS: Running | FPS=8.3 | SR mode=Auto | effective SR=4
+2026-04-27 13:58:59,470 INFO video_processor_gui | STATUS: Running | FPS=10.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:00,560 INFO video_processor_gui | STATUS: Running | FPS=10.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:01,586 INFO video_processor_gui | STATUS: Running | FPS=5.8 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:02,692 INFO video_processor_gui | STATUS: Running | FPS=6.3 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:03,713 INFO video_processor_gui | STATUS: Running | FPS=9.8 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:04,766 INFO video_processor_gui | STATUS: Running | FPS=8.5 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:05,860 INFO video_processor_gui | STATUS: Running | FPS=9.2 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:06,882 INFO video_processor_gui | STATUS: Running | FPS=8.8 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:07,925 INFO video_processor_gui | STATUS: Running | FPS=10.5 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:09,006 INFO video_processor_gui | STATUS: Running | FPS=6.5 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:10,035 INFO video_processor_gui | STATUS: Running | FPS=6.8 | SR mode=Auto | effective SR=8
+2026-04-27 13:59:11,045 INFO video_processor_gui | STATUS: Running | FPS=5.0 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:12,146 INFO video_processor_gui | STATUS: Running | FPS=7.2 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:13,240 INFO video_processor_gui | STATUS: Running | FPS=7.3 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:14,350 INFO video_processor_gui | STATUS: Running | FPS=5.4 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:15,493 INFO video_processor_gui | STATUS: Running | FPS=8.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:16,521 INFO video_processor_gui | STATUS: Running | FPS=7.8 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:17,938 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:19,102 INFO video_processor_gui | STATUS: Running | FPS=5.2 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:20,676 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:22,069 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:23,343 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:24,839 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:26,012 INFO video_processor_gui | STATUS: Running | FPS=2.6 | SR mode=Auto | effective SR=4
+2026-04-27 13:59:27,086 INFO video_processor_gui | STATUS: Running | FPS=6.5 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:28,131 INFO video_processor_gui | STATUS: Running | FPS=6.7 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:29,133 INFO video_processor_gui | STATUS: Running | FPS=7.0 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:30,228 INFO video_processor_gui | STATUS: Running | FPS=6.4 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:31,265 INFO video_processor_gui | STATUS: Running | FPS=6.8 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:32,268 INFO video_processor_gui | STATUS: Running | FPS=7.0 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:33,301 INFO video_processor_gui | STATUS: Running | FPS=8.6 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:34,490 INFO video_processor_gui | STATUS: Running | FPS=9.3 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:35,568 INFO video_processor_gui | STATUS: Running | FPS=9.3 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:36,604 INFO video_processor_gui | STATUS: Running | FPS=6.7 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:37,659 INFO video_processor_gui | STATUS: Running | FPS=7.6 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:38,687 INFO video_processor_gui | STATUS: Running | FPS=7.8 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:39,714 INFO video_processor_gui | STATUS: Running | FPS=10.7 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:40,779 INFO video_processor_gui | STATUS: Running | FPS=6.6 | SR mode=Auto | effective SR=2
+2026-04-27 13:59:41,863 INFO video_processor_gui | STATUS: Running | FPS=7.4 | SR mode=Auto | effective SR=2
+2026-04-27 14:15:22,662 INFO video_processor_gui | COM initialized for DeckLink (hr=0x00000000)
+2026-04-27 14:15:22,967 INFO video_processor_gui | DeckLink refresh: detected 1 device(s)
+2026-04-27 14:15:22,967 INFO video_processor_gui | DeckLink refresh: input devices=1 output devices=0
+2026-04-27 14:15:22,984 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 14:15:22,984 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 958, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 973, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 14:15:22,988 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 14:15:22,988 INFO video_processor_gui | DeckLink refresh: detected 1 device(s)
+2026-04-27 14:15:22,993 INFO video_processor_gui | DeckLink refresh: input devices=1 output devices=0
+2026-04-27 14:15:22,995 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 14:15:22,995 ERROR video_processor_gui | DeckLink setup failed
+Traceback (most recent call last):
+  File "c:\Coding Projects\video_processor\gui\app.py", line 958, in _on_apply_decklink_settings
+    self._start_decklink_sessions()
+  File "c:\Coding Projects\video_processor\gui\app.py", line 973, in _start_decklink_sessions
+    raise RuntimeError("No compatible DeckLink input/output devices selected")
+RuntimeError: No compatible DeckLink input/output devices selected
+2026-04-27 14:15:22,996 INFO video_processor_gui | STATUS: DeckLink setup failed: No compatible DeckLink input/output devices selected
+2026-04-27 14:15:22,996 INFO video_processor_gui | STATUS: Ready
+2026-04-27 14:15:22,996 INFO video_processor_gui | GUI initialized; default source mode=Blackmagic DeckLink
+2026-04-27 14:15:23,432 INFO video_processor_gui | STATUS: DeckLink selected but session not started
+2026-04-27 14:15:27,654 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 14:15:37,174 INFO video_processor_gui | COM initialized for DeckLink (hr=0x00000000)
+2026-04-27 14:15:38,002 INFO video_processor_gui | DeckLink refresh: detected 2 device(s)
+2026-04-27 14:15:38,006 INFO video_processor_gui | DeckLink refresh: input devices=1 output devices=1
+2026-04-27 14:15:38,109 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 14:15:38,211 INFO video_processor_gui | DeckLink started: input=UltraStudio Recorder 3G (0) mode=1080i59.94 (1920x1080, 29.97fps) output=UltraStudio Monitor 3G (1) mode=1080i59.94 (1920x1080, 29.97fps) fps=in=29.97, out=29.97, selected=29.97
+2026-04-27 14:15:38,229 INFO video_processor_gui | DeckLink refresh: detected 2 device(s)
+2026-04-27 14:15:38,229 INFO video_processor_gui | DeckLink refresh: input devices=1 output devices=1
+2026-04-27 14:15:38,285 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 14:15:38,411 INFO video_processor_gui | DeckLink started: input=UltraStudio Recorder 3G (0) mode=1080i59.94 (1920x1080, 29.97fps) output=UltraStudio Monitor 3G (1) mode=1080i59.94 (1920x1080, 29.97fps) fps=in=29.97, out=29.97, selected=29.97
+2026-04-27 14:15:38,416 INFO video_processor_gui | STATUS: Ready
+2026-04-27 14:15:38,418 INFO video_processor_gui | GUI initialized; default source mode=Blackmagic DeckLink
+2026-04-27 14:15:39,624 INFO video_processor_gui | STATUS: Running | FPS=0.5 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:40,995 INFO video_processor_gui | STATUS: Running | FPS=2.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:42,663 INFO video_processor_gui | STATUS: Running | FPS=1.8 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:44,102 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:45,390 INFO video_processor_gui | STATUS: Running | FPS=2.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:46,636 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:47,883 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:49,090 INFO video_processor_gui | STATUS: Running | FPS=2.5 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:50,425 INFO video_processor_gui | STATUS: Running | FPS=2.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:51,904 INFO video_processor_gui | STATUS: Running | FPS=2.0 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:53,310 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:54,490 INFO video_processor_gui | STATUS: Running | FPS=1.7 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:55,839 INFO video_processor_gui | STATUS: Running | FPS=2.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:57,248 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:58,263 INFO video_processor_gui | STATUS: Running | FPS=2.0 | SR mode=Auto | effective SR=4
+2026-04-27 14:15:59,721 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:01,011 INFO video_processor_gui | STATUS: Running | FPS=2.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:02,190 INFO video_processor_gui | STATUS: Running | FPS=2.5 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:03,461 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:04,727 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:05,999 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:07,248 INFO video_processor_gui | STATUS: Running | FPS=2.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:08,374 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:09,427 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:10,509 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:11,607 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:12,775 INFO video_processor_gui | STATUS: Running | FPS=2.6 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:13,894 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:15,019 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:16,159 INFO video_processor_gui | STATUS: Running | FPS=2.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:17,274 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:18,832 INFO video_processor_gui | STATUS: Running | FPS=1.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:20,042 INFO video_processor_gui | STATUS: Running | FPS=1.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:21,231 INFO video_processor_gui | STATUS: Running | FPS=2.5 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:22,574 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:23,633 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:24,708 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:25,734 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:26,749 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:27,744 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:28,815 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:29,859 INFO video_processor_gui | STATUS: Running | FPS=1.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:31,259 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:32,320 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:34,112 INFO video_processor_gui | STATUS: Running | FPS=1.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:35,173 INFO video_processor_gui | STATUS: Running | FPS=1.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:37,132 INFO video_processor_gui | STATUS: Running | FPS=1.0 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:38,410 INFO video_processor_gui | STATUS: Running | FPS=2.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:39,558 INFO video_processor_gui | STATUS: Running | FPS=2.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:40,605 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:41,910 INFO video_processor_gui | STATUS: Running | FPS=2.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:43,115 INFO video_processor_gui | STATUS: Running | FPS=2.5 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:44,164 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:45,395 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:46,620 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:47,719 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=4
+2026-04-27 14:16:49,083 INFO video_processor_gui | STATUS: Running | FPS=2.2 | SR mode=Auto | effective SR=8
+2026-04-27 14:16:50,103 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=8
+2026-04-27 14:16:51,540 INFO video_processor_gui | STATUS: Running | FPS=2.1 | SR mode=Auto | effective SR=16
+2026-04-27 14:16:52,769 INFO video_processor_gui | STATUS: Running | FPS=2.5 | SR mode=Auto | effective SR=16
+2026-04-27 14:16:53,943 INFO video_processor_gui | STATUS: Running | FPS=2.5 | SR mode=Auto | effective SR=8
+2026-04-27 14:16:54,956 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=8
+2026-04-27 14:16:55,999 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=8
+2026-04-27 14:16:57,256 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:58,378 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:16:59,549 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:00,651 INFO video_processor_gui | STATUS: Running | FPS=2.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:01,675 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:02,712 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:03,745 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:04,815 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:05,990 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:07,123 INFO video_processor_gui | STATUS: Running | FPS=2.6 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:08,361 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:09,436 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:10,661 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:11,767 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:12,994 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:14,188 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:15,231 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:16,311 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:17,385 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:18,698 INFO video_processor_gui | STATUS: Running | FPS=3.1 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:19,696 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:20,854 INFO video_processor_gui | STATUS: Running | FPS=2.6 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:22,087 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:23,271 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:24,525 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:25,657 INFO video_processor_gui | STATUS: Running | FPS=3.5 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:26,927 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:28,145 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:29,148 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:30,322 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:31,456 INFO video_processor_gui | STATUS: Running | FPS=3.5 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:32,728 INFO video_processor_gui | STATUS: Running | FPS=3.1 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:33,967 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:34,994 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:36,012 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:37,079 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:38,163 INFO video_processor_gui | STATUS: Running | FPS=2.8 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:39,447 INFO video_processor_gui | STATUS: Running | FPS=3.1 | SR mode=Auto | effective SR=8
+2026-04-27 14:17:40,571 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=4
+2026-04-27 14:17:41,629 INFO video_processor_gui | STATUS: Running | FPS=3.8 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:42,729 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:43,809 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:44,907 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:46,013 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:47,138 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:48,302 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:49,339 INFO video_processor_gui | STATUS: Running | FPS=3.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:50,354 INFO video_processor_gui | STATUS: Running | FPS=3.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:51,572 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:52,813 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:53,887 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:54,913 INFO video_processor_gui | STATUS: Running | FPS=3.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:55,938 INFO video_processor_gui | STATUS: Running | FPS=3.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:57,105 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:58,141 INFO video_processor_gui | STATUS: Running | FPS=3.9 | SR mode=Auto | effective SR=2
+2026-04-27 14:17:59,219 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:18:00,333 INFO video_processor_gui | STATUS: Running | FPS=3.6 | SR mode=Auto | effective SR=2
+2026-04-27 14:18:01,397 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:18:02,657 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:03,830 INFO video_processor_gui | STATUS: Running | FPS=3.4 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:05,080 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:06,341 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:07,350 INFO video_processor_gui | STATUS: Running | FPS=3.0 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:08,368 INFO video_processor_gui | STATUS: Running | FPS=2.9 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:09,615 INFO video_processor_gui | STATUS: Running | FPS=3.2 | SR mode=Auto | effective SR=4
+2026-04-27 14:18:10,811 INFO video_processor_gui | STATUS: Running | FPS=3.3 | SR mode=Auto | effective SR=2
+2026-04-27 14:18:11,860 INFO video_processor_gui | STATUS: Running | FPS=3.8 | SR mode=Auto | effective SR=2
+2026-04-27 14:18:12,924 INFO video_processor_gui | STATUS: Running | FPS=3.7 | SR mode=Auto | effective SR=2
+2026-04-27 14:18:13,756 INFO video_processor_gui | DeckLink sessions stopped
+2026-04-27 14:18:13,808 INFO video_processor_gui | STATUS: DeckLink selected but session not started
