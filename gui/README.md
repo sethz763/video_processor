@@ -32,3 +32,5 @@ The app auto-discovers the built extension from:
 - `Enable placeholder SR` recreates `VideoProcessor` because it is a constructor-time setting.
 - In `Synthetic` mode, input/output preview is generated locally.
 - In `Blackmagic DeckLink` mode, click `Apply DeckLink Settings` after selecting device indices and mode queries.
+- The GUI now attempts an experimental worker-process backend first; in Blackmagic mode this worker owns capture + processing + output, and the GUI only renders previews.
+- If worker startup fails, the app automatically falls back to the legacy in-process backend.

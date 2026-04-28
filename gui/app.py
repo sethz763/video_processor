@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing as mp
+import queue
 import site
 import sys
 import time
@@ -51,6 +53,26 @@ try:
     import cv2
 except Exception:
     cv2 = None
+
+# Running as `python gui/app.py` sets sys.path[0] to the gui folder; add project root
+# so `gui.processor_worker` and sibling imports resolve consistently.
+_project_root_for_imports = str(Path(__file__).resolve().parents[1])
+if _project_root_for_imports not in sys.path:
+    sys.path.insert(0, _project_root_for_imports)
+
+_worker_import_error: Exception | None = None
+try:
+    from gui.processor_worker import run_processor_worker
+except Exception as exc_gui_import:
+    try:
+        from processor_worker import run_processor_worker
+    except Exception as exc_local_import:
+        run_processor_worker = None
+        _worker_import_error = exc_local_import
+    else:
+        _worker_import_error = None
+else:
+    _worker_import_error = None
 
 
 _CV2_RGB_RING: list[np.ndarray] = []
@@ -719,6 +741,341 @@ class VideoProcessorController:
         if self.processor is not None:
             self.processor.set_max_auto_sr_scale(scale)
 
+    def process_frame(self, frame_bytes: bytes) -> bytes:
+        if self.processor is None:
+            raise RuntimeError("VideoProcessor is not initialized")
+        return self.processor.process_frame(frame_bytes)
+
+    def close(self) -> None:
+        self.processor = None
+
+    def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
+        raise RuntimeError("DeckLink capture/output in worker is unavailable for in-process backend")
+
+    def stop_decklink(self) -> None:
+        return
+
+    def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
+        raise RuntimeError("DeckLink worker tick is unavailable for in-process backend")
+
+
+class ProcessVideoProcessorController:
+    def __init__(self) -> None:
+        self.enable_placeholder_sr = True
+        self.deinterlace_enabled = True
+        self.max_auto_sr_scale = 4
+        self.sr_manual_scale = 4
+        self.sr_auto_mode = True
+
+        self._ctx = mp.get_context("spawn")
+        self._request_queue = None
+        self._response_queue = None
+        self._process = None
+
+        self._next_frame_id = 1
+        self._latest_output_frame: bytes | None = None
+        self._latest_decklink_frame: tuple[bytes, bytes] | None = None
+        self._latest_effective_scale = 1
+        self._decklink_no_frame_reason: str | None = None
+        self._decklink_processed_counter = 0
+        self._decklink_processed_fps = 0.0
+
+    def create(self, roi: Roi) -> None:
+        self.close()
+
+        if run_processor_worker is None:
+            raise RuntimeError("Process worker module is unavailable")
+
+        sr_scale = 0 if self.sr_auto_mode else self.sr_manual_scale
+        project_root = str(Path(__file__).resolve().parents[1])
+        startup_config = {
+            "project_root": project_root,
+            "width": FRAME_W,
+            "height": FRAME_H,
+            "roi_x": roi.x,
+            "roi_y": roi.y,
+            "roi_w": roi.w,
+            "roi_h": roi.h,
+            "enable_placeholder_sr": self.enable_placeholder_sr,
+            "sr_scale": sr_scale,
+            "sr_auto_mode": self.sr_auto_mode,
+            "sr_manual_scale": self.sr_manual_scale,
+            "max_auto_sr_scale": self.max_auto_sr_scale,
+            "deinterlace_enabled": self.deinterlace_enabled,
+        }
+
+        # Keep request queue larger than response queue so bursty UI events
+        # (ROI drag, tick polling) do not trip queue.Full in the GUI thread.
+        self._request_queue = self._ctx.Queue(maxsize=32)
+        self._response_queue = self._ctx.Queue(maxsize=8)
+        self._process = self._ctx.Process(
+            target=run_processor_worker,
+            args=(self._request_queue, self._response_queue, startup_config),
+            daemon=True,
+            name="video-processor-worker",
+        )
+        self._process.start()
+
+        self._latest_output_frame = None
+        self._latest_decklink_frame = None
+        self._latest_effective_scale = 1
+        self._next_frame_id = 1
+        self._wait_for_ready(timeout_seconds=5.0)
+
+    def _wait_for_ready(self, timeout_seconds: float) -> None:
+        if self._response_queue is None:
+            raise RuntimeError("Worker response queue is not initialized")
+
+        deadline = time.perf_counter() + timeout_seconds
+        while time.perf_counter() < deadline:
+            self._assert_worker_alive()
+            try:
+                message = self._response_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            message_type = message.get("type")
+            if message_type == "ready":
+                return
+            if message_type == "error":
+                raise RuntimeError(
+                    f"Worker startup failed: {message.get('error')}\n{message.get('traceback', '')}"
+                )
+
+        raise RuntimeError("Timed out waiting for worker startup")
+
+    def _assert_worker_alive(self) -> None:
+        if self._process is None:
+            raise RuntimeError("Worker process is not started")
+        if not self._process.is_alive():
+            raise RuntimeError("Worker process exited unexpectedly")
+
+    def _send_control(self, command: dict[str, object]) -> None:
+        self._assert_worker_alive()
+        if self._request_queue is None:
+            raise RuntimeError("Worker request queue is not initialized")
+
+        cmd = str(command.get("cmd", ""))
+        best_effort_cmds = {
+            "set_roi",
+            "decklink_tick",
+            "set_sr_mode_auto",
+            "set_sr_scale_manual",
+            "set_deinterlace_enabled",
+            "set_max_auto_sr_scale",
+        }
+
+        try:
+            self._request_queue.put_nowait(command)
+        except queue.Full:
+            # Prefer fresh control requests over stale queued work.
+            try:
+                self._request_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._request_queue.put_nowait(command)
+            except queue.Full:
+                # If still saturated, drop only best-effort commands.
+                if cmd in best_effort_cmds:
+                    return
+                raise RuntimeError(f"Worker request queue saturated while sending '{cmd}'")
+
+    def _drain_responses(self) -> None:
+        if self._response_queue is None:
+            return
+
+        while True:
+            try:
+                message = self._response_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            message_type = message.get("type")
+            if message_type == "frame":
+                self._latest_output_frame = message["frame_bytes"]
+                self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
+                continue
+
+            if message_type == "decklink_frame":
+                self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
+                self._latest_decklink_frame = (
+                    message["input_frame_bytes"],
+                    message["output_frame_bytes"],
+                )
+                self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
+                self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
+                self._decklink_no_frame_reason = None
+                continue
+
+            if message_type == "decklink_no_frame":
+                self._latest_decklink_frame = None
+                self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
+                continue
+
+            if message_type == "error":
+                raise RuntimeError(
+                    f"Worker runtime failure: {message.get('error')}\n{message.get('traceback', '')}"
+                )
+
+    def set_roi(self, roi: Roi) -> None:
+        self._send_control({"cmd": "set_roi", "x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h})
+
+    def set_auto_sr(self) -> None:
+        self.sr_auto_mode = True
+        if self.enable_placeholder_sr:
+            self._send_control({"cmd": "set_sr_mode_auto"})
+
+    def set_manual_sr(self, scale: int) -> None:
+        self.sr_manual_scale = scale
+        self.sr_auto_mode = False
+        if self.enable_placeholder_sr:
+            self._send_control({"cmd": "set_sr_scale_manual", "scale": int(scale)})
+
+    def effective_scale(self) -> int:
+        return max(1, int(self._latest_effective_scale))
+
+    def set_deinterlace_enabled(self, enabled: bool) -> None:
+        self.deinterlace_enabled = enabled
+        self._send_control({"cmd": "set_deinterlace_enabled", "enabled": bool(enabled)})
+
+    def set_max_auto_sr_scale(self, scale: int) -> None:
+        self.max_auto_sr_scale = scale
+        self._send_control({"cmd": "set_max_auto_sr_scale", "scale": int(scale)})
+
+    def _wait_for_ack(self, expected_cmd: str, timeout_seconds: float = 3.0) -> None:
+        if self._response_queue is None:
+            raise RuntimeError("Worker response queue is not initialized")
+
+        deadline = time.perf_counter() + timeout_seconds
+        while time.perf_counter() < deadline:
+            self._assert_worker_alive()
+            try:
+                message = self._response_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            message_type = message.get("type")
+            if message_type == "ack" and str(message.get("cmd")) == expected_cmd:
+                return
+            if message_type == "error":
+                raise RuntimeError(
+                    f"Worker runtime failure: {message.get('error')}\n{message.get('traceback', '')}"
+                )
+            if message_type == "frame":
+                self._latest_output_frame = message["frame_bytes"]
+                self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
+                continue
+            if message_type == "decklink_frame":
+                self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
+                self._latest_decklink_frame = (
+                    message["input_frame_bytes"],
+                    message["output_frame_bytes"],
+                )
+                self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
+                self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
+                self._decklink_no_frame_reason = None
+                continue
+            if message_type == "decklink_no_frame":
+                self._latest_decklink_frame = None
+                self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
+                continue
+
+        raise RuntimeError(f"Timed out waiting for worker ack: {expected_cmd}")
+
+    def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
+        self._drain_responses()
+        self._latest_decklink_frame = None
+        self._decklink_no_frame_reason = None
+        self._send_control(
+            {
+                "cmd": "start_decklink",
+                "in_device": int(in_device),
+                "in_mode": in_mode,
+                "out_device": int(out_device),
+                "out_mode": out_mode,
+                "enable_format_detection": bool(enable_format_detection),
+            }
+        )
+        self._wait_for_ack("start_decklink")
+
+    def stop_decklink(self) -> None:
+        if self._process is None:
+            return
+        self._send_control({"cmd": "stop_decklink"})
+        try:
+            self._wait_for_ack("stop_decklink", timeout_seconds=1.5)
+        except Exception:
+            pass
+        self._latest_decklink_frame = None
+
+    def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
+        self._drain_responses()
+        self._send_control({"cmd": "decklink_tick", "timeout_ms": int(timeout_ms)})
+        self._drain_responses()
+        return self._latest_decklink_frame
+
+    def decklink_no_frame_reason(self) -> str | None:
+        return self._decklink_no_frame_reason
+
+    def decklink_processed_fps(self) -> float:
+        return float(self._decklink_processed_fps)
+
+    def process_frame(self, frame_bytes: bytes) -> bytes:
+        self._drain_responses()
+        self._assert_worker_alive()
+        if self._request_queue is None:
+            raise RuntimeError("Worker request queue is not initialized")
+
+        frame_id = self._next_frame_id
+        self._next_frame_id += 1
+
+        frame_message = {
+            "cmd": "process_frame",
+            "frame_id": frame_id,
+            "frame_bytes": frame_bytes,
+        }
+
+        try:
+            self._request_queue.put_nowait(frame_message)
+        except queue.Full:
+            try:
+                self._request_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._request_queue.put_nowait(frame_message)
+            except queue.Full:
+                # Keep GUI responsive when worker is saturated; reuse latest output.
+                return self._latest_output_frame if self._latest_output_frame is not None else frame_bytes
+
+        self._drain_responses()
+        if self._latest_output_frame is None:
+            return frame_bytes
+        return self._latest_output_frame
+
+    def close(self) -> None:
+        try:
+            self.stop_decklink()
+        except Exception:
+            pass
+
+        if self._request_queue is not None:
+            try:
+                self._request_queue.put_nowait({"cmd": "shutdown"})
+            except Exception:
+                pass
+
+        if self._process is not None:
+            self._process.join(timeout=1.5)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=1.0)
+
+        self._process = None
+        self._request_queue = None
+        self._response_queue = None
+
 
 class MainWindow(QMainWindow):
     def __init__(self, module) -> None:
@@ -729,9 +1086,17 @@ class MainWindow(QMainWindow):
         self._source = SyntheticUyvySource()
         self._input_canvas = RoiCanvas(view_name="input")
         self._output_canvas = ImageCanvas(view_name="output")
-        self._controller = VideoProcessorController(module)
+        self._controller_backend = "in-process"
+        self._module = module
+        self._controller = self._create_processor_controller(module)
         self._roi = Roi(480, 270, 960, 540)
-        self._controller.create(self._roi)
+        try:
+            self._controller.create(self._roi)
+        except Exception as exc:
+            LOGGER.warning("Primary controller create failed (%s); switching to in-process backend", exc)
+            self._controller = VideoProcessorController(self._module)
+            self._controller_backend = "in-process"
+            self._controller.create(self._roi)
         self._source_mode = "Blackmagic DeckLink"
         self._capture_session = None
         self._output_session = None
@@ -770,6 +1135,7 @@ class MainWindow(QMainWindow):
         self._updating_controls = False
         self._fullscreen_view_name: str | None = None
         self._splitter_initialized = False
+        self._is_closing = False
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -835,8 +1201,26 @@ class MainWindow(QMainWindow):
         self._sync_blackmagic_controls_enabled_state()
         self._on_source_mode_changed()
         self._update_status("Ready")
+        if self._controller_backend == "worker-process":
+            self._update_status("Ready | Processing backend: worker process")
+        else:
+            self._update_status("Ready | Processing backend: in-process")
+            self.decklink_status_label.setText("Worker backend not active; running in GUI process")
         LOGGER.info("GUI initialized; default source mode=%s", self._source_mode)
         QTimer.singleShot(0, self._apply_initial_viewer_layout)
+
+    def _create_processor_controller(self, module):
+        if run_processor_worker is not None:
+            self._controller_backend = "worker-process"
+            LOGGER.info("Using worker-process video processor backend")
+            return ProcessVideoProcessorController()
+
+        self._controller_backend = "in-process"
+        if _worker_import_error is not None:
+            LOGGER.warning("Worker backend import failed; using in-process backend: %s", _worker_import_error)
+        else:
+            LOGGER.info("Worker backend unavailable; using in-process backend")
+        return VideoProcessorController(module)
 
     def _build_controls(self) -> QWidget:
         panel = QWidget()
@@ -1019,6 +1403,94 @@ class MainWindow(QMainWindow):
         try:
             tick_start = time.perf_counter()
 
+            if self._source_mode == "Blackmagic DeckLink" and self._controller_backend == "worker-process":
+                t0 = time.perf_counter()
+                decklink_frame = self._controller.decklink_tick(timeout_ms=50)
+                self._perf_add("acquire", (time.perf_counter() - t0) * 1000.0)
+
+                if decklink_frame is None:
+                    self._no_frame_counter += 1
+                    if self._no_frame_counter % 20 == 0:
+                        LOGGER.warning("No DeckLink worker frames yet (count=%d)", self._no_frame_counter)
+                    reason = None
+                    if hasattr(self._controller, "decklink_no_frame_reason"):
+                        reason = self._controller.decklink_no_frame_reason()
+                    if reason == "sessions_not_started":
+                        self._update_status("DeckLink worker sessions not started")
+                    else:
+                        self._update_status("DeckLink worker active but no input frames yet; check source signal and input mode")
+                    return
+
+                input_frame, output_frame = decklink_frame
+                self._no_frame_counter = 0
+
+                self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
+
+                input_preview_size = self._preview_target_for_view("input")
+                if input_preview_size is not None:
+                    t1 = time.perf_counter()
+                    input_image, input_backing = uyvy_to_qimage(
+                        input_frame,
+                        preview_max_w=input_preview_size[0],
+                        preview_max_h=input_preview_size[1],
+                    )
+                    self._input_canvas.set_image(input_image, input_backing)
+                    self._perf_add("convert_in", (time.perf_counter() - t1) * 1000.0)
+
+                output_preview_size = self._preview_target_for_view("output")
+                if output_preview_size is not None:
+                    t1 = time.perf_counter()
+                    output_image, output_backing = uyvy_to_qimage(
+                        output_frame,
+                        preview_max_w=output_preview_size[0],
+                        preview_max_h=output_preview_size[1],
+                    )
+                    self._output_canvas.set_image(output_image, output_backing)
+                    self._perf_add("convert_out", (time.perf_counter() - t1) * 1000.0)
+
+                self._perf_add("tick", (time.perf_counter() - tick_start) * 1000.0)
+                self._frame_count += 1
+
+                now = time.perf_counter()
+                dt = now - self._last_stat_time
+                if dt >= 1.0:
+                    fps = self._frame_count / dt
+                    perf = self._perf_snapshot_and_reset()
+                    self._frame_count = 0
+                    self._last_stat_time = now
+                    mode_text = "Auto" if self._controller.sr_auto_mode else "Manual"
+                    worker_fps = 0.0
+                    if hasattr(self._controller, "decklink_processed_fps"):
+                        worker_fps = float(self._controller.decklink_processed_fps())
+                    self._update_status(
+                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | SR mode={mode_text} | effective SR={self._controller.effective_scale()}"
+                    )
+                    LOGGER.info(
+                        (
+                            "PERF | preview_fps=%.1f | worker_fps=%.1f | acquire=%.2f/%.2fms | process=%.2f/%.2fms | "
+                            "output=%.2f/%.2fms | conv_in=%.2f/%.2fms | conv_out=%.2f/%.2fms | tick=%.2f/%.2fms"
+                        ),
+                        fps,
+                        worker_fps,
+                        perf["acquire"][0],
+                        perf["acquire"][1],
+                        perf["process"][0],
+                        perf["process"][1],
+                        perf["output"][0],
+                        perf["output"][1],
+                        perf["convert_in"][0],
+                        perf["convert_in"][1],
+                        perf["convert_out"][0],
+                        perf["convert_out"][1],
+                        perf["tick"][0],
+                        perf["tick"][1],
+                    )
+                    self.decklink_status_label.setText(
+                        f"DeckLink streaming via worker process | preview_fps={fps:.1f} | worker_fps={worker_fps:.1f}"
+                    )
+                    self._apply_performance_guard(fps)
+                return
+
             t0 = time.perf_counter()
             input_frame = self._next_input_frame()
             self._perf_add("acquire", (time.perf_counter() - t0) * 1000.0)
@@ -1026,7 +1498,7 @@ class MainWindow(QMainWindow):
                 return
 
             t0 = time.perf_counter()
-            output_frame = self._controller.processor.process_frame(input_frame)
+            output_frame = self._controller.process_frame(input_frame)
             self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
 
             if self._source_mode == "Blackmagic DeckLink" and self._output_session is not None:
@@ -1094,10 +1566,15 @@ class MainWindow(QMainWindow):
 
                 self._apply_performance_guard(fps)
         except Exception as exc:
+            if self._is_closing:
+                return
             self._timer.stop()
             self._update_status(f"Runtime error: {exc}")
 
     def closeEvent(self, event) -> None:
+        self._is_closing = True
+        self._timer.stop()
+        self._controller.close()
         self._stop_decklink_sessions()
         super().closeEvent(event)
 
@@ -1310,11 +1787,26 @@ class MainWindow(QMainWindow):
             self._update_status(f"Auto SR max change failed: {exc}")
 
     def _on_enable_sr_toggled(self, checked: bool) -> None:
+        previous_value = self._controller.enable_placeholder_sr
         self._controller.enable_placeholder_sr = checked
         try:
             self._controller.create(self._roi)
+            if self._source_mode == "Blackmagic DeckLink":
+                self._start_decklink_sessions()
             self._update_status("Recreated processor after placeholder SR toggle")
         except Exception as exc:
+            # Roll back to previous SR enable state so the app can recover in-place.
+            self._controller.enable_placeholder_sr = previous_value
+            try:
+                self._controller.create(self._roi)
+                if self._source_mode == "Blackmagic DeckLink":
+                    self._start_decklink_sessions()
+            except Exception:
+                pass
+
+            self.enable_sr_checkbox.blockSignals(True)
+            self.enable_sr_checkbox.setChecked(previous_value)
+            self.enable_sr_checkbox.blockSignals(False)
             self._update_status(f"Processor recreate failed: {exc}")
 
     def _on_deinterlace_toggled(self, checked: bool) -> None:
@@ -1456,22 +1948,33 @@ class MainWindow(QMainWindow):
         input_fps = self._resolve_mode_fps(in_device, in_mode, input_side=True)
         output_fps = self._resolve_mode_fps(out_device, out_mode, input_side=False)
 
-        self._capture_session = d.CaptureSession(
-            device_index=in_device,
-            display_mode=in_mode,
-            pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-            max_queue_frames=8,
-            enable_format_detection=self.decklink_enable_format_detection.isChecked(),
-        )
+        if self._controller_backend == "worker-process":
+            self._controller.start_decklink(
+                in_device=in_device,
+                in_mode=in_mode,
+                out_device=out_device,
+                out_mode=out_mode,
+                enable_format_detection=self.decklink_enable_format_detection.isChecked(),
+            )
+            self._capture_session = None
+            self._output_session = None
+        else:
+            self._capture_session = d.CaptureSession(
+                device_index=in_device,
+                display_mode=in_mode,
+                pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
+                max_queue_frames=8,
+                enable_format_detection=self.decklink_enable_format_detection.isChecked(),
+            )
 
-        self._output_session = d.OutputSession(
-            device_index=out_device,
-            display_mode=out_mode,
-            pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-        )
+            self._output_session = d.OutputSession(
+                device_index=out_device,
+                display_mode=out_mode,
+                pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
+            )
 
-        self._capture_session.start()
-        self._output_session.start()
+            self._capture_session.start()
+            self._output_session.start()
 
         selected_fps = self._select_decklink_fps(input_fps, output_fps)
         if selected_fps is not None:
@@ -1494,11 +1997,12 @@ class MainWindow(QMainWindow):
             if int(dev.index) == out_device:
                 output_name = f"{dev.display_name} ({out_device})"
 
+        backend_text = "worker process" if self._controller_backend == "worker-process" else "GUI process"
         self.decklink_status_label.setText(
             "DeckLink configured: "
             f"in={input_name} mode='{in_mode_name}' ({in_mode}); "
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
-            f"fps={fps_text}"
+            f"fps={fps_text}; backend={backend_text}"
         )
         LOGGER.info(
             "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s",
@@ -1655,6 +2159,12 @@ class MainWindow(QMainWindow):
         return combo.currentData()
 
     def _stop_decklink_sessions(self) -> None:
+        if self._controller_backend == "worker-process":
+            try:
+                self._controller.stop_decklink()
+            except Exception:
+                pass
+
         if self._output_session is not None:
             try:
                 self._output_session.stop()
