@@ -1,0 +1,1384 @@
+[
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\efrlfn_x2.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\efrlfn_x4.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\realesrgan_x2plus.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 2,
+      "even_only": true,
+      "odd_supported": false,
+      "failures": [
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ]
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 2,
+      "even_only": true,
+      "odd_supported": false,
+      "failures": [
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ]
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": [
+      "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Reshape node. Name:'node_view' Status Message: E:\\_work\\1\\s\\onnxruntime\\core\\providers\\cpu\\"
+    ]
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\realesrgan_x4plus.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x2.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 2,
+      "even_only": true,
+      "odd_supported": false,
+      "failures": [
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ]
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 2,
+      "even_only": true,
+      "odd_supported": false,
+      "failures": [
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ]
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": [
+      "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Reshape node. Name:'Reshape_29' Status Message: E:\\_work\\1\\s\\onnxruntime\\core\\providers\\cpu"
+    ]
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x2_fp16.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float16)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      4,
+      8,
+      12,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 2,
+      "even_only": true,
+      "odd_supported": false,
+      "failures": [
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ]
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 2,
+      "even_only": true,
+      "odd_supported": false,
+      "failures": [
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
+      ]
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": [
+      "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Reshape node. Name:'Reshape_29' Status Message: E:\\_work\\1\\s\\onnxruntime\\core\\providers\\cpu"
+    ]
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x4.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x4_fp16.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float16)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x8.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  },
+  {
+    "model": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x8_fp16.onnx",
+    "ok": true,
+    "error": null,
+    "input_name": "input",
+    "input_shape": [
+      "batch_size",
+      3,
+      "height",
+      "width"
+    ],
+    "input_type": "tensor(float16)",
+    "session_providers": [
+      "CPUExecutionProvider"
+    ],
+    "rank_dynamic": [
+      true,
+      false,
+      true,
+      true
+    ],
+    "h_fixed": null,
+    "w_fixed": null,
+    "tested_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_h": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "tested_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "ok_w": [
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      11,
+      12,
+      13,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "h_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "w_summary": {
+      "min_ok": 2,
+      "max_ok": 128,
+      "strongest_divisor": 1,
+      "even_only": false,
+      "odd_supported": true,
+      "failures": []
+    },
+    "pair_tests": [
+      {
+        "h": 2,
+        "w": 342,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 344,
+        "w": 344,
+        "ok": true,
+        "error": null
+      },
+      {
+        "h": 342,
+        "w": 342,
+        "ok": true,
+        "error": null
+      }
+    ],
+    "error_samples": []
+  }
+]
