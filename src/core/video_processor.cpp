@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <stdexcept>
 
 #include "cuda/kernels.cuh"
@@ -64,6 +65,38 @@ inline int SelectAutoSrScale(int width, int height, int roi_w, int roi_h, int ma
     return ClampToSupportedSrScale(selected);
 }
 
+inline const char* ToSrFlavorName(SrFlavor sr_flavor) {
+    switch (sr_flavor) {
+        case SrFlavor::Bilinear:
+            return "bilinear";
+        case SrFlavor::Bicubic:
+            return "bicubic";
+        case SrFlavor::BicubicSharpen:
+            return "bicubic_sharpen";
+    }
+    return "bicubic";
+}
+
+inline SrFlavor ParseSrFlavorName(const std::string& sr_flavor_name) {
+    std::string normalized;
+    normalized.reserve(sr_flavor_name.size());
+    for (char c : sr_flavor_name) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (normalized == "bilinear") {
+        return SrFlavor::Bilinear;
+    }
+    if (normalized == "bicubic") {
+        return SrFlavor::Bicubic;
+    }
+    if (normalized == "bicubic_sharpen" || normalized == "bicubic+sharpen") {
+        return SrFlavor::BicubicSharpen;
+    }
+
+    throw std::invalid_argument("SR flavor must be one of [bilinear, bicubic, bicubic_sharpen].");
+}
+
 } // namespace
 
 VideoProcessor::VideoProcessor(
@@ -84,6 +117,7 @@ VideoProcessor::VideoProcessor(
       roi_h_(roi_h),
       enable_placeholder_sr_(enable_placeholder_sr),
         enable_deinterlace_(true),
+            sr_flavor_(SrFlavor::Bicubic),
             auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
         max_auto_sr_scale_(8),
             sr_requested_scale_(sr_scale),
@@ -213,6 +247,25 @@ int VideoProcessor::GetMaxAutoSrScale() const {
     return max_auto_sr_scale_;
 }
 
+void VideoProcessor::SetSrFlavor(SrFlavor sr_flavor) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    sr_flavor_ = sr_flavor;
+}
+
+void VideoProcessor::SetSrFlavorByName(const std::string& sr_flavor_name) {
+    SetSrFlavor(ParseSrFlavorName(sr_flavor_name));
+}
+
+SrFlavor VideoProcessor::GetSrFlavor() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return sr_flavor_;
+}
+
+std::string VideoProcessor::GetSrFlavorName() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return ToSrFlavorName(sr_flavor_);
+}
+
 void VideoProcessor::SetSrScaleManual(int sr_scale) {
     if (!enable_placeholder_sr_) {
         throw std::runtime_error("Placeholder SR is disabled.");
@@ -338,6 +391,23 @@ void VideoProcessor::InitializeBuffers() {
 }
 
 std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
+    return ProcessFrameInternal(input_frame, false, false, false);
+}
+
+std::string VideoProcessor::ProcessFrameNoDeinterlace(const std::string& input_frame) {
+    return ProcessFrameInternal(input_frame, false, false, true);
+}
+
+std::string VideoProcessor::ProcessFrameDeinterlaceOnly(const std::string& input_frame) {
+    return ProcessFrameInternal(input_frame, true, true, false);
+}
+
+std::string VideoProcessor::ProcessFrameInternal(
+    const std::string& input_frame,
+    bool deinterlace_only,
+    bool force_deinterlace,
+    bool force_disable_deinterlace
+) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
 
     if (input_frame.size() != uyvy_bytes_) {
@@ -349,6 +419,7 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
     int roi_w = 0;
     int roi_h = 0;
     int sr_scale = 1;
+    SrFlavor sr_flavor = SrFlavor::Bicubic;
     int sr_width = width_;
     int sr_height = height_;
     bool deinterlace_enabled = true;
@@ -366,9 +437,17 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
         roi_w = roi_w_;
         roi_h = roi_h_;
         sr_scale = sr_scale_;
+        sr_flavor = sr_flavor_;
         sr_width = sr_width_;
         sr_height = sr_height_;
         deinterlace_enabled = enable_deinterlace_;
+
+        if (force_deinterlace) {
+            deinterlace_enabled = true;
+        }
+        if (force_disable_deinterlace) {
+            deinterlace_enabled = false;
+        }
     }
 
     CheckCuda(
@@ -391,6 +470,19 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
         crop_input = d_rgb_bob_;
     }
 
+    if (deinterlace_only) {
+        cuda_kernels::LaunchRgbToUyvy(crop_input, d_uyvy_out_, width_, height_, stream_);
+
+        CheckCuda(
+            cudaMemcpyAsync(host_output_.data(), d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
+            "cudaMemcpyAsync D2H"
+        );
+
+        CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+
+        return std::string(reinterpret_cast<const char*>(host_output_.data()), host_output_.size());
+    }
+
     if (enable_placeholder_sr_ && sr_scale > 1) {
         int sr_roi_w = std::max(2, roi_w * sr_scale);
         int sr_roi_h = std::max(2, roi_h * sr_scale);
@@ -402,23 +494,67 @@ std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
 
         const bool sr_pass_is_redundant = (sr_roi_w <= roi_w) && (sr_roi_h <= roi_h);
         if (!sr_pass_is_redundant) {
+            const uchar3* sr_output = d_rgb_sr_;
 
             // Upscale only the selected ROI region rather than the full frame.
-            cuda_kernels::LaunchCropZoomBilinear(
-                crop_input,
-                width_,
-                height_,
-                d_rgb_sr_,
-                sr_roi_w,
-                sr_roi_h,
-                roi_x,
-                roi_y,
-                roi_w,
-                roi_h,
-                stream_
-            );
+            switch (sr_flavor) {
+                case SrFlavor::Bilinear:
+                    cuda_kernels::LaunchCropZoomBilinear(
+                        crop_input,
+                        width_,
+                        height_,
+                        d_rgb_sr_,
+                        sr_roi_w,
+                        sr_roi_h,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        stream_
+                    );
+                    break;
+                case SrFlavor::Bicubic:
+                    cuda_kernels::LaunchCropZoomBicubic(
+                        crop_input,
+                        width_,
+                        height_,
+                        d_rgb_sr_,
+                        sr_roi_w,
+                        sr_roi_h,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        stream_
+                    );
+                    break;
+                case SrFlavor::BicubicSharpen:
+                    cuda_kernels::LaunchCropZoomBicubic(
+                        crop_input,
+                        width_,
+                        height_,
+                        d_rgb_sr_,
+                        sr_roi_w,
+                        sr_roi_h,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        stream_
+                    );
+                    // Reuse d_rgb_bob_ as scratch for sharpened ROI before final zoom-to-output.
+                    cuda_kernels::LaunchSharpen3x3(
+                        d_rgb_sr_,
+                        d_rgb_bob_,
+                        sr_roi_w,
+                        sr_roi_h,
+                        stream_
+                    );
+                    sr_output = d_rgb_bob_;
+                    break;
+            }
 
-            crop_input = d_rgb_sr_;
+            crop_input = sr_output;
             crop_src_w = sr_roi_w;
             crop_src_h = sr_roi_h;
             crop_roi_x = 0;

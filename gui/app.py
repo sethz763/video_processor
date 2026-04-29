@@ -3,10 +3,13 @@ from __future__ import annotations
 import logging
 import math
 import multiprocessing as mp
+import os
 import queue
+import json
 import site
 import sys
 import time
+import threading
 import ctypes
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
@@ -43,6 +46,13 @@ WINDOWED_PREVIEW_MAX_W = 640
 WINDOWED_PREVIEW_MAX_H = 360
 FULLSCREEN_PREVIEW_MAX_W = 1280
 FULLSCREEN_PREVIEW_MAX_H = 720
+
+SR_FLAVOR_LABEL_TO_NAME = {
+    "Bilinear (Fast)": "bilinear",
+    "Bicubic (Balanced)": "bicubic",
+    "Bicubic + Sharpen (Crisp)": "bicubic_sharpen",
+}
+SR_FLAVOR_NAME_TO_LABEL = {value: key for key, value in SR_FLAVOR_LABEL_TO_NAME.items()}
 
 try:
     import decklink_wrapper as d
@@ -110,6 +120,7 @@ def setup_logger() -> logging.Logger:
 LOGGER = setup_logger()
 
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
+_RPC_E_CHANGED_MODE_HEX = "0x80010106"
 
 
 def initialize_com_for_decklink() -> None:
@@ -119,15 +130,75 @@ def initialize_com_for_decklink() -> None:
     try:
         # decklink_wrapper expects MTA on this machine; using STA triggers 0x80010106 changed-mode failures.
         COINIT_MULTITHREADED = 0x0
+        RPC_E_CHANGED_MODE = -2147417850  # 0x80010106
         ole32 = ctypes.windll.ole32
         hr = ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
         # S_OK=0, S_FALSE=1 (already initialized on this thread with same model).
         if hr not in (0, 1):
-            LOGGER.warning("CoInitializeEx returned hr=0x%08X", hr & 0xFFFFFFFF)
+            if hr == RPC_E_CHANGED_MODE:
+                LOGGER.info("CoInitializeEx already set by Qt (hr=0x%08X)", hr & 0xFFFFFFFF)
+            else:
+                LOGGER.warning("CoInitializeEx returned hr=0x%08X", hr & 0xFFFFFFFF)
         else:
             LOGGER.info("COM initialized for DeckLink (hr=0x%08X)", hr & 0xFFFFFFFF)
     except Exception:
         LOGGER.exception("Failed to initialize COM for DeckLink")
+
+
+def _is_changed_mode_error(exc: Exception) -> bool:
+    return _RPC_E_CHANGED_MODE_HEX in str(exc)
+
+
+def _call_decklink_api_in_mta_thread(api_name: str, *args: object) -> object:
+    if d is None:
+        raise RuntimeError("decklink_wrapper is not available")
+
+    result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        coinitialized = False
+        try:
+            if sys.platform == "win32":
+                hr = ctypes.windll.ole32.CoInitializeEx(None, 0x0)  # COINIT_MULTITHREADED
+                # S_OK=0, S_FALSE=1.
+                coinitialized = hr in (0, 1)
+
+            result = getattr(d, api_name)(*args)
+            result_queue.put(("ok", result))
+        except Exception as worker_exc:
+            result_queue.put(("err", worker_exc))
+        finally:
+            if sys.platform == "win32" and coinitialized:
+                ctypes.windll.ole32.CoUninitialize()
+
+    worker = threading.Thread(target=_worker, name=f"decklink-mta-{api_name}", daemon=True)
+    worker.start()
+    worker.join(timeout=10.0)
+
+    if worker.is_alive():
+        raise TimeoutError(f"DeckLink API call timed out in MTA thread: {api_name}")
+
+    status, payload = result_queue.get()
+    if status == "err":
+        raise payload  # type: ignore[misc]
+    return payload
+
+
+def _call_decklink_api(api_name: str, *args: object) -> object:
+    if d is None:
+        raise RuntimeError("decklink_wrapper is not available")
+
+    api = getattr(d, api_name)
+    try:
+        return api(*args)
+    except Exception as exc:
+        if sys.platform == "win32" and _is_changed_mode_error(exc):
+            LOGGER.info(
+                "DeckLink API %s hit COM changed-mode on GUI thread; retrying in MTA worker thread",
+                api_name,
+            )
+            return _call_decklink_api_in_mta_thread(api_name, *args)
+        raise
 
 
 @dataclass
@@ -689,15 +760,30 @@ class ImageCanvas(QWidget):
 class VideoProcessorController:
     def __init__(self, module) -> None:
         self._module = module
-        self.enable_placeholder_sr = True
+        self.enable_basic_scaling = True
         self.deinterlace_enabled = True
-        self.max_auto_sr_scale = 4
-        self.sr_manual_scale = 4
-        self.sr_auto_mode = True
+        self.basic_scaling_method = "bicubic"
+        self.max_auto_basic_scaling = 4
+        self.basic_scaling_manual = 4
+        self.basic_scaling_auto_mode = True
+        self.basic_scaling_method_supported = False
+        self.ai_sr_enabled = False
+        self.ai_sr_active = False
+        self.ai_sr_model_path = ""
+        self.ai_sr_error: str | None = None
+        self.ai_sr_provider = "auto"
+        self.ai_sr_require_gpu = True
+        self.ai_sr_frame_interval = 2
+        self.ai_sr_strict = False
+        self.ai_sr_input_align = 2
+        self.ai_sr_roi_overscan_percent = 0.0
+        self.ai_sr_inference_divisor = 0
+        self.ai_sr_detail_preserve_percent = 0.0
+        self.ai_sr_info: dict[str, object] | None = None
         self.processor = None
 
     def create(self, roi: Roi) -> None:
-        sr_scale = 0 if self.sr_auto_mode else self.sr_manual_scale
+        sr_scale = 0 if self.basic_scaling_auto_mode else self.basic_scaling_manual
         self.processor = self._module.VideoProcessor(
             width=FRAME_W,
             height=FRAME_H,
@@ -705,41 +791,111 @@ class VideoProcessorController:
             roi_y=roi.y,
             roi_w=roi.w,
             roi_h=roi.h,
-            enable_placeholder_sr=self.enable_placeholder_sr,
+            enable_placeholder_sr=self.enable_basic_scaling,
             sr_scale=sr_scale,
         )
-        self.processor.set_max_auto_sr_scale(self.max_auto_sr_scale)
+        self.processor.set_max_auto_sr_scale(self.max_auto_basic_scaling)
+        self.basic_scaling_method_supported = hasattr(self.processor, "set_sr_flavor")
+        if self.basic_scaling_method_supported:
+            self.processor.set_sr_flavor(self.basic_scaling_method)
         self.processor.set_deinterlace_enabled(self.deinterlace_enabled)
 
     def set_roi(self, roi: Roi) -> None:
         if self.processor is not None:
             self.processor.set_roi(roi.x, roi.y, roi.w, roi.h)
 
-    def set_auto_sr(self) -> None:
-        self.sr_auto_mode = True
-        if self.processor is not None and self.enable_placeholder_sr:
+    def set_auto_basic_scaling(self) -> None:
+        self.basic_scaling_auto_mode = True
+        if self.processor is not None and self.enable_basic_scaling:
             self.processor.set_sr_mode_auto()
 
-    def set_manual_sr(self, scale: int) -> None:
-        self.sr_manual_scale = scale
-        self.sr_auto_mode = False
-        if self.processor is not None and self.enable_placeholder_sr:
+    def set_manual_basic_scaling(self, scale: int) -> None:
+        self.basic_scaling_manual = scale
+        self.basic_scaling_auto_mode = False
+        if self.processor is not None and self.enable_basic_scaling:
             self.processor.set_sr_scale_manual(scale)
 
     def effective_scale(self) -> int:
-        if self.processor is None or not self.enable_placeholder_sr:
+        if self.processor is None or not self.enable_basic_scaling:
             return 1
         return int(self.processor.get_effective_sr_scale())
+
+    @property
+    def enable_placeholder_sr(self) -> bool:
+        return bool(self.enable_basic_scaling)
+
+    @enable_placeholder_sr.setter
+    def enable_placeholder_sr(self, value: bool) -> None:
+        self.enable_basic_scaling = bool(value)
 
     def set_deinterlace_enabled(self, enabled: bool) -> None:
         self.deinterlace_enabled = enabled
         if self.processor is not None:
             self.processor.set_deinterlace_enabled(enabled)
 
-    def set_max_auto_sr_scale(self, scale: int) -> None:
-        self.max_auto_sr_scale = scale
+    def set_max_auto_basic_scaling(self, scale: int) -> None:
+        self.max_auto_basic_scaling = scale
         if self.processor is not None:
             self.processor.set_max_auto_sr_scale(scale)
+
+    def set_basic_scaling_method(self, basic_scaling_method: str) -> None:
+        self.basic_scaling_method = basic_scaling_method
+        if self.processor is not None and hasattr(self.processor, "set_sr_flavor"):
+            self.basic_scaling_method_supported = True
+            self.processor.set_sr_flavor(basic_scaling_method)
+
+    # Backward-compatible aliases for existing call sites.
+    def set_auto_sr(self) -> None:
+        self.set_auto_basic_scaling()
+
+    def set_manual_sr(self, scale: int) -> None:
+        self.set_manual_basic_scaling(scale)
+
+    def set_max_auto_sr_scale(self, scale: int) -> None:
+        self.set_max_auto_basic_scaling(scale)
+
+    def set_sr_flavor(self, sr_flavor: str) -> None:
+        self.set_basic_scaling_method(sr_flavor)
+
+    @property
+    def sr_flavor(self) -> str:
+        return self.basic_scaling_method
+
+    @sr_flavor.setter
+    def sr_flavor(self, value: str) -> None:
+        self.basic_scaling_method = str(value)
+
+    @property
+    def max_auto_sr_scale(self) -> int:
+        return int(self.max_auto_basic_scaling)
+
+    @max_auto_sr_scale.setter
+    def max_auto_sr_scale(self, value: int) -> None:
+        self.max_auto_basic_scaling = int(value)
+
+    @property
+    def sr_manual_scale(self) -> int:
+        return int(self.basic_scaling_manual)
+
+    @sr_manual_scale.setter
+    def sr_manual_scale(self, value: int) -> None:
+        self.basic_scaling_manual = int(value)
+
+    @property
+    def sr_auto_mode(self) -> bool:
+        return bool(self.basic_scaling_auto_mode)
+
+    @sr_auto_mode.setter
+    def sr_auto_mode(self, value: bool) -> None:
+        self.basic_scaling_auto_mode = bool(value)
+
+    @property
+    def sr_flavor_supported(self) -> bool:
+        return bool(self.basic_scaling_method_supported)
+
+    @sr_flavor_supported.setter
+    def sr_flavor_supported(self, value: bool) -> None:
+        self.basic_scaling_method_supported = bool(value)
 
     def process_frame(self, frame_bytes: bytes) -> bytes:
         if self.processor is None:
@@ -748,6 +904,38 @@ class VideoProcessorController:
 
     def close(self) -> None:
         self.processor = None
+
+    def set_ai_sr_enabled(self, enabled: bool) -> None:
+        self.ai_sr_enabled = bool(enabled)
+        self.ai_sr_active = False
+        self.ai_sr_error = "AI SR is only available with worker backend"
+
+    def set_ai_sr_model_path(self, model_path: str) -> None:
+        self.ai_sr_model_path = str(model_path)
+        self.ai_sr_active = False
+        self.ai_sr_error = "AI SR is only available with worker backend"
+
+    def set_ai_sr_settings(
+        self,
+        provider: str,
+        require_gpu: bool,
+        frame_interval: int,
+        strict: bool,
+        input_align: int,
+        roi_overscan_percent: float,
+        inference_divisor: int,
+        detail_preserve_percent: float,
+    ) -> None:
+        self.ai_sr_provider = str(provider)
+        self.ai_sr_require_gpu = bool(require_gpu)
+        self.ai_sr_frame_interval = max(1, int(frame_interval))
+        self.ai_sr_strict = bool(strict)
+        self.ai_sr_input_align = max(1, int(input_align))
+        self.ai_sr_roi_overscan_percent = max(0.0, float(roi_overscan_percent))
+        self.ai_sr_inference_divisor = max(0, int(inference_divisor))
+        self.ai_sr_detail_preserve_percent = max(0.0, float(detail_preserve_percent))
+        self.ai_sr_active = False
+        self.ai_sr_error = "AI SR is only available with worker backend"
 
     def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
         raise RuntimeError("DeckLink capture/output in worker is unavailable for in-process backend")
@@ -761,11 +949,27 @@ class VideoProcessorController:
 
 class ProcessVideoProcessorController:
     def __init__(self) -> None:
-        self.enable_placeholder_sr = True
+        self.enable_basic_scaling = True
         self.deinterlace_enabled = True
-        self.max_auto_sr_scale = 4
-        self.sr_manual_scale = 4
-        self.sr_auto_mode = True
+        self.basic_scaling_method = "bicubic"
+        self.max_auto_basic_scaling = 4
+        self.basic_scaling_manual = 4
+        self.basic_scaling_auto_mode = True
+        self.basic_scaling_method_supported = True
+        self.ai_sr_model_path = os.environ.get("VP_AI_SR_MODEL", "")
+        self.ai_sr_enabled = os.environ.get("VP_AI_SR_ENABLE", "0") == "1"
+        self.ai_sr_provider = os.environ.get("VP_AI_SR_PROVIDER", "auto")
+        self.ai_sr_require_gpu = os.environ.get("VP_AI_SR_REQUIRE_GPU", "1") == "1"
+        self.ai_sr_frame_interval = max(1, int(os.environ.get("VP_AI_SR_FRAME_INTERVAL", "2")))
+        self.ai_sr_strict = os.environ.get("VP_AI_SR_STRICT", "0") == "1"
+        self.ai_sr_input_align = max(1, int(os.environ.get("VP_AI_SR_INPUT_ALIGN", "2")))
+        self.ai_sr_roi_overscan_percent = max(0.0, float(os.environ.get("VP_AI_SR_ROI_OVERSCAN_PCT", "0")))
+        self.ai_sr_inference_divisor = max(0, int(os.environ.get("VP_AI_SR_INFERENCE_DIVISOR", "0")))
+        self.ai_sr_detail_preserve_percent = max(0.0, float(os.environ.get("VP_AI_SR_DETAIL_PRESERVE_PCT", "0")))
+        self.ai_sr_active = False
+        self.ai_sr_error: str | None = None
+        self.ai_sr_info: dict[str, object] | None = None
+        self.ai_sr_last_warning: str | None = None
 
         self._ctx = mp.get_context("spawn")
         self._request_queue = None
@@ -779,6 +983,9 @@ class ProcessVideoProcessorController:
         self._decklink_no_frame_reason: str | None = None
         self._decklink_processed_counter = 0
         self._decklink_processed_fps = 0.0
+        self._decklink_ai_applied_frames = 0
+        self._decklink_ai_passthrough_frames = 0
+        self._decklink_tick_pending = False
 
     def create(self, roi: Roi) -> None:
         self.close()
@@ -786,7 +993,7 @@ class ProcessVideoProcessorController:
         if run_processor_worker is None:
             raise RuntimeError("Process worker module is unavailable")
 
-        sr_scale = 0 if self.sr_auto_mode else self.sr_manual_scale
+        sr_scale = 0 if self.basic_scaling_auto_mode else self.basic_scaling_manual
         project_root = str(Path(__file__).resolve().parents[1])
         startup_config = {
             "project_root": project_root,
@@ -796,18 +1003,29 @@ class ProcessVideoProcessorController:
             "roi_y": roi.y,
             "roi_w": roi.w,
             "roi_h": roi.h,
-            "enable_placeholder_sr": self.enable_placeholder_sr,
+            "enable_basic_scaling": self.enable_basic_scaling,
             "sr_scale": sr_scale,
-            "sr_auto_mode": self.sr_auto_mode,
-            "sr_manual_scale": self.sr_manual_scale,
-            "max_auto_sr_scale": self.max_auto_sr_scale,
+            "basic_scaling_auto_mode": self.basic_scaling_auto_mode,
+            "basic_scaling_manual": self.basic_scaling_manual,
+            "basic_scaling_method": self.basic_scaling_method,
+            "max_auto_basic_scaling": self.max_auto_basic_scaling,
             "deinterlace_enabled": self.deinterlace_enabled,
+            "ai_sr_enabled": self.ai_sr_enabled,
+            "ai_sr_model_path": self.ai_sr_model_path,
+            "ai_sr_provider": self.ai_sr_provider,
+            "ai_sr_require_gpu": self.ai_sr_require_gpu,
+            "ai_sr_frame_interval": self.ai_sr_frame_interval,
+            "ai_sr_strict": self.ai_sr_strict,
+            "ai_sr_input_align": self.ai_sr_input_align,
+            "ai_sr_roi_overscan_percent": self.ai_sr_roi_overscan_percent,
+            "ai_sr_inference_divisor": self.ai_sr_inference_divisor,
+            "ai_sr_detail_preserve_percent": self.ai_sr_detail_preserve_percent,
         }
 
         # Keep request queue larger than response queue so bursty UI events
         # (ROI drag, tick polling) do not trip queue.Full in the GUI thread.
         self._request_queue = self._ctx.Queue(maxsize=32)
-        self._response_queue = self._ctx.Queue(maxsize=8)
+        self._response_queue = self._ctx.Queue(maxsize=64)
         self._process = self._ctx.Process(
             target=run_processor_worker,
             args=(self._request_queue, self._response_queue, startup_config),
@@ -820,6 +1038,7 @@ class ProcessVideoProcessorController:
         self._latest_decklink_frame = None
         self._latest_effective_scale = 1
         self._next_frame_id = 1
+        self._decklink_tick_pending = False
         self._wait_for_ready(timeout_seconds=5.0)
 
     def _wait_for_ready(self, timeout_seconds: float) -> None:
@@ -836,6 +1055,11 @@ class ProcessVideoProcessorController:
 
             message_type = message.get("type")
             if message_type == "ready":
+                self.basic_scaling_method_supported = bool(message.get("basic_scaling_method_supported", message.get("sr_flavor_supported", True)))
+                self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
+                self.ai_sr_active = bool(message.get("ai_sr_active", False))
+                self.ai_sr_error = message.get("ai_sr_error")
+                self.ai_sr_info = message.get("ai_sr_info")
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -859,9 +1083,8 @@ class ProcessVideoProcessorController:
         best_effort_cmds = {
             "set_roi",
             "decklink_tick",
-            "set_sr_mode_auto",
-            "set_sr_scale_manual",
             "set_deinterlace_enabled",
+            "set_max_auto_basic_scaling",
             "set_max_auto_sr_scale",
         }
 
@@ -905,12 +1128,33 @@ class ProcessVideoProcessorController:
                 )
                 self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
                 self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
+                self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
+                self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
                 self._decklink_no_frame_reason = None
+                self._decklink_tick_pending = False
                 continue
 
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
+                self._decklink_tick_pending = False
+                continue
+
+            if message_type == "ack":
+                ack_cmd = str(message.get("cmd", ""))
+                if ack_cmd in {"set_basic_scaling_method", "set_sr_flavor"}:
+                    self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                elif ack_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
+                    self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
+                    self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
+                    self.ai_sr_error = message.get("ai_sr_error")
+                    self.ai_sr_info = message.get("ai_sr_info")
+                continue
+
+            if message_type == "warning":
+                warning_text = str(message.get("warning", ""))
+                if warning_text:
+                    self.ai_sr_last_warning = warning_text
                 continue
 
             if message_type == "error":
@@ -921,16 +1165,18 @@ class ProcessVideoProcessorController:
     def set_roi(self, roi: Roi) -> None:
         self._send_control({"cmd": "set_roi", "x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h})
 
-    def set_auto_sr(self) -> None:
-        self.sr_auto_mode = True
-        if self.enable_placeholder_sr:
-            self._send_control({"cmd": "set_sr_mode_auto"})
+    def set_auto_basic_scaling(self) -> None:
+        self.basic_scaling_auto_mode = True
+        if self.enable_basic_scaling:
+            self._send_control({"cmd": "set_basic_scaling_mode_auto"})
+            self._wait_for_ack("set_basic_scaling_mode_auto", timeout_seconds=1.0)
 
-    def set_manual_sr(self, scale: int) -> None:
-        self.sr_manual_scale = scale
-        self.sr_auto_mode = False
-        if self.enable_placeholder_sr:
-            self._send_control({"cmd": "set_sr_scale_manual", "scale": int(scale)})
+    def set_manual_basic_scaling(self, scale: int) -> None:
+        self.basic_scaling_manual = scale
+        self.basic_scaling_auto_mode = False
+        if self.enable_basic_scaling:
+            self._send_control({"cmd": "set_basic_scaling_manual", "scale": int(scale)})
+            self._wait_for_ack("set_basic_scaling_manual", timeout_seconds=1.0)
 
     def effective_scale(self) -> int:
         return max(1, int(self._latest_effective_scale))
@@ -939,9 +1185,28 @@ class ProcessVideoProcessorController:
         self.deinterlace_enabled = enabled
         self._send_control({"cmd": "set_deinterlace_enabled", "enabled": bool(enabled)})
 
+    def set_max_auto_basic_scaling(self, scale: int) -> None:
+        self.max_auto_basic_scaling = scale
+        self._send_control({"cmd": "set_max_auto_basic_scaling", "scale": int(scale)})
+
+    def set_basic_scaling_method(self, basic_scaling_method: str) -> None:
+        self.basic_scaling_method = basic_scaling_method
+        if self.basic_scaling_method_supported:
+            self._send_control({"cmd": "set_basic_scaling_method", "basic_scaling_method": str(basic_scaling_method)})
+            self._wait_for_ack("set_basic_scaling_method", timeout_seconds=1.0)
+
+    # Backward-compatible aliases for existing call sites.
+    def set_auto_sr(self) -> None:
+        self.set_auto_basic_scaling()
+
+    def set_manual_sr(self, scale: int) -> None:
+        self.set_manual_basic_scaling(scale)
+
     def set_max_auto_sr_scale(self, scale: int) -> None:
-        self.max_auto_sr_scale = scale
-        self._send_control({"cmd": "set_max_auto_sr_scale", "scale": int(scale)})
+        self.set_max_auto_basic_scaling(scale)
+
+    def set_sr_flavor(self, sr_flavor: str) -> None:
+        self.set_basic_scaling_method(sr_flavor)
 
     def _wait_for_ack(self, expected_cmd: str, timeout_seconds: float = 3.0) -> None:
         if self._response_queue is None:
@@ -957,6 +1222,15 @@ class ProcessVideoProcessorController:
 
             message_type = message.get("type")
             if message_type == "ack" and str(message.get("cmd")) == expected_cmd:
+                if expected_cmd == "set_basic_scaling_method":
+                    self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                if expected_cmd == "set_sr_flavor":
+                    self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                if expected_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
+                    self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
+                    self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
+                    self.ai_sr_error = message.get("ai_sr_error")
+                    self.ai_sr_info = message.get("ai_sr_info")
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -974,11 +1248,20 @@ class ProcessVideoProcessorController:
                 )
                 self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
                 self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
+                self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
+                self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
                 self._decklink_no_frame_reason = None
+                self._decklink_tick_pending = False
                 continue
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
+                self._decklink_tick_pending = False
+                continue
+            if message_type == "warning":
+                warning_text = str(message.get("warning", ""))
+                if warning_text:
+                    self.ai_sr_last_warning = warning_text
                 continue
 
         raise RuntimeError(f"Timed out waiting for worker ack: {expected_cmd}")
@@ -987,6 +1270,7 @@ class ProcessVideoProcessorController:
         self._drain_responses()
         self._latest_decklink_frame = None
         self._decklink_no_frame_reason = None
+        self._decklink_tick_pending = False
         self._send_control(
             {
                 "cmd": "start_decklink",
@@ -1008,10 +1292,15 @@ class ProcessVideoProcessorController:
         except Exception:
             pass
         self._latest_decklink_frame = None
+        self._decklink_tick_pending = False
 
     def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
         self._drain_responses()
-        self._send_control({"cmd": "decklink_tick", "timeout_ms": int(timeout_ms)})
+        if not self._decklink_tick_pending:
+            # Keep at most one in-flight tick request so stale tick commands cannot
+            # build up and push preview display several seconds behind live processing.
+            self._send_control({"cmd": "decklink_tick", "timeout_ms": int(timeout_ms)})
+            self._decklink_tick_pending = True
         self._drain_responses()
         return self._latest_decklink_frame
 
@@ -1075,6 +1364,102 @@ class ProcessVideoProcessorController:
         self._process = None
         self._request_queue = None
         self._response_queue = None
+        self._decklink_tick_pending = False
+
+    def set_ai_sr_enabled(self, enabled: bool) -> None:
+        self.ai_sr_enabled = bool(enabled)
+        self._send_control({"cmd": "set_ai_sr_enabled", "enabled": bool(enabled)})
+        # Do not block the GUI thread waiting for worker ack; keep the last known
+        # error visible until the ack updates ai_sr_error/ai_sr_info.
+
+    def set_ai_sr_model_path(self, model_path: str) -> None:
+        self.ai_sr_model_path = str(model_path)
+        self._send_control({"cmd": "set_ai_sr_model_path", "model_path": self.ai_sr_model_path})
+        # Avoid synchronous wait here; keep the previous status until the ack arrives.
+
+    def set_ai_sr_settings(
+        self,
+        provider: str,
+        require_gpu: bool,
+        frame_interval: int,
+        strict: bool,
+        input_align: int,
+        roi_overscan_percent: float,
+        inference_divisor: int,
+        detail_preserve_percent: float,
+    ) -> None:
+        self.ai_sr_provider = str(provider)
+        self.ai_sr_require_gpu = bool(require_gpu)
+        self.ai_sr_frame_interval = max(1, int(frame_interval))
+        self.ai_sr_strict = bool(strict)
+        self.ai_sr_input_align = max(1, int(input_align))
+        self.ai_sr_roi_overscan_percent = max(0.0, float(roi_overscan_percent))
+        self.ai_sr_inference_divisor = max(0, int(inference_divisor))
+        self.ai_sr_detail_preserve_percent = max(0.0, float(detail_preserve_percent))
+        self._send_control(
+            {
+                "cmd": "set_ai_sr_settings",
+                "provider": self.ai_sr_provider,
+                "require_gpu": self.ai_sr_require_gpu,
+                "frame_interval": self.ai_sr_frame_interval,
+                "strict": self.ai_sr_strict,
+                "input_align": self.ai_sr_input_align,
+                "roi_overscan_percent": self.ai_sr_roi_overscan_percent,
+                "inference_divisor": self.ai_sr_inference_divisor,
+                "detail_preserve_percent": self.ai_sr_detail_preserve_percent,
+            }
+        )
+
+    @property
+    def enable_placeholder_sr(self) -> bool:
+        return bool(self.enable_basic_scaling)
+
+    @enable_placeholder_sr.setter
+    def enable_placeholder_sr(self, value: bool) -> None:
+        self.enable_basic_scaling = bool(value)
+
+    def decklink_ai_sr_counts(self) -> tuple[int, int]:
+        return int(self._decklink_ai_applied_frames), int(self._decklink_ai_passthrough_frames)
+
+    @property
+    def sr_flavor(self) -> str:
+        return self.basic_scaling_method
+
+    @sr_flavor.setter
+    def sr_flavor(self, value: str) -> None:
+        self.basic_scaling_method = str(value)
+
+    @property
+    def max_auto_sr_scale(self) -> int:
+        return int(self.max_auto_basic_scaling)
+
+    @max_auto_sr_scale.setter
+    def max_auto_sr_scale(self, value: int) -> None:
+        self.max_auto_basic_scaling = int(value)
+
+    @property
+    def sr_manual_scale(self) -> int:
+        return int(self.basic_scaling_manual)
+
+    @sr_manual_scale.setter
+    def sr_manual_scale(self, value: int) -> None:
+        self.basic_scaling_manual = int(value)
+
+    @property
+    def sr_auto_mode(self) -> bool:
+        return bool(self.basic_scaling_auto_mode)
+
+    @sr_auto_mode.setter
+    def sr_auto_mode(self, value: bool) -> None:
+        self.basic_scaling_auto_mode = bool(value)
+
+    @property
+    def sr_flavor_supported(self) -> bool:
+        return bool(self.basic_scaling_method_supported)
+
+    @sr_flavor_supported.setter
+    def sr_flavor_supported(self, value: bool) -> None:
+        self.basic_scaling_method_supported = bool(value)
 
 
 class MainWindow(QMainWindow):
@@ -1135,7 +1520,10 @@ class MainWindow(QMainWindow):
         self._updating_controls = False
         self._fullscreen_view_name: str | None = None
         self._splitter_initialized = False
+        self._main_splitter_initialized = False
         self._is_closing = False
+        self._ai_sr_profiles_path = Path(__file__).resolve().parent / "ai_sr_profiles.json"
+        self._ai_sr_profiles = self._load_ai_sr_profiles()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1173,15 +1561,20 @@ class MainWindow(QMainWindow):
         self._display_splitter.splitterMoved.connect(lambda _pos, _index: self._fit_viewers_to_video_aspect())
         viewers_layout.addWidget(self._display_splitter, 1)
 
-        root.addWidget(viewers, 4)
         self._controls_panel = self._build_controls()
         self._controls_scroll = QScrollArea()
         self._controls_scroll.setWidgetResizable(True)
         self._controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._controls_scroll.setWidget(self._controls_panel)
-        self._controls_scroll.setMinimumWidth(320)
-        self._controls_scroll.setMaximumWidth(520)
-        root.addWidget(self._controls_scroll, 1)
+        self._controls_scroll.setMinimumWidth(420)
+
+        self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.addWidget(viewers)
+        self._main_splitter.addWidget(self._controls_scroll)
+        self._main_splitter.setStretchFactor(0, 4)
+        self._main_splitter.setStretchFactor(1, 1)
+        root.addWidget(self._main_splitter, 1)
 
         self._input_canvas.set_roi(self._roi)
         self._input_canvas.roiChanged.connect(self._on_roi_from_canvas)
@@ -1200,6 +1593,7 @@ class MainWindow(QMainWindow):
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
         self._on_source_mode_changed()
+        self._refresh_ai_sr_runtime_panel()
         self._update_status("Ready")
         if self._controller_backend == "worker-process":
             self._update_status("Ready | Processing backend: worker process")
@@ -1222,6 +1616,92 @@ class MainWindow(QMainWindow):
             LOGGER.info("Worker backend unavailable; using in-process backend")
         return VideoProcessorController(module)
 
+    def _default_ai_sr_model_path(self) -> str:
+        return str(Path(__file__).resolve().parents[1] / "models" / "realesrgan_x4plus.onnx")
+
+    def _load_ai_sr_profiles(self) -> dict[str, dict[str, object]]:
+        try:
+            if not self._ai_sr_profiles_path.exists():
+                return {}
+            raw = json.loads(self._ai_sr_profiles_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {
+                    str(model_path): dict(profile)
+                    for model_path, profile in raw.items()
+                    if isinstance(model_path, str) and isinstance(profile, dict)
+                }
+        except Exception as exc:
+            LOGGER.warning("Failed to load AI SR profiles: %s", exc)
+        return {}
+
+    def _save_ai_sr_profiles(self) -> None:
+        try:
+            self._ai_sr_profiles_path.write_text(
+                json.dumps(self._ai_sr_profiles, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOGGER.warning("Failed to save AI SR profiles: %s", exc)
+
+    def _current_ai_sr_profile(self) -> dict[str, object]:
+        return {
+            "provider": self.ai_sr_provider_combo.currentText().strip().lower(),
+            "require_gpu": bool(self.ai_sr_require_gpu_checkbox.isChecked()),
+            "frame_interval": int(self.ai_sr_frame_interval_spin.value()),
+            "strict": bool(self.ai_sr_strict_checkbox.isChecked()),
+            "input_align": int(self.ai_sr_input_align_combo.currentText()),
+            "roi_overscan_percent": float(self.ai_sr_overscan_spin.value()),
+            "inference_divisor": int(self.ai_sr_inference_divisor_spin.value()),
+            "detail_preserve_percent": float(self.ai_sr_detail_preserve_spin.value()),
+        }
+
+    def _apply_ai_sr_profile(self, profile: dict[str, object]) -> None:
+        provider = str(profile.get("provider", getattr(self._controller, "ai_sr_provider", "auto"))).lower()
+        if provider not in {"auto", "cuda", "trt", "tensorrt", "cpu"}:
+            provider = "auto"
+        self.ai_sr_provider_combo.setCurrentText(provider)
+
+        self.ai_sr_require_gpu_checkbox.setChecked(bool(profile.get("require_gpu", getattr(self._controller, "ai_sr_require_gpu", True))))
+        self.ai_sr_frame_interval_spin.setValue(max(1, int(profile.get("frame_interval", getattr(self._controller, "ai_sr_frame_interval", 2)))))
+        self.ai_sr_strict_checkbox.setChecked(bool(profile.get("strict", getattr(self._controller, "ai_sr_strict", False))))
+
+        input_align = max(1, int(profile.get("input_align", getattr(self._controller, "ai_sr_input_align", 2))))
+        if str(input_align) not in {self.ai_sr_input_align_combo.itemText(i) for i in range(self.ai_sr_input_align_combo.count())}:
+            self.ai_sr_input_align_combo.addItem(str(input_align))
+        self.ai_sr_input_align_combo.setCurrentText(str(input_align))
+
+        overscan = max(0.0, float(profile.get("roi_overscan_percent", getattr(self._controller, "ai_sr_roi_overscan_percent", 0.0))))
+        self.ai_sr_overscan_spin.setValue(overscan)
+
+        inference_divisor = max(0, int(profile.get("inference_divisor", getattr(self._controller, "ai_sr_inference_divisor", 0))))
+        self.ai_sr_inference_divisor_spin.setValue(inference_divisor)
+
+        detail_preserve = max(0.0, float(profile.get("detail_preserve_percent", getattr(self._controller, "ai_sr_detail_preserve_percent", 0.0))))
+        self.ai_sr_detail_preserve_spin.setValue(detail_preserve)
+
+    def _discover_ai_sr_model_paths(self) -> list[str]:
+        models_root = Path(__file__).resolve().parents[1] / "models"
+        if not models_root.exists():
+            return []
+
+        discovered = {str(path.resolve()) for path in models_root.rglob("*.onnx") if path.is_file()}
+        return sorted(discovered, key=lambda p: p.lower())
+
+    def _refresh_ai_sr_model_options(self, preferred_model_path: str | None = None) -> None:
+        current_text = self.ai_sr_model_combo.currentText().strip()
+        preferred = (preferred_model_path or current_text or self._default_ai_sr_model_path()).strip()
+
+        options = self._discover_ai_sr_model_paths()
+        if preferred and preferred not in options:
+            options.insert(0, preferred)
+
+        self.ai_sr_model_combo.blockSignals(True)
+        self.ai_sr_model_combo.clear()
+        for model_path in options:
+            self.ai_sr_model_combo.addItem(model_path)
+        self.ai_sr_model_combo.setCurrentText(preferred)
+        self.ai_sr_model_combo.blockSignals(False)
+
     def _build_controls(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -1243,24 +1723,135 @@ class MainWindow(QMainWindow):
         self.sr_mode_combo = QComboBox()
         self.sr_mode_combo.addItems(["Auto", "Manual"])
         self.sr_mode_combo.currentIndexChanged.connect(self._on_sr_mode_changed)
-        settings_form.addRow("SR mode", self.sr_mode_combo)
+        settings_form.addRow("Basic scaling mode", self.sr_mode_combo)
+
+        self.sr_flavor_combo = QComboBox()
+        self.sr_flavor_combo.addItems(list(SR_FLAVOR_LABEL_TO_NAME.keys()))
+        self.sr_flavor_combo.setCurrentText(
+            SR_FLAVOR_NAME_TO_LABEL.get(self._controller.basic_scaling_method, "Bicubic (Balanced)")
+        )
+        self.sr_flavor_combo.currentIndexChanged.connect(self._on_sr_flavor_changed)
+        settings_form.addRow("Basic scaling method", self.sr_flavor_combo)
 
         self.sr_manual_combo = QComboBox()
         self.sr_manual_combo.addItems(["2", "4", "8", "16"])
         self.sr_manual_combo.setCurrentText("4")
         self.sr_manual_combo.currentIndexChanged.connect(self._on_sr_manual_changed)
-        settings_form.addRow("Manual SR", self.sr_manual_combo)
+        settings_form.addRow("Manual basic scaling", self.sr_manual_combo)
 
         self.auto_sr_max_combo = QComboBox()
         self.auto_sr_max_combo.addItems(["2", "4", "8", "16"])
         self.auto_sr_max_combo.setCurrentText("4")
         self.auto_sr_max_combo.currentIndexChanged.connect(self._on_auto_sr_max_changed)
-        settings_form.addRow("Auto SR max", self.auto_sr_max_combo)
+        settings_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
 
-        self.enable_sr_checkbox = QCheckBox("Enable placeholder SR")
+        self.enable_sr_checkbox = QCheckBox("Enable basic CUDA scaling")
         self.enable_sr_checkbox.setChecked(True)
         self.enable_sr_checkbox.toggled.connect(self._on_enable_sr_toggled)
         settings_form.addRow(self.enable_sr_checkbox)
+
+        self.enable_ai_sr_checkbox = QCheckBox("Enable AI SR (ONNX model)")
+        self.enable_ai_sr_checkbox.setChecked(getattr(self._controller, "ai_sr_enabled", False))
+        self.enable_ai_sr_checkbox.toggled.connect(self._on_enable_ai_sr_toggled)
+        settings_form.addRow(self.enable_ai_sr_checkbox)
+
+        self.ai_sr_model_combo = QComboBox()
+        self.ai_sr_model_combo.setEditable(True)
+        default_model_path = self._default_ai_sr_model_path()
+        current_model_path = getattr(self._controller, "ai_sr_model_path", "") or default_model_path
+        self._refresh_ai_sr_model_options(preferred_model_path=current_model_path)
+        self.ai_sr_model_combo.currentTextChanged.connect(self._on_ai_sr_model_selection_changed)
+        settings_form.addRow("AI SR model", self.ai_sr_model_combo)
+
+        ai_sr_model_actions = QWidget()
+        ai_sr_model_actions_layout = QHBoxLayout(ai_sr_model_actions)
+        ai_sr_model_actions_layout.setContentsMargins(0, 0, 0, 0)
+        ai_sr_model_actions_layout.setSpacing(8)
+
+        self.ai_sr_model_apply_btn = QPushButton("Apply AI SR Model Path")
+        self.ai_sr_model_apply_btn.clicked.connect(self._on_ai_sr_model_apply_clicked)
+        ai_sr_model_actions_layout.addWidget(self.ai_sr_model_apply_btn)
+
+        self.ai_sr_model_refresh_btn = QPushButton("Refresh Model List")
+        self.ai_sr_model_refresh_btn.clicked.connect(self._on_ai_sr_model_refresh_clicked)
+        ai_sr_model_actions_layout.addWidget(self.ai_sr_model_refresh_btn)
+
+        settings_form.addRow(ai_sr_model_actions)
+
+        self.ai_sr_provider_combo = QComboBox()
+        self.ai_sr_provider_combo.addItems(["auto", "cuda", "trt", "cpu"])
+        self.ai_sr_provider_combo.setCurrentText(str(getattr(self._controller, "ai_sr_provider", "auto")).lower())
+        settings_form.addRow("AI SR provider", self.ai_sr_provider_combo)
+
+        self.ai_sr_require_gpu_checkbox = QCheckBox("Require GPU provider")
+        self.ai_sr_require_gpu_checkbox.setChecked(bool(getattr(self._controller, "ai_sr_require_gpu", True)))
+        settings_form.addRow(self.ai_sr_require_gpu_checkbox)
+
+        self.ai_sr_frame_interval_spin = QSpinBox()
+        self.ai_sr_frame_interval_spin.setRange(1, 120)
+        self.ai_sr_frame_interval_spin.setValue(int(getattr(self._controller, "ai_sr_frame_interval", 2)))
+        settings_form.addRow("AI SR frame interval", self.ai_sr_frame_interval_spin)
+
+        self.ai_sr_strict_checkbox = QCheckBox("Strict AI SR (blocking)")
+        self.ai_sr_strict_checkbox.setChecked(bool(getattr(self._controller, "ai_sr_strict", False)))
+        settings_form.addRow(self.ai_sr_strict_checkbox)
+
+        self.ai_sr_input_align_combo = QComboBox()
+        self.ai_sr_input_align_combo.addItems(["1", "2", "4", "8"])
+        self.ai_sr_input_align_combo.setCurrentText(str(int(getattr(self._controller, "ai_sr_input_align", 2))))
+        settings_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
+
+        self.ai_sr_overscan_spin = QDoubleSpinBox()
+        self.ai_sr_overscan_spin.setRange(0.0, 50.0)
+        self.ai_sr_overscan_spin.setDecimals(1)
+        self.ai_sr_overscan_spin.setSingleStep(0.5)
+        self.ai_sr_overscan_spin.setValue(float(getattr(self._controller, "ai_sr_roi_overscan_percent", 0.0)))
+        settings_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
+
+        self.ai_sr_inference_divisor_spin = QSpinBox()
+        self.ai_sr_inference_divisor_spin.setRange(0, 16)
+        self.ai_sr_inference_divisor_spin.setValue(int(getattr(self._controller, "ai_sr_inference_divisor", 0)))
+        self.ai_sr_inference_divisor_spin.setToolTip("0 uses model-native divisor; lower values can improve quality at higher GPU cost")
+        settings_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
+
+        self.ai_sr_detail_preserve_spin = QDoubleSpinBox()
+        self.ai_sr_detail_preserve_spin.setRange(0.0, 100.0)
+        self.ai_sr_detail_preserve_spin.setDecimals(1)
+        self.ai_sr_detail_preserve_spin.setSingleStep(2.5)
+        self.ai_sr_detail_preserve_spin.setValue(float(getattr(self._controller, "ai_sr_detail_preserve_percent", 0.0)))
+        self.ai_sr_detail_preserve_spin.setToolTip("Blend original ROI detail back into AI output to reduce softness")
+        settings_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
+
+        initial_profile = self._ai_sr_profiles.get(current_model_path)
+        if initial_profile is not None:
+            self._apply_ai_sr_profile(initial_profile)
+
+        ai_sr_tuning_actions = QWidget()
+        ai_sr_tuning_actions_layout = QHBoxLayout(ai_sr_tuning_actions)
+        ai_sr_tuning_actions_layout.setContentsMargins(0, 0, 0, 0)
+        ai_sr_tuning_actions_layout.setSpacing(8)
+
+        self.ai_sr_tuning_apply_btn = QPushButton("Apply AI SR Tuning")
+        self.ai_sr_tuning_apply_btn.clicked.connect(self._on_ai_sr_tuning_apply_clicked)
+        ai_sr_tuning_actions_layout.addWidget(self.ai_sr_tuning_apply_btn)
+
+        self.ai_sr_profile_save_btn = QPushButton("Save Model Profile")
+        self.ai_sr_profile_save_btn.clicked.connect(self._on_ai_sr_profile_save_clicked)
+        ai_sr_tuning_actions_layout.addWidget(self.ai_sr_profile_save_btn)
+
+        self.ai_sr_profile_load_btn = QPushButton("Load Model Profile")
+        self.ai_sr_profile_load_btn.clicked.connect(self._on_ai_sr_profile_load_clicked)
+        ai_sr_tuning_actions_layout.addWidget(self.ai_sr_profile_load_btn)
+
+        settings_form.addRow(ai_sr_tuning_actions)
+
+        ai_sr_runtime_box = QGroupBox("AI SR Runtime")
+        ai_sr_runtime_layout = QVBoxLayout(ai_sr_runtime_box)
+        ai_sr_runtime_layout.setContentsMargins(8, 8, 8, 8)
+        self.ai_sr_runtime_label = QLabel("AI SR runtime info will appear after worker initialization.")
+        self.ai_sr_runtime_label.setWordWrap(True)
+        ai_sr_runtime_layout.addWidget(self.ai_sr_runtime_label)
+        settings_form.addRow(ai_sr_runtime_box)
 
         self.deinterlace_checkbox = QCheckBox("Enable Bob deinterlace")
         self.deinterlace_checkbox.setChecked(True)
@@ -1458,12 +2049,32 @@ class MainWindow(QMainWindow):
                     perf = self._perf_snapshot_and_reset()
                     self._frame_count = 0
                     self._last_stat_time = now
-                    mode_text = "Auto" if self._controller.sr_auto_mode else "Manual"
+                    mode_text = "Auto" if self._controller.basic_scaling_auto_mode else "Manual"
+                    flavor_text = SR_FLAVOR_NAME_TO_LABEL.get(self._controller.basic_scaling_method, self._controller.basic_scaling_method)
+                    ai_sr_state = "off"
+                    ai_sr_detail = ""
+                    if getattr(self._controller, "ai_sr_enabled", False):
+                        ai_sr_state = "active" if getattr(self._controller, "ai_sr_active", False) else "requested"
+                        ai_sr_info = getattr(self._controller, "ai_sr_info", None)
+                        ai_sr_error = getattr(self._controller, "ai_sr_error", None)
+                        if ai_sr_info and ai_sr_state == "active":
+                            provider = ai_sr_info.get("provider", "unknown")
+                            strict_text = " strict" if bool(ai_sr_info.get("strict_mode", False)) else " async"
+                            ai_sr_detail = f" ({provider},{strict_text})"
+                        elif ai_sr_error and ai_sr_state != "active":
+                            ai_sr_detail = f" ({ai_sr_error})"
+                        elif getattr(self._controller, "ai_sr_last_warning", None):
+                            ai_sr_detail = f" ({self._controller.ai_sr_last_warning})"
                     worker_fps = 0.0
+                    ai_applied = 0
+                    ai_passthrough = 0
                     if hasattr(self._controller, "decklink_processed_fps"):
                         worker_fps = float(self._controller.decklink_processed_fps())
+                    if hasattr(self._controller, "decklink_ai_sr_counts"):
+                        ai_applied, ai_passthrough = self._controller.decklink_ai_sr_counts()
+                    ai_counts = f"{ai_applied}/{ai_passthrough}"
                     self._update_status(
-                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | SR mode={mode_text} | effective SR={self._controller.effective_scale()}"
+                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | AI applied/passthrough={ai_counts}"
                     )
                     LOGGER.info(
                         (
@@ -1488,6 +2099,7 @@ class MainWindow(QMainWindow):
                     self.decklink_status_label.setText(
                         f"DeckLink streaming via worker process | preview_fps={fps:.1f} | worker_fps={worker_fps:.1f}"
                     )
+                    self._refresh_ai_sr_runtime_panel()
                     self._apply_performance_guard(fps)
                 return
 
@@ -1538,9 +2150,24 @@ class MainWindow(QMainWindow):
                 perf = self._perf_snapshot_and_reset()
                 self._frame_count = 0
                 self._last_stat_time = now
-                mode_text = "Auto" if self._controller.sr_auto_mode else "Manual"
+                mode_text = "Auto" if self._controller.basic_scaling_auto_mode else "Manual"
+                flavor_text = SR_FLAVOR_NAME_TO_LABEL.get(self._controller.basic_scaling_method, self._controller.basic_scaling_method)
+                ai_sr_state = "off"
+                ai_sr_detail = ""
+                if getattr(self._controller, "ai_sr_enabled", False):
+                    ai_sr_state = "active" if getattr(self._controller, "ai_sr_active", False) else "requested"
+                    ai_sr_info = getattr(self._controller, "ai_sr_info", None)
+                    ai_sr_error = getattr(self._controller, "ai_sr_error", None)
+                    if ai_sr_info and ai_sr_state == "active":
+                        provider = ai_sr_info.get("provider", "unknown")
+                        strict_text = " strict" if bool(ai_sr_info.get("strict_mode", False)) else " async"
+                        ai_sr_detail = f" ({provider},{strict_text})"
+                    elif ai_sr_error and ai_sr_state != "active":
+                        ai_sr_detail = f" ({ai_sr_error})"
+                    elif getattr(self._controller, "ai_sr_last_warning", None):
+                        ai_sr_detail = f" ({self._controller.ai_sr_last_warning})"
                 self._update_status(
-                    f"Running | FPS={fps:.1f} | SR mode={mode_text} | effective SR={self._controller.effective_scale()}"
+                    f"Running | FPS={fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail}"
                 )
                 LOGGER.info(
                     (
@@ -1564,6 +2191,7 @@ class MainWindow(QMainWindow):
                 if self._source_mode == "Blackmagic DeckLink":
                     self.decklink_status_label.setText("DeckLink streaming")
 
+                self._refresh_ai_sr_runtime_panel()
                 self._apply_performance_guard(fps)
         except Exception as exc:
             if self._is_closing:
@@ -1580,6 +2208,7 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._apply_initial_main_splitter_layout()
         self._apply_initial_viewer_layout()
         self._fit_viewers_to_video_aspect()
 
@@ -1601,6 +2230,20 @@ class MainWindow(QMainWindow):
         self._display_splitter.setSizes([half, max(1, total_h - half)])
         self._splitter_initialized = True
         self._fit_viewers_to_video_aspect()
+
+    def _apply_initial_main_splitter_layout(self) -> None:
+        if self._main_splitter_initialized:
+            return
+        if not self.isVisible():
+            return
+
+        total_w = self._main_splitter.size().width()
+        if total_w <= 2:
+            return
+
+        half = max(1, total_w // 2)
+        self._main_splitter.setSizes([max(1, total_w - half), half])
+        self._main_splitter_initialized = True
 
     def _fit_viewers_to_video_aspect(self) -> None:
         self._fit_canvas_in_panel(
@@ -1762,41 +2405,61 @@ class MainWindow(QMainWindow):
         mode = self.sr_mode_combo.currentText()
         try:
             if mode == "Auto":
-                self._controller.set_auto_sr()
+                self._controller.set_auto_basic_scaling()
             else:
-                self._controller.set_manual_sr(int(self.sr_manual_combo.currentText()))
+                self._controller.set_manual_basic_scaling(int(self.sr_manual_combo.currentText()))
         except Exception as exc:
-            self._update_status(f"SR mode change failed: {exc}")
+            self._update_status(f"Basic scaling mode change failed: {exc}")
 
     def _on_sr_manual_changed(self) -> None:
         if self.sr_mode_combo.currentText() != "Manual":
             return
         try:
-            self._controller.set_manual_sr(int(self.sr_manual_combo.currentText()))
+            self._controller.set_manual_basic_scaling(int(self.sr_manual_combo.currentText()))
         except Exception as exc:
-            self._update_status(f"Manual SR change failed: {exc}")
+            self._update_status(f"Manual basic scaling change failed: {exc}")
+
+    def _on_sr_flavor_changed(self) -> None:
+        selected_label = self.sr_flavor_combo.currentText()
+        selected_name = SR_FLAVOR_LABEL_TO_NAME.get(selected_label, "bicubic")
+        if not getattr(self._controller, "basic_scaling_method_supported", False):
+            self._update_status("Basic scaling method is not supported by the loaded video_processor build; rebuild extension to enable")
+            return
+        try:
+            self._controller.set_basic_scaling_method(selected_name)
+            applied_name = getattr(self._controller, "basic_scaling_method", selected_name)
+            applied_label = SR_FLAVOR_NAME_TO_LABEL.get(applied_name, applied_name)
+            effective_sr = int(self._controller.effective_scale()) if hasattr(self._controller, "effective_scale") else 1
+            if effective_sr <= 1:
+                self._update_status(
+                    f"Basic scaling method applied: {applied_label} | effective scaling=1 (set Manual basic scaling to 4 or 8 to see visible method differences)"
+                )
+            else:
+                self._update_status(f"Basic scaling method applied: {applied_label}")
+        except Exception as exc:
+            self._update_status(f"Basic scaling method change failed: {exc}")
 
     def _on_auto_sr_max_changed(self) -> None:
         try:
             max_scale = int(self.auto_sr_max_combo.currentText())
-            self._controller.set_max_auto_sr_scale(max_scale)
+            self._controller.set_max_auto_basic_scaling(max_scale)
             if self.sr_mode_combo.currentText() == "Auto":
-                self._controller.set_auto_sr()
-            self._update_status(f"Auto SR max set to {max_scale}")
+                self._controller.set_auto_basic_scaling()
+            self._update_status(f"Auto basic scaling max set to {max_scale}")
         except Exception as exc:
-            self._update_status(f"Auto SR max change failed: {exc}")
+            self._update_status(f"Auto basic scaling max change failed: {exc}")
 
     def _on_enable_sr_toggled(self, checked: bool) -> None:
-        previous_value = self._controller.enable_placeholder_sr
-        self._controller.enable_placeholder_sr = checked
+        previous_value = self._controller.enable_basic_scaling
+        self._controller.enable_basic_scaling = checked
         try:
             self._controller.create(self._roi)
             if self._source_mode == "Blackmagic DeckLink":
                 self._start_decklink_sessions()
-            self._update_status("Recreated processor after placeholder SR toggle")
+            self._update_status("Recreated processor after basic scaling toggle")
         except Exception as exc:
             # Roll back to previous SR enable state so the app can recover in-place.
-            self._controller.enable_placeholder_sr = previous_value
+            self._controller.enable_basic_scaling = previous_value
             try:
                 self._controller.create(self._roi)
                 if self._source_mode == "Blackmagic DeckLink":
@@ -1822,6 +2485,146 @@ class MainWindow(QMainWindow):
         self._perf_guard_low_fps_seconds = 0
         self._perf_guard_last_action = ""
 
+    def _on_enable_ai_sr_toggled(self, checked: bool) -> None:
+        try:
+            self._controller.set_ai_sr_enabled(checked)
+            if checked:
+                model_path = self.ai_sr_model_combo.currentText().strip()
+                self._update_status(f"AI SR toggle requested | awaiting worker ack | model={model_path}")
+            else:
+                self._update_status("AI SR disable requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"AI SR toggle failed: {exc}")
+
+    def _on_ai_sr_model_path_changed(self, model_path: str) -> None:
+        if self._updating_controls:
+            return
+        if not model_path.strip():
+            return
+        model_candidate = Path(model_path.strip())
+        if not model_candidate.exists():
+            self._update_status(f"AI SR model file not found: {model_candidate}")
+            return
+        try:
+            self._controller.set_ai_sr_model_path(model_path.strip())
+            self._update_status("AI SR model path update requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"AI SR model update failed: {exc}")
+
+    def _on_ai_sr_model_apply_clicked(self) -> None:
+        self._on_ai_sr_model_path_changed(self.ai_sr_model_combo.currentText())
+
+    def _on_ai_sr_model_selection_changed(self, model_path: str) -> None:
+        model_key = model_path.strip()
+        if not model_key:
+            return
+        profile = self._ai_sr_profiles.get(model_key)
+        if profile is None:
+            return
+        self._apply_ai_sr_profile(profile)
+        self._update_status("Loaded saved AI SR profile for selected model")
+
+    def _on_ai_sr_model_refresh_clicked(self) -> None:
+        previous_text = self.ai_sr_model_combo.currentText().strip()
+        self._refresh_ai_sr_model_options(preferred_model_path=previous_text)
+        model_count = self.ai_sr_model_combo.count()
+        self._update_status(f"AI SR model list refreshed ({model_count} model{'s' if model_count != 1 else ''})")
+
+    def _on_ai_sr_tuning_apply_clicked(self) -> None:
+        try:
+            profile = self._current_ai_sr_profile()
+            self._controller.set_ai_sr_settings(
+                provider=str(profile["provider"]),
+                require_gpu=bool(profile["require_gpu"]),
+                frame_interval=int(profile["frame_interval"]),
+                strict=bool(profile["strict"]),
+                input_align=int(profile["input_align"]),
+                roi_overscan_percent=float(profile["roi_overscan_percent"]),
+                inference_divisor=int(profile["inference_divisor"]),
+                detail_preserve_percent=float(profile["detail_preserve_percent"]),
+            )
+            self._update_status("AI SR tuning update requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"AI SR tuning update failed: {exc}")
+
+    def _on_ai_sr_profile_save_clicked(self) -> None:
+        model_path = self.ai_sr_model_combo.currentText().strip()
+        if not model_path:
+            self._update_status("Save profile failed: AI SR model path is empty")
+            return
+        self._ai_sr_profiles[model_path] = self._current_ai_sr_profile()
+        self._save_ai_sr_profiles()
+        self._update_status("Saved AI SR tuning profile for selected model")
+
+    def _on_ai_sr_profile_load_clicked(self) -> None:
+        model_path = self.ai_sr_model_combo.currentText().strip()
+        if not model_path:
+            self._update_status("Load profile failed: AI SR model path is empty")
+            return
+        profile = self._ai_sr_profiles.get(model_path)
+        if profile is None:
+            self._update_status("No saved AI SR profile for selected model")
+            return
+        self._apply_ai_sr_profile(profile)
+        self._refresh_ai_sr_runtime_panel()
+        self._update_status("Loaded AI SR profile for selected model")
+
+    def _refresh_ai_sr_runtime_panel(self) -> None:
+        info = getattr(self._controller, "ai_sr_info", None) or {}
+        enabled = bool(getattr(self._controller, "ai_sr_enabled", False))
+        active = bool(getattr(self._controller, "ai_sr_active", False))
+        error_text = getattr(self._controller, "ai_sr_error", None)
+        warning_text = getattr(self._controller, "ai_sr_last_warning", None)
+
+        provider = str(info.get("provider", "n/a"))
+        provider_upper = provider.upper()
+        gpu_active = provider in {"CUDAExecutionProvider", "TensorrtExecutionProvider"}
+        gpu_state = "YES" if gpu_active else "NO"
+        requested_provider = str(info.get("requested_provider", getattr(self._controller, "ai_sr_provider", "auto")))
+
+        available = info.get("available_providers", [])
+        if isinstance(available, (list, tuple)):
+            available_text = ", ".join(str(item) for item in available) if available else "n/a"
+        else:
+            available_text = str(available)
+
+        avg_infer_ms = info.get("avg_infer_ms")
+        avg_infer_text = f"{float(avg_infer_ms):.2f} ms" if isinstance(avg_infer_ms, (int, float)) else "n/a"
+
+        ai_applied = 0
+        ai_passthrough = 0
+        worker_fps = 0.0
+        if hasattr(self._controller, "decklink_ai_sr_counts"):
+            ai_applied, ai_passthrough = self._controller.decklink_ai_sr_counts()
+        if hasattr(self._controller, "decklink_processed_fps"):
+            worker_fps = float(self._controller.decklink_processed_fps())
+
+        lines = [
+            f"Enabled: {enabled} | Active: {active}",
+            f"GPU active: {gpu_state} | Provider: {provider_upper} | Requested: {requested_provider}",
+            f"Available providers: {available_text}",
+            f"Model path: {info.get('model_path', getattr(self._controller, 'ai_sr_model_path', 'n/a'))}",
+            f"Model scale: {info.get('model_scale', 'n/a')} | Input tensor: {info.get('model_input_w', 'n/a')}x{info.get('model_input_h', 'n/a')} | DType: {info.get('input_dtype', 'n/a')}",
+            f"Avg infer: {avg_infer_text} | Worker FPS: {worker_fps:.1f}",
+            (
+                "Tuning: "
+                f"interval={info.get('frame_interval', getattr(self._controller, 'ai_sr_frame_interval', 'n/a'))}, "
+                f"strict={info.get('strict_mode', getattr(self._controller, 'ai_sr_strict', False))}, "
+                f"align={info.get('input_align', getattr(self._controller, 'ai_sr_input_align', 'n/a'))}, "
+                f"overscan={info.get('roi_overscan_percent', getattr(self._controller, 'ai_sr_roi_overscan_percent', 'n/a'))}, "
+                f"divisor={info.get('inference_divisor', getattr(self._controller, 'ai_sr_inference_divisor', 'n/a'))}, "
+                f"detail={info.get('detail_preserve_percent', getattr(self._controller, 'ai_sr_detail_preserve_percent', 'n/a'))}"
+            ),
+            f"Frames: applied={ai_applied}, passthrough={ai_passthrough}",
+        ]
+
+        if error_text:
+            lines.append(f"Error: {error_text}")
+        elif warning_text:
+            lines.append(f"Warning: {warning_text}")
+
+        self.ai_sr_runtime_label.setText("\n".join(lines))
+
     def _target_fps(self) -> float:
         return float(max(1, self.fps_spin.value()))
 
@@ -1844,11 +2647,11 @@ class MainWindow(QMainWindow):
         if self._perf_guard_low_fps_seconds < 2:
             return
 
-        # First mitigation: clamp SR cost by switching to manual x2.
-        if self._controller.enable_placeholder_sr and (
-            self._controller.sr_auto_mode or self._controller.sr_manual_scale > 2 or self._controller.effective_scale() > 2
+        # First mitigation: clamp basic-scaling cost by switching to manual x2.
+        if self._controller.enable_basic_scaling and (
+            self._controller.basic_scaling_auto_mode or self._controller.basic_scaling_manual > 2 or self._controller.effective_scale() > 2
         ):
-            self._controller.set_manual_sr(2)
+            self._controller.set_manual_basic_scaling(2)
             self._updating_controls = True
             self.sr_mode_combo.setCurrentText("Manual")
             self.sr_manual_combo.setCurrentText("2")
@@ -1860,13 +2663,13 @@ class MainWindow(QMainWindow):
                 measured_fps,
                 target_fps,
             )
-            self._update_status("Performance guard: forced Manual SR=2 to improve FPS")
+            self._update_status("Performance guard: forced Manual basic scaling=2 to improve FPS")
             return
 
-        # Second mitigation: disable placeholder SR if still significantly below target.
+        # Second mitigation: disable basic scaling if still significantly below target.
         if (
-            self._controller.enable_placeholder_sr
-            and self._controller.sr_manual_scale == 2
+            self._controller.enable_basic_scaling
+            and self._controller.basic_scaling_manual == 2
             and measured_fps < severe_threshold
             and self._perf_guard_last_action != "disable_sr"
         ):
@@ -1874,7 +2677,7 @@ class MainWindow(QMainWindow):
             self._perf_guard_last_action = "disable_sr"
             self._perf_guard_low_fps_seconds = 0
             LOGGER.warning(
-                "PERF_GUARD | fps=%.1f target=%.1f | action=disable_placeholder_sr",
+                "PERF_GUARD | fps=%.1f target=%.1f | action=disable_basic_scaling",
                 measured_fps,
                 target_fps,
             )
@@ -1991,11 +2794,12 @@ class MainWindow(QMainWindow):
         output_name = f"device {out_device}"
         in_mode_name = self.decklink_input_mode_combo.currentText()
         out_mode_name = self.decklink_output_mode_combo.currentText()
-        for dev in d.list_devices():
-            if int(dev.index) == in_device:
-                input_name = f"{dev.display_name} ({in_device})"
-            if int(dev.index) == out_device:
-                output_name = f"{dev.display_name} ({out_device})"
+        input_label = self.decklink_input_device_combo.currentText()
+        output_label = self.decklink_output_device_combo.currentText()
+        if input_label:
+            input_name = input_label
+        if output_label:
+            output_name = output_label
 
         backend_text = "worker process" if self._controller_backend == "worker-process" else "GUI process"
         self.decklink_status_label.setText(
@@ -2017,7 +2821,11 @@ class MainWindow(QMainWindow):
         if d is None:
             return None
 
-        modes = d.list_input_display_modes(device_index) if input_side else d.list_output_display_modes(device_index)
+        modes = (
+            _call_decklink_api("list_input_display_modes", device_index)
+            if input_side
+            else _call_decklink_api("list_output_display_modes", device_index)
+        )
         for mode in modes:
             if mode.mode != mode_value:
                 continue
@@ -2043,7 +2851,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            devices = d.list_devices()
+            devices = _call_decklink_api("list_devices")
         except Exception as exc:
             LOGGER.exception("DeckLink catalog refresh failed while listing devices")
             self.decklink_status_label.setText(f"DeckLink refresh failed: {exc}")
@@ -2115,7 +2923,7 @@ class MainWindow(QMainWindow):
 
         if in_device is not None:
             try:
-                input_modes = d.list_input_display_modes(in_device)
+                input_modes = _call_decklink_api("list_input_display_modes", in_device)
             except Exception:
                 LOGGER.exception("Failed listing input modes for device %s", in_device)
                 input_modes = []
@@ -2126,7 +2934,7 @@ class MainWindow(QMainWindow):
 
         if out_device is not None:
             try:
-                output_modes = d.list_output_display_modes(out_device)
+                output_modes = _call_decklink_api("list_output_display_modes", out_device)
             except Exception:
                 LOGGER.exception("Failed listing output modes for device %s", out_device)
                 output_modes = []
@@ -2251,8 +3059,8 @@ def load_video_processor_module():
 
 
 def main() -> int:
-    initialize_com_for_decklink()
     app = QApplication(sys.argv)
+    initialize_com_for_decklink()
 
     try:
         module = load_video_processor_module()

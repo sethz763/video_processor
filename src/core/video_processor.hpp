@@ -10,6 +10,12 @@
 
 namespace vp {
 
+enum class SrFlavor {
+    Bilinear,
+    Bicubic,
+    BicubicSharpen,
+};
+
 class VideoProcessor {
 public:
     VideoProcessor(
@@ -29,6 +35,8 @@ public:
     VideoProcessor& operator=(const VideoProcessor&) = delete;
 
     std::string ProcessFrame(const std::string& input_frame);
+    std::string ProcessFrameNoDeinterlace(const std::string& input_frame);
+    std::string ProcessFrameDeinterlaceOnly(const std::string& input_frame);
 
     void SetRoi(int roi_x, int roi_y, int roi_w, int roi_h);
     void SetRoiPosition(int roi_x, int roi_y);
@@ -41,6 +49,10 @@ public:
     bool IsSrAutoMode() const;
     void SetMaxAutoSrScale(int sr_scale);
     int GetMaxAutoSrScale() const;
+    void SetSrFlavor(SrFlavor sr_flavor);
+    void SetSrFlavorByName(const std::string& sr_flavor_name);
+    SrFlavor GetSrFlavor() const;
+    std::string GetSrFlavorName() const;
     void SetDeinterlaceEnabled(bool enabled);
     bool IsDeinterlaceEnabled() const;
 
@@ -49,6 +61,12 @@ public:
     int sr_scale() const;
 
 private:
+    std::string ProcessFrameInternal(
+        const std::string& input_frame,
+        bool deinterlace_only,
+        bool force_deinterlace,
+        bool force_disable_deinterlace
+    );
     void InitializeBuffers();
     void ValidateConfiguration() const;
     void ClampRoi();
@@ -68,6 +86,7 @@ private:
 
     bool enable_placeholder_sr_;
     bool enable_deinterlace_;
+    SrFlavor sr_flavor_;
     bool auto_sr_scale_;
     int max_auto_sr_scale_;
     int sr_requested_scale_;

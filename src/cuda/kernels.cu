@@ -210,6 +210,110 @@ __global__ void CropZoomBilinearKernel(
     rgb_out[y * out_width + x] = SampleBilinear(rgb_in, src_width, src_height, src_x, src_y);
 }
 
+__global__ void CropZoomBicubicKernel(
+    const uchar3* rgb_in,
+    int src_width,
+    int src_height,
+    uchar3* rgb_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= out_width || y >= out_height) {
+        return;
+    }
+
+    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(out_width);
+    const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(out_height);
+
+    const float src_x = static_cast<float>(roi_x) + u * static_cast<float>(roi_w - 1);
+    const float src_y = static_cast<float>(roi_y) + v * static_cast<float>(roi_h - 1);
+
+    rgb_out[y * out_width + x] = SampleBicubic(rgb_in, src_width, src_height, src_x, src_y);
+}
+
+__global__ void Sharpen3x3Kernel(
+    const uchar3* rgb_in,
+    uchar3* rgb_out,
+    int width,
+    int height
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int xm1 = max(0, x - 1);
+    const int xp1 = min(width - 1, x + 1);
+    const int ym1 = max(0, y - 1);
+    const int yp1 = min(height - 1, y + 1);
+
+    const uchar3 c = rgb_in[y * width + x];
+    const uchar3 n = rgb_in[ym1 * width + x];
+    const uchar3 s = rgb_in[yp1 * width + x];
+    const uchar3 w = rgb_in[y * width + xm1];
+    const uchar3 e = rgb_in[y * width + xp1];
+    const uchar3 nw = rgb_in[ym1 * width + xm1];
+    const uchar3 ne = rgb_in[ym1 * width + xp1];
+    const uchar3 sw = rgb_in[yp1 * width + xm1];
+    const uchar3 se = rgb_in[yp1 * width + xp1];
+
+    auto sharpen_channel = [](float center, float north, float south, float west, float east, float c_nw, float c_ne, float c_sw, float c_se) {
+        const float blur = (
+            4.0f * center +
+            2.0f * (north + south + west + east) +
+            (c_nw + c_ne + c_sw + c_se)
+        ) / 16.0f;
+        // Keep this intentionally strong for A/B visibility during SR flavor experiments.
+        const float amount = 2.4f;
+        return ClampToU8(center + amount * (center - blur));
+    };
+
+    rgb_out[y * width + x] = make_uchar3(
+        sharpen_channel(
+            static_cast<float>(c.x),
+            static_cast<float>(n.x),
+            static_cast<float>(s.x),
+            static_cast<float>(w.x),
+            static_cast<float>(e.x),
+            static_cast<float>(nw.x),
+            static_cast<float>(ne.x),
+            static_cast<float>(sw.x),
+            static_cast<float>(se.x)
+        ),
+        sharpen_channel(
+            static_cast<float>(c.y),
+            static_cast<float>(n.y),
+            static_cast<float>(s.y),
+            static_cast<float>(w.y),
+            static_cast<float>(e.y),
+            static_cast<float>(nw.y),
+            static_cast<float>(ne.y),
+            static_cast<float>(sw.y),
+            static_cast<float>(se.y)
+        ),
+        sharpen_channel(
+            static_cast<float>(c.z),
+            static_cast<float>(n.z),
+            static_cast<float>(s.z),
+            static_cast<float>(w.z),
+            static_cast<float>(e.z),
+            static_cast<float>(nw.z),
+            static_cast<float>(ne.z),
+            static_cast<float>(sw.z),
+            static_cast<float>(se.z)
+        )
+    );
+}
+
 __global__ void UpscaleBilinearKernel(
     const uchar3* rgb_in,
     int in_width,
@@ -361,6 +465,52 @@ void LaunchCropZoomBilinear(
         roi_y,
         roi_w,
         roi_h
+    );
+}
+
+void LaunchCropZoomBicubic(
+    const uchar3* d_rgb_in,
+    int src_width,
+    int src_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    CropZoomBicubicKernel<<<Grid2D(out_width, out_height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        src_width,
+        src_height,
+        d_rgb_out,
+        out_width,
+        out_height,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h
+    );
+}
+
+void LaunchSharpen3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    Sharpen3x3Kernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height
     );
 }
 
