@@ -22,6 +22,22 @@ void LaunchBobDeinterlace(
     cudaStream_t stream
 );
 
+void LaunchBlendDeinterlace(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    cudaStream_t stream
+);
+
+void LaunchEdgeAdaptiveDeinterlace(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    cudaStream_t stream
+);
+
 void LaunchUpscaleBicubic(
     const uchar3* d_rgb_in,
     int in_width,
@@ -75,6 +91,34 @@ void LaunchSharpen3x3(
     uchar3* d_rgb_out,
     int width,
     int height,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseLumaGaussian3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseLumaMedian3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseFieldTemporalLuma(
+    const uchar3* d_rgb_in,
+    const uchar3* d_rgb_prev,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
     cudaStream_t stream
 );
 

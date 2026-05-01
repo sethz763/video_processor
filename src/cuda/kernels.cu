@@ -79,6 +79,219 @@ __global__ void BobDeinterlaceKernel(const uchar3* rgb_in, uchar3* rgb_out, int 
     );
 }
 
+__global__ void BlendDeinterlaceKernel(const uchar3* rgb_in, uchar3* rgb_out, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int y_prev = max(0, y - 1);
+    const int y_next = min(height - 1, y + 1);
+
+    const uchar3 p = rgb_in[y * width + x];
+    const uchar3 a = rgb_in[y_prev * width + x];
+    const uchar3 b = rgb_in[y_next * width + x];
+
+    rgb_out[y * width + x] = make_uchar3(
+        static_cast<uint8_t>((2 * static_cast<int>(p.x) + static_cast<int>(a.x) + static_cast<int>(b.x)) >> 2),
+        static_cast<uint8_t>((2 * static_cast<int>(p.y) + static_cast<int>(a.y) + static_cast<int>(b.y)) >> 2),
+        static_cast<uint8_t>((2 * static_cast<int>(p.z) + static_cast<int>(a.z) + static_cast<int>(b.z)) >> 2)
+    );
+}
+
+__device__ inline float RgbLuma(const uchar3& p) {
+    return 0.299f * static_cast<float>(p.x) + 0.587f * static_cast<float>(p.y) + 0.114f * static_cast<float>(p.z);
+}
+
+__global__ void EdgeAdaptiveDeinterlaceKernel(const uchar3* rgb_in, uchar3* rgb_out, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    if ((y & 1) == 0) {
+        rgb_out[y * width + x] = rgb_in[y * width + x];
+        return;
+    }
+
+    const int xm1 = max(0, x - 1);
+    const int xp1 = min(width - 1, x + 1);
+    const int y_prev = max(0, y - 1);
+    const int y_next = min(height - 1, y + 1);
+
+    const uchar3 v_a = rgb_in[y_prev * width + x];
+    const uchar3 v_b = rgb_in[y_next * width + x];
+    const uchar3 d1_a = rgb_in[y_prev * width + xm1];
+    const uchar3 d1_b = rgb_in[y_next * width + xp1];
+    const uchar3 d2_a = rgb_in[y_prev * width + xp1];
+    const uchar3 d2_b = rgb_in[y_next * width + xm1];
+
+    const float g_v = fabsf(RgbLuma(v_a) - RgbLuma(v_b));
+    const float g_d1 = fabsf(RgbLuma(d1_a) - RgbLuma(d1_b));
+    const float g_d2 = fabsf(RgbLuma(d2_a) - RgbLuma(d2_b));
+
+    uchar3 out_a = v_a;
+    uchar3 out_b = v_b;
+    if (g_d1 < g_v && g_d1 <= g_d2) {
+        out_a = d1_a;
+        out_b = d1_b;
+    } else if (g_d2 < g_v && g_d2 < g_d1) {
+        out_a = d2_a;
+        out_b = d2_b;
+    }
+
+    rgb_out[y * width + x] = make_uchar3(
+        static_cast<uint8_t>((static_cast<int>(out_a.x) + static_cast<int>(out_b.x)) >> 1),
+        static_cast<uint8_t>((static_cast<int>(out_a.y) + static_cast<int>(out_b.y)) >> 1),
+        static_cast<uint8_t>((static_cast<int>(out_a.z) + static_cast<int>(out_b.z)) >> 1)
+    );
+}
+
+__device__ inline uchar3 ApplyLumaDelta(const uchar3& src, float delta) {
+    return make_uchar3(
+        ClampToU8(static_cast<float>(src.x) + delta),
+        ClampToU8(static_cast<float>(src.y) + delta),
+        ClampToU8(static_cast<float>(src.z) + delta)
+    );
+}
+
+__global__ void DenoiseLumaGaussian3x3Kernel(
+    const uchar3* rgb_in,
+    uchar3* rgb_out,
+    int width,
+    int height,
+    float strength
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int xm1 = max(0, x - 1);
+    const int xp1 = min(width - 1, x + 1);
+    const int ym1 = max(0, y - 1);
+    const int yp1 = min(height - 1, y + 1);
+
+    const uchar3 c = rgb_in[y * width + x];
+    const float y_center = RgbLuma(c);
+
+    const float y_nw = RgbLuma(rgb_in[ym1 * width + xm1]);
+    const float y_n = RgbLuma(rgb_in[ym1 * width + x]);
+    const float y_ne = RgbLuma(rgb_in[ym1 * width + xp1]);
+    const float y_w = RgbLuma(rgb_in[y * width + xm1]);
+    const float y_e = RgbLuma(rgb_in[y * width + xp1]);
+    const float y_sw = RgbLuma(rgb_in[yp1 * width + xm1]);
+    const float y_s = RgbLuma(rgb_in[yp1 * width + x]);
+    const float y_se = RgbLuma(rgb_in[yp1 * width + xp1]);
+
+    const float y_blur = (
+        y_nw + 2.0f * y_n + y_ne +
+        2.0f * y_w + 4.0f * y_center + 2.0f * y_e +
+        y_sw + 2.0f * y_s + y_se
+    ) / 16.0f;
+
+    const float y_new = y_center + strength * (y_blur - y_center);
+    rgb_out[y * width + x] = ApplyLumaDelta(c, y_new - y_center);
+}
+
+__device__ inline float Median9(float a[9]) {
+    for (int i = 1; i < 9; ++i) {
+        float key = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > key) {
+            a[j + 1] = a[j];
+            --j;
+        }
+        a[j + 1] = key;
+    }
+    return a[4];
+}
+
+__global__ void DenoiseLumaMedian3x3Kernel(
+    const uchar3* rgb_in,
+    uchar3* rgb_out,
+    int width,
+    int height,
+    float strength
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int xm1 = max(0, x - 1);
+    const int xp1 = min(width - 1, x + 1);
+    const int ym1 = max(0, y - 1);
+    const int yp1 = min(height - 1, y + 1);
+
+    const uchar3 c = rgb_in[y * width + x];
+    const float y_center = RgbLuma(c);
+
+    float samples[9] = {
+        RgbLuma(rgb_in[ym1 * width + xm1]),
+        RgbLuma(rgb_in[ym1 * width + x]),
+        RgbLuma(rgb_in[ym1 * width + xp1]),
+        RgbLuma(rgb_in[y * width + xm1]),
+        y_center,
+        RgbLuma(rgb_in[y * width + xp1]),
+        RgbLuma(rgb_in[yp1 * width + xm1]),
+        RgbLuma(rgb_in[yp1 * width + x]),
+        RgbLuma(rgb_in[yp1 * width + xp1]),
+    };
+
+    const float y_med = Median9(samples);
+    const float y_new = y_center + strength * (y_med - y_center);
+    rgb_out[y * width + x] = ApplyLumaDelta(c, y_new - y_center);
+}
+
+__global__ void DenoiseFieldTemporalLumaKernel(
+    const uchar3* rgb_in,
+    const uchar3* rgb_prev,
+    uchar3* rgb_out,
+    int width,
+    int height,
+    float strength
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int xm1 = max(0, x - 1);
+    const int xp1 = min(width - 1, x + 1);
+    const int y2m = max(0, y - 2);
+    const int y2p = min(height - 1, y + 2);
+
+    const uchar3 c = rgb_in[y * width + x];
+    const uchar3 p = rgb_prev[y * width + x];
+    const float curr_luma = RgbLuma(c);
+    const float prev_luma = RgbLuma(p);
+
+    const float l_left = RgbLuma(rgb_in[y * width + xm1]);
+    const float l_right = RgbLuma(rgb_in[y * width + xp1]);
+    const float l_up2 = RgbLuma(rgb_in[y2m * width + x]);
+    const float l_dn2 = RgbLuma(rgb_in[y2p * width + x]);
+    const float field_spatial = (2.0f * curr_luma + l_left + l_right + l_up2 + l_dn2) / 6.0f;
+
+    const float luma_diff = fabsf(curr_luma - prev_luma);
+    const float motion_threshold = 22.0f;
+    const float temporal_gate = fminf(1.0f, fmaxf(0.0f, (motion_threshold - luma_diff) / motion_threshold));
+
+    const float spatial_mix = curr_luma + (0.55f * strength) * (field_spatial - curr_luma);
+    const float temporal_mix = spatial_mix + (0.75f * strength * temporal_gate) * (prev_luma - spatial_mix);
+    rgb_out[y * width + x] = ApplyLumaDelta(c, temporal_mix - curr_luma);
+}
+
 __device__ inline float CubicWeight(float x) {
     x = fabsf(x);
     if (x <= 1.0f) {
@@ -397,6 +610,28 @@ void LaunchBobDeinterlace(const uchar3* d_rgb_in, uchar3* d_rgb_out, int width, 
     );
 }
 
+void LaunchBlendDeinterlace(const uchar3* d_rgb_in, uchar3* d_rgb_out, int width, int height, cudaStream_t stream) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    BlendDeinterlaceKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height
+    );
+}
+
+void LaunchEdgeAdaptiveDeinterlace(const uchar3* d_rgb_in, uchar3* d_rgb_out, int width, int height, cudaStream_t stream) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    EdgeAdaptiveDeinterlaceKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height
+    );
+}
+
 void LaunchUpscaleBicubic(
     const uchar3* d_rgb_in,
     int in_width,
@@ -511,6 +746,65 @@ void LaunchSharpen3x3(
         d_rgb_out,
         width,
         height
+    );
+}
+
+void LaunchDenoiseLumaGaussian3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    DenoiseLumaGaussian3x3Kernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height,
+        fminf(1.0f, fmaxf(0.0f, strength))
+    );
+}
+
+void LaunchDenoiseLumaMedian3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    DenoiseLumaMedian3x3Kernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height,
+        fminf(1.0f, fmaxf(0.0f, strength))
+    );
+}
+
+void LaunchDenoiseFieldTemporalLuma(
+    const uchar3* d_rgb_in,
+    const uchar3* d_rgb_prev,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    DenoiseFieldTemporalLumaKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_prev,
+        d_rgb_out,
+        width,
+        height,
+        fminf(1.0f, fmaxf(0.0f, strength))
     );
 }
 

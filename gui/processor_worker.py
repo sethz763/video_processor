@@ -3,10 +3,13 @@ from __future__ import annotations
 import queue
 import site
 import sys
+import threading
 import time
 import traceback
 import os
+import importlib
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +34,8 @@ _bootstrap_project_venv_site()
 
 _CUDA_DLL_DIR_HANDLES: list[Any] = []
 _CUDA_DLL_DIR_KEYS: set[str] = set()
+_RTX_DLL_DIR_HANDLES: list[Any] = []
+_RTX_DLL_DIR_KEYS: set[str] = set()
 
 
 def _candidate_cuda_dll_dirs() -> list[Path]:
@@ -85,6 +90,40 @@ def _prepare_cuda_runtime_dll_paths() -> None:
             # Best effort: continue trying remaining directories.
             continue
 
+
+def _prepare_rtx_runtime_dll_paths(sdk_root: str, project_root: Path) -> None:
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory is None:
+        return
+
+    candidates = [
+        project_root / "build" / "src" / "Release",
+        project_root / "build" / "src" / "RelWithDebInfo",
+        project_root / "build" / "src" / "Debug",
+    ]
+
+    if sdk_root:
+        sdk_path = Path(sdk_root)
+        candidates.extend(
+            [
+                sdk_path / "bin" / "Windows" / "x64" / "rel",
+                sdk_path / "bin" / "Windows" / "x64" / "dev",
+            ]
+        )
+
+    for dll_dir in candidates:
+        key = str(dll_dir).lower()
+        if key in _RTX_DLL_DIR_KEYS:
+            continue
+        if not dll_dir.exists() or not dll_dir.is_dir():
+            continue
+        try:
+            handle = add_dll_directory(str(dll_dir))
+            _RTX_DLL_DIR_HANDLES.append(handle)
+            _RTX_DLL_DIR_KEYS.add(key)
+        except Exception:
+            continue
+
 try:
     import cv2
 except Exception:
@@ -100,10 +139,22 @@ try:
 except Exception:
     d = None
 
+try:
+    import rtx_vsr as rtx_vsr_module
+except Exception:
+    rtx_vsr_module = None
+
 
 FRAME_W = 1920
 FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
+
+RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
+    "nearest": cv2.INTER_NEAREST if cv2 is not None else 0,
+    "bilinear": cv2.INTER_LINEAR if cv2 is not None else 1,
+    "bicubic": cv2.INTER_CUBIC if cv2 is not None else 2,
+    "lanczos": cv2.INTER_LANCZOS4 if cv2 is not None else 4,
+}
 
 
 class AiSrOnnxEngine:
@@ -574,6 +625,9 @@ def _create_processor(module: Any, cfg: dict[str, Any]):
     basic_scaling_auto_mode = bool(cfg.get("basic_scaling_auto_mode", cfg.get("sr_auto_mode", True)))
     basic_scaling_method = str(cfg.get("basic_scaling_method", cfg.get("sr_flavor", "bicubic")))
     max_auto_basic_scaling = int(cfg.get("max_auto_basic_scaling", cfg.get("max_auto_sr_scale", 4)))
+    deinterlace_method = str(cfg.get("deinterlace_method", "bob"))
+    denoise_method = str(cfg.get("denoise_method", "off"))
+    denoise_strength = float(cfg.get("denoise_strength", 0.35))
     processor = module.VideoProcessor(
         width=int(cfg["width"]),
         height=int(cfg["height"]),
@@ -589,6 +643,12 @@ def _create_processor(module: Any, cfg: dict[str, Any]):
     if basic_scaling_method_supported:
         processor.set_sr_flavor(basic_scaling_method)
     processor.set_deinterlace_enabled(bool(cfg["deinterlace_enabled"]))
+    if hasattr(processor, "set_deinterlace_method"):
+        processor.set_deinterlace_method(deinterlace_method)
+    if hasattr(processor, "set_denoise_method"):
+        processor.set_denoise_method(denoise_method)
+    if hasattr(processor, "set_denoise_strength"):
+        processor.set_denoise_strength(max(0.0, min(1.0, denoise_strength)))
     # SR runtime mode APIs are invalid when basic scaling was disabled at construction.
     if enable_basic_scaling:
         if basic_scaling_auto_mode:
@@ -652,6 +712,17 @@ def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int
     return roi_x, roi_y, roi_w, roi_h
 
 
+@dataclass
+class _StageFrame:
+    frame_id: int
+    captured_ts: float
+    input_bytes: bytes
+    preprocess_bytes: bytes | None = None
+    output_bytes: bytes | None = None
+    ai_applied: bool = False
+    rtx_applied: bool = False
+
+
 def run_processor_worker(request_queue, response_queue, startup_config: dict[str, Any]) -> None:
     _FRAME_MESSAGE_TYPES = {"frame", "decklink_frame", "decklink_no_frame"}
     _CONTROL_MESSAGE_TYPES = {"ready", "ack", "warning", "error"}
@@ -709,23 +780,67 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             return
 
     processor = None
+    project_root_path = Path(startup_config.get("project_root", Path(__file__).resolve().parents[1]))
+    rtx_vsr_runtime_module = rtx_vsr_module
+    rtx_video_sdk_root = str(startup_config.get("rtx_video_sdk_root", "")).strip()
+    if not rtx_video_sdk_root:
+        rtx_video_sdk_root = os.environ.get("RTX_VIDEO_SDK_ROOT", r"C:\Coding Projects\sdks\NVidia video SDK").strip()
+    if rtx_video_sdk_root:
+        os.environ["RTX_VIDEO_SDK_ROOT"] = rtx_video_sdk_root
+    _prepare_rtx_runtime_dll_paths(rtx_video_sdk_root, project_root_path)
+
+    def _resolve_rtx_vsr_module():
+        nonlocal rtx_vsr_runtime_module
+        if rtx_vsr_runtime_module is not None:
+            return rtx_vsr_runtime_module, None
+
+        preferred_paths = [
+            project_root_path / "build" / "src" / "Release",
+            project_root_path / "build" / "src" / "RelWithDebInfo",
+            project_root_path / "build" / "src" / "Debug",
+        ]
+        for candidate in preferred_paths:
+            if candidate.exists() and str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+
+        try:
+            rtx_vsr_runtime_module = importlib.import_module("rtx_vsr")
+            return rtx_vsr_runtime_module, None
+        except Exception as exc:
+            return None, str(exc)
     capture_session = None
     output_session = None
+    pipeline_running = False
+    pipeline_stop_event = threading.Event()
+    capture_thread: threading.Thread | None = None
+    preprocess_thread: threading.Thread | None = None
+    upscale_thread: threading.Thread | None = None
+    output_thread: threading.Thread | None = None
+    q_capture_to_preprocess: queue.Queue[_StageFrame] | None = None
+    q_preprocess_to_upscale: queue.Queue[_StageFrame] | None = None
+    q_upscale_to_output: queue.Queue[_StageFrame] | None = None
+    frame_id_counter = 0
+    capture_drop_count = 0
+    preprocess_drop_count = 0
+    upscale_drop_count = 0
     latest_input_frame: bytes | None = None
     latest_output_frame: bytes | None = None
     latest_effective_sr_scale = 1
+    latest_rtx_vsr_applied = False
+    latest_rtx_effect_mean_abs_luma = 0.0
     processed_frame_counter = 0
     started_perf_ts = 0.0
     ai_sr_enabled = bool(startup_config.get("ai_sr_enabled", False))
     ai_sr_model_path = str(startup_config.get("ai_sr_model_path", ""))
     ai_sr_provider = str(startup_config.get("ai_sr_provider", "cuda"))
     ai_sr_require_gpu = bool(startup_config.get("ai_sr_require_gpu", False))
-    ai_sr_frame_interval = max(1, int(startup_config.get("ai_sr_frame_interval", 1)))
-    ai_sr_strict = bool(startup_config.get("ai_sr_strict", True))
+    ai_sr_frame_interval = max(1, int(startup_config.get("ai_sr_frame_interval", 2)))
+    ai_sr_strict = bool(startup_config.get("ai_sr_strict", False))
     ai_sr_input_align = max(1, int(startup_config.get("ai_sr_input_align", 2)))
     ai_sr_roi_overscan_percent = float(startup_config.get("ai_sr_roi_overscan_percent", 0.0))
     ai_sr_inference_divisor = max(0, int(startup_config.get("ai_sr_inference_divisor", 0)))
     ai_sr_detail_preserve_percent = float(startup_config.get("ai_sr_detail_preserve_percent", 0.0))
+    ai_sr_runtime_note: str | None = None
     ai_sr_engine: AiSrOnnxEngine | None = None
     ai_sr_info: dict[str, object] | None = None
     ai_sr_frame_counter = 0
@@ -735,12 +850,40 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     ai_sr_dropped_frames = 0
     ai_sr_applied_frames = 0
     ai_sr_passthrough_frames = 0
+    rtx_vsr_enabled = bool(startup_config.get("rtx_vsr_enabled", False))
+    rtx_vsr_quality = str(startup_config.get("rtx_vsr_quality", "high")).strip().lower() or "high"
+    rtx_vsr_scale = max(1, int(startup_config.get("rtx_vsr_scale", 2)))
+    rtx_vsr_post_scale_method = str(startup_config.get("rtx_vsr_post_scale_method", "bicubic")).strip().lower() or "bicubic"
+    rtx_thdr_enabled = bool(startup_config.get("rtx_thdr_enabled", False))
+    rtx_thdr_contrast = max(0, int(startup_config.get("rtx_thdr_contrast", 50)))
+    rtx_thdr_saturation = max(0, int(startup_config.get("rtx_thdr_saturation", 50)))
+    rtx_thdr_middle_gray = max(0, int(startup_config.get("rtx_thdr_middle_gray", 50)))
+    rtx_thdr_max_luminance = max(0, int(startup_config.get("rtx_thdr_max_luminance", 1000)))
+    rtx_vsr_engine = None
+    rtx_vsr_info: dict[str, object] | None = None
+    rtx_vsr_error: str | None = None
     current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bicubic"))
     current_roi_x = int(startup_config.get("roi_x", 0))
     current_roi_y = int(startup_config.get("roi_y", 0))
     current_roi_w = int(startup_config.get("roi_w", FRAME_W))
     current_roi_h = int(startup_config.get("roi_h", FRAME_H))
     current_deinterlace_enabled = bool(startup_config.get("deinterlace_enabled", True))
+    current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
+    current_denoise_method = str(startup_config.get("denoise_method", "off"))
+    current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
+    basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
+    state_lock = threading.Lock()
+
+    def _is_live_passthrough_mode() -> bool:
+        # Passthrough mode is valid only when no stage is expected to modify pixels.
+        denoise_enabled = current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
+        return (
+            (not current_deinterlace_enabled)
+            and (not denoise_enabled)
+            and (not basic_scaling_enabled)
+            and (not ai_sr_enabled)
+            and (not rtx_vsr_enabled)
+        )
 
     def _cleanup_ai_async() -> None:
         nonlocal ai_sr_executor, ai_sr_future
@@ -812,11 +955,139 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_passthrough_frames += 1
         return output_frame, ai_applied
 
-    def _process_pipeline_frame(frame_bytes: bytes) -> tuple[bytes, bool]:
-        frame_for_ai = frame_bytes
+    def _apply_rtx_vsr(frame_bytes: bytes, roi: tuple[int, int, int, int]) -> bytes:
+        if rtx_vsr_engine is None:
+            return frame_bytes
+
+        roi_x, roi_y, roi_w, roi_h = _normalize_worker_roi(int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
+        yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+        roi_yuv = np.ascontiguousarray(yuv422[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w, :])
+        roi_rgb = cv2.cvtColor(roi_yuv, cv2.COLOR_YUV2RGB_UYVY)
+        roi_rgba = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2RGBA)
+
+        sr_rgba = rtx_vsr_engine.process_rgba(roi_rgba)
+        if not isinstance(sr_rgba, np.ndarray):
+            sr_rgba = np.asarray(sr_rgba)
+
+        if sr_rgba.shape[0] != FRAME_H or sr_rgba.shape[1] != FRAME_W:
+            interpolation = RTX_POST_SCALE_METHOD_TO_CV2_INTERP.get(rtx_vsr_post_scale_method, cv2.INTER_CUBIC)
+            sr_rgba = cv2.resize(sr_rgba, (FRAME_W, FRAME_H), interpolation=interpolation)
+
+        sr_rgb = cv2.cvtColor(sr_rgba, cv2.COLOR_RGBA2RGB)
+        sr_yuv422 = cv2.cvtColor(sr_rgb, cv2.COLOR_RGB2YUV_UYVY)
+        return sr_yuv422.tobytes()
+
+    def _apply_ai_sr_performance_profile() -> None:
+        nonlocal ai_sr_strict, ai_sr_frame_interval, ai_sr_inference_divisor, ai_sr_runtime_note
+        ai_sr_runtime_note = None
+
+        model_name = Path(ai_sr_model_path).name.lower()
+        profile_changes: list[str] = []
+
+        # Quality-first throughput policy for heavy models:
+        # 1) Never force lower inference resolution automatically.
+        # 2) Keep async submission so output cadence stays responsive.
+        # 3) Use only a mild cadence adjustment for very heavy models.
+        if "x4_fp16" in model_name or "x8" in model_name:
+            if ai_sr_strict:
+                ai_sr_strict = False
+                profile_changes.append("strict->async")
+
+            # Keep high per-frame detail by avoiding forced divisor changes.
+            # If the user explicitly set a divisor, preserve it as-is.
+
+            target_interval = 8 if "x8" in model_name else 6
+            if ai_sr_frame_interval < target_interval:
+                ai_sr_frame_interval = target_interval
+                profile_changes.append(f"frame_interval={target_interval}")
+
+            if ai_sr_inference_divisor > 0:
+                profile_changes.append(f"inference_divisor=user:{ai_sr_inference_divisor}")
+            else:
+                profile_changes.append("inference_divisor=auto-quality")
+
+        if profile_changes:
+            ai_sr_runtime_note = "; ".join(profile_changes)
+
+    def _put_latest_stage_frame(stage_queue: queue.Queue[_StageFrame], item: _StageFrame) -> bool:
+        # Keep newest frames and drop oldest when saturated to bound latency.
+        try:
+            stage_queue.put_nowait(item)
+            return False
+        except queue.Full:
+            try:
+                stage_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                stage_queue.put_nowait(item)
+                return True
+            except queue.Full:
+                return True
+
+    def _preprocess_stage(frame_bytes: bytes) -> bytes:
+        if not ((ai_sr_enabled and ai_sr_engine is not None) or (rtx_vsr_enabled and rtx_vsr_engine is not None)):
+            # Non-AI mode uses a single fused C++ pass in _upscale_stage.
+            return frame_bytes
+
+        preprocess_for_ai = current_deinterlace_enabled or (
+            current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
+        )
+
+        if not preprocess_for_ai:
+            return frame_bytes
+
+        if hasattr(processor, "process_frame_preprocess_only"):
+            return processor.process_frame_preprocess_only(frame_bytes)
 
         if current_deinterlace_enabled and hasattr(processor, "process_frame_deinterlace_only"):
-            frame_for_ai = processor.process_frame_deinterlace_only(frame_for_ai)
+            return processor.process_frame_deinterlace_only(frame_bytes)
+
+        return frame_bytes
+
+    def _upscale_stage(preprocessed_bytes: bytes) -> tuple[bytes, bool]:
+        # AI SR and basic CUDA upscale are mutually exclusive. If AI SR is enabled,
+        # always route through AI stage behavior and never invoke basic CUDA upscale.
+        if ai_sr_enabled and ai_sr_engine is not None:
+            ai_output_bytes, ai_applied = _apply_ai_sr(
+                preprocessed_bytes,
+                (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
+                current_basic_scaling_method,
+            )
+            return ai_output_bytes, ai_applied
+
+        if rtx_vsr_enabled and rtx_vsr_engine is not None:
+            try:
+                return _apply_rtx_vsr(
+                    preprocessed_bytes,
+                    (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
+                ), True
+            except Exception as rtx_exc:
+                _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {rtx_exc}"})
+                return preprocessed_bytes, False
+
+        # Fused path: deinterlace + denoise + basic scaling in one GPU pass.
+        return processor.process_frame(preprocessed_bytes), False
+
+    def _process_pipeline_frame(frame_bytes: bytes) -> tuple[bytes, bool]:
+        if rtx_vsr_enabled and rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None):
+            preprocessed = _preprocess_stage(frame_bytes)
+            return _upscale_stage(preprocessed)
+
+        if not (ai_sr_enabled and ai_sr_engine is not None):
+            return processor.process_frame(frame_bytes), False
+
+        frame_for_ai = frame_bytes
+
+        preprocess_for_ai = current_deinterlace_enabled or (
+            current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
+        )
+
+        if preprocess_for_ai:
+            if hasattr(processor, "process_frame_preprocess_only"):
+                frame_for_ai = processor.process_frame_preprocess_only(frame_for_ai)
+            elif current_deinterlace_enabled and hasattr(processor, "process_frame_deinterlace_only"):
+                frame_for_ai = processor.process_frame_deinterlace_only(frame_for_ai)
 
         ai_output_bytes, ai_applied = _apply_ai_sr(
             frame_for_ai,
@@ -832,8 +1103,194 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
         return processor.process_frame(ai_output_bytes), ai_applied
 
+    def _stop_live_pipeline() -> None:
+        nonlocal pipeline_running, capture_thread, preprocess_thread, upscale_thread, output_thread
+        if not pipeline_running:
+            return
+        pipeline_stop_event.set()
+        for thread in (capture_thread, preprocess_thread, upscale_thread, output_thread):
+            if thread is not None:
+                thread.join(timeout=1.0)
+        capture_thread = None
+        preprocess_thread = None
+        upscale_thread = None
+        output_thread = None
+        pipeline_running = False
+
+    def _start_live_pipeline() -> None:
+        nonlocal pipeline_running
+        nonlocal q_capture_to_preprocess, q_preprocess_to_upscale, q_upscale_to_output
+        nonlocal frame_id_counter, capture_drop_count, preprocess_drop_count, upscale_drop_count
+        nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
+        nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
+        nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+        if capture_session is None or output_session is None:
+            raise RuntimeError("Cannot start pipeline without active DeckLink sessions")
+
+        _stop_live_pipeline()
+        pipeline_stop_event.clear()
+        q_capture_to_preprocess = queue.Queue(maxsize=2)
+        q_preprocess_to_upscale = queue.Queue(maxsize=2)
+        q_upscale_to_output = queue.Queue(maxsize=1)
+        frame_id_counter = 0
+        capture_drop_count = 0
+        preprocess_drop_count = 0
+        upscale_drop_count = 0
+        latest_input_frame = None
+        latest_output_frame = None
+        latest_effective_sr_scale = 1
+        latest_rtx_vsr_applied = False
+        latest_rtx_effect_mean_abs_luma = 0.0
+        processed_frame_counter = 0
+        started_perf_ts = time.perf_counter()
+
+        def _capture_worker() -> None:
+            nonlocal frame_id_counter, capture_drop_count
+            nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
+            nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+            assert q_capture_to_preprocess is not None
+            while not pipeline_stop_event.is_set():
+                try:
+                    frame = capture_session.acquire(timeout_ms=2) if capture_session is not None else None
+                except Exception:
+                    frame = None
+                if frame is None:
+                    continue
+                try:
+                    input_bytes = _tight_uyvy_bytes(frame)
+                except Exception as exc:
+                    _safe_put({"type": "warning", "warning": f"Capture frame conversion failed: {exc}"})
+                    continue
+
+                if _is_live_passthrough_mode():
+                    # In zero-processing mode, avoid staged queueing and preserve output cadence.
+                    try:
+                        if output_session is not None:
+                            _write_frame_to_output(output_session, input_bytes)
+                    except Exception as exc:
+                        _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
+                        continue
+
+                    with state_lock:
+                        latest_input_frame = input_bytes
+                        latest_output_frame = input_bytes
+                        latest_effective_sr_scale = 1
+                        latest_rtx_vsr_applied = False
+                        latest_rtx_effect_mean_abs_luma = 0.0
+                        processed_frame_counter += 1
+                    continue
+
+                frame_id_counter += 1
+                item = _StageFrame(frame_id=frame_id_counter, captured_ts=time.perf_counter(), input_bytes=input_bytes)
+                if _put_latest_stage_frame(q_capture_to_preprocess, item):
+                    capture_drop_count += 1
+
+        def _preprocess_worker() -> None:
+            nonlocal preprocess_drop_count
+            assert q_capture_to_preprocess is not None
+            assert q_preprocess_to_upscale is not None
+            while not pipeline_stop_event.is_set():
+                try:
+                    item = q_capture_to_preprocess.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+                try:
+                    item.preprocess_bytes = _preprocess_stage(item.input_bytes)
+                except Exception as exc:
+                    _safe_put({"type": "warning", "warning": f"Preprocess stage failed: {exc}"})
+                    continue
+                if _put_latest_stage_frame(q_preprocess_to_upscale, item):
+                    preprocess_drop_count += 1
+
+        def _upscale_worker() -> None:
+            nonlocal upscale_drop_count, ai_sr_dropped_frames
+            assert q_preprocess_to_upscale is not None
+            assert q_upscale_to_output is not None
+            while not pipeline_stop_event.is_set():
+                try:
+                    item = q_preprocess_to_upscale.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+
+                preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
+                try:
+                    output_bytes, ai_applied = _upscale_stage(preprocessed)
+                except Exception as exc:
+                    _safe_put({"type": "warning", "warning": f"Upscale stage failed: {exc}"})
+                    continue
+
+                if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
+                    ai_sr_dropped_frames += 1
+
+                item.output_bytes = output_bytes
+                item.ai_applied = ai_applied
+                item.rtx_applied = bool(
+                    ai_applied
+                    and rtx_vsr_enabled
+                    and rtx_vsr_engine is not None
+                    and not (ai_sr_enabled and ai_sr_engine is not None)
+                )
+                if _put_latest_stage_frame(q_upscale_to_output, item):
+                    upscale_drop_count += 1
+
+        def _output_worker() -> None:
+            nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
+            nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+            assert q_upscale_to_output is not None
+            while not pipeline_stop_event.is_set():
+                try:
+                    item = q_upscale_to_output.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+
+                output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
+                # A lightweight, sampled UYVY byte-delta metric helps verify that
+                # RTX VSR is measurably altering output in real time.
+                sampled_delta = 0.0
+                try:
+                    in_arr = np.frombuffer(item.input_bytes, dtype=np.uint8)
+                    out_arr = np.frombuffer(output_bytes, dtype=np.uint8)
+                    if in_arr.size == out_arr.size and in_arr.size > 0:
+                        step = 8
+                        sampled_delta = float(
+                            np.mean(
+                                np.abs(
+                                    in_arr[::step].astype(np.int16)
+                                    - out_arr[::step].astype(np.int16)
+                                )
+                            )
+                        )
+                except Exception:
+                    sampled_delta = 0.0
+
+                try:
+                    if output_session is not None:
+                        _write_frame_to_output(output_session, output_bytes)
+                except Exception as exc:
+                    _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
+                    continue
+
+                with state_lock:
+                    latest_input_frame = item.input_bytes
+                    latest_output_frame = output_bytes
+                    latest_effective_sr_scale = int(processor.get_effective_sr_scale())
+                    latest_rtx_vsr_applied = bool(item.rtx_applied)
+                    latest_rtx_effect_mean_abs_luma = sampled_delta
+                    processed_frame_counter += 1
+
+        capture_thread = threading.Thread(target=_capture_worker, name="vp-capture", daemon=True)
+        preprocess_thread = threading.Thread(target=_preprocess_worker, name="vp-preprocess", daemon=True)
+        upscale_thread = threading.Thread(target=_upscale_worker, name="vp-upscale", daemon=True)
+        output_thread = threading.Thread(target=_output_worker, name="vp-output", daemon=True)
+
+        capture_thread.start()
+        preprocess_thread.start()
+        upscale_thread.start()
+        output_thread.start()
+        pipeline_running = True
+
     def _refresh_ai_sr_engine() -> str | None:
-        nonlocal ai_sr_engine, ai_sr_info, ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_executor, ai_sr_future, ai_sr_dropped_frames, ai_sr_applied_frames, ai_sr_passthrough_frames
+        nonlocal ai_sr_engine, ai_sr_info, ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_executor, ai_sr_future, ai_sr_dropped_frames, ai_sr_applied_frames, ai_sr_passthrough_frames, ai_sr_runtime_note
         _cleanup_ai_async()
 
         if not ai_sr_enabled:
@@ -847,6 +1304,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             return None
 
         try:
+            _apply_ai_sr_performance_profile()
+
             ai_sr_engine = AiSrOnnxEngine(
                 ai_sr_model_path,
                 provider=ai_sr_provider,
@@ -863,6 +1322,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_info["discard_while_busy"] = False
             ai_sr_info["requested_provider"] = str(ai_sr_provider)
             ai_sr_info["gpu_required"] = bool(ai_sr_require_gpu)
+            ai_sr_info["runtime_profile_note"] = ai_sr_runtime_note
             ai_sr_frame_counter = 0
             ai_sr_latest_output_frame = None
             ai_sr_dropped_frames = 0
@@ -872,6 +1332,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_future = None
             if ai_sr_strict:
                 _cleanup_ai_async()
+            if ai_sr_runtime_note is not None:
+                _safe_put({"type": "warning", "warning": f"AI SR throughput profile applied: {ai_sr_runtime_note}"})
             return None
         except Exception as ai_exc:
             ai_sr_engine = None
@@ -894,8 +1356,99 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 )
             return error_text
 
+    def _refresh_rtx_vsr_engine() -> str | None:
+        nonlocal rtx_vsr_engine, rtx_vsr_info
+
+        if rtx_vsr_engine is not None:
+            try:
+                rtx_vsr_engine.close()
+            except Exception:
+                pass
+            rtx_vsr_engine = None
+        rtx_vsr_info = None
+
+        if not rtx_vsr_enabled:
+            return None
+
+        resolved_rtx_module, resolved_rtx_error = _resolve_rtx_vsr_module()
+        if resolved_rtx_module is None:
+            return (
+                "rtx_vsr module is not available"
+                f" | import_error={resolved_rtx_error}"
+                f" | sdk_root={rtx_video_sdk_root or 'unset'}"
+                f" | worker_python={sys.executable}"
+            )
+        if cv2 is None:
+            return "opencv-python is required for RTX VSR color conversion"
+
+        try:
+            in_w = max(2, int(current_roi_w) & ~1)
+            in_h = max(2, int(current_roi_h))
+            rtx_vsr_engine = resolved_rtx_module.RTXVideoSR(
+                in_w,
+                in_h,
+                FRAME_W,
+                FRAME_H,
+                quality=rtx_vsr_quality,
+                thdr_enabled=rtx_thdr_enabled,
+                thdr_contrast=rtx_thdr_contrast,
+                thdr_saturation=rtx_thdr_saturation,
+                thdr_middle_gray=rtx_thdr_middle_gray,
+                thdr_max_luminance=rtx_thdr_max_luminance,
+            )
+            engine_input_w = int(getattr(rtx_vsr_engine, "input_width", in_w))
+            engine_input_h = int(getattr(rtx_vsr_engine, "input_height", in_h))
+            engine_output_w = int(getattr(rtx_vsr_engine, "output_width", FRAME_W))
+            engine_output_h = int(getattr(rtx_vsr_engine, "output_height", FRAME_H))
+            rtx_vsr_info = {
+                "backend": "nvidia_rtx_video_sdk",
+                "quality": rtx_vsr_quality,
+                "scale": int(rtx_vsr_scale),
+                "post_scale_method": rtx_vsr_post_scale_method,
+                "thdr_enabled": bool(rtx_thdr_enabled),
+                "thdr_contrast": int(rtx_thdr_contrast),
+                "thdr_saturation": int(rtx_thdr_saturation),
+                "thdr_middle_gray": int(rtx_thdr_middle_gray),
+                "thdr_max_luminance": int(rtx_thdr_max_luminance),
+                "input_w": engine_input_w,
+                "input_h": engine_input_h,
+                "output_w": engine_output_w,
+                "output_h": engine_output_h,
+            }
+            return None
+        except Exception as rtx_exc:
+            rtx_vsr_engine = None
+            rtx_vsr_info = None
+            module_file = getattr(resolved_rtx_module, "__file__", "unknown")
+            return (
+                f"{rtx_exc}"
+                f" | roi={current_roi_w}x{current_roi_h}"
+                f" | engine_in={in_w}x{in_h}"
+                f" | engine_out={FRAME_W}x{FRAME_H}"
+                f" | quality={rtx_vsr_quality}"
+                f" | thdr_enabled={rtx_thdr_enabled}"
+                f" | thdr_contrast={rtx_thdr_contrast}"
+                f" | thdr_saturation={rtx_thdr_saturation}"
+                f" | thdr_middle_gray={rtx_thdr_middle_gray}"
+                f" | thdr_max_luminance={rtx_thdr_max_luminance}"
+                f" | sdk_root={rtx_video_sdk_root or 'unset'}"
+                f" | module={module_file}"
+            )
+
+    def _close_rtx_vsr_engine() -> None:
+        nonlocal rtx_vsr_engine
+        if rtx_vsr_engine is None:
+            return
+        try:
+            rtx_vsr_engine.close()
+        except Exception:
+            pass
+        rtx_vsr_engine = None
+
     def _stop_sessions() -> None:
         nonlocal capture_session, output_session
+
+        _stop_live_pipeline()
 
         if output_session is not None:
             try:
@@ -912,7 +1465,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             capture_session = None
 
     def _start_sessions(message: dict[str, Any]) -> None:
-        nonlocal capture_session, output_session, processed_frame_counter, started_perf_ts
+        nonlocal capture_session, output_session
         if d is None:
             raise RuntimeError("decklink_wrapper is not available in worker process")
 
@@ -934,13 +1487,13 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         capture_session.start()
         output_session.start()
 
-        processed_frame_counter = 0
-        started_perf_ts = time.perf_counter()
+        _start_live_pipeline()
     try:
         project_root = Path(startup_config["project_root"])
         module = _load_video_processor_module(project_root)
         processor, basic_scaling_method_supported = _create_processor(module, startup_config)
         ai_sr_error = _refresh_ai_sr_engine()
+        rtx_vsr_error = _refresh_rtx_vsr_engine()
         _safe_put(
             {
                 "type": "ready",
@@ -950,25 +1503,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 "ai_sr_active": bool(ai_sr_engine is not None),
                 "ai_sr_error": ai_sr_error,
                 "ai_sr_info": ai_sr_info,
+                "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                "rtx_vsr_error": rtx_vsr_error,
+                "rtx_vsr_info": rtx_vsr_info,
             }
         )
 
         while True:
-            if capture_session is not None and output_session is not None:
-                frame = capture_session.acquire(timeout_ms=1)
-                if frame is not None:
-                    input_bytes = _tight_uyvy_bytes(frame)
-                    output_bytes, ai_applied = _process_pipeline_frame(input_bytes)
-                    if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
-                        ai_sr_dropped_frames += 1
-
-                    _write_frame_to_output(output_session, output_bytes)
-
-                    latest_input_frame = input_bytes
-                    latest_output_frame = output_bytes
-                    latest_effective_sr_scale = int(processor.get_effective_sr_scale())
-                    processed_frame_counter += 1
-
             message = None
             try:
                 message = request_queue.get_nowait()
@@ -979,12 +1521,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 if capture_session is None or output_session is None:
                     # Idle backoff when no active DeckLink sessions and no control message.
                     time.sleep(0.002)
+                else:
+                    time.sleep(0.001)
                 continue
 
             command = message.get("cmd")
             if command == "shutdown":
                 _stop_sessions()
                 _cleanup_ai_async()
+                _close_rtx_vsr_engine()
                 return
 
             if command == "start_decklink":
@@ -1002,22 +1547,44 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     _safe_put({"type": "decklink_no_frame", "reason": "sessions_not_started"})
                     continue
 
-                if latest_input_frame is None or latest_output_frame is None:
+                with state_lock:
+                    current_input = latest_input_frame
+                    current_output = latest_output_frame
+                    current_scale = int(latest_effective_sr_scale)
+                    current_counter = int(processed_frame_counter)
+                    current_rtx_applied = bool(latest_rtx_vsr_applied)
+                    current_rtx_delta = float(latest_rtx_effect_mean_abs_luma)
+
+                if current_input is None or current_output is None:
                     _safe_put({"type": "decklink_no_frame", "reason": "no_input_signal"})
                     continue
 
                 elapsed = max(0.0001, time.perf_counter() - started_perf_ts)
-                processed_fps = float(processed_frame_counter) / elapsed
+                processed_fps = float(current_counter) / elapsed
+                stage_depths = {
+                    "capture_to_preprocess": 0 if q_capture_to_preprocess is None else q_capture_to_preprocess.qsize(),
+                    "preprocess_to_upscale": 0 if q_preprocess_to_upscale is None else q_preprocess_to_upscale.qsize(),
+                    "upscale_to_output": 0 if q_upscale_to_output is None else q_upscale_to_output.qsize(),
+                }
                 _safe_put(
                     {
                         "type": "decklink_frame",
-                        "input_frame_bytes": latest_input_frame,
-                        "output_frame_bytes": latest_output_frame,
-                        "effective_sr_scale": int(latest_effective_sr_scale),
-                        "processed_frame_counter": int(processed_frame_counter),
+                        "input_frame_bytes": current_input,
+                        "output_frame_bytes": current_output,
+                        "effective_sr_scale": current_scale,
+                        "processed_frame_counter": current_counter,
                         "processed_fps": processed_fps,
                         "ai_sr_applied_frames": int(ai_sr_applied_frames),
                         "ai_sr_passthrough_frames": int(ai_sr_passthrough_frames),
+                        "rtx_vsr_applied": current_rtx_applied,
+                        "rtx_effect_mean_abs_luma": current_rtx_delta,
+                        "pipeline_running": bool(pipeline_running),
+                        "stage_queue_depths": stage_depths,
+                        "stage_drop_counts": {
+                            "capture": int(capture_drop_count),
+                            "preprocess": int(preprocess_drop_count),
+                            "upscale": int(upscale_drop_count),
+                        },
                     }
                 )
                 continue
@@ -1049,6 +1616,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     int(message["h"]),
                 )
                 processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                if rtx_vsr_enabled:
+                    rtx_vsr_error = _refresh_rtx_vsr_engine()
                 continue
 
             if command in {"set_basic_scaling_mode_auto", "set_sr_mode_auto"}:
@@ -1083,6 +1652,42 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 processor.set_deinterlace_enabled(current_deinterlace_enabled)
                 continue
 
+            if command == "set_deinterlace_method":
+                current_deinterlace_method = str(message.get("method", current_deinterlace_method)).strip().lower()
+                if hasattr(processor, "set_deinterlace_method"):
+                    processor.set_deinterlace_method(current_deinterlace_method)
+                    if hasattr(processor, "get_deinterlace_method"):
+                        current_deinterlace_method = str(processor.get_deinterlace_method())
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_deinterlace_method",
+                        "deinterlace_method": current_deinterlace_method,
+                    }
+                )
+                continue
+
+            if command == "set_denoise_settings":
+                current_denoise_method = str(message.get("method", current_denoise_method)).strip().lower()
+                current_denoise_strength = max(0.0, min(1.0, float(message.get("strength", current_denoise_strength))))
+                if hasattr(processor, "set_denoise_method"):
+                    processor.set_denoise_method(current_denoise_method)
+                    if hasattr(processor, "get_denoise_method"):
+                        current_denoise_method = str(processor.get_denoise_method())
+                if hasattr(processor, "set_denoise_strength"):
+                    processor.set_denoise_strength(current_denoise_strength)
+                    if hasattr(processor, "get_denoise_strength"):
+                        current_denoise_strength = float(processor.get_denoise_strength())
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_denoise_settings",
+                        "denoise_method": current_denoise_method,
+                        "denoise_strength": current_denoise_strength,
+                    }
+                )
+                continue
+
             if command in {"set_max_auto_basic_scaling", "set_max_auto_sr_scale"}:
                 processor.set_max_auto_sr_scale(int(message["scale"]))
                 continue
@@ -1096,8 +1701,13 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         "cmd": "set_ai_sr_enabled",
                         "ai_sr_enabled": bool(ai_sr_enabled),
                         "ai_sr_active": bool(ai_sr_engine is not None),
+                        "basic_upscale_enabled": not bool(ai_sr_enabled),
                         "ai_sr_error": ai_sr_error,
                         "ai_sr_info": ai_sr_info,
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
                     }
                 )
                 continue
@@ -1111,8 +1721,13 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         "cmd": "set_ai_sr_model_path",
                         "ai_sr_enabled": bool(ai_sr_enabled),
                         "ai_sr_active": bool(ai_sr_engine is not None),
+                        "basic_upscale_enabled": not bool(ai_sr_enabled),
                         "ai_sr_error": ai_sr_error,
                         "ai_sr_info": ai_sr_info,
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
                     }
                 )
                 continue
@@ -1133,8 +1748,50 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         "cmd": "set_ai_sr_settings",
                         "ai_sr_enabled": bool(ai_sr_enabled),
                         "ai_sr_active": bool(ai_sr_engine is not None),
+                        "basic_upscale_enabled": not bool(ai_sr_enabled),
                         "ai_sr_error": ai_sr_error,
                         "ai_sr_info": ai_sr_info,
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
+                    }
+                )
+                continue
+
+            if command == "set_rtx_vsr_enabled":
+                rtx_vsr_enabled = bool(message.get("enabled", False))
+                rtx_vsr_error = _refresh_rtx_vsr_engine()
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_rtx_vsr_enabled",
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
+                    }
+                )
+                continue
+
+            if command == "set_rtx_vsr_settings":
+                rtx_vsr_quality = str(message.get("quality", rtx_vsr_quality)).strip().lower() or "high"
+                rtx_vsr_scale = max(1, int(message.get("scale", rtx_vsr_scale)))
+                rtx_vsr_post_scale_method = str(message.get("post_scale_method", rtx_vsr_post_scale_method)).strip().lower() or "bicubic"
+                rtx_thdr_enabled = bool(message.get("thdr_enabled", rtx_thdr_enabled))
+                rtx_thdr_contrast = max(0, int(message.get("thdr_contrast", rtx_thdr_contrast)))
+                rtx_thdr_saturation = max(0, int(message.get("thdr_saturation", rtx_thdr_saturation)))
+                rtx_thdr_middle_gray = max(0, int(message.get("thdr_middle_gray", rtx_thdr_middle_gray)))
+                rtx_thdr_max_luminance = max(0, int(message.get("thdr_max_luminance", rtx_thdr_max_luminance)))
+                rtx_vsr_error = _refresh_rtx_vsr_engine()
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_rtx_vsr_settings",
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
                     }
                 )
                 continue
@@ -1142,6 +1799,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     except BaseException as exc:
         _stop_sessions()
         _cleanup_ai_async()
+        _close_rtx_vsr_engine()
         try:
             _safe_put(
                 {

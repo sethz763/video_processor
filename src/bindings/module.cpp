@@ -52,6 +52,16 @@ PYBIND11_MODULE(video_processor, m) {
             "Apply Bob deinterlacing and return deinterlaced UYVY bytes without ROI scaling."
         )
         .def(
+            "process_frame_preprocess_only",
+            [](vp::VideoProcessor& self, py::bytes frame) {
+                const std::string input = static_cast<std::string>(frame);
+                const std::string output = self.ProcessFramePreprocessOnly(input);
+                return py::bytes(output);
+            },
+            py::arg("frame"),
+            "Apply enabled preprocess stages (deinterlace/denoise) and return UYVY bytes without ROI scaling."
+        )
+        .def(
             "set_roi",
             &vp::VideoProcessor::SetRoi,
             py::arg("roi_x"),
@@ -165,6 +175,39 @@ PYBIND11_MODULE(video_processor, m) {
             &vp::VideoProcessor::IsDeinterlaceEnabled,
             "Return whether Bob deinterlacing is currently enabled."
         )
+        .def(
+            "set_deinterlace_method",
+            &vp::VideoProcessor::SetDeinterlaceMethodByName,
+            py::arg("method"),
+            "Set deinterlace method to one of [bob, blend, edge_adaptive]."
+        )
+        .def(
+            "get_deinterlace_method",
+            &vp::VideoProcessor::GetDeinterlaceMethodName,
+            "Get current deinterlace method name."
+        )
+        .def(
+            "set_denoise_method",
+            &vp::VideoProcessor::SetDenoiseMethodByName,
+            py::arg("method"),
+            "Set denoise method to one of [off, luma_gaussian3x3, luma_median3x3, field_temporal_luma]."
+        )
+        .def(
+            "get_denoise_method",
+            &vp::VideoProcessor::GetDenoiseMethodName,
+            "Get current denoise method name."
+        )
+        .def(
+            "set_denoise_strength",
+            &vp::VideoProcessor::SetDenoiseStrength,
+            py::arg("strength"),
+            "Set denoise strength in [0.0, 1.0]."
+        )
+        .def(
+            "get_denoise_strength",
+            &vp::VideoProcessor::GetDenoiseStrength,
+            "Get denoise strength in [0.0, 1.0]."
+        )
         .def_property_readonly("width", &vp::VideoProcessor::width)
         .def_property_readonly("height", &vp::VideoProcessor::height)
         .def_property_readonly("sr_scale", &vp::VideoProcessor::sr_scale)
@@ -175,5 +218,8 @@ PYBIND11_MODULE(video_processor, m) {
         .def_property("basic_scaling_method", &vp::VideoProcessor::GetSrFlavorName, &vp::VideoProcessor::SetSrFlavorByName)
         .def_property("max_auto_sr_scale", &vp::VideoProcessor::GetMaxAutoSrScale, &vp::VideoProcessor::SetMaxAutoSrScale)
         .def_property("max_auto_basic_scaling", &vp::VideoProcessor::GetMaxAutoSrScale, &vp::VideoProcessor::SetMaxAutoSrScale)
-        .def_property("deinterlace_enabled", &vp::VideoProcessor::IsDeinterlaceEnabled, &vp::VideoProcessor::SetDeinterlaceEnabled);
+        .def_property("deinterlace_enabled", &vp::VideoProcessor::IsDeinterlaceEnabled, &vp::VideoProcessor::SetDeinterlaceEnabled)
+        .def_property("deinterlace_method", &vp::VideoProcessor::GetDeinterlaceMethodName, &vp::VideoProcessor::SetDeinterlaceMethodByName)
+        .def_property("denoise_method", &vp::VideoProcessor::GetDenoiseMethodName, &vp::VideoProcessor::SetDenoiseMethodByName)
+        .def_property("denoise_strength", &vp::VideoProcessor::GetDenoiseStrength, &vp::VideoProcessor::SetDenoiseStrength);
 }

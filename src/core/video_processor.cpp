@@ -77,6 +77,75 @@ inline const char* ToSrFlavorName(SrFlavor sr_flavor) {
     return "bicubic";
 }
 
+inline const char* ToDeinterlaceMethodName(DeinterlaceMethod method) {
+    switch (method) {
+        case DeinterlaceMethod::Bob:
+            return "bob";
+        case DeinterlaceMethod::Blend:
+            return "blend";
+        case DeinterlaceMethod::EdgeAdaptive:
+            return "edge_adaptive";
+    }
+    return "bob";
+}
+
+inline DeinterlaceMethod ParseDeinterlaceMethodName(const std::string& method_name) {
+    std::string normalized;
+    normalized.reserve(method_name.size());
+    for (char c : method_name) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (normalized == "bob") {
+        return DeinterlaceMethod::Bob;
+    }
+    if (normalized == "blend" || normalized == "weave_blend") {
+        return DeinterlaceMethod::Blend;
+    }
+    if (normalized == "edge_adaptive" || normalized == "ela" || normalized == "edge") {
+        return DeinterlaceMethod::EdgeAdaptive;
+    }
+
+    throw std::invalid_argument("Deinterlace method must be one of [bob, blend, edge_adaptive].");
+}
+
+inline const char* ToDenoiseMethodName(DenoiseMethod method) {
+    switch (method) {
+        case DenoiseMethod::Off:
+            return "off";
+        case DenoiseMethod::LumaGaussian3x3:
+            return "luma_gaussian3x3";
+        case DenoiseMethod::LumaMedian3x3:
+            return "luma_median3x3";
+        case DenoiseMethod::FieldTemporalLuma:
+            return "field_temporal_luma";
+    }
+    return "off";
+}
+
+inline DenoiseMethod ParseDenoiseMethodName(const std::string& method_name) {
+    std::string normalized;
+    normalized.reserve(method_name.size());
+    for (char c : method_name) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (normalized == "off" || normalized == "none") {
+        return DenoiseMethod::Off;
+    }
+    if (normalized == "luma_gaussian3x3" || normalized == "gaussian" || normalized == "gaussian3x3") {
+        return DenoiseMethod::LumaGaussian3x3;
+    }
+    if (normalized == "luma_median3x3" || normalized == "median" || normalized == "median3x3") {
+        return DenoiseMethod::LumaMedian3x3;
+    }
+    if (normalized == "field_temporal_luma" || normalized == "temporal" || normalized == "field_temporal") {
+        return DenoiseMethod::FieldTemporalLuma;
+    }
+
+    throw std::invalid_argument("Denoise method must be one of [off, luma_gaussian3x3, luma_median3x3, field_temporal_luma].");
+}
+
 inline SrFlavor ParseSrFlavorName(const std::string& sr_flavor_name) {
     std::string normalized;
     normalized.reserve(sr_flavor_name.size());
@@ -116,15 +185,18 @@ VideoProcessor::VideoProcessor(
       roi_w_(roi_w),
       roi_h_(roi_h),
       enable_placeholder_sr_(enable_placeholder_sr),
-        enable_deinterlace_(true),
-            sr_flavor_(SrFlavor::Bicubic),
-            auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
-        max_auto_sr_scale_(8),
-            sr_requested_scale_(sr_scale),
+    enable_deinterlace_(true),
+    deinterlace_method_(DeinterlaceMethod::Bob),
+    denoise_method_(DenoiseMethod::Off),
+    denoise_strength_(0.35f),
+    sr_flavor_(SrFlavor::Bicubic),
+    auto_sr_scale_(enable_placeholder_sr && sr_scale == 0),
+    max_auto_sr_scale_(8),
+    sr_requested_scale_(sr_scale),
       sr_scale_(sr_scale),
       sr_width_(width),
       sr_height_(height),
-            sr_buffer_scale_capacity_(0),
+    sr_buffer_scale_capacity_(0),
       uyvy_bytes_(static_cast<size_t>(width) * static_cast<size_t>(height) * kUyvyBytesPerPixel),
       rgb_pixels_(static_cast<size_t>(width) * static_cast<size_t>(height)),
       stream_(nullptr),
@@ -132,8 +204,11 @@ VideoProcessor::VideoProcessor(
       d_uyvy_out_(nullptr),
       d_rgb_full_(nullptr),
       d_rgb_bob_(nullptr),
+    d_rgb_denoise_(nullptr),
+            d_rgb_prev_full_(nullptr),
       d_rgb_sr_(nullptr),
-      d_rgb_zoom_(nullptr) {
+            d_rgb_zoom_(nullptr),
+            has_prev_rgb_full_(false) {
     ValidateConfiguration();
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -300,6 +375,54 @@ bool VideoProcessor::IsDeinterlaceEnabled() const {
     return enable_deinterlace_;
 }
 
+void VideoProcessor::SetDeinterlaceMethod(DeinterlaceMethod method) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    deinterlace_method_ = method;
+}
+
+void VideoProcessor::SetDeinterlaceMethodByName(const std::string& method_name) {
+    SetDeinterlaceMethod(ParseDeinterlaceMethodName(method_name));
+}
+
+DeinterlaceMethod VideoProcessor::GetDeinterlaceMethod() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return deinterlace_method_;
+}
+
+std::string VideoProcessor::GetDeinterlaceMethodName() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return ToDeinterlaceMethodName(deinterlace_method_);
+}
+
+void VideoProcessor::SetDenoiseMethod(DenoiseMethod method) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    denoise_method_ = method;
+}
+
+void VideoProcessor::SetDenoiseMethodByName(const std::string& method_name) {
+    SetDenoiseMethod(ParseDenoiseMethodName(method_name));
+}
+
+DenoiseMethod VideoProcessor::GetDenoiseMethod() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return denoise_method_;
+}
+
+std::string VideoProcessor::GetDenoiseMethodName() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return ToDenoiseMethodName(denoise_method_);
+}
+
+void VideoProcessor::SetDenoiseStrength(float strength) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    denoise_strength_ = std::clamp(strength, 0.0f, 1.0f);
+}
+
+float VideoProcessor::GetDenoiseStrength() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return denoise_strength_;
+}
+
 int VideoProcessor::sr_scale() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return sr_scale_;
@@ -382,6 +505,8 @@ void VideoProcessor::InitializeBuffers() {
 
     CheckCuda(cudaMalloc(&d_rgb_full_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_full_");
     CheckCuda(cudaMalloc(&d_rgb_bob_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_bob_");
+    CheckCuda(cudaMalloc(&d_rgb_denoise_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_denoise_");
+    CheckCuda(cudaMalloc(&d_rgb_prev_full_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_prev_full_");
     CheckCuda(cudaMalloc(&d_rgb_zoom_, rgb_pixels_ * sizeof(uchar3)), "cudaMalloc d_rgb_zoom_");
 
     if (enable_placeholder_sr_) {
@@ -400,6 +525,10 @@ std::string VideoProcessor::ProcessFrameNoDeinterlace(const std::string& input_f
 
 std::string VideoProcessor::ProcessFrameDeinterlaceOnly(const std::string& input_frame) {
     return ProcessFrameInternal(input_frame, true, true, false);
+}
+
+std::string VideoProcessor::ProcessFramePreprocessOnly(const std::string& input_frame) {
+    return ProcessFrameInternal(input_frame, true, false, false);
 }
 
 std::string VideoProcessor::ProcessFrameInternal(
@@ -423,6 +552,9 @@ std::string VideoProcessor::ProcessFrameInternal(
     int sr_width = width_;
     int sr_height = height_;
     bool deinterlace_enabled = true;
+    DeinterlaceMethod deinterlace_method = DeinterlaceMethod::Bob;
+    DenoiseMethod denoise_method = DenoiseMethod::Off;
+    float denoise_strength = 0.0f;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (enable_placeholder_sr_ && auto_sr_scale_) {
@@ -441,6 +573,9 @@ std::string VideoProcessor::ProcessFrameInternal(
         sr_width = sr_width_;
         sr_height = sr_height_;
         deinterlace_enabled = enable_deinterlace_;
+        deinterlace_method = deinterlace_method_;
+        denoise_method = denoise_method_;
+        denoise_strength = denoise_strength_;
 
         if (force_deinterlace) {
             deinterlace_enabled = true;
@@ -465,9 +600,55 @@ std::string VideoProcessor::ProcessFrameInternal(
     int crop_roi_w = roi_w;
     int crop_roi_h = roi_h;
 
+    if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+        if (has_prev_rgb_full_) {
+            cuda_kernels::LaunchDenoiseFieldTemporalLuma(
+                d_rgb_full_,
+                d_rgb_prev_full_,
+                d_rgb_denoise_,
+                width_,
+                height_,
+                denoise_strength,
+                stream_
+            );
+        } else {
+            CheckCuda(
+                cudaMemcpyAsync(
+                    d_rgb_denoise_,
+                    d_rgb_full_,
+                    rgb_pixels_ * sizeof(uchar3),
+                    cudaMemcpyDeviceToDevice,
+                    stream_
+                ),
+                "cudaMemcpyAsync D2D field temporal warmup"
+            );
+        }
+        crop_input = d_rgb_denoise_;
+    }
+
     if (deinterlace_enabled) {
-        cuda_kernels::LaunchBobDeinterlace(d_rgb_full_, d_rgb_bob_, width_, height_, stream_);
+        switch (deinterlace_method) {
+            case DeinterlaceMethod::Blend:
+                cuda_kernels::LaunchBlendDeinterlace(crop_input, d_rgb_bob_, width_, height_, stream_);
+                break;
+            case DeinterlaceMethod::EdgeAdaptive:
+                cuda_kernels::LaunchEdgeAdaptiveDeinterlace(crop_input, d_rgb_bob_, width_, height_, stream_);
+                break;
+            case DeinterlaceMethod::Bob:
+            default:
+                cuda_kernels::LaunchBobDeinterlace(crop_input, d_rgb_bob_, width_, height_, stream_);
+                break;
+        }
         crop_input = d_rgb_bob_;
+    }
+
+    if (denoise_method != DenoiseMethod::Off && denoise_method != DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+        if (denoise_method == DenoiseMethod::LumaMedian3x3) {
+            cuda_kernels::LaunchDenoiseLumaMedian3x3(crop_input, d_rgb_denoise_, width_, height_, denoise_strength, stream_);
+        } else {
+            cuda_kernels::LaunchDenoiseLumaGaussian3x3(crop_input, d_rgb_denoise_, width_, height_, denoise_strength, stream_);
+        }
+        crop_input = d_rgb_denoise_;
     }
 
     if (deinterlace_only) {
@@ -477,6 +658,18 @@ std::string VideoProcessor::ProcessFrameInternal(
             cudaMemcpyAsync(host_output_.data(), d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
             "cudaMemcpyAsync D2H"
         );
+
+        CheckCuda(
+            cudaMemcpyAsync(
+                d_rgb_prev_full_,
+                d_rgb_full_,
+                rgb_pixels_ * sizeof(uchar3),
+                cudaMemcpyDeviceToDevice,
+                stream_
+            ),
+            "cudaMemcpyAsync D2D update prev rgb"
+        );
+        has_prev_rgb_full_ = true;
 
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
 
@@ -585,6 +778,18 @@ std::string VideoProcessor::ProcessFrameInternal(
         "cudaMemcpyAsync D2H"
     );
 
+    CheckCuda(
+        cudaMemcpyAsync(
+            d_rgb_prev_full_,
+            d_rgb_full_,
+            rgb_pixels_ * sizeof(uchar3),
+            cudaMemcpyDeviceToDevice,
+            stream_
+        ),
+        "cudaMemcpyAsync D2D update prev rgb"
+    );
+    has_prev_rgb_full_ = true;
+
     CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
 
     return std::string(reinterpret_cast<const char*>(host_output_.data()), host_output_.size());
@@ -604,6 +809,16 @@ void VideoProcessor::Cleanup() {
     if (d_rgb_bob_ != nullptr) {
         cudaFree(d_rgb_bob_);
         d_rgb_bob_ = nullptr;
+    }
+
+    if (d_rgb_denoise_ != nullptr) {
+        cudaFree(d_rgb_denoise_);
+        d_rgb_denoise_ = nullptr;
+    }
+
+    if (d_rgb_prev_full_ != nullptr) {
+        cudaFree(d_rgb_prev_full_);
+        d_rgb_prev_full_ = nullptr;
     }
 
     if (d_rgb_full_ != nullptr) {

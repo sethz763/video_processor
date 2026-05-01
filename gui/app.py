@@ -54,6 +54,29 @@ SR_FLAVOR_LABEL_TO_NAME = {
 }
 SR_FLAVOR_NAME_TO_LABEL = {value: key for key, value in SR_FLAVOR_LABEL_TO_NAME.items()}
 
+DEINTERLACE_METHOD_LABEL_TO_NAME = {
+    "Bob (Fast)": "bob",
+    "Blend (Stable)": "blend",
+    "Edge Adaptive (Field Aware)": "edge_adaptive",
+}
+DEINTERLACE_METHOD_NAME_TO_LABEL = {value: key for key, value in DEINTERLACE_METHOD_LABEL_TO_NAME.items()}
+
+DENOISE_METHOD_LABEL_TO_NAME = {
+    "Off": "off",
+    "Luma Gaussian 3x3 (Balanced)": "luma_gaussian3x3",
+    "Luma Median 3x3 (Stronger)": "luma_median3x3",
+    "Field Temporal Luma (Advanced)": "field_temporal_luma",
+}
+DENOISE_METHOD_NAME_TO_LABEL = {value: key for key, value in DENOISE_METHOD_LABEL_TO_NAME.items()}
+
+RTX_POST_SCALE_METHOD_LABEL_TO_NAME = {
+    "Nearest (Pixelated)": "nearest",
+    "Bilinear (Fast)": "bilinear",
+    "Bicubic (Balanced)": "bicubic",
+    "Lanczos (Sharp)": "lanczos",
+}
+RTX_POST_SCALE_METHOD_NAME_TO_LABEL = {value: key for key, value in RTX_POST_SCALE_METHOD_LABEL_TO_NAME.items()}
+
 try:
     import decklink_wrapper as d
 except Exception:
@@ -469,6 +492,10 @@ class RoiCanvas(QWidget):
 
         self._last_touch_center: QPointF | None = None
         self._last_touch_dist: float | None = None
+        self._last_touch_emit_ts = 0.0
+        self._touch_emit_interval_s = 1.0 / 45.0
+        self._touch_emit_pending = False
+        self._touch_emit_pending_scale = False
 
     def set_image(self, image: QImage, backing: np.ndarray | None = None) -> None:
         self._image = image
@@ -604,11 +631,15 @@ class RoiCanvas(QWidget):
                 new_h,
             )
 
-        self._set_roi_and_emit(clamp_roi(new_roi))
+        self._set_roi_and_emit_touch_throttled(
+            clamp_roi(new_roi),
+            emit_scale=(self._drag_mode != "move"),
+        )
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         del event
         self._drag_mode = "none"
+        self._flush_pending_touch_emit()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
@@ -634,12 +665,14 @@ class RoiCanvas(QWidget):
         et = event.type()
         if et in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
             self._handle_touch_event(event)
+            event.accept()
             return True
         return super().event(event)
 
     def _handle_touch_event(self, event: QTouchEvent) -> None:
         points = event.points()
         if not points:
+            self._flush_pending_touch_emit()
             self._last_touch_center = None
             self._last_touch_dist = None
             return
@@ -652,7 +685,7 @@ class RoiCanvas(QWidget):
                 dx = int(round(frame.x() - last_frame.x()))
                 dy = int(round(frame.y() - last_frame.y()))
                 roi = clamp_roi(Roi(self._roi.x + dx, self._roi.y + dy, self._roi.w, self._roi.h))
-                self._set_roi_and_emit(roi)
+                self._set_roi_and_emit_touch_throttled(roi)
             self._last_touch_center = pos
             self._last_touch_dist = None
             return
@@ -668,19 +701,36 @@ class RoiCanvas(QWidget):
             dx = int(round(cur_frame.x() - prev_frame.x()))
             dy = int(round(cur_frame.y() - prev_frame.y()))
             moved = clamp_roi(Roi(self._roi.x + dx, self._roi.y + dy, self._roi.w, self._roi.h))
-            self.set_roi(moved)
+            if self._last_touch_dist is not None and self._last_touch_dist > 0:
+                self.set_roi(moved)
+            else:
+                self._set_roi_and_emit_touch_throttled(moved, emit_scale=False)
 
         if self._last_touch_dist is not None and self._last_touch_dist > 0:
             ratio = dist / self._last_touch_dist
-            self._apply_scale(roi_scale_from_roi(self._roi) * ratio, self._widget_to_frame(center), emit_scale=False)
+            self._apply_scale(
+                roi_scale_from_roi(self._roi) * ratio,
+                self._widget_to_frame(center),
+                emit_scale=False,
+                touch_throttle=True,
+            )
 
         self._last_touch_center = center
         self._last_touch_dist = dist
 
-    def _apply_scale(self, new_scale: float, anchor_frame: QPointF, emit_scale: bool = True) -> None:
+    def _apply_scale(
+        self,
+        new_scale: float,
+        anchor_frame: QPointF,
+        emit_scale: bool = True,
+        touch_throttle: bool = False,
+    ) -> None:
         new_scale = max(1.0, min(new_scale, 16.0))
         center = anchor_frame
         new_roi = roi_from_scale(new_scale, center.x(), center.y())
+        if touch_throttle:
+            self._set_roi_and_emit_touch_throttled(new_roi, emit_scale=emit_scale)
+            return
         self._set_roi_and_emit(new_roi, emit_scale=emit_scale)
 
     def _set_roi_and_emit(self, roi: Roi, emit_scale: bool = True) -> None:
@@ -688,6 +738,31 @@ class RoiCanvas(QWidget):
         self.roiChanged.emit(roi.x, roi.y, roi.w, roi.h)
         if emit_scale:
             self.scaleChanged.emit(roi_scale_from_roi(roi))
+
+    def _set_roi_and_emit_touch_throttled(self, roi: Roi, emit_scale: bool = True) -> None:
+        self.set_roi(roi)
+        now = time.perf_counter()
+        if (now - self._last_touch_emit_ts) >= self._touch_emit_interval_s:
+            self._last_touch_emit_ts = now
+            self._touch_emit_pending = False
+            self._touch_emit_pending_scale = False
+            self.roiChanged.emit(self._roi.x, self._roi.y, self._roi.w, self._roi.h)
+            if emit_scale:
+                self.scaleChanged.emit(roi_scale_from_roi(self._roi))
+            return
+        self._touch_emit_pending = True
+        self._touch_emit_pending_scale = self._touch_emit_pending_scale or emit_scale
+
+    def _flush_pending_touch_emit(self) -> None:
+        if not self._touch_emit_pending:
+            return
+        self._last_touch_emit_ts = time.perf_counter()
+        self._touch_emit_pending = False
+        emit_scale = self._touch_emit_pending_scale
+        self._touch_emit_pending_scale = False
+        self.roiChanged.emit(self._roi.x, self._roi.y, self._roi.w, self._roi.h)
+        if emit_scale:
+            self.scaleChanged.emit(roi_scale_from_roi(self._roi))
 
     def _roi_center(self) -> QPointF:
         return QPointF(self._roi.x + (self._roi.w / 2.0), self._roi.y + (self._roi.h / 2.0))
@@ -763,6 +838,9 @@ class VideoProcessorController:
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
         self.basic_scaling_method = "bicubic"
+        self.deinterlace_method = "bob"
+        self.denoise_method = "off"
+        self.denoise_strength = 0.35
         self.max_auto_basic_scaling = 4
         self.basic_scaling_manual = 4
         self.basic_scaling_auto_mode = True
@@ -780,6 +858,18 @@ class VideoProcessorController:
         self.ai_sr_inference_divisor = 0
         self.ai_sr_detail_preserve_percent = 0.0
         self.ai_sr_info: dict[str, object] | None = None
+        self.rtx_vsr_enabled = False
+        self.rtx_vsr_active = False
+        self.rtx_vsr_quality = "high"
+        self.rtx_vsr_scale = 2
+        self.rtx_vsr_post_scale_method = "bicubic"
+        self.rtx_thdr_enabled = False
+        self.rtx_thdr_contrast = 50
+        self.rtx_thdr_saturation = 50
+        self.rtx_thdr_middle_gray = 50
+        self.rtx_thdr_max_luminance = 1000
+        self.rtx_vsr_error: str | None = None
+        self.rtx_vsr_info: dict[str, object] | None = None
         self.processor = None
 
     def create(self, roi: Roi) -> None:
@@ -799,6 +889,12 @@ class VideoProcessorController:
         if self.basic_scaling_method_supported:
             self.processor.set_sr_flavor(self.basic_scaling_method)
         self.processor.set_deinterlace_enabled(self.deinterlace_enabled)
+        if hasattr(self.processor, "set_deinterlace_method"):
+            self.processor.set_deinterlace_method(self.deinterlace_method)
+        if hasattr(self.processor, "set_denoise_method"):
+            self.processor.set_denoise_method(self.denoise_method)
+        if hasattr(self.processor, "set_denoise_strength"):
+            self.processor.set_denoise_strength(self.denoise_strength)
 
     def set_roi(self, roi: Roi) -> None:
         if self.processor is not None:
@@ -832,6 +928,20 @@ class VideoProcessorController:
         self.deinterlace_enabled = enabled
         if self.processor is not None:
             self.processor.set_deinterlace_enabled(enabled)
+
+    def set_deinterlace_method(self, method: str) -> None:
+        self.deinterlace_method = str(method)
+        if self.processor is not None and hasattr(self.processor, "set_deinterlace_method"):
+            self.processor.set_deinterlace_method(method)
+
+    def set_denoise_settings(self, method: str, strength: float) -> None:
+        self.denoise_method = str(method)
+        self.denoise_strength = max(0.0, min(1.0, float(strength)))
+        if self.processor is not None:
+            if hasattr(self.processor, "set_denoise_method"):
+                self.processor.set_denoise_method(self.denoise_method)
+            if hasattr(self.processor, "set_denoise_strength"):
+                self.processor.set_denoise_strength(self.denoise_strength)
 
     def set_max_auto_basic_scaling(self, scale: int) -> None:
         self.max_auto_basic_scaling = scale
@@ -937,6 +1047,33 @@ class VideoProcessorController:
         self.ai_sr_active = False
         self.ai_sr_error = "AI SR is only available with worker backend"
 
+    def set_rtx_vsr_enabled(self, enabled: bool) -> None:
+        self.rtx_vsr_enabled = bool(enabled)
+        self.rtx_vsr_active = False
+        self.rtx_vsr_error = "RTX VSR is only available with worker backend"
+
+    def set_rtx_vsr_settings(
+        self,
+        quality: str,
+        scale: int,
+        post_scale_method: str,
+        thdr_enabled: bool,
+        thdr_contrast: int,
+        thdr_saturation: int,
+        thdr_middle_gray: int,
+        thdr_max_luminance: int,
+    ) -> None:
+        self.rtx_vsr_quality = str(quality).strip().lower()
+        self.rtx_vsr_scale = max(1, int(scale))
+        self.rtx_vsr_post_scale_method = str(post_scale_method).strip().lower() or "bicubic"
+        self.rtx_thdr_enabled = bool(thdr_enabled)
+        self.rtx_thdr_contrast = max(0, int(thdr_contrast))
+        self.rtx_thdr_saturation = max(0, int(thdr_saturation))
+        self.rtx_thdr_middle_gray = max(0, int(thdr_middle_gray))
+        self.rtx_thdr_max_luminance = max(0, int(thdr_max_luminance))
+        self.rtx_vsr_active = False
+        self.rtx_vsr_error = "RTX VSR is only available with worker backend"
+
     def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
         raise RuntimeError("DeckLink capture/output in worker is unavailable for in-process backend")
 
@@ -952,6 +1089,9 @@ class ProcessVideoProcessorController:
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
         self.basic_scaling_method = "bicubic"
+        self.deinterlace_method = "bob"
+        self.denoise_method = "off"
+        self.denoise_strength = 0.35
         self.max_auto_basic_scaling = 4
         self.basic_scaling_manual = 4
         self.basic_scaling_auto_mode = True
@@ -970,6 +1110,18 @@ class ProcessVideoProcessorController:
         self.ai_sr_error: str | None = None
         self.ai_sr_info: dict[str, object] | None = None
         self.ai_sr_last_warning: str | None = None
+        self.rtx_vsr_enabled = os.environ.get("VP_RTX_VSR_ENABLE", "0") == "1"
+        self.rtx_vsr_quality = os.environ.get("VP_RTX_VSR_QUALITY", "high").strip().lower() or "high"
+        self.rtx_vsr_scale = max(1, int(os.environ.get("VP_RTX_VSR_SCALE", "2")))
+        self.rtx_vsr_post_scale_method = os.environ.get("VP_RTX_VSR_POST_SCALE_METHOD", "bicubic").strip().lower() or "bicubic"
+        self.rtx_thdr_enabled = os.environ.get("VP_RTX_THDR_ENABLE", "0") == "1"
+        self.rtx_thdr_contrast = max(0, int(os.environ.get("VP_RTX_THDR_CONTRAST", "50")))
+        self.rtx_thdr_saturation = max(0, int(os.environ.get("VP_RTX_THDR_SATURATION", "50")))
+        self.rtx_thdr_middle_gray = max(0, int(os.environ.get("VP_RTX_THDR_MIDDLE_GRAY", "50")))
+        self.rtx_thdr_max_luminance = max(0, int(os.environ.get("VP_RTX_THDR_MAX_LUMINANCE", "1000")))
+        self.rtx_vsr_active = False
+        self.rtx_vsr_error: str | None = None
+        self.rtx_vsr_info: dict[str, object] | None = None
 
         self._ctx = mp.get_context("spawn")
         self._request_queue = None
@@ -985,6 +1137,8 @@ class ProcessVideoProcessorController:
         self._decklink_processed_fps = 0.0
         self._decklink_ai_applied_frames = 0
         self._decklink_ai_passthrough_frames = 0
+        self._decklink_rtx_vsr_applied = False
+        self._decklink_rtx_effect_mean_abs_luma = 0.0
         self._decklink_tick_pending = False
 
     def create(self, roi: Roi) -> None:
@@ -1010,6 +1164,9 @@ class ProcessVideoProcessorController:
             "basic_scaling_method": self.basic_scaling_method,
             "max_auto_basic_scaling": self.max_auto_basic_scaling,
             "deinterlace_enabled": self.deinterlace_enabled,
+            "deinterlace_method": self.deinterlace_method,
+            "denoise_method": self.denoise_method,
+            "denoise_strength": self.denoise_strength,
             "ai_sr_enabled": self.ai_sr_enabled,
             "ai_sr_model_path": self.ai_sr_model_path,
             "ai_sr_provider": self.ai_sr_provider,
@@ -1020,6 +1177,16 @@ class ProcessVideoProcessorController:
             "ai_sr_roi_overscan_percent": self.ai_sr_roi_overscan_percent,
             "ai_sr_inference_divisor": self.ai_sr_inference_divisor,
             "ai_sr_detail_preserve_percent": self.ai_sr_detail_preserve_percent,
+            "rtx_vsr_enabled": self.rtx_vsr_enabled,
+            "rtx_vsr_quality": self.rtx_vsr_quality,
+            "rtx_vsr_scale": self.rtx_vsr_scale,
+            "rtx_vsr_post_scale_method": self.rtx_vsr_post_scale_method,
+            "rtx_thdr_enabled": self.rtx_thdr_enabled,
+            "rtx_thdr_contrast": self.rtx_thdr_contrast,
+            "rtx_thdr_saturation": self.rtx_thdr_saturation,
+            "rtx_thdr_middle_gray": self.rtx_thdr_middle_gray,
+            "rtx_thdr_max_luminance": self.rtx_thdr_max_luminance,
+            "rtx_video_sdk_root": os.environ.get("RTX_VIDEO_SDK_ROOT", r"C:\Coding Projects\sdks\NVidia video SDK"),
         }
 
         # Keep request queue larger than response queue so bursty UI events
@@ -1060,6 +1227,10 @@ class ProcessVideoProcessorController:
                 self.ai_sr_active = bool(message.get("ai_sr_active", False))
                 self.ai_sr_error = message.get("ai_sr_error")
                 self.ai_sr_info = message.get("ai_sr_info")
+                self.rtx_vsr_enabled = bool(message.get("rtx_vsr_enabled", self.rtx_vsr_enabled))
+                self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
+                self.rtx_vsr_error = message.get("rtx_vsr_error")
+                self.rtx_vsr_info = message.get("rtx_vsr_info")
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -1084,8 +1255,12 @@ class ProcessVideoProcessorController:
             "set_roi",
             "decklink_tick",
             "set_deinterlace_enabled",
+            "set_deinterlace_method",
+            "set_denoise_settings",
             "set_max_auto_basic_scaling",
             "set_max_auto_sr_scale",
+            "set_rtx_vsr_enabled",
+            "set_rtx_vsr_settings",
         }
 
         try:
@@ -1130,6 +1305,10 @@ class ProcessVideoProcessorController:
                 self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
                 self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
                 self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
+                self._decklink_rtx_vsr_applied = bool(message.get("rtx_vsr_applied", self._decklink_rtx_vsr_applied))
+                self._decklink_rtx_effect_mean_abs_luma = float(
+                    message.get("rtx_effect_mean_abs_luma", self._decklink_rtx_effect_mean_abs_luma)
+                )
                 self._decklink_no_frame_reason = None
                 self._decklink_tick_pending = False
                 continue
@@ -1144,11 +1323,21 @@ class ProcessVideoProcessorController:
                 ack_cmd = str(message.get("cmd", ""))
                 if ack_cmd in {"set_basic_scaling_method", "set_sr_flavor"}:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                elif ack_cmd == "set_deinterlace_method":
+                    self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
+                elif ack_cmd == "set_denoise_settings":
+                    self.denoise_method = str(message.get("denoise_method", self.denoise_method))
+                    self.denoise_strength = float(message.get("denoise_strength", self.denoise_strength))
                 elif ack_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
                     self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                     self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
                     self.ai_sr_error = message.get("ai_sr_error")
                     self.ai_sr_info = message.get("ai_sr_info")
+                elif ack_cmd in {"set_rtx_vsr_enabled", "set_rtx_vsr_settings"}:
+                    self.rtx_vsr_enabled = bool(message.get("rtx_vsr_enabled", self.rtx_vsr_enabled))
+                    self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
+                    self.rtx_vsr_error = message.get("rtx_vsr_error")
+                    self.rtx_vsr_info = message.get("rtx_vsr_info")
                 continue
 
             if message_type == "warning":
@@ -1184,6 +1373,23 @@ class ProcessVideoProcessorController:
     def set_deinterlace_enabled(self, enabled: bool) -> None:
         self.deinterlace_enabled = enabled
         self._send_control({"cmd": "set_deinterlace_enabled", "enabled": bool(enabled)})
+
+    def set_deinterlace_method(self, method: str) -> None:
+        self.deinterlace_method = str(method)
+        self._send_control({"cmd": "set_deinterlace_method", "method": self.deinterlace_method})
+        self._wait_for_ack("set_deinterlace_method", timeout_seconds=1.0)
+
+    def set_denoise_settings(self, method: str, strength: float) -> None:
+        self.denoise_method = str(method)
+        self.denoise_strength = max(0.0, min(1.0, float(strength)))
+        self._send_control(
+            {
+                "cmd": "set_denoise_settings",
+                "method": self.denoise_method,
+                "strength": self.denoise_strength,
+            }
+        )
+        self._wait_for_ack("set_denoise_settings", timeout_seconds=1.0)
 
     def set_max_auto_basic_scaling(self, scale: int) -> None:
         self.max_auto_basic_scaling = scale
@@ -1226,11 +1432,21 @@ class ProcessVideoProcessorController:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
                 if expected_cmd == "set_sr_flavor":
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                if expected_cmd == "set_deinterlace_method":
+                    self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
+                if expected_cmd == "set_denoise_settings":
+                    self.denoise_method = str(message.get("denoise_method", self.denoise_method))
+                    self.denoise_strength = float(message.get("denoise_strength", self.denoise_strength))
                 if expected_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
                     self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                     self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
                     self.ai_sr_error = message.get("ai_sr_error")
                     self.ai_sr_info = message.get("ai_sr_info")
+                if expected_cmd in {"set_rtx_vsr_enabled", "set_rtx_vsr_settings"}:
+                    self.rtx_vsr_enabled = bool(message.get("rtx_vsr_enabled", self.rtx_vsr_enabled))
+                    self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
+                    self.rtx_vsr_error = message.get("rtx_vsr_error")
+                    self.rtx_vsr_info = message.get("rtx_vsr_info")
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -1410,6 +1626,43 @@ class ProcessVideoProcessorController:
             }
         )
 
+    def set_rtx_vsr_enabled(self, enabled: bool) -> None:
+        self.rtx_vsr_enabled = bool(enabled)
+        self._send_control({"cmd": "set_rtx_vsr_enabled", "enabled": self.rtx_vsr_enabled})
+
+    def set_rtx_vsr_settings(
+        self,
+        quality: str,
+        scale: int,
+        post_scale_method: str,
+        thdr_enabled: bool,
+        thdr_contrast: int,
+        thdr_saturation: int,
+        thdr_middle_gray: int,
+        thdr_max_luminance: int,
+    ) -> None:
+        self.rtx_vsr_quality = str(quality).strip().lower()
+        self.rtx_vsr_scale = max(1, int(scale))
+        self.rtx_vsr_post_scale_method = str(post_scale_method).strip().lower() or "bicubic"
+        self.rtx_thdr_enabled = bool(thdr_enabled)
+        self.rtx_thdr_contrast = max(0, int(thdr_contrast))
+        self.rtx_thdr_saturation = max(0, int(thdr_saturation))
+        self.rtx_thdr_middle_gray = max(0, int(thdr_middle_gray))
+        self.rtx_thdr_max_luminance = max(0, int(thdr_max_luminance))
+        self._send_control(
+            {
+                "cmd": "set_rtx_vsr_settings",
+                "quality": self.rtx_vsr_quality,
+                "scale": self.rtx_vsr_scale,
+                "post_scale_method": self.rtx_vsr_post_scale_method,
+                "thdr_enabled": self.rtx_thdr_enabled,
+                "thdr_contrast": self.rtx_thdr_contrast,
+                "thdr_saturation": self.rtx_thdr_saturation,
+                "thdr_middle_gray": self.rtx_thdr_middle_gray,
+                "thdr_max_luminance": self.rtx_thdr_max_luminance,
+            }
+        )
+
     @property
     def enable_placeholder_sr(self) -> bool:
         return bool(self.enable_basic_scaling)
@@ -1420,6 +1673,9 @@ class ProcessVideoProcessorController:
 
     def decklink_ai_sr_counts(self) -> tuple[int, int]:
         return int(self._decklink_ai_applied_frames), int(self._decklink_ai_passthrough_frames)
+
+    def decklink_rtx_stats(self) -> tuple[bool, float]:
+        return bool(self._decklink_rtx_vsr_applied), float(self._decklink_rtx_effect_mean_abs_luma)
 
     @property
     def sr_flavor(self) -> str:
@@ -1518,6 +1774,7 @@ class MainWindow(QMainWindow):
         self._perf_guard_low_fps_seconds = 0
         self._perf_guard_last_action = ""
         self._updating_controls = False
+        self._pending_controller_roi: Roi | None = None
         self._fullscreen_view_name: str | None = None
         self._splitter_initialized = False
         self._main_splitter_initialized = False
@@ -1587,6 +1844,11 @@ class MainWindow(QMainWindow):
         self._update_timer_interval()
         self._timer.start()
 
+        self._roi_push_timer = QTimer(self)
+        self._roi_push_timer.setSingleShot(True)
+        self._roi_push_timer.setInterval(33)
+        self._roi_push_timer.timeout.connect(self._flush_pending_controller_roi)
+
         self._setup_shortcuts()
         self._sync_controls_from_roi(self._roi)
         self.source_mode_combo.setCurrentText("Blackmagic DeckLink")
@@ -1594,6 +1856,7 @@ class MainWindow(QMainWindow):
         self._sync_blackmagic_controls_enabled_state()
         self._on_source_mode_changed()
         self._refresh_ai_sr_runtime_panel()
+        self._refresh_rtx_vsr_runtime_panel()
         self._update_status("Ready")
         if self._controller_backend == "worker-process":
             self._update_status("Ready | Processing backend: worker process")
@@ -1706,7 +1969,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        settings_box = QGroupBox("Settings")
+        settings_box = QGroupBox("General")
         settings_form = QFormLayout(settings_box)
 
         self.fps_spin = QSpinBox()
@@ -1715,15 +1978,9 @@ class MainWindow(QMainWindow):
         self.fps_spin.valueChanged.connect(self._update_timer_interval)
         settings_form.addRow("FPS", self.fps_spin)
 
-        self.source_mode_combo = QComboBox()
-        self.source_mode_combo.addItems(["Synthetic", "Blackmagic DeckLink"])
-        self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
-        settings_form.addRow("Input source", self.source_mode_combo)
-
         self.sr_mode_combo = QComboBox()
         self.sr_mode_combo.addItems(["Auto", "Manual"])
         self.sr_mode_combo.currentIndexChanged.connect(self._on_sr_mode_changed)
-        settings_form.addRow("Basic scaling mode", self.sr_mode_combo)
 
         self.sr_flavor_combo = QComboBox()
         self.sr_flavor_combo.addItems(list(SR_FLAVOR_LABEL_TO_NAME.keys()))
@@ -1731,29 +1988,28 @@ class MainWindow(QMainWindow):
             SR_FLAVOR_NAME_TO_LABEL.get(self._controller.basic_scaling_method, "Bicubic (Balanced)")
         )
         self.sr_flavor_combo.currentIndexChanged.connect(self._on_sr_flavor_changed)
-        settings_form.addRow("Basic scaling method", self.sr_flavor_combo)
 
         self.sr_manual_combo = QComboBox()
         self.sr_manual_combo.addItems(["2", "4", "8", "16"])
         self.sr_manual_combo.setCurrentText("4")
         self.sr_manual_combo.currentIndexChanged.connect(self._on_sr_manual_changed)
-        settings_form.addRow("Manual basic scaling", self.sr_manual_combo)
 
         self.auto_sr_max_combo = QComboBox()
         self.auto_sr_max_combo.addItems(["2", "4", "8", "16"])
         self.auto_sr_max_combo.setCurrentText("4")
         self.auto_sr_max_combo.currentIndexChanged.connect(self._on_auto_sr_max_changed)
-        settings_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
 
         self.enable_sr_checkbox = QCheckBox("Enable basic CUDA scaling")
         self.enable_sr_checkbox.setChecked(True)
         self.enable_sr_checkbox.toggled.connect(self._on_enable_sr_toggled)
-        settings_form.addRow(self.enable_sr_checkbox)
 
         self.enable_ai_sr_checkbox = QCheckBox("Enable AI SR (ONNX model)")
         self.enable_ai_sr_checkbox.setChecked(getattr(self._controller, "ai_sr_enabled", False))
         self.enable_ai_sr_checkbox.toggled.connect(self._on_enable_ai_sr_toggled)
-        settings_form.addRow(self.enable_ai_sr_checkbox)
+
+        self.enable_rtx_vsr_checkbox = QCheckBox("Enable RTX VSR (NVIDIA SDK path)")
+        self.enable_rtx_vsr_checkbox.setChecked(bool(getattr(self._controller, "rtx_vsr_enabled", False)))
+        self.enable_rtx_vsr_checkbox.toggled.connect(self._on_enable_rtx_vsr_toggled)
 
         self.ai_sr_model_combo = QComboBox()
         self.ai_sr_model_combo.setEditable(True)
@@ -1761,7 +2017,6 @@ class MainWindow(QMainWindow):
         current_model_path = getattr(self._controller, "ai_sr_model_path", "") or default_model_path
         self._refresh_ai_sr_model_options(preferred_model_path=current_model_path)
         self.ai_sr_model_combo.currentTextChanged.connect(self._on_ai_sr_model_selection_changed)
-        settings_form.addRow("AI SR model", self.ai_sr_model_combo)
 
         ai_sr_model_actions = QWidget()
         ai_sr_model_actions_layout = QHBoxLayout(ai_sr_model_actions)
@@ -1776,43 +2031,34 @@ class MainWindow(QMainWindow):
         self.ai_sr_model_refresh_btn.clicked.connect(self._on_ai_sr_model_refresh_clicked)
         ai_sr_model_actions_layout.addWidget(self.ai_sr_model_refresh_btn)
 
-        settings_form.addRow(ai_sr_model_actions)
-
         self.ai_sr_provider_combo = QComboBox()
         self.ai_sr_provider_combo.addItems(["auto", "cuda", "trt", "cpu"])
         self.ai_sr_provider_combo.setCurrentText(str(getattr(self._controller, "ai_sr_provider", "auto")).lower())
-        settings_form.addRow("AI SR provider", self.ai_sr_provider_combo)
 
         self.ai_sr_require_gpu_checkbox = QCheckBox("Require GPU provider")
         self.ai_sr_require_gpu_checkbox.setChecked(bool(getattr(self._controller, "ai_sr_require_gpu", True)))
-        settings_form.addRow(self.ai_sr_require_gpu_checkbox)
 
         self.ai_sr_frame_interval_spin = QSpinBox()
         self.ai_sr_frame_interval_spin.setRange(1, 120)
         self.ai_sr_frame_interval_spin.setValue(int(getattr(self._controller, "ai_sr_frame_interval", 2)))
-        settings_form.addRow("AI SR frame interval", self.ai_sr_frame_interval_spin)
 
         self.ai_sr_strict_checkbox = QCheckBox("Strict AI SR (blocking)")
         self.ai_sr_strict_checkbox.setChecked(bool(getattr(self._controller, "ai_sr_strict", False)))
-        settings_form.addRow(self.ai_sr_strict_checkbox)
 
         self.ai_sr_input_align_combo = QComboBox()
         self.ai_sr_input_align_combo.addItems(["1", "2", "4", "8"])
         self.ai_sr_input_align_combo.setCurrentText(str(int(getattr(self._controller, "ai_sr_input_align", 2))))
-        settings_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
 
         self.ai_sr_overscan_spin = QDoubleSpinBox()
         self.ai_sr_overscan_spin.setRange(0.0, 50.0)
         self.ai_sr_overscan_spin.setDecimals(1)
         self.ai_sr_overscan_spin.setSingleStep(0.5)
         self.ai_sr_overscan_spin.setValue(float(getattr(self._controller, "ai_sr_roi_overscan_percent", 0.0)))
-        settings_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
 
         self.ai_sr_inference_divisor_spin = QSpinBox()
         self.ai_sr_inference_divisor_spin.setRange(0, 16)
         self.ai_sr_inference_divisor_spin.setValue(int(getattr(self._controller, "ai_sr_inference_divisor", 0)))
         self.ai_sr_inference_divisor_spin.setToolTip("0 uses model-native divisor; lower values can improve quality at higher GPU cost")
-        settings_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
 
         self.ai_sr_detail_preserve_spin = QDoubleSpinBox()
         self.ai_sr_detail_preserve_spin.setRange(0.0, 100.0)
@@ -1820,7 +2066,6 @@ class MainWindow(QMainWindow):
         self.ai_sr_detail_preserve_spin.setSingleStep(2.5)
         self.ai_sr_detail_preserve_spin.setValue(float(getattr(self._controller, "ai_sr_detail_preserve_percent", 0.0)))
         self.ai_sr_detail_preserve_spin.setToolTip("Blend original ROI detail back into AI output to reduce softness")
-        settings_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
 
         initial_profile = self._ai_sr_profiles.get(current_model_path)
         if initial_profile is not None:
@@ -1843,28 +2088,136 @@ class MainWindow(QMainWindow):
         self.ai_sr_profile_load_btn.clicked.connect(self._on_ai_sr_profile_load_clicked)
         ai_sr_tuning_actions_layout.addWidget(self.ai_sr_profile_load_btn)
 
-        settings_form.addRow(ai_sr_tuning_actions)
-
         ai_sr_runtime_box = QGroupBox("AI SR Runtime")
         ai_sr_runtime_layout = QVBoxLayout(ai_sr_runtime_box)
         ai_sr_runtime_layout.setContentsMargins(8, 8, 8, 8)
         self.ai_sr_runtime_label = QLabel("AI SR runtime info will appear after worker initialization.")
         self.ai_sr_runtime_label.setWordWrap(True)
         ai_sr_runtime_layout.addWidget(self.ai_sr_runtime_label)
-        settings_form.addRow(ai_sr_runtime_box)
 
-        self.deinterlace_checkbox = QCheckBox("Enable Bob deinterlace")
+        rtx_vsr_box = QGroupBox("RTX Video SDK (VSR)")
+        rtx_vsr_form = QFormLayout(rtx_vsr_box)
+
+        self.rtx_vsr_quality_combo = QComboBox()
+        self.rtx_vsr_quality_combo.addItems(["low", "medium", "high", "ultra"])
+        self.rtx_vsr_quality_combo.setCurrentText(str(getattr(self._controller, "rtx_vsr_quality", "high")).lower())
+
+        self.rtx_vsr_scale_combo = QComboBox()
+        self.rtx_vsr_scale_combo.addItems(["1", "2", "4"])
+        self.rtx_vsr_scale_combo.setCurrentText(str(int(getattr(self._controller, "rtx_vsr_scale", 2))))
+
+        self.rtx_vsr_post_scale_method_combo = QComboBox()
+        self.rtx_vsr_post_scale_method_combo.addItems(list(RTX_POST_SCALE_METHOD_LABEL_TO_NAME.keys()))
+        self.rtx_vsr_post_scale_method_combo.setCurrentText(
+            RTX_POST_SCALE_METHOD_NAME_TO_LABEL.get(
+                str(getattr(self._controller, "rtx_vsr_post_scale_method", "bicubic")),
+                "Bicubic (Balanced)",
+            )
+        )
+
+        self.rtx_thdr_enable_checkbox = QCheckBox("Enable RTX TrueHDR")
+        self.rtx_thdr_enable_checkbox.setChecked(bool(getattr(self._controller, "rtx_thdr_enabled", False)))
+
+        self.rtx_thdr_contrast_spin = QSpinBox()
+        self.rtx_thdr_contrast_spin.setRange(0, 1000)
+        self.rtx_thdr_contrast_spin.setValue(int(getattr(self._controller, "rtx_thdr_contrast", 50)))
+
+        self.rtx_thdr_saturation_spin = QSpinBox()
+        self.rtx_thdr_saturation_spin.setRange(0, 1000)
+        self.rtx_thdr_saturation_spin.setValue(int(getattr(self._controller, "rtx_thdr_saturation", 50)))
+
+        self.rtx_thdr_middle_gray_spin = QSpinBox()
+        self.rtx_thdr_middle_gray_spin.setRange(0, 1000)
+        self.rtx_thdr_middle_gray_spin.setValue(int(getattr(self._controller, "rtx_thdr_middle_gray", 50)))
+
+        self.rtx_thdr_max_luminance_spin = QSpinBox()
+        self.rtx_thdr_max_luminance_spin.setRange(0, 10000)
+        self.rtx_thdr_max_luminance_spin.setValue(int(getattr(self._controller, "rtx_thdr_max_luminance", 1000)))
+
+        self.rtx_vsr_apply_btn = QPushButton("Apply RTX VSR Settings")
+        self.rtx_vsr_apply_btn.clicked.connect(self._on_rtx_vsr_settings_apply_clicked)
+
+        self.rtx_vsr_runtime_label = QLabel("RTX VSR runtime info will appear after worker initialization.")
+        self.rtx_vsr_runtime_label.setWordWrap(True)
+
+        rtx_vsr_form.addRow("Quality", self.rtx_vsr_quality_combo)
+        rtx_vsr_form.addRow(self.rtx_thdr_enable_checkbox)
+        rtx_vsr_form.addRow("THDR contrast", self.rtx_thdr_contrast_spin)
+        rtx_vsr_form.addRow("THDR saturation", self.rtx_thdr_saturation_spin)
+        rtx_vsr_form.addRow("THDR middle gray", self.rtx_thdr_middle_gray_spin)
+        rtx_vsr_form.addRow("THDR max luminance", self.rtx_thdr_max_luminance_spin)
+        rtx_vsr_form.addRow(self.rtx_vsr_apply_btn)
+        rtx_vsr_form.addRow(self.rtx_vsr_runtime_label)
+
+        self.deinterlace_checkbox = QCheckBox("Enable deinterlace")
         self.deinterlace_checkbox.setChecked(True)
         self.deinterlace_checkbox.toggled.connect(self._on_deinterlace_toggled)
-        settings_form.addRow(self.deinterlace_checkbox)
+
+        self.deinterlace_method_combo = QComboBox()
+        self.deinterlace_method_combo.addItems(list(DEINTERLACE_METHOD_LABEL_TO_NAME.keys()))
+        self.deinterlace_method_combo.setCurrentText(
+            DEINTERLACE_METHOD_NAME_TO_LABEL.get(getattr(self._controller, "deinterlace_method", "bob"), "Bob (Fast)")
+        )
+        self.deinterlace_method_combo.currentIndexChanged.connect(self._on_deinterlace_method_changed)
+
+        self.denoise_method_combo = QComboBox()
+        self.denoise_method_combo.addItems(list(DENOISE_METHOD_LABEL_TO_NAME.keys()))
+        self.denoise_method_combo.setCurrentText(
+            DENOISE_METHOD_NAME_TO_LABEL.get(getattr(self._controller, "denoise_method", "off"), "Off")
+        )
+        self.denoise_method_combo.currentIndexChanged.connect(self._on_denoise_settings_changed)
+
+        self.denoise_strength_spin = QDoubleSpinBox()
+        self.denoise_strength_spin.setRange(0.0, 1.0)
+        self.denoise_strength_spin.setDecimals(2)
+        self.denoise_strength_spin.setSingleStep(0.05)
+        self.denoise_strength_spin.setValue(float(getattr(self._controller, "denoise_strength", 0.35)))
+        self.denoise_strength_spin.valueChanged.connect(self._on_denoise_settings_changed)
+
+        deinterlace_box = QGroupBox("De-interlacing")
+        deinterlace_form = QFormLayout(deinterlace_box)
+        deinterlace_form.addRow(self.deinterlace_checkbox)
+        deinterlace_form.addRow("Method", self.deinterlace_method_combo)
+
+        denoise_box = QGroupBox("Noise Reduction")
+        denoise_form = QFormLayout(denoise_box)
+        denoise_form.addRow("Method", self.denoise_method_combo)
+        denoise_form.addRow("Strength", self.denoise_strength_spin)
+
+        upscaling_box = QGroupBox("Upscaling (Basic or AI)")
+        upscaling_form = QFormLayout(upscaling_box)
+        upscaling_form.addRow(self.enable_sr_checkbox)
+        upscaling_form.addRow("Basic scaling mode", self.sr_mode_combo)
+        upscaling_form.addRow("Basic scaling method", self.sr_flavor_combo)
+        upscaling_form.addRow("Manual basic scaling", self.sr_manual_combo)
+        upscaling_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
+        upscaling_form.addRow(self.enable_ai_sr_checkbox)
+        upscaling_form.addRow(self.enable_rtx_vsr_checkbox)
+        upscaling_form.addRow("AI SR model", self.ai_sr_model_combo)
+        upscaling_form.addRow(ai_sr_model_actions)
+        upscaling_form.addRow("AI SR provider", self.ai_sr_provider_combo)
+        upscaling_form.addRow(self.ai_sr_require_gpu_checkbox)
+        upscaling_form.addRow("AI SR frame interval", self.ai_sr_frame_interval_spin)
+        upscaling_form.addRow(self.ai_sr_strict_checkbox)
+        upscaling_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
+        upscaling_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
+        upscaling_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
+        upscaling_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
+        upscaling_form.addRow(ai_sr_tuning_actions)
+        upscaling_form.addRow(ai_sr_runtime_box)
 
         self.perf_guard_checkbox = QCheckBox("Auto performance guard (reduce SR when overloaded)")
         self.perf_guard_checkbox.setChecked(False)
         self.perf_guard_checkbox.toggled.connect(self._on_perf_guard_toggled)
         settings_form.addRow(self.perf_guard_checkbox)
 
-        decklink_box = QGroupBox("Blackmagic Video Format")
+        decklink_box = QGroupBox("Blackmagic I/O")
         decklink_form = QFormLayout(decklink_box)
+
+        self.source_mode_combo = QComboBox()
+        self.source_mode_combo.addItems(["Synthetic", "Blackmagic DeckLink"])
+        self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
+        decklink_form.addRow("Input source", self.source_mode_combo)
 
         self.decklink_input_device_combo = QComboBox()
         self.decklink_input_device_combo.currentIndexChanged.connect(self._on_decklink_device_changed)
@@ -1941,6 +2294,20 @@ class MainWindow(QMainWindow):
         reset_btn.clicked.connect(self._reset_roi)
         roi_form.addRow(reset_btn)
 
+        post_vsr_scaling_box = QGroupBox("Post VSR Scaling")
+        post_vsr_scaling_form = QFormLayout(post_vsr_scaling_box)
+
+        self.rtx_vsr_scaling_apply_btn = QPushButton("Apply VSR Scaling")
+        self.rtx_vsr_scaling_apply_btn.clicked.connect(self._on_rtx_vsr_settings_apply_clicked)
+
+        self.rtx_vsr_scaling_info_label = QLabel("VSR scaling info will appear after worker initialization.")
+        self.rtx_vsr_scaling_info_label.setWordWrap(True)
+
+        post_vsr_scaling_form.addRow("Internal scale", self.rtx_vsr_scale_combo)
+        post_vsr_scaling_form.addRow("Post-VSR scaling method", self.rtx_vsr_post_scale_method_combo)
+        post_vsr_scaling_form.addRow(self.rtx_vsr_scaling_apply_btn)
+        post_vsr_scaling_form.addRow(self.rtx_vsr_scaling_info_label)
+
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
 
@@ -1956,9 +2323,14 @@ class MainWindow(QMainWindow):
         )
         controls_hint.setWordWrap(True)
 
-        layout.addWidget(settings_box)
         layout.addWidget(decklink_box)
+        layout.addWidget(deinterlace_box)
+        layout.addWidget(denoise_box)
+        layout.addWidget(upscaling_box)
+        layout.addWidget(rtx_vsr_box)
+        layout.addWidget(settings_box)
         layout.addWidget(roi_box)
+        layout.addWidget(post_vsr_scaling_box)
         layout.addWidget(controls_hint)
         layout.addWidget(self.status_label)
         layout.addStretch(1)
@@ -2073,8 +2445,27 @@ class MainWindow(QMainWindow):
                     if hasattr(self._controller, "decklink_ai_sr_counts"):
                         ai_applied, ai_passthrough = self._controller.decklink_ai_sr_counts()
                     ai_counts = f"{ai_applied}/{ai_passthrough}"
+                    rtx_applied = False
+                    rtx_delta = 0.0
+                    if hasattr(self._controller, "decklink_rtx_stats"):
+                        rtx_applied, rtx_delta = self._controller.decklink_rtx_stats()
+                    rtx_vsr_state = "off"
+                    rtx_vsr_detail = ""
+                    if getattr(self._controller, "rtx_vsr_enabled", False):
+                        rtx_vsr_state = "active" if getattr(self._controller, "rtx_vsr_active", False) else "requested"
+                        rtx_vsr_info = getattr(self._controller, "rtx_vsr_info", None)
+                        rtx_vsr_error = getattr(self._controller, "rtx_vsr_error", None)
+                        if rtx_vsr_info and rtx_vsr_state == "active":
+                            quality = rtx_vsr_info.get("quality", getattr(self._controller, "rtx_vsr_quality", "high"))
+                            thdr_enabled = bool(rtx_vsr_info.get("thdr_enabled", False))
+                            if thdr_enabled:
+                                rtx_vsr_detail = f" ({quality}, thdr=on)"
+                            else:
+                                rtx_vsr_detail = f" ({quality}, thdr=off)"
+                        elif rtx_vsr_error and rtx_vsr_state != "active":
+                            rtx_vsr_detail = f" ({rtx_vsr_error})"
                     self._update_status(
-                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | AI applied/passthrough={ai_counts}"
+                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI applied/passthrough={ai_counts}"
                     )
                     LOGGER.info(
                         (
@@ -2100,6 +2491,7 @@ class MainWindow(QMainWindow):
                         f"DeckLink streaming via worker process | preview_fps={fps:.1f} | worker_fps={worker_fps:.1f}"
                     )
                     self._refresh_ai_sr_runtime_panel()
+                    self._refresh_rtx_vsr_runtime_panel()
                     self._apply_performance_guard(fps)
                 return
 
@@ -2166,8 +2558,19 @@ class MainWindow(QMainWindow):
                         ai_sr_detail = f" ({ai_sr_error})"
                     elif getattr(self._controller, "ai_sr_last_warning", None):
                         ai_sr_detail = f" ({self._controller.ai_sr_last_warning})"
+                rtx_vsr_state = "off"
+                rtx_vsr_detail = ""
+                if getattr(self._controller, "rtx_vsr_enabled", False):
+                    rtx_vsr_state = "active" if getattr(self._controller, "rtx_vsr_active", False) else "requested"
+                    rtx_vsr_info = getattr(self._controller, "rtx_vsr_info", None)
+                    rtx_vsr_error = getattr(self._controller, "rtx_vsr_error", None)
+                    if rtx_vsr_info and rtx_vsr_state == "active":
+                        quality = rtx_vsr_info.get("quality", getattr(self._controller, "rtx_vsr_quality", "high"))
+                        rtx_vsr_detail = f" ({quality})"
+                    elif rtx_vsr_error and rtx_vsr_state != "active":
+                        rtx_vsr_detail = f" ({rtx_vsr_error})"
                 self._update_status(
-                    f"Running | FPS={fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail}"
+                    f"Running | FPS={fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail}"
                 )
                 LOGGER.info(
                     (
@@ -2192,6 +2595,7 @@ class MainWindow(QMainWindow):
                     self.decklink_status_label.setText("DeckLink streaming")
 
                 self._refresh_ai_sr_runtime_panel()
+                self._refresh_rtx_vsr_runtime_panel()
                 self._apply_performance_guard(fps)
         except Exception as exc:
             if self._is_closing:
@@ -2353,8 +2757,16 @@ class MainWindow(QMainWindow):
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._roi = clamp_roi(Roi(x, y, w, h))
-        self._controller.set_roi(self._roi)
+        self._pending_controller_roi = self._roi
+        if not self._roi_push_timer.isActive():
+            self._roi_push_timer.start()
         self._sync_controls_from_roi(self._roi)
+
+    def _flush_pending_controller_roi(self) -> None:
+        if self._pending_controller_roi is None:
+            return
+        self._controller.set_roi(self._pending_controller_roi)
+        self._pending_controller_roi = None
 
     def _on_scale_from_canvas(self, scale: float) -> None:
         if self._updating_controls:
@@ -2385,6 +2797,9 @@ class MainWindow(QMainWindow):
             )
         )
         self._roi = roi
+        self._pending_controller_roi = None
+        if self._roi_push_timer.isActive():
+            self._roi_push_timer.stop()
         self._input_canvas.set_roi(roi)
         self._controller.set_roi(roi)
         self._sync_controls_from_roi(roi)
@@ -2397,6 +2812,9 @@ class MainWindow(QMainWindow):
         center_y = self._roi.y + (self._roi.h / 2.0)
         roi = roi_from_scale(value, center_x, center_y)
         self._roi = roi
+        self._pending_controller_roi = None
+        if self._roi_push_timer.isActive():
+            self._roi_push_timer.stop()
         self._input_canvas.set_roi(roi)
         self._controller.set_roi(roi)
         self._sync_controls_from_roi(roi)
@@ -2476,9 +2894,31 @@ class MainWindow(QMainWindow):
         try:
             self._controller.set_deinterlace_enabled(checked)
             mode_text = "enabled" if checked else "disabled"
-            self._update_status(f"Bob deinterlace {mode_text}")
+            self._update_status(f"Deinterlace {mode_text}")
         except Exception as exc:
             self._update_status(f"Deinterlace toggle failed: {exc}")
+
+    def _on_deinterlace_method_changed(self) -> None:
+        method_label = self.deinterlace_method_combo.currentText()
+        method_name = DEINTERLACE_METHOD_LABEL_TO_NAME.get(method_label, "bob")
+        try:
+            self._controller.set_deinterlace_method(method_name)
+            applied_method = getattr(self._controller, "deinterlace_method", method_name)
+            self._update_status(f"Deinterlace method applied: {applied_method}")
+        except Exception as exc:
+            self._update_status(f"Deinterlace method change failed: {exc}")
+
+    def _on_denoise_settings_changed(self) -> None:
+        method_label = self.denoise_method_combo.currentText()
+        method_name = DENOISE_METHOD_LABEL_TO_NAME.get(method_label, "off")
+        strength = float(self.denoise_strength_spin.value())
+        try:
+            self._controller.set_denoise_settings(method_name, strength)
+            applied_method = getattr(self._controller, "denoise_method", method_name)
+            applied_strength = float(getattr(self._controller, "denoise_strength", strength))
+            self._update_status(f"Denoise applied: {applied_method} (strength={applied_strength:.2f})")
+        except Exception as exc:
+            self._update_status(f"Denoise setting update failed: {exc}")
 
     def _on_perf_guard_toggled(self, checked: bool) -> None:
         self._perf_guard_enabled = checked
@@ -2495,6 +2935,19 @@ class MainWindow(QMainWindow):
                 self._update_status("AI SR disable requested | awaiting worker ack")
         except Exception as exc:
             self._update_status(f"AI SR toggle failed: {exc}")
+
+    def _on_enable_rtx_vsr_toggled(self, checked: bool) -> None:
+        try:
+            self._controller.set_rtx_vsr_enabled(checked)
+            if checked:
+                if bool(getattr(self._controller, "ai_sr_enabled", False)):
+                    self._update_status("RTX VSR enable requested | awaiting worker ack | note: RTX path is bypassed while AI SR is enabled")
+                else:
+                    self._update_status("RTX VSR enable requested | awaiting worker ack")
+            else:
+                self._update_status("RTX VSR disable requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"RTX VSR toggle failed: {exc}")
 
     def _on_ai_sr_model_path_changed(self, model_path: str) -> None:
         if self._updating_controls:
@@ -2547,6 +3000,31 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._update_status(f"AI SR tuning update failed: {exc}")
 
+    def _on_rtx_vsr_settings_apply_clicked(self) -> None:
+        try:
+            quality = self.rtx_vsr_quality_combo.currentText().strip().lower()
+            scale = int(self.rtx_vsr_scale_combo.currentText())
+            post_scale_method = RTX_POST_SCALE_METHOD_LABEL_TO_NAME.get(
+                self.rtx_vsr_post_scale_method_combo.currentText(),
+                "bicubic",
+            )
+            self._controller.set_rtx_vsr_settings(
+                quality,
+                scale,
+                post_scale_method,
+                bool(self.rtx_thdr_enable_checkbox.isChecked()),
+                int(self.rtx_thdr_contrast_spin.value()),
+                int(self.rtx_thdr_saturation_spin.value()),
+                int(self.rtx_thdr_middle_gray_spin.value()),
+                int(self.rtx_thdr_max_luminance_spin.value()),
+            )
+            if bool(getattr(self._controller, "ai_sr_enabled", False)):
+                self._update_status("RTX VSR settings update requested | awaiting worker ack | note: AI SR currently overrides RTX path")
+            else:
+                self._update_status("RTX VSR settings update requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"RTX VSR settings update failed: {exc}")
+
     def _on_ai_sr_profile_save_clicked(self) -> None:
         model_path = self.ai_sr_model_combo.currentText().strip()
         if not model_path:
@@ -2567,6 +3045,7 @@ class MainWindow(QMainWindow):
             return
         self._apply_ai_sr_profile(profile)
         self._refresh_ai_sr_runtime_panel()
+        self._refresh_rtx_vsr_runtime_panel()
         self._update_status("Loaded AI SR profile for selected model")
 
     def _refresh_ai_sr_runtime_panel(self) -> None:
@@ -2624,6 +3103,55 @@ class MainWindow(QMainWindow):
             lines.append(f"Warning: {warning_text}")
 
         self.ai_sr_runtime_label.setText("\n".join(lines))
+
+    def _refresh_rtx_vsr_runtime_panel(self) -> None:
+        info = getattr(self._controller, "rtx_vsr_info", None) or {}
+        enabled = bool(getattr(self._controller, "rtx_vsr_enabled", False))
+        active = bool(getattr(self._controller, "rtx_vsr_active", False))
+        error_text = getattr(self._controller, "rtx_vsr_error", None)
+
+        quality = info.get("quality", getattr(self._controller, "rtx_vsr_quality", "high"))
+        scale = info.get("scale", getattr(self._controller, "rtx_vsr_scale", 2))
+        post_scale_method = str(info.get("post_scale_method", getattr(self._controller, "rtx_vsr_post_scale_method", "bicubic")))
+        post_scale_label = RTX_POST_SCALE_METHOD_NAME_TO_LABEL.get(post_scale_method, post_scale_method)
+        thdr_enabled = bool(info.get("thdr_enabled", getattr(self._controller, "rtx_thdr_enabled", False)))
+        thdr_contrast = int(info.get("thdr_contrast", getattr(self._controller, "rtx_thdr_contrast", 50)))
+        thdr_saturation = int(info.get("thdr_saturation", getattr(self._controller, "rtx_thdr_saturation", 50)))
+        thdr_middle_gray = int(info.get("thdr_middle_gray", getattr(self._controller, "rtx_thdr_middle_gray", 50)))
+        thdr_max_luminance = int(info.get("thdr_max_luminance", getattr(self._controller, "rtx_thdr_max_luminance", 1000)))
+        backend = info.get("backend", "n/a")
+        input_w = info.get("input_w", "n/a")
+        input_h = info.get("input_h", "n/a")
+        output_w = info.get("output_w", "n/a")
+        output_h = info.get("output_h", "n/a")
+
+        lines = [
+            f"Enabled: {enabled} | Active: {active}",
+            f"Backend: {backend}",
+            f"Quality: {quality} | Scale: {scale} | Post scale: {post_scale_label}",
+            f"VSR input resolution: {input_w}x{input_h} | Output resolution: {output_w}x{output_h}",
+            (
+                "TrueHDR: "
+                f"enabled={thdr_enabled}, "
+                f"contrast={thdr_contrast}, "
+                f"saturation={thdr_saturation}, "
+                f"middle_gray={thdr_middle_gray}, "
+                f"max_luminance={thdr_max_luminance}"
+            ),
+        ]
+        if enabled and not active and bool(getattr(self._controller, "ai_sr_enabled", False)):
+            lines.append("Note: RTX VSR path is bypassed while AI SR is enabled.")
+        if error_text:
+            lines.append(f"Error: {error_text}")
+
+        self.rtx_vsr_runtime_label.setText("\n".join(lines))
+        self.rtx_vsr_scaling_info_label.setText(
+            (
+                f"Scale: {scale} | Post method: {post_scale_label}\n"
+                f"VSR input resolution: {input_w}x{input_h}\n"
+                f"Output resolution: {output_w}x{output_h}"
+            )
+        )
 
     def _target_fps(self) -> float:
         return float(max(1, self.fps_spin.value()))
@@ -3017,6 +3545,9 @@ class MainWindow(QMainWindow):
 
     def _reset_roi(self) -> None:
         self._roi = Roi(480, 270, 960, 540)
+        self._pending_controller_roi = None
+        if self._roi_push_timer.isActive():
+            self._roi_push_timer.stop()
         self._input_canvas.set_roi(self._roi)
         self._controller.set_roi(self._roi)
         self._sync_controls_from_roi(self._roi)

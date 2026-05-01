@@ -43,6 +43,39 @@ cmake --build build --config Release
 If pybind11 is already installed with CMake config files, CMake will use that copy.
 If not, CMake will fetch pybind11 automatically during configure.
 
+## RTX VSR pybind11 wrapper (rtx_vsr)
+
+This repo now includes a separate Windows x64 pybind11 extension module named `rtx_vsr`.
+
+Python API:
+- `RTXVideoSR(input_width, input_height, output_width, output_height, quality="high")`
+- `process_rgba(np.ndarray[uint8, H, W, 4]) -> np.ndarray[uint8, outH, outW, 4]`
+- `close()`
+
+Current milestone:
+- correctness-first copy path (NumPy RGBA -> D3D11 texture -> RTX VSR -> NumPy RGBA)
+- not zero-copy yet
+
+Configure and build commands:
+
+cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+
+SDK path:
+- by default, CMake expects `C:/Coding Projects/sdks/NVidia video SDK`
+- override with `-DRTX_VIDEO_SDK_ROOT="C:/path/to/NVidia video SDK"`
+
+Runtime DLL requirement:
+- `nvngx_vsr.dll` must be discoverable at runtime
+- the build attempts to copy it from `bin/Windows/x64/rel` into the module output directory
+
+Smoke test:
+
+python python/test_rtx_vsr.py
+
+TODO (next milestone):
+- add zero-copy interop API such as `process_cuda_ptr(input_ptr, output_ptr, stream_ptr)` or D3D texture interop
+
 Locate module:
 - build/src/Release/video_processor.cp<python-abi>-win_amd64.pyd (name may vary by Python version)
 

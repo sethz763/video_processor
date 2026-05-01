@@ -16,6 +16,19 @@ enum class SrFlavor {
     BicubicSharpen,
 };
 
+enum class DeinterlaceMethod {
+    Bob,
+    Blend,
+    EdgeAdaptive,
+};
+
+enum class DenoiseMethod {
+    Off,
+    LumaGaussian3x3,
+    LumaMedian3x3,
+    FieldTemporalLuma,
+};
+
 class VideoProcessor {
 public:
     VideoProcessor(
@@ -37,6 +50,7 @@ public:
     std::string ProcessFrame(const std::string& input_frame);
     std::string ProcessFrameNoDeinterlace(const std::string& input_frame);
     std::string ProcessFrameDeinterlaceOnly(const std::string& input_frame);
+    std::string ProcessFramePreprocessOnly(const std::string& input_frame);
 
     void SetRoi(int roi_x, int roi_y, int roi_w, int roi_h);
     void SetRoiPosition(int roi_x, int roi_y);
@@ -55,6 +69,16 @@ public:
     std::string GetSrFlavorName() const;
     void SetDeinterlaceEnabled(bool enabled);
     bool IsDeinterlaceEnabled() const;
+    void SetDeinterlaceMethod(DeinterlaceMethod method);
+    void SetDeinterlaceMethodByName(const std::string& method_name);
+    DeinterlaceMethod GetDeinterlaceMethod() const;
+    std::string GetDeinterlaceMethodName() const;
+    void SetDenoiseMethod(DenoiseMethod method);
+    void SetDenoiseMethodByName(const std::string& method_name);
+    DenoiseMethod GetDenoiseMethod() const;
+    std::string GetDenoiseMethodName() const;
+    void SetDenoiseStrength(float strength);
+    float GetDenoiseStrength() const;
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -86,6 +110,9 @@ private:
 
     bool enable_placeholder_sr_;
     bool enable_deinterlace_;
+    DeinterlaceMethod deinterlace_method_;
+    DenoiseMethod denoise_method_;
+    float denoise_strength_;
     SrFlavor sr_flavor_;
     bool auto_sr_scale_;
     int max_auto_sr_scale_;
@@ -104,8 +131,11 @@ private:
     uint8_t* d_uyvy_out_;
     uchar3* d_rgb_full_;
     uchar3* d_rgb_bob_;
+    uchar3* d_rgb_denoise_;
+    uchar3* d_rgb_prev_full_;
     uchar3* d_rgb_sr_;
     uchar3* d_rgb_zoom_;
+    bool has_prev_rgb_full_;
 
     std::vector<uint8_t> host_output_;
 };
