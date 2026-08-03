@@ -1071,6 +1071,10 @@ class VideoProcessorController:
     def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
         raise RuntimeError("DeckLink worker tick is unavailable for in-process backend")
 
+    def set_preview_fps(self, preview_fps: float) -> None:
+        # In-process backend does not use worker tick preview throttling.
+        _ = preview_fps
+
 
 class ProcessVideoProcessorController:
     def __init__(self) -> None:
@@ -1124,6 +1128,9 @@ class ProcessVideoProcessorController:
         self._decklink_no_frame_reason: str | None = None
         self._decklink_processed_counter = 0
         self._decklink_processed_fps = 0.0
+        self._decklink_processed_counter_last = 0
+        self._decklink_processed_counter_last_ts = 0.0
+        self._decklink_processed_fps_smoothed = 0.0
         self._decklink_ai_applied_frames = 0
         self._decklink_ai_passthrough_frames = 0
         self._decklink_rtx_vsr_applied = False
@@ -1151,8 +1158,63 @@ class ProcessVideoProcessorController:
         self._decklink_preview_interval = max(1, int(os.environ.get("VP_DECKLINK_PREVIEW_INTERVAL", "3")))
         self._decklink_tick_counter = 0
         self._gpu_live_mode = os.environ.get("VP_GPU_LIVE_MODE", "1") == "1"
-        self._preview_fps = max(0.0, float(os.environ.get("VP_PREVIEW_FPS", "2")))
+        self._preview_fps = max(0.0, float(os.environ.get("VP_PREVIEW_FPS", "30")))
         self._last_preview_request_ts = 0.0
+
+    def _reset_decklink_fps_tracking(self) -> None:
+        self._decklink_processed_counter = 0
+        self._decklink_processed_fps = 0.0
+        self._decklink_processed_counter_last = 0
+        self._decklink_processed_counter_last_ts = 0.0
+        self._decklink_processed_fps_smoothed = 0.0
+
+    def _apply_decklink_frame_message(self, message: dict[str, object]) -> None:
+        self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
+        if "input_frame_bytes" in message and "output_frame_bytes" in message:
+            self._latest_decklink_frame = (
+                message["input_frame_bytes"],
+                message["output_frame_bytes"],
+            )
+            self._decklink_frame_updated = True
+
+        new_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
+        worker_reported_fps = float(message.get("processed_fps", self._decklink_processed_fps))
+        now = time.perf_counter()
+        local_fps = None
+
+        if self._decklink_processed_counter_last_ts > 0.0 and new_counter >= self._decklink_processed_counter_last:
+            dt = now - self._decklink_processed_counter_last_ts
+            dc = new_counter - self._decklink_processed_counter_last
+            if dt > 1e-4:
+                local_fps = float(dc) / dt
+
+        self._decklink_processed_counter = new_counter
+        self._decklink_processed_counter_last = new_counter
+        self._decklink_processed_counter_last_ts = now
+
+        if local_fps is None:
+            effective_fps = worker_reported_fps
+        elif self._decklink_processed_fps_smoothed <= 0.0:
+            effective_fps = local_fps
+        else:
+            # Smooth short-term jitter while preserving real output-rate changes.
+            alpha = 0.35
+            effective_fps = (1.0 - alpha) * self._decklink_processed_fps_smoothed + alpha * local_fps
+
+        self._decklink_processed_fps_smoothed = max(0.0, float(effective_fps))
+        self._decklink_processed_fps = self._decklink_processed_fps_smoothed
+
+        self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
+        self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
+        self._decklink_rtx_vsr_applied = bool(message.get("rtx_vsr_applied", self._decklink_rtx_vsr_applied))
+        self._decklink_rtx_effect_mean_abs_luma = float(
+            message.get("rtx_effect_mean_abs_luma", self._decklink_rtx_effect_mean_abs_luma)
+        )
+        self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
+        self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
+        self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
+        self._decklink_no_frame_reason = None
+        self._decklink_tick_pending = False
 
     def create(self, roi: Roi) -> None:
         self.close()
@@ -1219,6 +1281,7 @@ class ProcessVideoProcessorController:
         self._latest_effective_scale = 1
         self._next_frame_id = 1
         self._decklink_tick_pending = False
+        self._reset_decklink_fps_tracking()
         self._wait_for_ready(timeout_seconds=5.0)
 
     def _wait_for_ready(self, timeout_seconds: float) -> None:
@@ -1300,26 +1363,7 @@ class ProcessVideoProcessorController:
                 continue
 
             if message_type == "decklink_frame":
-                self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
-                if "input_frame_bytes" in message and "output_frame_bytes" in message:
-                    self._latest_decklink_frame = (
-                        message["input_frame_bytes"],
-                        message["output_frame_bytes"],
-                    )
-                    self._decklink_frame_updated = True
-                self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
-                self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
-                self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
-                self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
-                self._decklink_rtx_vsr_applied = bool(message.get("rtx_vsr_applied", self._decklink_rtx_vsr_applied))
-                self._decklink_rtx_effect_mean_abs_luma = float(
-                    message.get("rtx_effect_mean_abs_luma", self._decklink_rtx_effect_mean_abs_luma)
-                )
-                self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
-                self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
-                self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
-                self._decklink_no_frame_reason = None
-                self._decklink_tick_pending = False
+                self._apply_decklink_frame_message(message)
                 continue
 
             if message_type == "decklink_no_frame":
@@ -1472,22 +1516,7 @@ class ProcessVideoProcessorController:
                 self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
                 continue
             if message_type == "decklink_frame":
-                self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
-                if "input_frame_bytes" in message and "output_frame_bytes" in message:
-                    self._latest_decklink_frame = (
-                        message["input_frame_bytes"],
-                        message["output_frame_bytes"],
-                    )
-                    self._decklink_frame_updated = True
-                self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
-                self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
-                self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
-                self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
-                self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
-                self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
-                self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
-                self._decklink_no_frame_reason = None
-                self._decklink_tick_pending = False
+                self._apply_decklink_frame_message(message)
                 continue
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
@@ -1511,6 +1540,7 @@ class ProcessVideoProcessorController:
         self._decklink_tick_pending = False
         self._decklink_tick_counter = 0
         self._last_preview_request_ts = 0.0
+        self._reset_decklink_fps_tracking()
         self._send_control(
             {
                 "cmd": "start_decklink",
@@ -1536,6 +1566,7 @@ class ProcessVideoProcessorController:
         self._decklink_tick_pending = False
         self._decklink_tick_counter = 0
         self._last_preview_request_ts = 0.0
+        self._reset_decklink_fps_tracking()
 
     def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
         self._drain_responses()
@@ -1573,6 +1604,11 @@ class ProcessVideoProcessorController:
 
     def decklink_processed_fps(self) -> float:
         return float(self._decklink_processed_fps)
+
+    def set_preview_fps(self, preview_fps: float) -> None:
+        self._preview_fps = max(0.0, float(preview_fps))
+        # Allow an immediate preview request after a user-adjusted FPS change.
+        self._last_preview_request_ts = 0.0
 
     def consume_decklink_frame_updated(self) -> bool:
         updated = bool(self._decklink_frame_updated)
@@ -1844,7 +1880,7 @@ class MainWindow(QMainWindow):
         self._preview_downsample_factor = self._normalize_preview_downsample_factor(
             float(os.environ.get("VP_PREVIEW_DOWNSAMPLE", "0.25"))
         )
-        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "12")))
+        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "60")))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2041,6 +2077,19 @@ class MainWindow(QMainWindow):
         self.fps_spin.setValue(20)
         self.fps_spin.valueChanged.connect(self._update_timer_interval)
         settings_form.addRow("FPS", self.fps_spin)
+
+        self.preview_request_fps_spin = QSpinBox()
+        self.preview_request_fps_spin.setRange(1, 60)
+        initial_preview_fps = int(round(float(getattr(self._controller, "_preview_fps", 30.0))))
+        self.preview_request_fps_spin.setValue(max(1, min(60, initial_preview_fps)))
+        self.preview_request_fps_spin.valueChanged.connect(self._on_preview_request_fps_changed)
+        settings_form.addRow("Preview request FPS", self.preview_request_fps_spin)
+
+        self.preview_poll_fps_spin = QSpinBox()
+        self.preview_poll_fps_spin.setRange(1, 120)
+        self.preview_poll_fps_spin.setValue(int(round(self._decklink_tick_poll_fps)))
+        self.preview_poll_fps_spin.valueChanged.connect(self._on_preview_poll_fps_changed)
+        settings_form.addRow("Preview poll FPS cap", self.preview_poll_fps_spin)
 
         self.preview_downsample_combo = QComboBox()
         self.preview_downsample_combo.addItems(list(PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.keys()))
@@ -2565,7 +2614,7 @@ class MainWindow(QMainWindow):
                         elif rtx_vsr_error and rtx_vsr_state != "active":
                             rtx_vsr_detail = f" ({rtx_vsr_error})"
                     self._update_status(
-                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI applied/passthrough={ai_counts} | Stage enabled[{stage_enable_text}] | Stage last[{stage_last_text}] | Stage counts[{stage_count_text}]"
+                        f"Running | Preview FPS={fps:.1f} | Output FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI applied/passthrough={ai_counts} | Stage enabled[{stage_enable_text}] | Stage last[{stage_last_text}] | Stage counts[{stage_count_text}]"
                     )
                     LOGGER.info(
                         (
@@ -2588,7 +2637,7 @@ class MainWindow(QMainWindow):
                         perf["tick"][1],
                     )
                     self.decklink_status_label.setText(
-                        f"DeckLink streaming via worker process | preview_fps={fps:.1f} | worker_fps={worker_fps:.1f}"
+                        f"DeckLink streaming via worker process | preview_fps={fps:.1f} | output_fps={worker_fps:.1f}"
                     )
                     self._refresh_ai_sr_runtime_panel()
                     self._refresh_rtx_vsr_runtime_panel()
@@ -2882,6 +2931,17 @@ class MainWindow(QMainWindow):
         self._update_status(
             f"Preview downsample set to {label} ({int(round(self._preview_downsample_factor * 100.0))}% linear size)"
         )
+
+    def _on_preview_request_fps_changed(self) -> None:
+        preview_fps = int(self.preview_request_fps_spin.value())
+        if hasattr(self._controller, "set_preview_fps"):
+            self._controller.set_preview_fps(float(preview_fps))
+        self._update_status(f"Preview request FPS set to {preview_fps}")
+
+    def _on_preview_poll_fps_changed(self) -> None:
+        self._decklink_tick_poll_fps = float(max(1, self.preview_poll_fps_spin.value()))
+        self._update_timer_interval()
+        self._update_status(f"Preview poll FPS cap set to {int(self._decklink_tick_poll_fps)}")
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._roi = clamp_roi(Roi(x, y, w, h))

@@ -887,6 +887,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     rtx_vsr_engine = None
     rtx_vsr_info: dict[str, object] | None = None
     rtx_vsr_error: str | None = None
+    rtx_roi_rebuild_pending = False
+    rtx_roi_rebuild_due_ts = 0.0
+    rtx_roi_rebuild_settle_s = 0.25
     current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bilinear_sharp"))
     current_roi_x = int(startup_config.get("roi_x", 0))
     current_roi_y = int(startup_config.get("roi_y", 0))
@@ -1001,6 +1004,13 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         roi_yuv = np.ascontiguousarray(yuv422[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w, :])
         roi_rgb = cv2.cvtColor(roi_yuv, cv2.COLOR_YUV2RGB_UYVY)
         roi_rgba = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2RGBA)
+
+        engine_in_w = max(2, int(getattr(rtx_vsr_engine, "input_width", roi_w)) & ~1)
+        engine_in_h = max(2, int(getattr(rtx_vsr_engine, "input_height", roi_h)))
+        if roi_rgba.shape[1] != engine_in_w or roi_rgba.shape[0] != engine_in_h:
+            # Keep RTX active while ROI is being resized by adapting the current
+            # ROI crop to the engine's fixed input dimensions.
+            roi_rgba = cv2.resize(roi_rgba, (engine_in_w, engine_in_h), interpolation=cv2.INTER_CUBIC)
 
         sr_rgba = rtx_vsr_engine.process_rgba(roi_rgba)
         if not isinstance(sr_rgba, np.ndarray):
@@ -1515,7 +1525,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             return error_text
 
     def _refresh_rtx_vsr_engine() -> str | None:
-        nonlocal rtx_vsr_engine, rtx_vsr_info
+        nonlocal rtx_vsr_engine, rtx_vsr_info, rtx_roi_rebuild_pending
+
+        rtx_roi_rebuild_pending = False
 
         if rtx_vsr_engine is not None:
             try:
@@ -1593,6 +1605,25 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 f" | module={module_file}"
             )
 
+    def _schedule_rtx_roi_rebuild() -> None:
+        nonlocal rtx_roi_rebuild_pending, rtx_roi_rebuild_due_ts
+        rtx_roi_rebuild_pending = True
+        rtx_roi_rebuild_due_ts = time.perf_counter() + rtx_roi_rebuild_settle_s
+
+    def _maybe_run_pending_rtx_roi_rebuild() -> None:
+        nonlocal rtx_vsr_error, rtx_roi_rebuild_pending
+        if not rtx_roi_rebuild_pending:
+            return
+        if not rtx_vsr_enabled:
+            rtx_roi_rebuild_pending = False
+            return
+        if time.perf_counter() < rtx_roi_rebuild_due_ts:
+            return
+
+        rtx_vsr_error = _refresh_rtx_vsr_engine()
+        if rtx_vsr_error:
+            _safe_put({"type": "warning", "warning": f"RTX VSR ROI resize reconfigure failed: {rtx_vsr_error}"})
+
     def _close_rtx_vsr_engine() -> None:
         nonlocal rtx_vsr_engine
         if rtx_vsr_engine is None:
@@ -1669,6 +1700,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         )
 
         while True:
+            _maybe_run_pending_rtx_roi_rebuild()
+
             message = None
             try:
                 message = request_queue.get_nowait()
@@ -1793,6 +1826,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if command == "set_roi":
+                prev_roi_w = current_roi_w
+                prev_roi_h = current_roi_h
                 current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
                     int(message["x"]),
                     int(message["y"]),
@@ -1801,7 +1836,10 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 )
                 processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
                 if rtx_vsr_enabled:
-                    rtx_vsr_error = _refresh_rtx_vsr_engine()
+                    if rtx_vsr_engine is None:
+                        rtx_vsr_error = _refresh_rtx_vsr_engine()
+                    elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
+                        _schedule_rtx_roi_rebuild()
                 continue
 
             if command in {"set_basic_scaling_mode_auto", "set_sr_mode_auto"}:
