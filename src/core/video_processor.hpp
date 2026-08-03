@@ -12,6 +12,7 @@ namespace vp {
 
 enum class SrFlavor {
     Bilinear,
+    BilinearSharp,
     Bicubic,
     BicubicSharpen,
 };
@@ -26,6 +27,8 @@ enum class DenoiseMethod {
     Off,
     LumaGaussian3x3,
     LumaMedian3x3,
+    LumaBilateral3x3,
+    LumaBilateral5x5,
     FieldTemporalLuma,
 };
 
@@ -136,6 +139,7 @@ private:
     uchar3* d_rgb_sr_;
     uchar3* d_rgb_zoom_;
     bool has_prev_rgb_full_;
+    uint8_t* h_output_pinned_;
 
     std::vector<uint8_t> host_output_;
 };

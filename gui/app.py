@@ -46,9 +46,15 @@ WINDOWED_PREVIEW_MAX_W = 640
 WINDOWED_PREVIEW_MAX_H = 360
 FULLSCREEN_PREVIEW_MAX_W = 1280
 FULLSCREEN_PREVIEW_MAX_H = 720
+PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR = {
+    "Full (1:1)": 1.0,
+    "Half (1/2)": 0.5,
+    "Quarter (1/4)": 0.25,
+}
 
 SR_FLAVOR_LABEL_TO_NAME = {
     "Bilinear (Fast)": "bilinear",
+    "Bilinear + Edge Boost (Realtime)": "bilinear_sharp",
     "Bicubic (Balanced)": "bicubic",
     "Bicubic + Sharpen (Crisp)": "bicubic_sharpen",
 }
@@ -65,6 +71,8 @@ DENOISE_METHOD_LABEL_TO_NAME = {
     "Off": "off",
     "Luma Gaussian 3x3 (Balanced)": "luma_gaussian3x3",
     "Luma Median 3x3 (Stronger)": "luma_median3x3",
+    "Luma Bilateral 3x3 (Artifact Cleaner)": "luma_bilateral3x3",
+    "Luma Bilateral 5x5 (Still Image Heavy)": "luma_bilateral5x5",
     "Field Temporal Luma (Advanced)": "field_temporal_luma",
 }
 DENOISE_METHOD_NAME_TO_LABEL = {value: key for key, value in DENOISE_METHOD_LABEL_TO_NAME.items()}
@@ -354,6 +362,15 @@ def uyvy_to_qimage(
     return image, rgb
 
 
+def looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
+    if len(frame_bytes) != UYVY_FRAME_BYTES:
+        return False
+
+    # Sample sparsely so this check remains cheap in real-time preview.
+    sample = np.frombuffer(frame_bytes, dtype=np.uint8)[::4096]
+    return sample.size > 0 and int(np.count_nonzero(sample)) == 0
+
+
 def tight_uyvy_bytes(frame: object) -> bytes:
     row_bytes = int(frame.row_bytes)
     expected_row_bytes = FRAME_W * 2
@@ -490,12 +507,13 @@ class RoiCanvas(QWidget):
         self._drag_start_pos = QPointF()
         self._drag_start_roi = self._roi
 
-        self._last_touch_center: QPointF | None = None
-        self._last_touch_dist: float | None = None
         self._last_touch_emit_ts = 0.0
         self._touch_emit_interval_s = 1.0 / 45.0
         self._touch_emit_pending = False
         self._touch_emit_pending_scale = False
+        self._interaction_emit_flush_timer = QTimer(self)
+        self._interaction_emit_flush_timer.setSingleShot(True)
+        self._interaction_emit_flush_timer.timeout.connect(self._flush_pending_touch_emit)
 
     def set_image(self, image: QImage, backing: np.ndarray | None = None) -> None:
         self._image = image
@@ -649,74 +667,33 @@ class RoiCanvas(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        delta = event.angleDelta().y()
-        if delta == 0:
-            delta = event.pixelDelta().y()
+        angle_delta = event.angleDelta().y()
+        delta = angle_delta
         if delta == 0:
             return
 
-        factor = 1.0 + (0.1 if delta > 0 else -0.1)
-        target_scale = roi_scale_from_roi(self._roi) * factor
+        # Ignore touchpad/touch pinch-like wheel streams to avoid unstable zoom.
+        if event.pixelDelta().y() != 0 or bool(event.modifiers() & Qt.ControlModifier):
+            return
 
+        effective_delta = float(delta)
+
+        # Exponential scaling keeps wheel notches crisp while smoothing high-rate
+        # touchpad/pinch delta bursts.
+        base_step = 1.08
+        sensitivity = math.log(base_step) / 120.0
+        factor = math.exp(effective_delta * sensitivity)
+        target_scale = roi_scale_from_roi(self._roi) * factor
         anchor_frame = self._widget_to_frame(event.position())
         self._apply_scale(target_scale, anchor_frame)
 
     def event(self, event) -> bool:
         et = event.type()
         if et in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
-            self._handle_touch_event(event)
+            # Pinch touch input is intentionally disabled due to unstable tablet behavior.
             event.accept()
             return True
         return super().event(event)
-
-    def _handle_touch_event(self, event: QTouchEvent) -> None:
-        points = event.points()
-        if not points:
-            self._flush_pending_touch_emit()
-            self._last_touch_center = None
-            self._last_touch_dist = None
-            return
-
-        if len(points) == 1:
-            pos = points[0].position()
-            frame = self._widget_to_frame(pos)
-            if self._last_touch_center is not None:
-                last_frame = self._widget_to_frame(self._last_touch_center)
-                dx = int(round(frame.x() - last_frame.x()))
-                dy = int(round(frame.y() - last_frame.y()))
-                roi = clamp_roi(Roi(self._roi.x + dx, self._roi.y + dy, self._roi.w, self._roi.h))
-                self._set_roi_and_emit_touch_throttled(roi)
-            self._last_touch_center = pos
-            self._last_touch_dist = None
-            return
-
-        p0 = points[0].position()
-        p1 = points[1].position()
-        center = QPointF((p0.x() + p1.x()) / 2.0, (p0.y() + p1.y()) / 2.0)
-        dist = math.hypot(p0.x() - p1.x(), p0.y() - p1.y())
-
-        if self._last_touch_center is not None:
-            cur_frame = self._widget_to_frame(center)
-            prev_frame = self._widget_to_frame(self._last_touch_center)
-            dx = int(round(cur_frame.x() - prev_frame.x()))
-            dy = int(round(cur_frame.y() - prev_frame.y()))
-            moved = clamp_roi(Roi(self._roi.x + dx, self._roi.y + dy, self._roi.w, self._roi.h))
-            if self._last_touch_dist is not None and self._last_touch_dist > 0:
-                self.set_roi(moved)
-            else:
-                self._set_roi_and_emit_touch_throttled(moved, emit_scale=False)
-
-        if self._last_touch_dist is not None and self._last_touch_dist > 0:
-            ratio = dist / self._last_touch_dist
-            self._apply_scale(
-                roi_scale_from_roi(self._roi) * ratio,
-                self._widget_to_frame(center),
-                emit_scale=False,
-                touch_throttle=True,
-            )
-
-        self._last_touch_center = center
-        self._last_touch_dist = dist
 
     def _apply_scale(
         self,
@@ -763,6 +740,10 @@ class RoiCanvas(QWidget):
         self.roiChanged.emit(self._roi.x, self._roi.y, self._roi.w, self._roi.h)
         if emit_scale:
             self.scaleChanged.emit(roi_scale_from_roi(self._roi))
+
+    def _schedule_interaction_emit_flush(self) -> None:
+        # Trailing-edge flush ensures the final zoom state is always propagated.
+        self._interaction_emit_flush_timer.start(40)
 
     def _roi_center(self) -> QPointF:
         return QPointF(self._roi.x + (self._roi.w / 2.0), self._roi.y + (self._roi.h / 2.0))
@@ -837,7 +818,7 @@ class VideoProcessorController:
         self._module = module
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
-        self.basic_scaling_method = "bicubic"
+        self.basic_scaling_method = "bilinear_sharp"
         self.deinterlace_method = "bob"
         self.denoise_method = "off"
         self.denoise_strength = 0.35
@@ -871,6 +852,7 @@ class VideoProcessorController:
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
         self.processor = None
+        self._zeroed_output_warning_emitted = False
 
     def create(self, roi: Roi) -> None:
         sr_scale = 0 if self.basic_scaling_auto_mode else self.basic_scaling_manual
@@ -1010,7 +992,13 @@ class VideoProcessorController:
     def process_frame(self, frame_bytes: bytes) -> bytes:
         if self.processor is None:
             raise RuntimeError("VideoProcessor is not initialized")
-        return self.processor.process_frame(frame_bytes)
+        output = self.processor.process_frame(frame_bytes)
+        if looks_zeroed_uyvy_frame(output):
+            if not self._zeroed_output_warning_emitted:
+                LOGGER.warning("GPU processing produced an all-zero UYVY frame; using passthrough fallback")
+                self._zeroed_output_warning_emitted = True
+            return frame_bytes
+        return output
 
     def close(self) -> None:
         self.processor = None
@@ -1088,7 +1076,7 @@ class ProcessVideoProcessorController:
     def __init__(self) -> None:
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
-        self.basic_scaling_method = "bicubic"
+        self.basic_scaling_method = "bilinear_sharp"
         self.deinterlace_method = "bob"
         self.denoise_method = "off"
         self.denoise_strength = 0.35
@@ -1131,6 +1119,7 @@ class ProcessVideoProcessorController:
         self._next_frame_id = 1
         self._latest_output_frame: bytes | None = None
         self._latest_decklink_frame: tuple[bytes, bytes] | None = None
+        self._decklink_frame_updated = False
         self._latest_effective_scale = 1
         self._decklink_no_frame_reason: str | None = None
         self._decklink_processed_counter = 0
@@ -1139,7 +1128,31 @@ class ProcessVideoProcessorController:
         self._decklink_ai_passthrough_frames = 0
         self._decklink_rtx_vsr_applied = False
         self._decklink_rtx_effect_mean_abs_luma = 0.0
+        self._decklink_stage_enable_flags: dict[str, bool] = {
+            "preprocess": False,
+            "basic_scaling": False,
+            "ai_sr": False,
+            "rtx_vsr": False,
+        }
+        self._decklink_stage_last_applied: dict[str, bool] = {
+            "preprocess": False,
+            "basic_scaling": False,
+            "ai_sr": False,
+            "rtx_vsr": False,
+        }
+        self._decklink_stage_apply_counts: dict[str, int] = {
+            "preprocess": 0,
+            "basic_scaling": 0,
+            "ai_sr": 0,
+            "rtx_vsr": 0,
+            "passthrough": 0,
+        }
         self._decklink_tick_pending = False
+        self._decklink_preview_interval = max(1, int(os.environ.get("VP_DECKLINK_PREVIEW_INTERVAL", "3")))
+        self._decklink_tick_counter = 0
+        self._gpu_live_mode = os.environ.get("VP_GPU_LIVE_MODE", "1") == "1"
+        self._preview_fps = max(0.0, float(os.environ.get("VP_PREVIEW_FPS", "2")))
+        self._last_preview_request_ts = 0.0
 
     def create(self, roi: Roi) -> None:
         self.close()
@@ -1252,31 +1265,22 @@ class ProcessVideoProcessorController:
 
         cmd = str(command.get("cmd", ""))
         best_effort_cmds = {
-            "set_roi",
             "decklink_tick",
-            "set_deinterlace_enabled",
-            "set_deinterlace_method",
-            "set_denoise_settings",
-            "set_max_auto_basic_scaling",
-            "set_max_auto_sr_scale",
-            "set_rtx_vsr_enabled",
-            "set_rtx_vsr_settings",
         }
 
         try:
             self._request_queue.put_nowait(command)
         except queue.Full:
-            # Prefer fresh control requests over stale queued work.
+            # Never evict pending critical commands. Drop only the best-effort
+            # command itself (e.g. tick) and preserve queued state updates.
+            if cmd in best_effort_cmds:
+                return
+
+            # For critical commands, wait briefly for queue capacity instead of
+            # removing existing requests that may contain user settings changes.
             try:
-                self._request_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._request_queue.put_nowait(command)
+                self._request_queue.put(command, timeout=0.25)
             except queue.Full:
-                # If still saturated, drop only best-effort commands.
-                if cmd in best_effort_cmds:
-                    return
                 raise RuntimeError(f"Worker request queue saturated while sending '{cmd}'")
 
     def _drain_responses(self) -> None:
@@ -1297,10 +1301,12 @@ class ProcessVideoProcessorController:
 
             if message_type == "decklink_frame":
                 self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
-                self._latest_decklink_frame = (
-                    message["input_frame_bytes"],
-                    message["output_frame_bytes"],
-                )
+                if "input_frame_bytes" in message and "output_frame_bytes" in message:
+                    self._latest_decklink_frame = (
+                        message["input_frame_bytes"],
+                        message["output_frame_bytes"],
+                    )
+                    self._decklink_frame_updated = True
                 self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
                 self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
                 self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
@@ -1309,12 +1315,16 @@ class ProcessVideoProcessorController:
                 self._decklink_rtx_effect_mean_abs_luma = float(
                     message.get("rtx_effect_mean_abs_luma", self._decklink_rtx_effect_mean_abs_luma)
                 )
+                self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
+                self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
+                self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
                 self._decklink_no_frame_reason = None
                 self._decklink_tick_pending = False
                 continue
 
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
+                self._decklink_frame_updated = False
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
                 self._decklink_tick_pending = False
                 continue
@@ -1323,6 +1333,8 @@ class ProcessVideoProcessorController:
                 ack_cmd = str(message.get("cmd", ""))
                 if ack_cmd in {"set_basic_scaling_method", "set_sr_flavor"}:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                elif ack_cmd == "set_deinterlace_enabled":
+                    self.deinterlace_enabled = bool(message.get("deinterlace_enabled", self.deinterlace_enabled))
                 elif ack_cmd == "set_deinterlace_method":
                     self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
                 elif ack_cmd == "set_denoise_settings":
@@ -1373,6 +1385,7 @@ class ProcessVideoProcessorController:
     def set_deinterlace_enabled(self, enabled: bool) -> None:
         self.deinterlace_enabled = enabled
         self._send_control({"cmd": "set_deinterlace_enabled", "enabled": bool(enabled)})
+        self._wait_for_ack("set_deinterlace_enabled", timeout_seconds=1.0)
 
     def set_deinterlace_method(self, method: str) -> None:
         self.deinterlace_method = str(method)
@@ -1434,6 +1447,8 @@ class ProcessVideoProcessorController:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
                 if expected_cmd == "set_deinterlace_method":
                     self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
+                if expected_cmd == "set_deinterlace_enabled":
+                    self.deinterlace_enabled = bool(message.get("deinterlace_enabled", self.deinterlace_enabled))
                 if expected_cmd == "set_denoise_settings":
                     self.denoise_method = str(message.get("denoise_method", self.denoise_method))
                     self.denoise_strength = float(message.get("denoise_strength", self.denoise_strength))
@@ -1458,19 +1473,25 @@ class ProcessVideoProcessorController:
                 continue
             if message_type == "decklink_frame":
                 self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
-                self._latest_decklink_frame = (
-                    message["input_frame_bytes"],
-                    message["output_frame_bytes"],
-                )
+                if "input_frame_bytes" in message and "output_frame_bytes" in message:
+                    self._latest_decklink_frame = (
+                        message["input_frame_bytes"],
+                        message["output_frame_bytes"],
+                    )
+                    self._decklink_frame_updated = True
                 self._decklink_processed_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
                 self._decklink_processed_fps = float(message.get("processed_fps", self._decklink_processed_fps))
                 self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
                 self._decklink_ai_passthrough_frames = int(message.get("ai_sr_passthrough_frames", self._decklink_ai_passthrough_frames))
+                self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
+                self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
+                self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
                 self._decklink_no_frame_reason = None
                 self._decklink_tick_pending = False
                 continue
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
+                self._decklink_frame_updated = False
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
                 self._decklink_tick_pending = False
                 continue
@@ -1485,8 +1506,11 @@ class ProcessVideoProcessorController:
     def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
         self._drain_responses()
         self._latest_decklink_frame = None
+        self._decklink_frame_updated = False
         self._decklink_no_frame_reason = None
         self._decklink_tick_pending = False
+        self._decklink_tick_counter = 0
+        self._last_preview_request_ts = 0.0
         self._send_control(
             {
                 "cmd": "start_decklink",
@@ -1508,14 +1532,38 @@ class ProcessVideoProcessorController:
         except Exception:
             pass
         self._latest_decklink_frame = None
+        self._decklink_frame_updated = False
         self._decklink_tick_pending = False
+        self._decklink_tick_counter = 0
+        self._last_preview_request_ts = 0.0
 
     def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
         self._drain_responses()
         if not self._decklink_tick_pending:
             # Keep at most one in-flight tick request so stale tick commands cannot
             # build up and push preview display several seconds behind live processing.
-            self._send_control({"cmd": "decklink_tick", "timeout_ms": int(timeout_ms)})
+            self._decklink_tick_counter += 1
+            include_frames = True
+            if self._gpu_live_mode:
+                now = time.perf_counter()
+                include_frames = False
+                if self._latest_decklink_frame is None:
+                    include_frames = True
+                elif self._preview_fps > 0.0 and (now - self._last_preview_request_ts) >= (1.0 / self._preview_fps):
+                    include_frames = True
+                if include_frames:
+                    self._last_preview_request_ts = now
+            else:
+                include_frames = (self._decklink_tick_counter % self._decklink_preview_interval) == 0
+                if self._latest_decklink_frame is None:
+                    include_frames = True
+            self._send_control(
+                {
+                    "cmd": "decklink_tick",
+                    "timeout_ms": int(timeout_ms),
+                    "include_frames": bool(include_frames),
+                }
+            )
             self._decklink_tick_pending = True
         self._drain_responses()
         return self._latest_decklink_frame
@@ -1525,6 +1573,11 @@ class ProcessVideoProcessorController:
 
     def decklink_processed_fps(self) -> float:
         return float(self._decklink_processed_fps)
+
+    def consume_decklink_frame_updated(self) -> bool:
+        updated = bool(self._decklink_frame_updated)
+        self._decklink_frame_updated = False
+        return updated
 
     def process_frame(self, frame_bytes: bytes) -> bytes:
         self._drain_responses()
@@ -1677,6 +1730,13 @@ class ProcessVideoProcessorController:
     def decklink_rtx_stats(self) -> tuple[bool, float]:
         return bool(self._decklink_rtx_vsr_applied), float(self._decklink_rtx_effect_mean_abs_luma)
 
+    def decklink_stage_telemetry(self) -> tuple[dict[str, bool], dict[str, bool], dict[str, int]]:
+        return (
+            dict(self._decklink_stage_enable_flags),
+            dict(self._decklink_stage_last_applied),
+            dict(self._decklink_stage_apply_counts),
+        )
+
     @property
     def sr_flavor(self) -> str:
         return self.basic_scaling_method
@@ -1781,6 +1841,10 @@ class MainWindow(QMainWindow):
         self._is_closing = False
         self._ai_sr_profiles_path = Path(__file__).resolve().parent / "ai_sr_profiles.json"
         self._ai_sr_profiles = self._load_ai_sr_profiles()
+        self._preview_downsample_factor = self._normalize_preview_downsample_factor(
+            float(os.environ.get("VP_PREVIEW_DOWNSAMPLE", "0.25"))
+        )
+        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "12")))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1977,6 +2041,14 @@ class MainWindow(QMainWindow):
         self.fps_spin.setValue(20)
         self.fps_spin.valueChanged.connect(self._update_timer_interval)
         settings_form.addRow("FPS", self.fps_spin)
+
+        self.preview_downsample_combo = QComboBox()
+        self.preview_downsample_combo.addItems(list(PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.keys()))
+        self.preview_downsample_combo.setCurrentText(
+            self._preview_downsample_label_for_factor(self._preview_downsample_factor)
+        )
+        self.preview_downsample_combo.currentIndexChanged.connect(self._on_preview_downsample_changed)
+        settings_form.addRow("Preview downsample", self.preview_downsample_combo)
 
         self.sr_mode_combo = QComboBox()
         self.sr_mode_combo.addItems(["Auto", "Manual"])
@@ -2316,7 +2388,7 @@ class MainWindow(QMainWindow):
             "- Input view only: Mouse drag to move ROI\n"
             "- Input view only: Drag bottom-right handle to resize ROI\n"
             "- Input view only: Wheel/Touchpad to zoom\n"
-            "- Input view only: Touch 1-finger pan, 2-finger pinch\n"
+            "- Input view only: Touch pinch zoom disabled (tablet)\n"
             "- Input view only: Arrow keys move ROI\n"
             "- Input view only: Shift+Arrows resize ROI\n"
             "- +/-: zoom"
@@ -2386,11 +2458,14 @@ class MainWindow(QMainWindow):
 
                 input_frame, output_frame = decklink_frame
                 self._no_frame_counter = 0
+                preview_updated = True
+                if hasattr(self._controller, "consume_decklink_frame_updated"):
+                    preview_updated = bool(self._controller.consume_decklink_frame_updated())
 
                 self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
 
                 input_preview_size = self._preview_target_for_view("input")
-                if input_preview_size is not None:
+                if input_preview_size is not None and preview_updated:
                     t1 = time.perf_counter()
                     input_image, input_backing = uyvy_to_qimage(
                         input_frame,
@@ -2401,7 +2476,7 @@ class MainWindow(QMainWindow):
                     self._perf_add("convert_in", (time.perf_counter() - t1) * 1000.0)
 
                 output_preview_size = self._preview_target_for_view("output")
-                if output_preview_size is not None:
+                if output_preview_size is not None and preview_updated:
                     t1 = time.perf_counter()
                     output_image, output_backing = uyvy_to_qimage(
                         output_frame,
@@ -2449,6 +2524,31 @@ class MainWindow(QMainWindow):
                     rtx_delta = 0.0
                     if hasattr(self._controller, "decklink_rtx_stats"):
                         rtx_applied, rtx_delta = self._controller.decklink_rtx_stats()
+                    stage_enable = {"preprocess": False, "basic_scaling": False, "ai_sr": False, "rtx_vsr": False}
+                    stage_last = {"preprocess": False, "basic_scaling": False, "ai_sr": False, "rtx_vsr": False}
+                    stage_counts = {"preprocess": 0, "basic_scaling": 0, "ai_sr": 0, "rtx_vsr": 0, "passthrough": 0}
+                    if hasattr(self._controller, "decklink_stage_telemetry"):
+                        stage_enable, stage_last, stage_counts = self._controller.decklink_stage_telemetry()
+
+                    stage_enable_text = (
+                        f"P={'1' if stage_enable.get('preprocess', False) else '0'}"
+                        f" B={'1' if stage_enable.get('basic_scaling', False) else '0'}"
+                        f" A={'1' if stage_enable.get('ai_sr', False) else '0'}"
+                        f" R={'1' if stage_enable.get('rtx_vsr', False) else '0'}"
+                    )
+                    stage_last_text = (
+                        f"P={'1' if stage_last.get('preprocess', False) else '0'}"
+                        f" B={'1' if stage_last.get('basic_scaling', False) else '0'}"
+                        f" A={'1' if stage_last.get('ai_sr', False) else '0'}"
+                        f" R={'1' if stage_last.get('rtx_vsr', False) else '0'}"
+                    )
+                    stage_count_text = (
+                        f"P={int(stage_counts.get('preprocess', 0))}"
+                        f" B={int(stage_counts.get('basic_scaling', 0))}"
+                        f" A={int(stage_counts.get('ai_sr', 0))}"
+                        f" R={int(stage_counts.get('rtx_vsr', 0))}"
+                        f" X={int(stage_counts.get('passthrough', 0))}"
+                    )
                     rtx_vsr_state = "off"
                     rtx_vsr_detail = ""
                     if getattr(self._controller, "rtx_vsr_enabled", False):
@@ -2465,7 +2565,7 @@ class MainWindow(QMainWindow):
                         elif rtx_vsr_error and rtx_vsr_state != "active":
                             rtx_vsr_detail = f" ({rtx_vsr_error})"
                     self._update_status(
-                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI applied/passthrough={ai_counts}"
+                        f"Running | Preview FPS={fps:.1f} | Worker FPS={worker_fps:.1f} | Basic scaling mode={mode_text} | Basic scaling method={flavor_text} | effective scaling={self._controller.effective_scale()} | AI SR={ai_sr_state}{ai_sr_detail} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI applied/passthrough={ai_counts} | Stage enabled[{stage_enable_text}] | Stage last[{stage_last_text}] | Stage counts[{stage_count_text}]"
                     )
                     LOGGER.info(
                         (
@@ -2749,11 +2849,39 @@ class MainWindow(QMainWindow):
             cap_w = FULLSCREEN_PREVIEW_MAX_W
             cap_h = FULLSCREEN_PREVIEW_MAX_H
 
-        return (min(canvas_w, cap_w), min(canvas_h, cap_h))
+        base_w = min(canvas_w, cap_w)
+        base_h = min(canvas_h, cap_h)
+        ds = self._preview_downsample_factor
+        preview_w = max(1, int(round(base_w * ds)))
+        preview_h = max(1, int(round(base_h * ds)))
+        return (preview_w, preview_h)
 
     def _update_timer_interval(self) -> None:
         fps = max(1, self.fps_spin.value())
-        self._timer.setInterval(int(1000 / fps))
+        poll_fps = float(fps)
+        if self._source_mode == "Blackmagic DeckLink" and self._controller_backend == "worker-process":
+            poll_fps = min(poll_fps, self._decklink_tick_poll_fps)
+        self._timer.setInterval(max(1, int(round(1000.0 / max(1.0, poll_fps)))))
+
+    def _normalize_preview_downsample_factor(self, value: float) -> float:
+        candidates = sorted(PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.values())
+        nearest = min(candidates, key=lambda f: abs(f - float(value)))
+        return float(nearest)
+
+    def _preview_downsample_label_for_factor(self, factor: float) -> str:
+        normalized = self._normalize_preview_downsample_factor(factor)
+        for label, value in PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.items():
+            if abs(value - normalized) < 1e-6:
+                return label
+        return "Quarter (1/4)"
+
+    def _on_preview_downsample_changed(self) -> None:
+        label = self.preview_downsample_combo.currentText()
+        factor = PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.get(label, 0.25)
+        self._preview_downsample_factor = self._normalize_preview_downsample_factor(factor)
+        self._update_status(
+            f"Preview downsample set to {label} ({int(round(self._preview_downsample_factor * 100.0))}% linear size)"
+        )
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._roi = clamp_roi(Roi(x, y, w, h))
@@ -2839,7 +2967,7 @@ class MainWindow(QMainWindow):
 
     def _on_sr_flavor_changed(self) -> None:
         selected_label = self.sr_flavor_combo.currentText()
-        selected_name = SR_FLAVOR_LABEL_TO_NAME.get(selected_label, "bicubic")
+        selected_name = SR_FLAVOR_LABEL_TO_NAME.get(selected_label, "bilinear_sharp")
         if not getattr(self._controller, "basic_scaling_method_supported", False):
             self._update_status("Basic scaling method is not supported by the loaded video_processor build; rebuild extension to enable")
             return
@@ -2941,7 +3069,7 @@ class MainWindow(QMainWindow):
             self._controller.set_rtx_vsr_enabled(checked)
             if checked:
                 if bool(getattr(self._controller, "ai_sr_enabled", False)):
-                    self._update_status("RTX VSR enable requested | awaiting worker ack | note: RTX path is bypassed while AI SR is enabled")
+                    self._update_status("RTX VSR enable requested | awaiting worker ack | note: with AI SR enabled, RTX runs as fallback when AI is unavailable on a frame")
                 else:
                     self._update_status("RTX VSR enable requested | awaiting worker ack")
             else:
@@ -3019,7 +3147,7 @@ class MainWindow(QMainWindow):
                 int(self.rtx_thdr_max_luminance_spin.value()),
             )
             if bool(getattr(self._controller, "ai_sr_enabled", False)):
-                self._update_status("RTX VSR settings update requested | awaiting worker ack | note: AI SR currently overrides RTX path")
+                self._update_status("RTX VSR settings update requested | awaiting worker ack | note: with AI SR enabled, RTX runs as fallback when AI is unavailable on a frame")
             else:
                 self._update_status("RTX VSR settings update requested | awaiting worker ack")
         except Exception as exc:
@@ -3213,6 +3341,7 @@ class MainWindow(QMainWindow):
     def _on_source_mode_changed(self) -> None:
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
+        self._update_timer_interval()
         if self._source_mode == "Synthetic":
             self._stop_decklink_sessions()
             self.decklink_status_label.setText("Synthetic mode active")
@@ -3346,9 +3475,6 @@ class MainWindow(QMainWindow):
         )
 
     def _resolve_mode_fps(self, device_index: int, mode_value: object, input_side: bool) -> float | None:
-        if d is None:
-            return None
-
         modes = (
             _call_decklink_api("list_input_display_modes", device_index)
             if input_side
@@ -3362,7 +3488,6 @@ class MainWindow(QMainWindow):
             if frame_duration <= 0 or time_scale <= 0:
                 return None
             return time_scale / frame_duration
-
         return None
 
     def _select_decklink_fps(self, input_fps: float | None, output_fps: float | None) -> float | None:

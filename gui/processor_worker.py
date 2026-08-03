@@ -149,6 +149,16 @@ FRAME_W = 1920
 FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
 
+
+def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
+    expected_size = UYVY_ROW_BYTES * FRAME_H
+    if len(frame_bytes) != expected_size:
+        return False
+
+    # Sample sparsely to keep per-frame validation cheap in live mode.
+    sample = np.frombuffer(frame_bytes, dtype=np.uint8)[::4096]
+    return sample.size > 0 and int(np.count_nonzero(sample)) == 0
+
 RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
     "nearest": cv2.INTER_NEAREST if cv2 is not None else 0,
     "bilinear": cv2.INTER_LINEAR if cv2 is not None else 1,
@@ -567,7 +577,7 @@ class AiSrOnnxEngine:
         target_h = FRAME_H
         method_name = str(method).strip().lower()
         upscale_interp = cv2.INTER_LANCZOS4
-        if method_name == "bilinear":
+        if method_name in {"bilinear", "bilinear_sharp"}:
             upscale_interp = cv2.INTER_LINEAR
         elif method_name in {"bicubic", "bicubic_sharpen"}:
             upscale_interp = cv2.INTER_CUBIC
@@ -590,6 +600,8 @@ class AiSrOnnxEngine:
 
         if method_name == "bicubic_sharpen":
             sr_rgb = cv2.addWeighted(sr_rgb, 1.35, cv2.GaussianBlur(sr_rgb, (0, 0), 1.0), -0.35, 0)
+        elif method_name == "bilinear_sharp":
+            sr_rgb = cv2.addWeighted(sr_rgb, 1.20, cv2.GaussianBlur(sr_rgb, (0, 0), 0.8), -0.20, 0)
 
         if self._detail_preserve_percent > 0.0:
             preserve = self._detail_preserve_percent / 100.0
@@ -623,7 +635,7 @@ def _create_processor(module: Any, cfg: dict[str, Any]):
     enable_basic_scaling = bool(cfg.get("enable_basic_scaling", cfg.get("enable_placeholder_sr", True)))
     basic_scaling_manual = int(cfg.get("basic_scaling_manual", cfg.get("sr_manual_scale", 4)))
     basic_scaling_auto_mode = bool(cfg.get("basic_scaling_auto_mode", cfg.get("sr_auto_mode", True)))
-    basic_scaling_method = str(cfg.get("basic_scaling_method", cfg.get("sr_flavor", "bicubic")))
+    basic_scaling_method = str(cfg.get("basic_scaling_method", cfg.get("sr_flavor", "bilinear_sharp")))
     max_auto_basic_scaling = int(cfg.get("max_auto_basic_scaling", cfg.get("max_auto_sr_scale", 4)))
     deinterlace_method = str(cfg.get("deinterlace_method", "bob"))
     denoise_method = str(cfg.get("denoise_method", "off"))
@@ -828,8 +840,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     latest_effective_sr_scale = 1
     latest_rtx_vsr_applied = False
     latest_rtx_effect_mean_abs_luma = 0.0
+    rtx_effect_sample_counter = 0
     processed_frame_counter = 0
     started_perf_ts = 0.0
+    stage_preprocess_applied_frames = 0
+    stage_basic_applied_frames = 0
+    stage_ai_applied_frames = 0
+    stage_rtx_applied_frames = 0
+    stage_passthrough_frames = 0
+    last_stage_preprocess_applied = False
+    last_stage_basic_applied = False
+    last_stage_ai_applied = False
+    last_stage_rtx_applied = False
+    last_stage_stack: list[str] = []
     ai_sr_enabled = bool(startup_config.get("ai_sr_enabled", False))
     ai_sr_model_path = str(startup_config.get("ai_sr_model_path", ""))
     ai_sr_provider = str(startup_config.get("ai_sr_provider", "cuda"))
@@ -850,6 +873,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     ai_sr_dropped_frames = 0
     ai_sr_applied_frames = 0
     ai_sr_passthrough_frames = 0
+    zeroed_output_warning_emitted = False
+    preprocess_noop_warning_emitted = False
     rtx_vsr_enabled = bool(startup_config.get("rtx_vsr_enabled", False))
     rtx_vsr_quality = str(startup_config.get("rtx_vsr_quality", "high")).strip().lower() or "high"
     rtx_vsr_scale = max(1, int(startup_config.get("rtx_vsr_scale", 2)))
@@ -862,7 +887,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     rtx_vsr_engine = None
     rtx_vsr_info: dict[str, object] | None = None
     rtx_vsr_error: str | None = None
-    current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bicubic"))
+    current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bilinear_sharp"))
     current_roi_x = int(startup_config.get("roi_x", 0))
     current_roi_y = int(startup_config.get("roi_y", 0))
     current_roi_w = int(startup_config.get("roi_w", FRAME_W))
@@ -881,6 +906,18 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             (not current_deinterlace_enabled)
             and (not denoise_enabled)
             and (not basic_scaling_enabled)
+            and (not ai_sr_enabled)
+            and (not rtx_vsr_enabled)
+        )
+
+    def _is_live_basic_scaling_fast_mode() -> bool:
+        # Basic scaling fast mode keeps processing in capture thread when the
+        # pipeline is native-only (no Python AI/RTX/preprocess stages).
+        denoise_enabled = current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
+        return (
+            (not current_deinterlace_enabled)
+            and (not denoise_enabled)
+            and basic_scaling_enabled
             and (not ai_sr_enabled)
             and (not rtx_vsr_enabled)
         )
@@ -1025,90 +1062,144 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             except queue.Full:
                 return True
 
-    def _preprocess_stage(frame_bytes: bytes) -> bytes:
-        if not ((ai_sr_enabled and ai_sr_engine is not None) or (rtx_vsr_enabled and rtx_vsr_engine is not None)):
-            # Non-AI mode uses a single fused C++ pass in _upscale_stage.
-            return frame_bytes
+    def _denoise_enabled() -> bool:
+        return current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
 
-        preprocess_for_ai = current_deinterlace_enabled or (
-            current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
-        )
+    def _is_valid_uyvy_frame(frame_bytes: bytes) -> bool:
+        return isinstance(frame_bytes, (bytes, bytearray)) and len(frame_bytes) == (UYVY_ROW_BYTES * FRAME_H)
 
-        if not preprocess_for_ai:
-            return frame_bytes
+    def _is_preprocess_enabled() -> bool:
+        return bool(current_deinterlace_enabled) or _denoise_enabled()
 
+    def _basic_scaling_enabled() -> bool:
+        return bool(basic_scaling_enabled)
+
+    def _preprocess_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
+        nonlocal preprocess_noop_warning_emitted
+        if not _is_preprocess_enabled():
+            return frame_bytes, False
+
+        native_out = frame_bytes
         if hasattr(processor, "process_frame_preprocess_only"):
-            return processor.process_frame_preprocess_only(frame_bytes)
+            native_out = processor.process_frame_preprocess_only(frame_bytes)
+        elif current_deinterlace_enabled and hasattr(processor, "process_frame_deinterlace_only"):
+            native_out = processor.process_frame_deinterlace_only(frame_bytes)
+        else:
+            return frame_bytes, False
 
-        if current_deinterlace_enabled and hasattr(processor, "process_frame_deinterlace_only"):
-            return processor.process_frame_deinterlace_only(frame_bytes)
+        native_invalid = (not _is_valid_uyvy_frame(native_out)) or _looks_zeroed_uyvy_frame(native_out)
+        if native_invalid:
+            if not preprocess_noop_warning_emitted:
+                _safe_put(
+                    {
+                        "type": "warning",
+                        "warning": "Native preprocess produced invalid/zero output in GPU-only mode.",
+                    }
+                )
+                preprocess_noop_warning_emitted = True
+            return frame_bytes, False
 
-        return frame_bytes
+        return native_out, True
 
-    def _upscale_stage(preprocessed_bytes: bytes) -> tuple[bytes, bool]:
-        # AI SR and basic CUDA upscale are mutually exclusive. If AI SR is enabled,
-        # always route through AI stage behavior and never invoke basic CUDA upscale.
-        if ai_sr_enabled and ai_sr_engine is not None:
-            ai_output_bytes, ai_applied = _apply_ai_sr(
-                preprocessed_bytes,
+    def _apply_basic_scaling_stage(frame_bytes: bytes, preprocess_already_applied: bool) -> tuple[bytes, bool]:
+        nonlocal zeroed_output_warning_emitted
+        if not _basic_scaling_enabled():
+            return frame_bytes, False
+
+        if preprocess_already_applied and hasattr(processor, "process_frame_no_deinterlace"):
+            scaled = processor.process_frame_no_deinterlace(frame_bytes)
+        else:
+            scaled = processor.process_frame(frame_bytes)
+
+        # Strict GPU-only mode: no CPU fallback.
+        if (not _is_valid_uyvy_frame(scaled)) or _looks_zeroed_uyvy_frame(scaled):
+            if not zeroed_output_warning_emitted:
+                _safe_put(
+                    {
+                        "type": "warning",
+                        "warning": "Native CUDA basic scaling produced invalid/zero output in GPU-only mode.",
+                    }
+                )
+                zeroed_output_warning_emitted = True
+            return frame_bytes, False
+
+        return scaled, True
+
+    def _apply_rtx_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
+        if not (rtx_vsr_enabled and rtx_vsr_engine is not None):
+            return frame_bytes, False
+        try:
+            rtx_out = _apply_rtx_vsr(
+                frame_bytes,
                 (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
-                current_basic_scaling_method,
             )
-            return ai_output_bytes, ai_applied
+            if _looks_zeroed_uyvy_frame(rtx_out):
+                return frame_bytes, False
+            return rtx_out, True
+        except Exception as rtx_exc:
+            _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {rtx_exc}"})
+            return frame_bytes, False
 
+    def _build_stage_stack() -> list[str]:
+        # Plugin-style stage ordering: each enabled filter is appended in order,
+        # and output of one stage becomes input to the next stage.
+        stack: list[str] = []
+        if _is_preprocess_enabled():
+            stack.append("preprocess")
+        if ai_sr_enabled and ai_sr_engine is not None:
+            stack.append("ai_sr")
         if rtx_vsr_enabled and rtx_vsr_engine is not None:
-            try:
-                return _apply_rtx_vsr(
-                    preprocessed_bytes,
+            stack.append("rtx_vsr")
+        if _basic_scaling_enabled():
+            stack.append("basic_scaling")
+        return stack
+
+    def _process_pipeline_frame(frame_bytes: bytes) -> tuple[bytes, bool, bool, bool, bool]:
+        # Canonical plugin chain:
+        # preprocess (deinterlace/denoise) -> AI SR -> RTX VSR -> basic scaling.
+        stage_stack = _build_stage_stack()
+        if not stage_stack:
+            return frame_bytes, False, False, False, False
+
+        preprocess_applied = False
+        working = frame_bytes
+        ai_applied = False
+        rtx_applied = False
+        basic_applied = False
+
+        for stage_name in stage_stack:
+            if stage_name == "preprocess":
+                working, preprocess_applied = _preprocess_stage(working)
+                continue
+
+            if stage_name == "ai_sr":
+                ai_out, ai_applied = _apply_ai_sr(
+                    working,
                     (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
-                ), True
-            except Exception as rtx_exc:
-                _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {rtx_exc}"})
-                return preprocessed_bytes, False
+                    current_basic_scaling_method,
+                )
+                if _looks_zeroed_uyvy_frame(ai_out):
+                    ai_out = working
+                    ai_applied = False
+                working = ai_out
+                continue
 
-        # Fused path: deinterlace + denoise + basic scaling in one GPU pass.
-        return processor.process_frame(preprocessed_bytes), False
+            if stage_name == "rtx_vsr":
+                working, rtx_applied = _apply_rtx_stage(working)
+                continue
 
-    def _process_pipeline_frame(frame_bytes: bytes) -> tuple[bytes, bool]:
-        if rtx_vsr_enabled and rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None):
-            preprocessed = _preprocess_stage(frame_bytes)
-            return _upscale_stage(preprocessed)
+            if stage_name == "basic_scaling":
+                working, basic_applied = _apply_basic_scaling_stage(working, preprocess_applied)
+                continue
 
-        if not (ai_sr_enabled and ai_sr_engine is not None):
-            return processor.process_frame(frame_bytes), False
-
-        frame_for_ai = frame_bytes
-
-        preprocess_for_ai = current_deinterlace_enabled or (
-            current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
-        )
-
-        if preprocess_for_ai:
-            if hasattr(processor, "process_frame_preprocess_only"):
-                frame_for_ai = processor.process_frame_preprocess_only(frame_for_ai)
-            elif current_deinterlace_enabled and hasattr(processor, "process_frame_deinterlace_only"):
-                frame_for_ai = processor.process_frame_deinterlace_only(frame_for_ai)
-
-        ai_output_bytes, ai_applied = _apply_ai_sr(
-            frame_for_ai,
-            (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
-            current_basic_scaling_method,
-        )
-
-        if ai_applied and ai_sr_engine is not None:
-            return ai_output_bytes, True
-
-        if hasattr(processor, "process_frame_no_deinterlace"):
-            return processor.process_frame_no_deinterlace(ai_output_bytes), ai_applied
-
-        return processor.process_frame(ai_output_bytes), ai_applied
+        return working, preprocess_applied, basic_applied, ai_applied, rtx_applied
 
     def _stop_live_pipeline() -> None:
         nonlocal pipeline_running, capture_thread, preprocess_thread, upscale_thread, output_thread
         if not pipeline_running:
             return
         pipeline_stop_event.set()
-        for thread in (capture_thread, preprocess_thread, upscale_thread, output_thread):
+        for thread in (capture_thread, upscale_thread, output_thread):
             if thread is not None:
                 thread.join(timeout=1.0)
         capture_thread = None
@@ -1124,13 +1215,18 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+        nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted
+        nonlocal rtx_effect_sample_counter
+        nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
+        nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
+        nonlocal last_stage_stack
         if capture_session is None or output_session is None:
             raise RuntimeError("Cannot start pipeline without active DeckLink sessions")
 
         _stop_live_pipeline()
         pipeline_stop_event.clear()
         q_capture_to_preprocess = queue.Queue(maxsize=2)
-        q_preprocess_to_upscale = queue.Queue(maxsize=2)
+        q_preprocess_to_upscale = None
         q_upscale_to_output = queue.Queue(maxsize=1)
         frame_id_counter = 0
         capture_drop_count = 0
@@ -1141,13 +1237,28 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         latest_effective_sr_scale = 1
         latest_rtx_vsr_applied = False
         latest_rtx_effect_mean_abs_luma = 0.0
+        rtx_effect_sample_counter = 0
         processed_frame_counter = 0
         started_perf_ts = time.perf_counter()
+        stage_preprocess_applied_frames = 0
+        stage_basic_applied_frames = 0
+        stage_ai_applied_frames = 0
+        stage_rtx_applied_frames = 0
+        stage_passthrough_frames = 0
+        last_stage_preprocess_applied = False
+        last_stage_basic_applied = False
+        last_stage_ai_applied = False
+        last_stage_rtx_applied = False
+        last_stage_stack = []
+        preprocess_noop_warning_emitted = False
 
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+            nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
+            nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
+            nonlocal last_stage_stack
             assert q_capture_to_preprocess is not None
             while not pipeline_stop_event.is_set():
                 try:
@@ -1161,6 +1272,10 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Capture frame conversion failed: {exc}"})
                     continue
+
+                # Keep input preview live even when processing is backlogged.
+                with state_lock:
+                    latest_input_frame = input_bytes
 
                 if _is_live_passthrough_mode():
                     # In zero-processing mode, avoid staged queueing and preserve output cadence.
@@ -1180,62 +1295,105 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         processed_frame_counter += 1
                     continue
 
+                if _is_live_basic_scaling_fast_mode():
+                    # Keep basic-scaling-only path off the staged queue graph to
+                    # reduce Python scheduling overhead at 1080p60.
+                    try:
+                        output_bytes, basic_applied = _apply_basic_scaling_stage(input_bytes, False)
+                    except Exception as exc:
+                        _safe_put({"type": "warning", "warning": f"Basic scaling fast path failed: {exc}"})
+                        continue
+
+                    try:
+                        if output_session is not None:
+                            _write_frame_to_output(output_session, output_bytes)
+                    except Exception as exc:
+                        _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
+                        continue
+
+                    if basic_applied:
+                        stage_basic_applied_frames += 1
+                    else:
+                        stage_passthrough_frames += 1
+
+                    last_stage_preprocess_applied = False
+                    last_stage_basic_applied = bool(basic_applied)
+                    last_stage_ai_applied = False
+                    last_stage_rtx_applied = False
+                    last_stage_stack = ["basic_scaling"] if basic_applied else []
+
+                    with state_lock:
+                        latest_input_frame = input_bytes
+                        latest_output_frame = output_bytes
+                        latest_effective_sr_scale = int(processor.get_effective_sr_scale())
+                        latest_rtx_vsr_applied = False
+                        latest_rtx_effect_mean_abs_luma = 0.0
+                        processed_frame_counter += 1
+                    continue
+
                 frame_id_counter += 1
                 item = _StageFrame(frame_id=frame_id_counter, captured_ts=time.perf_counter(), input_bytes=input_bytes)
                 if _put_latest_stage_frame(q_capture_to_preprocess, item):
                     capture_drop_count += 1
 
-        def _preprocess_worker() -> None:
-            nonlocal preprocess_drop_count
+        def _upscale_worker() -> None:
+            nonlocal upscale_drop_count, ai_sr_dropped_frames, preprocess_drop_count
+            nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
+            nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
+            nonlocal last_stage_stack
             assert q_capture_to_preprocess is not None
-            assert q_preprocess_to_upscale is not None
+            assert q_upscale_to_output is not None
             while not pipeline_stop_event.is_set():
                 try:
                     item = q_capture_to_preprocess.get(timeout=0.01)
                 except queue.Empty:
                     continue
-                try:
-                    item.preprocess_bytes = _preprocess_stage(item.input_bytes)
-                except Exception as exc:
-                    _safe_put({"type": "warning", "warning": f"Preprocess stage failed: {exc}"})
-                    continue
-                if _put_latest_stage_frame(q_preprocess_to_upscale, item):
-                    preprocess_drop_count += 1
 
-        def _upscale_worker() -> None:
-            nonlocal upscale_drop_count, ai_sr_dropped_frames
-            assert q_preprocess_to_upscale is not None
-            assert q_upscale_to_output is not None
-            while not pipeline_stop_event.is_set():
                 try:
-                    item = q_preprocess_to_upscale.get(timeout=0.01)
-                except queue.Empty:
+                    item.preprocess_bytes = item.input_bytes
+                except Exception as exc:
+                    preprocess_drop_count += 1
+                    _safe_put({"type": "warning", "warning": f"Preprocess stage failed: {exc}"})
                     continue
 
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
-                    output_bytes, ai_applied = _upscale_stage(preprocessed)
+                    output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied = _process_pipeline_frame(preprocessed)
+                    stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Upscale stage failed: {exc}"})
                     continue
 
-                if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
+                if ai_sr_engine is not None and not stage_applied and _ai_inference_busy():
                     ai_sr_dropped_frames += 1
 
+                if preprocess_applied:
+                    stage_preprocess_applied_frames += 1
+                if basic_applied:
+                    stage_basic_applied_frames += 1
+                if ai_applied:
+                    stage_ai_applied_frames += 1
+                if rtx_applied:
+                    stage_rtx_applied_frames += 1
+                if not stage_applied:
+                    stage_passthrough_frames += 1
+
+                last_stage_preprocess_applied = bool(preprocess_applied)
+                last_stage_basic_applied = bool(basic_applied)
+                last_stage_ai_applied = bool(ai_applied)
+                last_stage_rtx_applied = bool(rtx_applied)
+                last_stage_stack = _build_stage_stack()
+
                 item.output_bytes = output_bytes
-                item.ai_applied = ai_applied
-                item.rtx_applied = bool(
-                    ai_applied
-                    and rtx_vsr_enabled
-                    and rtx_vsr_engine is not None
-                    and not (ai_sr_enabled and ai_sr_engine is not None)
-                )
+                item.ai_applied = bool(ai_applied)
+                item.rtx_applied = bool(rtx_applied)
                 if _put_latest_stage_frame(q_upscale_to_output, item):
                     upscale_drop_count += 1
 
         def _output_worker() -> None:
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+            nonlocal rtx_effect_sample_counter
             assert q_upscale_to_output is not None
             while not pipeline_stop_event.is_set():
                 try:
@@ -1244,24 +1402,25 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     continue
 
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
-                # A lightweight, sampled UYVY byte-delta metric helps verify that
-                # RTX VSR is measurably altering output in real time.
                 sampled_delta = 0.0
-                try:
-                    in_arr = np.frombuffer(item.input_bytes, dtype=np.uint8)
-                    out_arr = np.frombuffer(output_bytes, dtype=np.uint8)
-                    if in_arr.size == out_arr.size and in_arr.size > 0:
-                        step = 8
-                        sampled_delta = float(
-                            np.mean(
-                                np.abs(
-                                    in_arr[::step].astype(np.int16)
-                                    - out_arr[::step].astype(np.int16)
+                if item.rtx_applied:
+                    rtx_effect_sample_counter += 1
+                    if (rtx_effect_sample_counter % 12) == 0:
+                        try:
+                            in_arr = np.frombuffer(item.input_bytes, dtype=np.uint8)
+                            out_arr = np.frombuffer(output_bytes, dtype=np.uint8)
+                            if in_arr.size == out_arr.size and in_arr.size > 0:
+                                step = 32
+                                sampled_delta = float(
+                                    np.mean(
+                                        np.abs(
+                                            in_arr[::step].astype(np.int16)
+                                            - out_arr[::step].astype(np.int16)
+                                        )
+                                    )
                                 )
-                            )
-                        )
-                except Exception:
-                    sampled_delta = 0.0
+                        except Exception:
+                            sampled_delta = 0.0
 
                 try:
                     if output_session is not None:
@@ -1279,12 +1438,11 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     processed_frame_counter += 1
 
         capture_thread = threading.Thread(target=_capture_worker, name="vp-capture", daemon=True)
-        preprocess_thread = threading.Thread(target=_preprocess_worker, name="vp-preprocess", daemon=True)
+        preprocess_thread = None
         upscale_thread = threading.Thread(target=_upscale_worker, name="vp-upscale", daemon=True)
         output_thread = threading.Thread(target=_output_worker, name="vp-output", daemon=True)
 
         capture_thread.start()
-        preprocess_thread.start()
         upscale_thread.start()
         output_thread.start()
         pipeline_running = True
@@ -1547,6 +1705,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     _safe_put({"type": "decklink_no_frame", "reason": "sessions_not_started"})
                     continue
 
+                include_frames = bool(message.get("include_frames", True))
+
                 with state_lock:
                     current_input = latest_input_frame
                     current_output = latest_output_frame
@@ -1566,38 +1726,62 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     "preprocess_to_upscale": 0 if q_preprocess_to_upscale is None else q_preprocess_to_upscale.qsize(),
                     "upscale_to_output": 0 if q_upscale_to_output is None else q_upscale_to_output.qsize(),
                 }
-                _safe_put(
-                    {
-                        "type": "decklink_frame",
-                        "input_frame_bytes": current_input,
-                        "output_frame_bytes": current_output,
-                        "effective_sr_scale": current_scale,
-                        "processed_frame_counter": current_counter,
-                        "processed_fps": processed_fps,
-                        "ai_sr_applied_frames": int(ai_sr_applied_frames),
-                        "ai_sr_passthrough_frames": int(ai_sr_passthrough_frames),
-                        "rtx_vsr_applied": current_rtx_applied,
-                        "rtx_effect_mean_abs_luma": current_rtx_delta,
-                        "pipeline_running": bool(pipeline_running),
-                        "stage_queue_depths": stage_depths,
-                        "stage_drop_counts": {
-                            "capture": int(capture_drop_count),
-                            "preprocess": int(preprocess_drop_count),
-                            "upscale": int(upscale_drop_count),
-                        },
-                    }
-                )
+                payload: dict[str, object] = {
+                    "type": "decklink_frame",
+                    "effective_sr_scale": current_scale,
+                    "processed_frame_counter": current_counter,
+                    "processed_fps": processed_fps,
+                    "ai_sr_applied_frames": int(ai_sr_applied_frames),
+                    "ai_sr_passthrough_frames": int(ai_sr_passthrough_frames),
+                    "rtx_vsr_applied": current_rtx_applied,
+                    "rtx_effect_mean_abs_luma": current_rtx_delta,
+                    "stage_enable_flags": {
+                        "preprocess": bool(_is_preprocess_enabled()),
+                        "basic_scaling": bool(_basic_scaling_enabled()),
+                        "ai_sr": bool(ai_sr_enabled and ai_sr_engine is not None),
+                        "rtx_vsr": bool(rtx_vsr_enabled and rtx_vsr_engine is not None),
+                    },
+                    "stage_last_applied": {
+                        "preprocess": bool(last_stage_preprocess_applied),
+                        "basic_scaling": bool(last_stage_basic_applied),
+                        "ai_sr": bool(last_stage_ai_applied),
+                        "rtx_vsr": bool(last_stage_rtx_applied),
+                    },
+                    "stage_stack": list(last_stage_stack),
+                    "stage_apply_counts": {
+                        "preprocess": int(stage_preprocess_applied_frames),
+                        "basic_scaling": int(stage_basic_applied_frames),
+                        "ai_sr": int(stage_ai_applied_frames),
+                        "rtx_vsr": int(stage_rtx_applied_frames),
+                        "passthrough": int(stage_passthrough_frames),
+                    },
+                    "pipeline_running": bool(pipeline_running),
+                    "stage_queue_depths": stage_depths,
+                    "stage_drop_counts": {
+                        "capture": int(capture_drop_count),
+                        "preprocess": int(preprocess_drop_count),
+                        "upscale": int(upscale_drop_count),
+                    },
+                }
+                if include_frames:
+                    payload["input_frame_bytes"] = current_input
+                    payload["output_frame_bytes"] = current_output
+                _safe_put(payload)
                 continue
 
             if command == "process_frame":
                 frame_id = int(message["frame_id"])
                 frame_bytes = message["frame_bytes"]
-                output_bytes, ai_applied = _process_pipeline_frame(frame_bytes)
+                output_bytes, _, basic_applied, ai_applied, rtx_applied = _process_pipeline_frame(frame_bytes)
 
                 if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
                     ai_sr_dropped_frames += 1
 
                 latest_output_frame = output_bytes
+                last_stage_basic_applied = bool(basic_applied)
+                last_stage_ai_applied = bool(ai_applied)
+                last_stage_rtx_applied = bool(rtx_applied)
+                last_stage_stack = _build_stage_stack()
                 _safe_put(
                     {
                         "type": "frame",
@@ -1631,7 +1815,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if command in {"set_basic_scaling_method", "set_sr_flavor"}:
-                applied_basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", "bicubic")))
+                applied_basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", "bilinear_sharp")))
                 if hasattr(processor, "set_sr_flavor"):
                     processor.set_sr_flavor(applied_basic_scaling_method)
                     if hasattr(processor, "get_sr_flavor"):
@@ -1650,6 +1834,13 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             if command == "set_deinterlace_enabled":
                 current_deinterlace_enabled = bool(message["enabled"])
                 processor.set_deinterlace_enabled(current_deinterlace_enabled)
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_deinterlace_enabled",
+                        "deinterlace_enabled": bool(current_deinterlace_enabled),
+                    }
+                )
                 continue
 
             if command == "set_deinterlace_method":

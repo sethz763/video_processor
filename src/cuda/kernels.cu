@@ -2,9 +2,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace vp::cuda_kernels {
 namespace {
+
+inline void CheckKernelLaunch(const char* op) {
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string(op) + " failed: " + cudaGetErrorString(err));
+    }
+}
 
 __device__ inline uint8_t ClampToU8(float v) {
     v = fminf(255.0f, fmaxf(0.0f, v));
@@ -12,25 +21,35 @@ __device__ inline uint8_t ClampToU8(float v) {
 }
 
 __device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v) {
-    const float yf = static_cast<float>(y);
-    const float uf = static_cast<float>(u) - 128.0f;
-    const float vf = static_cast<float>(v) - 128.0f;
+    // BT.601 limited-range conversion (Y:16-235, U/V:16-240), used by UYVY video feeds.
+    const float c = static_cast<float>(y) - 16.0f;
+    const float d = static_cast<float>(u) - 128.0f;
+    const float e = static_cast<float>(v) - 128.0f;
 
-    const float r = yf + 1.402f * vf;
-    const float g = yf - 0.344136f * uf - 0.714136f * vf;
-    const float b = yf + 1.772f * uf;
+    const float r = 1.164383f * c + 1.596027f * e;
+    const float g = 1.164383f * c - 0.391762f * d - 0.812968f * e;
+    const float b = 1.164383f * c + 2.017232f * d;
 
     return make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
 }
 
-__device__ inline void RgbToYuv(const uchar3& rgb, float& y, float& u, float& v) {
+struct YuvF {
+    float y;
+    float u;
+    float v;
+};
+
+__device__ inline YuvF RgbToYuv(const uchar3& rgb) {
     const float r = static_cast<float>(rgb.x);
     const float g = static_cast<float>(rgb.y);
     const float b = static_cast<float>(rgb.z);
 
-    y = 0.299f * r + 0.587f * g + 0.114f * b;
-    u = -0.169f * r - 0.331f * g + 0.5f * b + 128.0f;
-    v = 0.5f * r - 0.419f * g - 0.081f * b + 128.0f;
+    // BT.601 limited-range conversion (inverse of MakeRgbFromYuv).
+    return {
+        16.0f + 0.256788f * r + 0.504129f * g + 0.097906f * b,
+        128.0f - 0.148223f * r - 0.290993f * g + 0.439216f * b,
+        128.0f + 0.439216f * r - 0.367788f * g - 0.071427f * b,
+    };
 }
 
 __global__ void UyvyToRgbKernel(const uint8_t* uyvy, uchar3* rgb, int width, int height) {
@@ -51,6 +70,76 @@ __global__ void UyvyToRgbKernel(const uint8_t* uyvy, uchar3* rgb, int width, int
 
     const uint8_t luma = (x & 1) ? y1 : y0;
     rgb[y * width + x] = MakeRgbFromYuv(luma, u, v);
+}
+
+__device__ inline void SampleUyvyPixel(
+    const uint8_t* uyvy,
+    int width,
+    int height,
+    int x,
+    int y,
+    uint8_t& out_y,
+    uint8_t& out_u,
+    uint8_t& out_v
+) {
+    const int sx = max(0, min(width - 1, x));
+    const int sy = max(0, min(height - 1, y));
+    const int pair_x = sx >> 1;
+    const int pair_index = (sy * (width >> 1) + pair_x) * 4;
+
+    const uint8_t u = uyvy[pair_index + 0];
+    const uint8_t y0 = uyvy[pair_index + 1];
+    const uint8_t v = uyvy[pair_index + 2];
+    const uint8_t y1 = uyvy[pair_index + 3];
+
+    out_y = (sx & 1) ? y1 : y0;
+    out_u = u;
+    out_v = v;
+}
+
+__global__ void UyvyCropZoomNearestKernel(
+    const uint8_t* uyvy_in,
+    int src_width,
+    int src_height,
+    uint8_t* uyvy_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h
+) {
+    const int out_pair_x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int out_pairs_per_row = out_width >> 1;
+    if (out_pair_x >= out_pairs_per_row || y >= out_height) {
+        return;
+    }
+
+    const int x0 = out_pair_x << 1;
+    const int x1 = x0 + 1;
+
+    const float u0 = (static_cast<float>(x0) + 0.5f) / static_cast<float>(out_width);
+    const float u1 = (static_cast<float>(x1) + 0.5f) / static_cast<float>(out_width);
+    const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(out_height);
+
+    const int src_x0 = max(0, min(src_width - 1, static_cast<int>(roi_x + u0 * static_cast<float>(roi_w - 1) + 0.5f)));
+    const int src_x1 = max(0, min(src_width - 1, static_cast<int>(roi_x + u1 * static_cast<float>(roi_w - 1) + 0.5f)));
+    const int src_y = max(0, min(src_height - 1, static_cast<int>(roi_y + v * static_cast<float>(roi_h - 1) + 0.5f)));
+
+    uint8_t y0, u_a, v_a;
+    uint8_t y1, u_b, v_b;
+    SampleUyvyPixel(uyvy_in, src_width, src_height, src_x0, src_y, y0, u_a, v_a);
+    SampleUyvyPixel(uyvy_in, src_width, src_height, src_x1, src_y, y1, u_b, v_b);
+
+    const uint8_t u = static_cast<uint8_t>((static_cast<int>(u_a) + static_cast<int>(u_b)) >> 1);
+    const uint8_t vv = static_cast<uint8_t>((static_cast<int>(v_a) + static_cast<int>(v_b)) >> 1);
+
+    const int out_base = (y * out_pairs_per_row + out_pair_x) * 4;
+    uyvy_out[out_base + 0] = u;
+    uyvy_out[out_base + 1] = y0;
+    uyvy_out[out_base + 2] = vv;
+    uyvy_out[out_base + 3] = y1;
 }
 
 __global__ void BobDeinterlaceKernel(const uchar3* rgb_in, uchar3* rgb_out, int width, int height) {
@@ -395,6 +484,33 @@ __device__ inline uchar3 SampleBilinear(const uchar3* src, int width, int height
     );
 }
 
+__device__ inline uchar3 SampleBilinearSharp(const uchar3* src, int width, int height, float x, float y) {
+    const uchar3 c = SampleBilinear(src, width, height, x, y);
+
+    const int ix = max(0, min(width - 1, static_cast<int>(x + 0.5f)));
+    const int iy = max(0, min(height - 1, static_cast<int>(y + 0.5f)));
+
+    const uchar3 n = src[max(0, iy - 1) * width + ix];
+    const uchar3 s = src[min(height - 1, iy + 1) * width + ix];
+    const uchar3 w = src[iy * width + max(0, ix - 1)];
+    const uchar3 e = src[iy * width + min(width - 1, ix + 1)];
+
+    const float amount = 0.60f;
+    const float c_r = static_cast<float>(c.x);
+    const float c_g = static_cast<float>(c.y);
+    const float c_b = static_cast<float>(c.z);
+
+    const float blur_r = 0.25f * (static_cast<float>(n.x) + static_cast<float>(s.x) + static_cast<float>(w.x) + static_cast<float>(e.x));
+    const float blur_g = 0.25f * (static_cast<float>(n.y) + static_cast<float>(s.y) + static_cast<float>(w.y) + static_cast<float>(e.y));
+    const float blur_b = 0.25f * (static_cast<float>(n.z) + static_cast<float>(s.z) + static_cast<float>(w.z) + static_cast<float>(e.z));
+
+    return make_uchar3(
+        ClampToU8(c_r + amount * (c_r - blur_r)),
+        ClampToU8(c_g + amount * (c_g - blur_g)),
+        ClampToU8(c_b + amount * (c_b - blur_b))
+    );
+}
+
 __global__ void CropZoomBilinearKernel(
     const uchar3* rgb_in,
     int src_width,
@@ -449,6 +565,34 @@ __global__ void CropZoomBicubicKernel(
     const float src_y = static_cast<float>(roi_y) + v * static_cast<float>(roi_h - 1);
 
     rgb_out[y * out_width + x] = SampleBicubic(rgb_in, src_width, src_height, src_x, src_y);
+}
+
+__global__ void CropZoomBilinearSharpKernel(
+    const uchar3* rgb_in,
+    int src_width,
+    int src_height,
+    uchar3* rgb_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= out_width || y >= out_height) {
+        return;
+    }
+
+    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(out_width);
+    const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(out_height);
+
+    const float src_x = static_cast<float>(roi_x) + u * static_cast<float>(roi_w - 1);
+    const float src_y = static_cast<float>(roi_y) + v * static_cast<float>(roi_h - 1);
+
+    rgb_out[y * out_width + x] = SampleBilinearSharp(rgb_in, src_width, src_height, src_x, src_y);
 }
 
 __global__ void Sharpen3x3Kernel(
@@ -550,6 +694,112 @@ __global__ void UpscaleBilinearKernel(
     rgb_out[y * out_width + x] = SampleBilinear(rgb_in, in_width, in_height, src_x, src_y);
 }
 
+__global__ void UpscaleBilinearSharpKernel(
+    const uchar3* rgb_in,
+    int in_width,
+    int in_height,
+    uchar3* rgb_out,
+    int out_width,
+    int out_height
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= out_width || y >= out_height) {
+        return;
+    }
+
+    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(out_width);
+    const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(out_height);
+    const float src_x = u * static_cast<float>(in_width - 1);
+    const float src_y = v * static_cast<float>(in_height - 1);
+
+    rgb_out[y * out_width + x] = SampleBilinearSharp(rgb_in, in_width, in_height, src_x, src_y);
+}
+
+__device__ inline float BilateralRangeWeight(float diff, float inv_sigma_sq) {
+    const float v = diff * diff * inv_sigma_sq;
+    return __fdividef(1.0f, 1.0f + v);
+}
+
+__global__ void DenoiseLumaBilateral3x3Kernel(
+    const uchar3* rgb_in,
+    uchar3* rgb_out,
+    int width,
+    int height,
+    float strength
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const uchar3 c = rgb_in[y * width + x];
+    const float y_center = RgbLuma(c);
+    const float sigma = 8.0f + 52.0f * strength;
+    const float inv_sigma_sq = __fdividef(1.0f, sigma * sigma + 1e-3f);
+
+    float weighted_sum = 0.0f;
+    float sum_w = 0.0f;
+    for (int j = -1; j <= 1; ++j) {
+        const int sy = max(0, min(height - 1, y + j));
+        for (int i = -1; i <= 1; ++i) {
+            const int sx = max(0, min(width - 1, x + i));
+            const float l = RgbLuma(rgb_in[sy * width + sx]);
+            const float spatial_w = static_cast<float>((i == 0 && j == 0) ? 4 : ((i == 0 || j == 0) ? 2 : 1));
+            const float w = spatial_w * BilateralRangeWeight(l - y_center, inv_sigma_sq);
+            weighted_sum += w * l;
+            sum_w += w;
+        }
+    }
+
+    const float y_filtered = (sum_w > 1e-6f) ? (weighted_sum / sum_w) : y_center;
+    const float y_new = y_center + strength * (y_filtered - y_center);
+    rgb_out[y * width + x] = ApplyLumaDelta(c, y_new - y_center);
+}
+
+__global__ void DenoiseLumaBilateral5x5Kernel(
+    const uchar3* rgb_in,
+    uchar3* rgb_out,
+    int width,
+    int height,
+    float strength
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int g[5] = {1, 4, 6, 4, 1};
+
+    const uchar3 c = rgb_in[y * width + x];
+    const float y_center = RgbLuma(c);
+    const float sigma = 10.0f + 68.0f * strength;
+    const float inv_sigma_sq = __fdividef(1.0f, sigma * sigma + 1e-3f);
+
+    float weighted_sum = 0.0f;
+    float sum_w = 0.0f;
+    for (int j = -2; j <= 2; ++j) {
+        const int sy = max(0, min(height - 1, y + j));
+        for (int i = -2; i <= 2; ++i) {
+            const int sx = max(0, min(width - 1, x + i));
+            const float l = RgbLuma(rgb_in[sy * width + sx]);
+            const float spatial_w = static_cast<float>(g[j + 2] * g[i + 2]);
+            const float w = spatial_w * BilateralRangeWeight(l - y_center, inv_sigma_sq);
+            weighted_sum += w * l;
+            sum_w += w;
+        }
+    }
+
+    const float y_filtered = (sum_w > 1e-6f) ? (weighted_sum / sum_w) : y_center;
+    const float y_new = y_center + strength * (y_filtered - y_center);
+    rgb_out[y * width + x] = ApplyLumaDelta(c, y_new - y_center);
+}
+
 __global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int height) {
     const int pair_x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -565,15 +815,13 @@ __global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int
     const uchar3 p0 = rgb[y * width + x0];
     const uchar3 p1 = rgb[y * width + x1];
 
-    float y0, u0, v0;
-    float y1, u1, v1;
-    RgbToYuv(p0, y0, u0, v0);
-    RgbToYuv(p1, y1, u1, v1);
+    const YuvF yuv0 = RgbToYuv(p0);
+    const YuvF yuv1 = RgbToYuv(p1);
 
-    const uint8_t y0_u8 = ClampToU8(y0);
-    const uint8_t y1_u8 = ClampToU8(y1);
-    const uint8_t u_u8 = ClampToU8((u0 + u1) * 0.5f);
-    const uint8_t v_u8 = ClampToU8((v0 + v1) * 0.5f);
+    const uint8_t y0_u8 = ClampToU8(yuv0.y);
+    const uint8_t y1_u8 = ClampToU8(yuv1.y);
+    const uint8_t u_u8 = ClampToU8((yuv0.u + yuv1.u) * 0.5f);
+    const uint8_t v_u8 = ClampToU8((yuv0.v + yuv1.v) * 0.5f);
 
     const int base = (y * pairs_per_row + pair_x) * 4;
     uyvy[base + 0] = u_u8;
@@ -597,6 +845,40 @@ void LaunchUyvyToRgb(const uint8_t* d_uyvy, uchar3* d_rgb, int width, int height
         width,
         height
     );
+    CheckKernelLaunch("UyvyToRgbKernel launch");
+}
+
+void LaunchUyvyCropZoomNearest(
+    const uint8_t* d_uyvy_in,
+    int src_width,
+    int src_height,
+    uint8_t* d_uyvy_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const dim3 grid(((out_width >> 1) + kBlockX - 1) / kBlockX, (out_height + kBlockY - 1) / kBlockY, 1);
+    const dim3 block(kBlockX, kBlockY, 1);
+
+    UyvyCropZoomNearestKernel<<<grid, block, 0, stream>>>(
+        d_uyvy_in,
+        src_width,
+        src_height,
+        d_uyvy_out,
+        out_width,
+        out_height,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h
+    );
+    CheckKernelLaunch("UyvyCropZoomNearestKernel launch");
 }
 
 void LaunchBobDeinterlace(const uchar3* d_rgb_in, uchar3* d_rgb_out, int width, int height, cudaStream_t stream) {
@@ -674,6 +956,27 @@ void LaunchUpscaleBilinear(
     );
 }
 
+void LaunchUpscaleBilinearSharp(
+    const uchar3* d_rgb_in,
+    int in_width,
+    int in_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    UpscaleBilinearSharpKernel<<<Grid2D(out_width, out_height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        in_width,
+        in_height,
+        d_rgb_out,
+        out_width,
+        out_height
+    );
+}
+
 void LaunchCropZoomBilinear(
     const uchar3* d_rgb_in,
     int src_width,
@@ -701,6 +1004,7 @@ void LaunchCropZoomBilinear(
         roi_w,
         roi_h
     );
+    CheckKernelLaunch("CropZoomBilinearKernel launch");
 }
 
 void LaunchCropZoomBicubic(
@@ -730,6 +1034,37 @@ void LaunchCropZoomBicubic(
         roi_w,
         roi_h
     );
+    CheckKernelLaunch("CropZoomBicubicKernel launch");
+}
+
+void LaunchCropZoomBilinearSharp(
+    const uchar3* d_rgb_in,
+    int src_width,
+    int src_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    CropZoomBilinearSharpKernel<<<Grid2D(out_width, out_height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        src_width,
+        src_height,
+        d_rgb_out,
+        out_width,
+        out_height,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h
+    );
+    CheckKernelLaunch("CropZoomBilinearSharpKernel launch");
 }
 
 void LaunchSharpen3x3(
@@ -787,6 +1122,44 @@ void LaunchDenoiseLumaMedian3x3(
     );
 }
 
+void LaunchDenoiseLumaBilateral3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    DenoiseLumaBilateral3x3Kernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height,
+        fminf(1.0f, fmaxf(0.0f, strength))
+    );
+}
+
+void LaunchDenoiseLumaBilateral5x5(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    DenoiseLumaBilateral5x5Kernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in,
+        d_rgb_out,
+        width,
+        height,
+        fminf(1.0f, fmaxf(0.0f, strength))
+    );
+}
+
 void LaunchDenoiseFieldTemporalLuma(
     const uchar3* d_rgb_in,
     const uchar3* d_rgb_prev,
@@ -815,6 +1188,7 @@ void LaunchRgbToUyvy(const uchar3* d_rgb, uint8_t* d_uyvy, int width, int height
     const dim3 block(kBlockX, kBlockY, 1);
 
     RgbToUyvyKernel<<<grid, block, 0, stream>>>(d_rgb, d_uyvy, width, height);
+    CheckKernelLaunch("RgbToUyvyKernel launch");
 }
 
 } // namespace vp::cuda_kernels

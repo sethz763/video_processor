@@ -146,13 +146,13 @@ PYBIND11_MODULE(video_processor, m) {
             "set_sr_flavor",
             &vp::VideoProcessor::SetSrFlavorByName,
             py::arg("sr_flavor"),
-            "Set SR flavor to one of [bilinear, bicubic, bicubic_sharpen]."
+            "Set SR flavor to one of [bilinear, bilinear_sharp, bicubic, bicubic_sharpen]."
         )
         .def(
             "set_basic_scaling_method",
             &vp::VideoProcessor::SetSrFlavorByName,
             py::arg("method"),
-            "Set basic scaling method to one of [bilinear, bicubic, bicubic_sharpen]."
+            "Set basic scaling method to one of [bilinear, bilinear_sharp, bicubic, bicubic_sharpen]."
         )
         .def(
             "get_sr_flavor",
@@ -190,7 +190,7 @@ PYBIND11_MODULE(video_processor, m) {
             "set_denoise_method",
             &vp::VideoProcessor::SetDenoiseMethodByName,
             py::arg("method"),
-            "Set denoise method to one of [off, luma_gaussian3x3, luma_median3x3, field_temporal_luma]."
+            "Set denoise method to one of [off, luma_gaussian3x3, luma_median3x3, luma_bilateral3x3, luma_bilateral5x5, field_temporal_luma]."
         )
         .def(
             "get_denoise_method",

@@ -14,6 +14,20 @@ void LaunchUyvyToRgb(
     cudaStream_t stream
 );
 
+void LaunchUyvyCropZoomNearest(
+    const uint8_t* d_uyvy_in,
+    int src_width,
+    int src_height,
+    uint8_t* d_uyvy_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    cudaStream_t stream
+);
+
 void LaunchBobDeinterlace(
     const uchar3* d_rgb_in,
     uchar3* d_rgb_out,
@@ -58,7 +72,31 @@ void LaunchUpscaleBilinear(
     cudaStream_t stream
 );
 
+void LaunchUpscaleBilinearSharp(
+    const uchar3* d_rgb_in,
+    int in_width,
+    int in_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    cudaStream_t stream
+);
+
 void LaunchCropZoomBilinear(
+    const uchar3* d_rgb_in,
+    int src_width,
+    int src_height,
+    uchar3* d_rgb_out,
+    int out_width,
+    int out_height,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    cudaStream_t stream
+);
+
+void LaunchCropZoomBilinearSharp(
     const uchar3* d_rgb_in,
     int src_width,
     int src_height,
@@ -104,6 +142,24 @@ void LaunchDenoiseLumaGaussian3x3(
 );
 
 void LaunchDenoiseLumaMedian3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseLumaBilateral3x3(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseLumaBilateral5x5(
     const uchar3* d_rgb_in,
     uchar3* d_rgb_out,
     int width,
