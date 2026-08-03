@@ -501,7 +501,7 @@ class RoiCanvas(QWidget):
 
         self._image: QImage | None = None
         self._image_backing: np.ndarray | None = None
-        self._roi = Roi(480, 270, 960, 540)
+        self._roi = Roi(0, 0, FRAME_W, FRAME_H)
 
         self._drag_mode = "none"
         self._drag_start_pos = QPointF()
@@ -511,9 +511,14 @@ class RoiCanvas(QWidget):
         self._touch_emit_interval_s = 1.0 / 45.0
         self._touch_emit_pending = False
         self._touch_emit_pending_scale = False
+        self._interaction_target_roi: Roi | None = None
+        self._interaction_target_emit_scale = False
+        self._interaction_interp_timer = QTimer(self)
+        self._interaction_interp_timer.setInterval(16)
+        self._interaction_interp_timer.timeout.connect(self._on_interaction_interp_tick)
         self._interaction_emit_flush_timer = QTimer(self)
         self._interaction_emit_flush_timer.setSingleShot(True)
-        self._interaction_emit_flush_timer.timeout.connect(self._flush_pending_touch_emit)
+        self._interaction_emit_flush_timer.timeout.connect(self._flush_interaction_emit)
 
     def set_image(self, image: QImage, backing: np.ndarray | None = None) -> None:
         self._image = image
@@ -521,8 +526,8 @@ class RoiCanvas(QWidget):
         self.update()
 
     def set_roi(self, roi: Roi) -> None:
-        self._roi = clamp_roi(roi)
-        self.update()
+        self._cancel_interaction_interpolation()
+        self._apply_roi_local(roi)
 
     def roi(self) -> Roi:
         return self._roi
@@ -601,6 +606,7 @@ class RoiCanvas(QWidget):
         if event.button() != Qt.LeftButton:
             return
 
+        self._cancel_interaction_interpolation()
         self.setFocus(Qt.MouseFocusReason)
         self._drag_start_pos = event.position()
         self._drag_start_roi = self._roi
@@ -649,15 +655,14 @@ class RoiCanvas(QWidget):
                 new_h,
             )
 
-        self._set_roi_and_emit_touch_throttled(
-            clamp_roi(new_roi),
-            emit_scale=(self._drag_mode != "move"),
-        )
+        target_roi = clamp_roi(new_roi)
+        emit_scale = self._drag_mode != "move"
+        self._queue_interpolated_roi(target_roi, emit_scale=emit_scale)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         del event
         self._drag_mode = "none"
-        self._flush_pending_touch_emit()
+        self._flush_interaction_emit()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
@@ -685,7 +690,8 @@ class RoiCanvas(QWidget):
         factor = math.exp(effective_delta * sensitivity)
         target_scale = roi_scale_from_roi(self._roi) * factor
         anchor_frame = self._widget_to_frame(event.position())
-        self._apply_scale(target_scale, anchor_frame)
+        self._apply_scale(target_scale, anchor_frame, touch_throttle=True)
+        self._schedule_interaction_emit_flush()
 
     def event(self, event) -> bool:
         et = event.type()
@@ -706,18 +712,79 @@ class RoiCanvas(QWidget):
         center = anchor_frame
         new_roi = roi_from_scale(new_scale, center.x(), center.y())
         if touch_throttle:
-            self._set_roi_and_emit_touch_throttled(new_roi, emit_scale=emit_scale)
+            self._queue_interpolated_roi(clamp_roi(new_roi), emit_scale=emit_scale)
             return
         self._set_roi_and_emit(new_roi, emit_scale=emit_scale)
 
+    def _queue_interpolated_roi(self, target_roi: Roi, emit_scale: bool = True) -> None:
+        self._interaction_target_roi = clamp_roi(target_roi)
+        self._interaction_target_emit_scale = self._interaction_target_emit_scale or emit_scale
+        if not self._interaction_interp_timer.isActive():
+            self._interaction_interp_timer.start()
+        self._schedule_interaction_emit_flush()
+
+    def _on_interaction_interp_tick(self) -> None:
+        target_roi = self._interaction_target_roi
+        if target_roi is None:
+            self._interaction_interp_timer.stop()
+            return
+
+        next_roi = self._interpolate_roi_step(self._roi, target_roi)
+        emit_scale = self._interaction_target_emit_scale
+        self._set_roi_and_emit_touch_throttled(next_roi, emit_scale=emit_scale)
+
+        if self._is_roi_close(next_roi, target_roi):
+            self._set_roi_and_emit_touch_throttled(target_roi, emit_scale=emit_scale)
+            self._interaction_target_roi = None
+            self._interaction_target_emit_scale = False
+            self._interaction_interp_timer.stop()
+
+    def _interpolate_roi_step(self, current: Roi, target: Roi) -> Roi:
+        alpha_pos = 0.24
+        alpha_size = 0.22
+
+        def _step(c: int, t: int, alpha: float) -> int:
+            delta = t - c
+            if delta == 0:
+                return c
+            move = int(round(delta * alpha))
+            if move == 0:
+                move = 1 if delta > 0 else -1
+            return c + move
+
+        x = _step(current.x, target.x, alpha_pos)
+        y = _step(current.y, target.y, alpha_pos)
+        w = _step(current.w, target.w, alpha_size)
+        h = _step(current.h, target.h, alpha_size)
+        return clamp_roi(Roi(x, y, w, h))
+
+    def _is_roi_close(self, roi_a: Roi, roi_b: Roi) -> bool:
+        return (
+            abs(roi_a.x - roi_b.x) <= 1
+            and abs(roi_a.y - roi_b.y) <= 1
+            and abs(roi_a.w - roi_b.w) <= 2
+            and abs(roi_a.h - roi_b.h) <= 2
+        )
+
+    def _apply_roi_local(self, roi: Roi) -> None:
+        self._roi = clamp_roi(roi)
+        self.update()
+
+    def _cancel_interaction_interpolation(self) -> None:
+        self._interaction_interp_timer.stop()
+        self._interaction_emit_flush_timer.stop()
+        self._interaction_target_roi = None
+        self._interaction_target_emit_scale = False
+
     def _set_roi_and_emit(self, roi: Roi, emit_scale: bool = True) -> None:
-        self.set_roi(roi)
+        self._cancel_interaction_interpolation()
+        self._apply_roi_local(roi)
         self.roiChanged.emit(roi.x, roi.y, roi.w, roi.h)
         if emit_scale:
             self.scaleChanged.emit(roi_scale_from_roi(roi))
 
     def _set_roi_and_emit_touch_throttled(self, roi: Roi, emit_scale: bool = True) -> None:
-        self.set_roi(roi)
+        self._apply_roi_local(roi)
         now = time.perf_counter()
         if (now - self._last_touch_emit_ts) >= self._touch_emit_interval_s:
             self._last_touch_emit_ts = now
@@ -740,6 +807,23 @@ class RoiCanvas(QWidget):
         self.roiChanged.emit(self._roi.x, self._roi.y, self._roi.w, self._roi.h)
         if emit_scale:
             self.scaleChanged.emit(roi_scale_from_roi(self._roi))
+
+    def _flush_interaction_emit(self) -> None:
+        target_roi = self._interaction_target_roi
+        emit_scale = self._interaction_target_emit_scale
+        self._interaction_interp_timer.stop()
+        self._interaction_target_roi = None
+        self._interaction_target_emit_scale = False
+
+        if target_roi is not None and (
+            target_roi.x != self._roi.x
+            or target_roi.y != self._roi.y
+            or target_roi.w != self._roi.w
+            or target_roi.h != self._roi.h
+        ):
+            self._set_roi_and_emit(target_roi, emit_scale=emit_scale)
+
+        self._flush_pending_touch_emit()
 
     def _schedule_interaction_emit_flush(self) -> None:
         # Trailing-edge flush ensures the final zoom state is always propagated.
@@ -1826,7 +1910,7 @@ class MainWindow(QMainWindow):
         self._controller_backend = "in-process"
         self._module = module
         self._controller = self._create_processor_controller(module)
-        self._roi = Roi(480, 270, 960, 540)
+        self._roi = Roi(0, 0, FRAME_W, FRAME_H)
         try:
             self._controller.create(self._roi)
         except Exception as exc:
@@ -1870,11 +1954,21 @@ class MainWindow(QMainWindow):
         self._perf_guard_low_fps_seconds = 0
         self._perf_guard_last_action = ""
         self._updating_controls = False
-        self._pending_controller_roi: Roi | None = None
+        self._controller_roi_target: Roi | None = None
+        self._controller_roi_applied = self._roi
         self._fullscreen_view_name: str | None = None
         self._splitter_initialized = False
         self._main_splitter_initialized = False
         self._is_closing = False
+        self._pending_persisted_input_device = None
+        self._pending_persisted_output_device = None
+        self._pending_persisted_input_mode_text = ""
+        self._pending_persisted_output_mode_text = ""
+        self._settings_path = Path(__file__).resolve().parent / "app_settings.json"
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(250)
+        self._settings_save_timer.timeout.connect(self._save_settings)
         self._ai_sr_profiles_path = Path(__file__).resolve().parent / "ai_sr_profiles.json"
         self._ai_sr_profiles = self._load_ai_sr_profiles()
         self._preview_downsample_factor = self._normalize_preview_downsample_factor(
@@ -1944,14 +2038,14 @@ class MainWindow(QMainWindow):
         self._update_timer_interval()
         self._timer.start()
 
-        self._roi_push_timer = QTimer(self)
-        self._roi_push_timer.setSingleShot(True)
-        self._roi_push_timer.setInterval(33)
-        self._roi_push_timer.timeout.connect(self._flush_pending_controller_roi)
+        self._controller_roi_interp_timer = QTimer(self)
+        self._controller_roi_interp_timer.setInterval(16)
+        self._controller_roi_interp_timer.timeout.connect(self._step_controller_roi_interpolation)
 
         self._setup_shortcuts()
+        self._connect_settings_persistence_signals()
         self._sync_controls_from_roi(self._roi)
-        self.source_mode_combo.setCurrentText("Blackmagic DeckLink")
+        self._load_settings()
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
         self._on_source_mode_changed()
@@ -2005,6 +2099,238 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             LOGGER.warning("Failed to save AI SR profiles: %s", exc)
+
+    def _connect_settings_persistence_signals(self) -> None:
+        combo_widgets = [
+            self.preview_downsample_combo,
+            self.sr_mode_combo,
+            self.sr_flavor_combo,
+            self.sr_manual_combo,
+            self.auto_sr_max_combo,
+            self.deinterlace_method_combo,
+            self.denoise_method_combo,
+            self.ai_sr_provider_combo,
+            self.ai_sr_input_align_combo,
+            self.rtx_vsr_quality_combo,
+            self.rtx_vsr_scale_combo,
+            self.rtx_vsr_post_scale_method_combo,
+            self.source_mode_combo,
+            self.decklink_input_device_combo,
+            self.decklink_output_device_combo,
+            self.decklink_input_mode_combo,
+            self.decklink_output_mode_combo,
+        ]
+        for combo in combo_widgets:
+            combo.currentTextChanged.connect(self._schedule_settings_save)
+
+        checkbox_widgets = [
+            self.enable_sr_checkbox,
+            self.enable_ai_sr_checkbox,
+            self.enable_rtx_vsr_checkbox,
+            self.deinterlace_checkbox,
+            self.perf_guard_checkbox,
+            self.ai_sr_require_gpu_checkbox,
+            self.ai_sr_strict_checkbox,
+            self.rtx_thdr_enable_checkbox,
+            self.decklink_auto_detect_devices,
+            self.decklink_enable_format_detection,
+        ]
+        for checkbox in checkbox_widgets:
+            checkbox.toggled.connect(self._schedule_settings_save)
+
+        spin_widgets = [
+            self.fps_spin,
+            self.preview_request_fps_spin,
+            self.preview_poll_fps_spin,
+            self.roi_x_spin,
+            self.roi_y_spin,
+            self.roi_w_spin,
+            self.roi_h_spin,
+            self.scale_spin,
+            self.ai_sr_frame_interval_spin,
+            self.ai_sr_overscan_spin,
+            self.ai_sr_inference_divisor_spin,
+            self.ai_sr_detail_preserve_spin,
+            self.denoise_strength_spin,
+            self.rtx_thdr_contrast_spin,
+            self.rtx_thdr_saturation_spin,
+            self.rtx_thdr_middle_gray_spin,
+            self.rtx_thdr_max_luminance_spin,
+        ]
+        for spin in spin_widgets:
+            spin.valueChanged.connect(self._schedule_settings_save)
+
+        self.ai_sr_model_combo.currentTextChanged.connect(self._schedule_settings_save)
+        self._display_splitter.splitterMoved.connect(lambda _pos, _index: self._schedule_settings_save())
+        self._main_splitter.splitterMoved.connect(lambda _pos, _index: self._schedule_settings_save())
+
+    def _schedule_settings_save(self, *_args) -> None:
+        if self._updating_controls:
+            return
+        self._settings_save_timer.start()
+
+    def _collect_settings_payload(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "fps": int(self.fps_spin.value()),
+            "preview_request_fps": int(self.preview_request_fps_spin.value()),
+            "preview_poll_fps": int(self.preview_poll_fps_spin.value()),
+            "preview_downsample": str(self.preview_downsample_combo.currentText()),
+            "basic_scaling_mode": str(self.sr_mode_combo.currentText()),
+            "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
+            "basic_scaling_manual": str(self.sr_manual_combo.currentText()),
+            "basic_scaling_auto_max": str(self.auto_sr_max_combo.currentText()),
+            "basic_scaling_enabled": bool(self.enable_sr_checkbox.isChecked()),
+            "deinterlace_enabled": bool(self.deinterlace_checkbox.isChecked()),
+            "deinterlace_method": str(self.deinterlace_method_combo.currentText()),
+            "denoise_method": str(self.denoise_method_combo.currentText()),
+            "denoise_strength": float(self.denoise_strength_spin.value()),
+            "perf_guard_enabled": bool(self.perf_guard_checkbox.isChecked()),
+            "ai_sr_enabled": bool(self.enable_ai_sr_checkbox.isChecked()),
+            "ai_sr_model_path": str(self.ai_sr_model_combo.currentText().strip()),
+            "ai_sr_provider": str(self.ai_sr_provider_combo.currentText()),
+            "ai_sr_require_gpu": bool(self.ai_sr_require_gpu_checkbox.isChecked()),
+            "ai_sr_frame_interval": int(self.ai_sr_frame_interval_spin.value()),
+            "ai_sr_strict": bool(self.ai_sr_strict_checkbox.isChecked()),
+            "ai_sr_input_align": str(self.ai_sr_input_align_combo.currentText()),
+            "ai_sr_roi_overscan_percent": float(self.ai_sr_overscan_spin.value()),
+            "ai_sr_inference_divisor": int(self.ai_sr_inference_divisor_spin.value()),
+            "ai_sr_detail_preserve_percent": float(self.ai_sr_detail_preserve_spin.value()),
+            "rtx_vsr_enabled": bool(self.enable_rtx_vsr_checkbox.isChecked()),
+            "rtx_vsr_quality": str(self.rtx_vsr_quality_combo.currentText()),
+            "rtx_vsr_scale": str(self.rtx_vsr_scale_combo.currentText()),
+            "rtx_vsr_post_scale_method": str(self.rtx_vsr_post_scale_method_combo.currentText()),
+            "rtx_thdr_enabled": bool(self.rtx_thdr_enable_checkbox.isChecked()),
+            "rtx_thdr_contrast": int(self.rtx_thdr_contrast_spin.value()),
+            "rtx_thdr_saturation": int(self.rtx_thdr_saturation_spin.value()),
+            "rtx_thdr_middle_gray": int(self.rtx_thdr_middle_gray_spin.value()),
+            "rtx_thdr_max_luminance": int(self.rtx_thdr_max_luminance_spin.value()),
+            "source_mode": str(self.source_mode_combo.currentText()),
+            "decklink_auto_detect": bool(self.decklink_auto_detect_devices.isChecked()),
+            "decklink_input_device": self.decklink_input_device_combo.currentData(),
+            "decklink_output_device": self.decklink_output_device_combo.currentData(),
+            "decklink_input_mode_text": str(self.decklink_input_mode_combo.currentText()),
+            "decklink_output_mode_text": str(self.decklink_output_mode_combo.currentText()),
+            "decklink_enable_format_detection": bool(self.decklink_enable_format_detection.isChecked()),
+            "display_splitter_sizes": list(self._display_splitter.sizes()),
+            "main_splitter_sizes": list(self._main_splitter.sizes()),
+        }
+
+    def _save_settings(self) -> None:
+        try:
+            payload = self._collect_settings_payload()
+            self._settings_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception as exc:
+            LOGGER.warning("Failed to save app settings: %s", exc)
+
+    def _load_settings(self) -> None:
+        if not self._settings_path.exists():
+            return
+        try:
+            raw = json.loads(self._settings_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Failed to parse app settings: %s", exc)
+            return
+
+        if not isinstance(raw, dict):
+            return
+
+        self._updating_controls = True
+        try:
+            self.fps_spin.setValue(max(1, min(60, int(raw.get("fps", self.fps_spin.value())))))
+            self.preview_request_fps_spin.setValue(max(1, min(60, int(raw.get("preview_request_fps", self.preview_request_fps_spin.value())))))
+            self.preview_poll_fps_spin.setValue(max(1, min(120, int(raw.get("preview_poll_fps", self.preview_poll_fps_spin.value())))))
+
+            self.preview_downsample_combo.setCurrentText(str(raw.get("preview_downsample", self.preview_downsample_combo.currentText())))
+            self.sr_mode_combo.setCurrentText(str(raw.get("basic_scaling_mode", self.sr_mode_combo.currentText())))
+            self.sr_flavor_combo.setCurrentText(str(raw.get("basic_scaling_method", self.sr_flavor_combo.currentText())))
+            self.sr_manual_combo.setCurrentText(str(raw.get("basic_scaling_manual", self.sr_manual_combo.currentText())))
+            self.auto_sr_max_combo.setCurrentText(str(raw.get("basic_scaling_auto_max", self.auto_sr_max_combo.currentText())))
+
+            self.enable_sr_checkbox.setChecked(bool(raw.get("basic_scaling_enabled", self.enable_sr_checkbox.isChecked())))
+            self.deinterlace_checkbox.setChecked(bool(raw.get("deinterlace_enabled", self.deinterlace_checkbox.isChecked())))
+            self.deinterlace_method_combo.setCurrentText(str(raw.get("deinterlace_method", self.deinterlace_method_combo.currentText())))
+            self.denoise_method_combo.setCurrentText(str(raw.get("denoise_method", self.denoise_method_combo.currentText())))
+            self.denoise_strength_spin.setValue(float(raw.get("denoise_strength", self.denoise_strength_spin.value())))
+            self.perf_guard_checkbox.setChecked(bool(raw.get("perf_guard_enabled", self.perf_guard_checkbox.isChecked())))
+
+            self.enable_ai_sr_checkbox.setChecked(bool(raw.get("ai_sr_enabled", self.enable_ai_sr_checkbox.isChecked())))
+            self.ai_sr_model_combo.setCurrentText(str(raw.get("ai_sr_model_path", self.ai_sr_model_combo.currentText())))
+            self.ai_sr_provider_combo.setCurrentText(str(raw.get("ai_sr_provider", self.ai_sr_provider_combo.currentText())))
+            self.ai_sr_require_gpu_checkbox.setChecked(bool(raw.get("ai_sr_require_gpu", self.ai_sr_require_gpu_checkbox.isChecked())))
+            self.ai_sr_frame_interval_spin.setValue(max(1, min(120, int(raw.get("ai_sr_frame_interval", self.ai_sr_frame_interval_spin.value())))))
+            self.ai_sr_strict_checkbox.setChecked(bool(raw.get("ai_sr_strict", self.ai_sr_strict_checkbox.isChecked())))
+
+            persisted_align = str(raw.get("ai_sr_input_align", self.ai_sr_input_align_combo.currentText()))
+            if persisted_align and persisted_align not in {self.ai_sr_input_align_combo.itemText(i) for i in range(self.ai_sr_input_align_combo.count())}:
+                self.ai_sr_input_align_combo.addItem(persisted_align)
+            self.ai_sr_input_align_combo.setCurrentText(persisted_align)
+
+            self.ai_sr_overscan_spin.setValue(float(raw.get("ai_sr_roi_overscan_percent", self.ai_sr_overscan_spin.value())))
+            self.ai_sr_inference_divisor_spin.setValue(max(0, int(raw.get("ai_sr_inference_divisor", self.ai_sr_inference_divisor_spin.value()))))
+            self.ai_sr_detail_preserve_spin.setValue(float(raw.get("ai_sr_detail_preserve_percent", self.ai_sr_detail_preserve_spin.value())))
+
+            self.enable_rtx_vsr_checkbox.setChecked(bool(raw.get("rtx_vsr_enabled", self.enable_rtx_vsr_checkbox.isChecked())))
+            self.rtx_vsr_quality_combo.setCurrentText(str(raw.get("rtx_vsr_quality", self.rtx_vsr_quality_combo.currentText())))
+            self.rtx_vsr_scale_combo.setCurrentText(str(raw.get("rtx_vsr_scale", self.rtx_vsr_scale_combo.currentText())))
+            self.rtx_vsr_post_scale_method_combo.setCurrentText(str(raw.get("rtx_vsr_post_scale_method", self.rtx_vsr_post_scale_method_combo.currentText())))
+            self.rtx_thdr_enable_checkbox.setChecked(bool(raw.get("rtx_thdr_enabled", self.rtx_thdr_enable_checkbox.isChecked())))
+            self.rtx_thdr_contrast_spin.setValue(int(raw.get("rtx_thdr_contrast", self.rtx_thdr_contrast_spin.value())))
+            self.rtx_thdr_saturation_spin.setValue(int(raw.get("rtx_thdr_saturation", self.rtx_thdr_saturation_spin.value())))
+            self.rtx_thdr_middle_gray_spin.setValue(int(raw.get("rtx_thdr_middle_gray", self.rtx_thdr_middle_gray_spin.value())))
+            self.rtx_thdr_max_luminance_spin.setValue(int(raw.get("rtx_thdr_max_luminance", self.rtx_thdr_max_luminance_spin.value())))
+
+            self.source_mode_combo.setCurrentText(str(raw.get("source_mode", self.source_mode_combo.currentText())))
+            self.decklink_auto_detect_devices.setChecked(bool(raw.get("decklink_auto_detect", self.decklink_auto_detect_devices.isChecked())))
+            self.decklink_enable_format_detection.setChecked(
+                bool(raw.get("decklink_enable_format_detection", self.decklink_enable_format_detection.isChecked()))
+            )
+        finally:
+            self._updating_controls = False
+
+        self._preview_downsample_factor = self._normalize_preview_downsample_factor(
+            PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.get(self.preview_downsample_combo.currentText(), self._preview_downsample_factor)
+        )
+        self._decklink_tick_poll_fps = float(max(1, self.preview_poll_fps_spin.value()))
+
+        persisted_in_device = raw.get("decklink_input_device")
+        persisted_out_device = raw.get("decklink_output_device")
+        self._pending_persisted_input_device = persisted_in_device
+        self._pending_persisted_output_device = persisted_out_device
+        if persisted_in_device is not None or persisted_out_device is not None:
+            for i in range(self.decklink_input_device_combo.count()):
+                if self.decklink_input_device_combo.itemData(i) == persisted_in_device:
+                    self.decklink_input_device_combo.setCurrentIndex(i)
+                    break
+            for i in range(self.decklink_output_device_combo.count()):
+                if self.decklink_output_device_combo.itemData(i) == persisted_out_device:
+                    self.decklink_output_device_combo.setCurrentIndex(i)
+                    break
+
+        input_mode_text = str(raw.get("decklink_input_mode_text", "")).strip()
+        output_mode_text = str(raw.get("decklink_output_mode_text", "")).strip()
+        self._pending_persisted_input_mode_text = input_mode_text
+        self._pending_persisted_output_mode_text = output_mode_text
+        if input_mode_text:
+            for i in range(self.decklink_input_mode_combo.count()):
+                if self.decklink_input_mode_combo.itemText(i) == input_mode_text:
+                    self.decklink_input_mode_combo.setCurrentIndex(i)
+                    break
+        if output_mode_text:
+            for i in range(self.decklink_output_mode_combo.count()):
+                if self.decklink_output_mode_combo.itemText(i) == output_mode_text:
+                    self.decklink_output_mode_combo.setCurrentIndex(i)
+                    break
+
+        display_sizes = raw.get("display_splitter_sizes")
+        if isinstance(display_sizes, list) and len(display_sizes) >= 2:
+            self._display_splitter.setSizes([int(display_sizes[0]), int(display_sizes[1])])
+
+        main_sizes = raw.get("main_splitter_sizes")
+        if isinstance(main_sizes, list) and len(main_sizes) >= 2:
+            self._main_splitter.setSizes([int(main_sizes[0]), int(main_sizes[1])])
+
+        self._update_timer_interval()
 
     def _current_ai_sr_profile(self) -> dict[str, object]:
         return {
@@ -2754,6 +3080,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._is_closing = True
+        self._save_settings()
+        self._controller_roi_target = None
+        self._controller_roi_interp_timer.stop()
         self._timer.stop()
         self._controller.close()
         self._stop_decklink_sessions()
@@ -2945,16 +3274,83 @@ class MainWindow(QMainWindow):
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._roi = clamp_roi(Roi(x, y, w, h))
-        self._pending_controller_roi = self._roi
-        if not self._roi_push_timer.isActive():
-            self._roi_push_timer.start()
+        self._queue_controller_roi_target(self._roi)
         self._sync_controls_from_roi(self._roi)
 
-    def _flush_pending_controller_roi(self) -> None:
-        if self._pending_controller_roi is None:
+    def _queue_controller_roi_target(self, roi: Roi) -> None:
+        self._controller_roi_target = clamp_roi(roi)
+        if not self._controller_roi_interp_timer.isActive():
+            self._controller_roi_interp_timer.start()
+
+    def _apply_controller_roi_immediate(self, roi: Roi) -> None:
+        clamped = clamp_roi(roi)
+        self._controller_roi_target = None
+        self._controller_roi_interp_timer.stop()
+        self._controller.set_roi(clamped)
+        self._controller_roi_applied = clamped
+
+    def _step_controller_roi_interpolation(self) -> None:
+        target = self._controller_roi_target
+        if target is None:
+            self._controller_roi_interp_timer.stop()
             return
-        self._controller.set_roi(self._pending_controller_roi)
-        self._pending_controller_roi = None
+
+        current = self._controller_roi_applied
+        step_roi = self._interpolate_controller_roi_step(current, target)
+        try:
+            self._controller.set_roi(step_roi)
+        except Exception as exc:
+            self._controller_roi_target = None
+            self._controller_roi_interp_timer.stop()
+            self._update_status(f"ROI update failed: {exc}")
+            return
+        self._controller_roi_applied = step_roi
+
+        if self._is_controller_roi_close(step_roi, target):
+            if (
+                target.x != step_roi.x
+                or target.y != step_roi.y
+                or target.w != step_roi.w
+                or target.h != step_roi.h
+            ):
+                try:
+                    self._controller.set_roi(target)
+                except Exception as exc:
+                    self._update_status(f"ROI finalize failed: {exc}")
+                else:
+                    self._controller_roi_applied = target
+            self._controller_roi_target = None
+            self._controller_roi_interp_timer.stop()
+
+    def _interpolate_controller_roi_step(self, current: Roi, target: Roi) -> Roi:
+        alpha_pos = 0.26
+        alpha_size = 0.24
+
+        def _step(c: int, t: int, alpha: float) -> int:
+            delta = t - c
+            if delta == 0:
+                return c
+            move = int(round(delta * alpha))
+            if move == 0:
+                move = 1 if delta > 0 else -1
+            return c + move
+
+        return clamp_roi(
+            Roi(
+                _step(current.x, target.x, alpha_pos),
+                _step(current.y, target.y, alpha_pos),
+                _step(current.w, target.w, alpha_size),
+                _step(current.h, target.h, alpha_size),
+            )
+        )
+
+    def _is_controller_roi_close(self, roi_a: Roi, roi_b: Roi) -> bool:
+        return (
+            abs(roi_a.x - roi_b.x) <= 1
+            and abs(roi_a.y - roi_b.y) <= 1
+            and abs(roi_a.w - roi_b.w) <= 2
+            and abs(roi_a.h - roi_b.h) <= 2
+        )
 
     def _on_scale_from_canvas(self, scale: float) -> None:
         if self._updating_controls:
@@ -2985,11 +3381,8 @@ class MainWindow(QMainWindow):
             )
         )
         self._roi = roi
-        self._pending_controller_roi = None
-        if self._roi_push_timer.isActive():
-            self._roi_push_timer.stop()
         self._input_canvas.set_roi(roi)
-        self._controller.set_roi(roi)
+        self._apply_controller_roi_immediate(roi)
         self._sync_controls_from_roi(roi)
 
     def _on_scale_spin_changed(self, value: float) -> None:
@@ -3000,11 +3393,8 @@ class MainWindow(QMainWindow):
         center_y = self._roi.y + (self._roi.h / 2.0)
         roi = roi_from_scale(value, center_x, center_y)
         self._roi = roi
-        self._pending_controller_roi = None
-        if self._roi_push_timer.isActive():
-            self._roi_push_timer.stop()
         self._input_canvas.set_roi(roi)
-        self._controller.set_roi(roi)
+        self._apply_controller_roi_immediate(roi)
         self._sync_controls_from_roi(roi)
 
     def _on_sr_mode_changed(self) -> None:
@@ -3607,6 +3997,17 @@ class MainWindow(QMainWindow):
 
         if self.decklink_auto_detect_devices.isChecked():
             self._apply_auto_detect_device_selection()
+        else:
+            if self._pending_persisted_input_device is not None:
+                for i in range(self.decklink_input_device_combo.count()):
+                    if self.decklink_input_device_combo.itemData(i) == self._pending_persisted_input_device:
+                        self.decklink_input_device_combo.setCurrentIndex(i)
+                        break
+            if self._pending_persisted_output_device is not None:
+                for i in range(self.decklink_output_device_combo.count()):
+                    if self.decklink_output_device_combo.itemData(i) == self._pending_persisted_output_device:
+                        self.decklink_output_device_combo.setCurrentIndex(i)
+                        break
 
         self._populate_mode_combos()
 
@@ -3658,6 +4059,17 @@ class MainWindow(QMainWindow):
 
         self._select_default_mode(self.decklink_input_mode_combo, INPUT_MODE_QUERY_DEFAULT)
         self._select_default_mode(self.decklink_output_mode_combo, OUTPUT_MODE_QUERY_DEFAULT)
+
+        if self._pending_persisted_input_mode_text:
+            for i in range(self.decklink_input_mode_combo.count()):
+                if self.decklink_input_mode_combo.itemText(i) == self._pending_persisted_input_mode_text:
+                    self.decklink_input_mode_combo.setCurrentIndex(i)
+                    break
+        if self._pending_persisted_output_mode_text:
+            for i in range(self.decklink_output_mode_combo.count()):
+                if self.decklink_output_mode_combo.itemText(i) == self._pending_persisted_output_mode_text:
+                    self.decklink_output_mode_combo.setCurrentIndex(i)
+                    break
 
     def _fps_from_mode(self, mode: object) -> float:
         frame_duration = float(getattr(mode, "frame_duration", 0))
@@ -3729,12 +4141,9 @@ class MainWindow(QMainWindow):
         return frame_bytes
 
     def _reset_roi(self) -> None:
-        self._roi = Roi(480, 270, 960, 540)
-        self._pending_controller_roi = None
-        if self._roi_push_timer.isActive():
-            self._roi_push_timer.stop()
+        self._roi = Roi(0, 0, FRAME_W, FRAME_H)
         self._input_canvas.set_roi(self._roi)
-        self._controller.set_roi(self._roi)
+        self._apply_controller_roi_immediate(self._roi)
         self._sync_controls_from_roi(self._roi)
 
     def _sync_controls_from_roi(self, roi: Roi) -> None:
