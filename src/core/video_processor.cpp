@@ -620,7 +620,11 @@ std::string VideoProcessor::ProcessFrameInternal(
         "cudaMemcpyAsync H2D"
     );
 
-    if (enable_placeholder_sr_ && sr_scale > 1 && !deinterlace_enabled && denoise_method == DenoiseMethod::Off) {
+    if (enable_placeholder_sr_ && sr_scale > 1 && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
+        sr_flavor == SrFlavor::Bilinear) {
+        // Fast-path is intentionally tied to the explicit "Bilinear (Fast)"
+        // mode. Other flavors must run their dedicated kernels so method
+        // selection has visible effect.
         if (roi_w == width_ && roi_h == height_) {
             int zoom_roi_w = std::max(2, width_ / sr_scale);
             int zoom_roi_h = std::max(2, height_ / sr_scale);
