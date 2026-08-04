@@ -536,30 +536,63 @@ void VideoProcessor::InitializeBuffers() {
 }
 
 std::string VideoProcessor::ProcessFrame(const std::string& input_frame) {
-    return ProcessFrameInternal(input_frame, false, false, false);
+    return ProcessFrameBuffer(
+        reinterpret_cast<const uint8_t*>(input_frame.data()),
+        input_frame.size()
+    );
 }
 
 std::string VideoProcessor::ProcessFrameNoDeinterlace(const std::string& input_frame) {
-    return ProcessFrameInternal(input_frame, false, false, true);
+    return ProcessFrameNoDeinterlaceBuffer(
+        reinterpret_cast<const uint8_t*>(input_frame.data()),
+        input_frame.size()
+    );
 }
 
 std::string VideoProcessor::ProcessFrameDeinterlaceOnly(const std::string& input_frame) {
-    return ProcessFrameInternal(input_frame, true, true, false);
+    return ProcessFrameDeinterlaceOnlyBuffer(
+        reinterpret_cast<const uint8_t*>(input_frame.data()),
+        input_frame.size()
+    );
 }
 
 std::string VideoProcessor::ProcessFramePreprocessOnly(const std::string& input_frame) {
-    return ProcessFrameInternal(input_frame, true, false, false);
+    return ProcessFramePreprocessOnlyBuffer(
+        reinterpret_cast<const uint8_t*>(input_frame.data()),
+        input_frame.size()
+    );
+}
+
+std::string VideoProcessor::ProcessFrameBuffer(const uint8_t* input_frame, size_t input_size) {
+    return ProcessFrameInternal(input_frame, input_size, false, false, false);
+}
+
+std::string VideoProcessor::ProcessFrameNoDeinterlaceBuffer(const uint8_t* input_frame, size_t input_size) {
+    return ProcessFrameInternal(input_frame, input_size, false, false, true);
+}
+
+std::string VideoProcessor::ProcessFrameDeinterlaceOnlyBuffer(const uint8_t* input_frame, size_t input_size) {
+    return ProcessFrameInternal(input_frame, input_size, true, true, false);
+}
+
+std::string VideoProcessor::ProcessFramePreprocessOnlyBuffer(const uint8_t* input_frame, size_t input_size) {
+    return ProcessFrameInternal(input_frame, input_size, true, false, false);
 }
 
 std::string VideoProcessor::ProcessFrameInternal(
-    const std::string& input_frame,
+    const uint8_t* input_frame,
+    size_t input_size,
     bool deinterlace_only,
     bool force_deinterlace,
     bool force_disable_deinterlace
 ) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
 
-    if (input_frame.size() != uyvy_bytes_) {
+    if (input_frame == nullptr) {
+        throw std::invalid_argument("Input frame pointer is null.");
+    }
+
+    if (input_size != uyvy_bytes_) {
         throw std::invalid_argument("Invalid frame size; expected 1920*1080*2 bytes in UYVY.");
     }
 
@@ -610,13 +643,13 @@ std::string VideoProcessor::ProcessFrameInternal(
     if (!deinterlace_only && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
         (!enable_placeholder_sr_ || sr_scale <= 1) &&
         roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_) {
-        return input_frame;
+        return std::string(reinterpret_cast<const char*>(input_frame), uyvy_bytes_);
     }
 
     uint8_t* host_output_ptr = h_output_pinned_ != nullptr ? h_output_pinned_ : host_output_.data();
 
     CheckCuda(
-        cudaMemcpyAsync(d_uyvy_in_, input_frame.data(), uyvy_bytes_, cudaMemcpyHostToDevice, stream_),
+        cudaMemcpyAsync(d_uyvy_in_, input_frame, uyvy_bytes_, cudaMemcpyHostToDevice, stream_),
         "cudaMemcpyAsync H2D"
     );
 
@@ -655,7 +688,14 @@ std::string VideoProcessor::ProcessFrameInternal(
         return std::string(reinterpret_cast<const char*>(host_output_ptr), uyvy_bytes_);
     }
 
-    if (enable_placeholder_sr_ && sr_scale > 1 && !deinterlace_enabled && denoise_method == DenoiseMethod::Off) {
+    const bool use_uyvy_scaling_fast_path =
+        enable_placeholder_sr_ &&
+        sr_scale > 1 &&
+        !deinterlace_enabled &&
+        denoise_method == DenoiseMethod::Off &&
+        sr_flavor == SrFlavor::Bilinear;
+
+    if (use_uyvy_scaling_fast_path) {
         // Interlaced-safe scaling path: preserve field parity while sampling
         // UYVY directly to avoid vertical field blending artifacts.
         if (roi_w == width_ && roi_h == height_) {
@@ -892,8 +932,6 @@ std::string VideoProcessor::ProcessFrameInternal(
                         break;
                     case SrFlavor::BicubicSharpen:
                         cuda_kernels::LaunchUpscaleBicubic(crop_input, crop_src_w, crop_src_h, d_rgb_sr_, sr_roi_w, sr_roi_h, stream_);
-                        cuda_kernels::LaunchSharpen3x3(d_rgb_sr_, d_rgb_bob_, sr_roi_w, sr_roi_h, stream_);
-                        sr_output = d_rgb_bob_;
                         break;
                 }
             } else {
@@ -958,15 +996,6 @@ std::string VideoProcessor::ProcessFrameInternal(
                             roi_h,
                             stream_
                         );
-                        // Reuse d_rgb_bob_ as scratch for sharpened ROI before final zoom-to-output.
-                        cuda_kernels::LaunchSharpen3x3(
-                            d_rgb_sr_,
-                            d_rgb_bob_,
-                            sr_roi_w,
-                            sr_roi_h,
-                            stream_
-                        );
-                        sr_output = d_rgb_bob_;
                         break;
                 }
             }
@@ -1042,7 +1071,14 @@ std::string VideoProcessor::ProcessFrameInternal(
                 crop_roi_h,
                 stream_
             );
-            cuda_kernels::LaunchSharpen3x3(d_rgb_zoom_, d_rgb_bob_, width_, height_, stream_);
+            cuda_kernels::LaunchSharpen3x3(
+                d_rgb_zoom_,
+                d_rgb_bob_,
+                width_,
+                height_,
+                !deinterlace_enabled,
+                stream_
+            );
             final_output = d_rgb_bob_;
             break;
     }

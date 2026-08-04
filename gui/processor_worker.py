@@ -148,6 +148,7 @@ except Exception:
 FRAME_W = 1920
 FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
+_OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 
 
 def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
@@ -690,20 +691,73 @@ def _tight_uyvy_bytes(frame: object) -> bytes:
 
 def _write_frame_to_output(out: object, frame_bytes: bytes) -> None:
     if out.row_bytes == UYVY_ROW_BYTES:
-        out.display_frame_sync(frame_bytes)
+        payload = frame_bytes
+    else:
+        if out.row_bytes < UYVY_ROW_BYTES:
+            raise RuntimeError(f"Output row_bytes {out.row_bytes} is smaller than expected {UYVY_ROW_BYTES}")
+
+        padded = np.zeros((FRAME_H, int(out.row_bytes)), dtype=np.uint8)
+        src = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, UYVY_ROW_BYTES)
+        padded[:, :UYVY_ROW_BYTES] = src
+        payload = padded.tobytes()
+
+    out_id = id(out)
+    state = _OUTPUT_SCHEDULE_STATE.get(out_id)
+    if state is None:
+        schedule_fn = getattr(out, "schedule_frame_copy", None)
+        start_fn = getattr(out, "start_scheduled_playback", None)
+        buffered_fn = getattr(out, "buffered_video_frame_count", None)
+        state = {
+            "enabled": callable(schedule_fn) and callable(start_fn),
+            "can_query_buffered": callable(buffered_fn),
+            "started": False,
+            "display_time": 0,
+            "frame_duration": int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0,
+            "time_scale": int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0,
+        }
+        _OUTPUT_SCHEDULE_STATE[out_id] = state
+
+    if bool(state.get("enabled", False)):
+        frame_duration = int(state.get("frame_duration", 0))
+        time_scale = int(state.get("time_scale", 0))
+        if frame_duration > 0 and time_scale > 0:
+            try:
+                out.schedule_frame_copy(
+                    payload,
+                    int(state.get("display_time", 0)),
+                    frame_duration,
+                    time_scale,
+                )
+                state["display_time"] = int(state.get("display_time", 0)) + frame_duration
+
+                if not bool(state.get("started", False)):
+                    should_start = False
+                    if bool(state.get("can_query_buffered", False)):
+                        try:
+                            buffered_count = int(out.buffered_video_frame_count())
+                            # Small preroll avoids startup underflow with low added latency.
+                            should_start = buffered_count >= 2
+                        except Exception:
+                            state["can_query_buffered"] = False
+                            should_start = True
+                    else:
+                        should_start = True
+
+                    if should_start:
+                        out.start_scheduled_playback(0, time_scale, 1.0)
+                        state["started"] = True
+                return
+            except Exception:
+                # Fall back to blocking output if scheduling path errors at runtime.
+                state["enabled"] = False
+
+    out.display_frame_sync(payload)
+
+
+def _clear_output_schedule_state(out: object | None) -> None:
+    if out is None:
         return
-
-    if out.row_bytes < UYVY_ROW_BYTES:
-        raise RuntimeError(f"Output row_bytes {out.row_bytes} is smaller than expected {UYVY_ROW_BYTES}")
-
-    padded = bytearray(out.row_bytes * out.height)
-    for y in range(FRAME_H):
-        src_start = y * UYVY_ROW_BYTES
-        src_end = src_start + UYVY_ROW_BYTES
-        dst_start = y * out.row_bytes
-        padded[dst_start : dst_start + UYVY_ROW_BYTES] = frame_bytes[src_start:src_end]
-
-    out.display_frame_sync(padded)
+    _OUTPUT_SCHEDULE_STATE.pop(id(out), None)
 
 
 def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -1642,6 +1696,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         _stop_live_pipeline()
 
         if output_session is not None:
+            _clear_output_schedule_state(output_session)
             try:
                 output_session.stop()
             except Exception:

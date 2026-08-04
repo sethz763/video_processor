@@ -1413,7 +1413,10 @@ class ProcessVideoProcessorController:
         if self._process is None:
             raise RuntimeError("Worker process is not started")
         if not self._process.is_alive():
-            raise RuntimeError("Worker process exited unexpectedly")
+            exit_code = self._process.exitcode
+            if exit_code is None:
+                raise RuntimeError("Worker process exited unexpectedly")
+            raise RuntimeError(f"Worker process exited unexpectedly (exit_code={exit_code})")
 
     def _send_control(self, command: dict[str, object]) -> None:
         self._assert_worker_alive()

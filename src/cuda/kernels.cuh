@@ -144,6 +144,7 @@ void LaunchSharpen3x3(
     uchar3* d_rgb_out,
     int width,
     int height,
+    bool preserve_field_parity,
     cudaStream_t stream
 );
 

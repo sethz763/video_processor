@@ -1,10 +1,44 @@
 #include <pybind11/pybind11.h>
 
+#include <cstdint>
 #include <string>
+#include <utility>
 
 #include "core/video_processor.hpp"
 
 namespace py = pybind11;
+
+namespace {
+
+std::pair<const std::uint8_t*, std::size_t> GetContiguousByteBuffer(const py::buffer& frame) {
+    const py::buffer_info info = frame.request();
+    if (info.itemsize != 1) {
+        throw py::value_error("Frame buffer must have byte-sized elements");
+    }
+    if (info.ndim < 1) {
+        throw py::value_error("Frame buffer must have at least one dimension");
+    }
+
+    std::size_t total_bytes = static_cast<std::size_t>(info.itemsize);
+    for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+        const py::ssize_t shape = info.shape[dim];
+        const py::ssize_t stride = info.strides[dim];
+        if (shape < 0) {
+            throw py::value_error("Frame buffer has invalid shape");
+        }
+        if (shape > 1 && stride != static_cast<py::ssize_t>(total_bytes)) {
+            throw py::value_error("Frame buffer must be C-contiguous");
+        }
+        total_bytes *= static_cast<std::size_t>(shape);
+    }
+
+    return {
+        reinterpret_cast<const std::uint8_t*>(info.ptr),
+        total_bytes,
+    };
+}
+
+}  // namespace
 
 PYBIND11_MODULE(video_processor, m) {
     m.doc() = "CUDA video processor module for UYVY deinterlace/crop/zoom basic scaling";
@@ -23,9 +57,13 @@ PYBIND11_MODULE(video_processor, m) {
         )
         .def(
             "process_frame",
-            [](vp::VideoProcessor& self, py::bytes frame) {
-                const std::string input = static_cast<std::string>(frame);
-                const std::string output = self.ProcessFrame(input);
+            [](vp::VideoProcessor& self, const py::buffer& frame) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFrameBuffer(frame_ptr, frame_size);
+                }
                 return py::bytes(output);
             },
             py::arg("frame"),
@@ -33,9 +71,13 @@ PYBIND11_MODULE(video_processor, m) {
         )
         .def(
             "process_frame_no_deinterlace",
-            [](vp::VideoProcessor& self, py::bytes frame) {
-                const std::string input = static_cast<std::string>(frame);
-                const std::string output = self.ProcessFrameNoDeinterlace(input);
+            [](vp::VideoProcessor& self, const py::buffer& frame) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFrameNoDeinterlaceBuffer(frame_ptr, frame_size);
+                }
                 return py::bytes(output);
             },
             py::arg("frame"),
@@ -43,9 +85,13 @@ PYBIND11_MODULE(video_processor, m) {
         )
         .def(
             "process_frame_deinterlace_only",
-            [](vp::VideoProcessor& self, py::bytes frame) {
-                const std::string input = static_cast<std::string>(frame);
-                const std::string output = self.ProcessFrameDeinterlaceOnly(input);
+            [](vp::VideoProcessor& self, const py::buffer& frame) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFrameDeinterlaceOnlyBuffer(frame_ptr, frame_size);
+                }
                 return py::bytes(output);
             },
             py::arg("frame"),
@@ -53,9 +99,13 @@ PYBIND11_MODULE(video_processor, m) {
         )
         .def(
             "process_frame_preprocess_only",
-            [](vp::VideoProcessor& self, py::bytes frame) {
-                const std::string input = static_cast<std::string>(frame);
-                const std::string output = self.ProcessFramePreprocessOnly(input);
+            [](vp::VideoProcessor& self, const py::buffer& frame) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFramePreprocessOnlyBuffer(frame_ptr, frame_size);
+                }
                 return py::bytes(output);
             },
             py::arg("frame"),

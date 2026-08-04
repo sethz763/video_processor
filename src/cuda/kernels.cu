@@ -646,7 +646,8 @@ __global__ void Sharpen3x3Kernel(
     const uchar3* rgb_in,
     uchar3* rgb_out,
     int width,
-    int height
+    int height,
+    int preserve_field_parity
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -657,8 +658,21 @@ __global__ void Sharpen3x3Kernel(
 
     const int xm1 = max(0, x - 1);
     const int xp1 = min(width - 1, x + 1);
-    const int ym1 = max(0, y - 1);
-    const int yp1 = min(height - 1, y + 1);
+
+    int ym1 = max(0, y - 1);
+    int yp1 = min(height - 1, y + 1);
+    if (preserve_field_parity != 0) {
+        // Preserve interlaced field parity by sampling vertical neighbors from
+        // the same field line set (y-2/y+2) rather than adjacent opposite field lines.
+        ym1 = y - 2;
+        yp1 = y + 2;
+        if (ym1 < 0) {
+            ym1 = y;
+        }
+        if (yp1 >= height) {
+            yp1 = y;
+        }
+    }
 
     const uchar3 c = rgb_in[y * width + x];
     const uchar3 n = rgb_in[ym1 * width + x];
@@ -676,8 +690,8 @@ __global__ void Sharpen3x3Kernel(
             2.0f * (north + south + west + east) +
             (c_nw + c_ne + c_sw + c_se)
         ) / 16.0f;
-        // Keep this intentionally strong for A/B visibility during SR flavor experiments.
-        const float amount = 2.4f;
+        // Keep sharpening moderate to avoid accentuating interlaced comb artifacts.
+        const float amount = 1.35f;
         return ClampToU8(center + amount * (center - blur));
     };
 
@@ -1315,6 +1329,7 @@ void LaunchSharpen3x3(
     uchar3* d_rgb_out,
     int width,
     int height,
+    bool preserve_field_parity,
     cudaStream_t stream
 ) {
     constexpr int kBlockX = 16;
@@ -1323,7 +1338,8 @@ void LaunchSharpen3x3(
         d_rgb_in,
         d_rgb_out,
         width,
-        height
+        height,
+        preserve_field_parity ? 1 : 0
     );
 }
 

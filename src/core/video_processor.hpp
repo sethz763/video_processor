@@ -54,6 +54,10 @@ public:
     std::string ProcessFrameNoDeinterlace(const std::string& input_frame);
     std::string ProcessFrameDeinterlaceOnly(const std::string& input_frame);
     std::string ProcessFramePreprocessOnly(const std::string& input_frame);
+    std::string ProcessFrameBuffer(const uint8_t* input_frame, size_t input_size);
+    std::string ProcessFrameNoDeinterlaceBuffer(const uint8_t* input_frame, size_t input_size);
+    std::string ProcessFrameDeinterlaceOnlyBuffer(const uint8_t* input_frame, size_t input_size);
+    std::string ProcessFramePreprocessOnlyBuffer(const uint8_t* input_frame, size_t input_size);
 
     void SetRoi(int roi_x, int roi_y, int roi_w, int roi_h);
     void SetRoiPosition(int roi_x, int roi_y);
@@ -89,7 +93,8 @@ public:
 
 private:
     std::string ProcessFrameInternal(
-        const std::string& input_frame,
+        const uint8_t* input_frame,
+        size_t input_size,
         bool deinterlace_only,
         bool force_deinterlace,
         bool force_disable_deinterlace
