@@ -1154,7 +1154,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         # Plugin-style stage ordering: each enabled filter is appended in order,
         # and output of one stage becomes input to the next stage.
         stack: list[str] = []
-        if _is_preprocess_enabled():
+        # When native basic scaling is active, preprocess is fused into that
+        # stage so effects run in the post-ROI/pre-upscale slot.
+        if _is_preprocess_enabled() and not _basic_scaling_enabled():
             stack.append("preprocess")
         if ai_sr_enabled and ai_sr_engine is not None:
             stack.append("ai_sr")

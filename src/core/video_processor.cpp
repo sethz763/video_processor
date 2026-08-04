@@ -620,11 +620,44 @@ std::string VideoProcessor::ProcessFrameInternal(
         "cudaMemcpyAsync H2D"
     );
 
-    if (enable_placeholder_sr_ && sr_scale > 1 && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
-        sr_flavor == SrFlavor::Bilinear) {
-        // Fast-path is intentionally tied to the explicit "Bilinear (Fast)"
-        // mode. Other flavors must run their dedicated kernels so method
-        // selection has visible effect.
+    const bool denoise_active = denoise_method != DenoiseMethod::Off && denoise_strength > 0.001f;
+    const bool sr_inactive = (!enable_placeholder_sr_) || (sr_scale <= 1);
+    const bool full_frame_roi = (roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_);
+    if (!deinterlace_only && !deinterlace_enabled && denoise_active &&
+        denoise_method != DenoiseMethod::FieldTemporalLuma &&
+        sr_inactive && full_frame_roi) {
+        CheckCuda(
+            cudaMemcpyAsync(d_uyvy_out_, d_uyvy_in_, uyvy_bytes_, cudaMemcpyDeviceToDevice, stream_),
+            "cudaMemcpyAsync D2D uyvy denoise prep"
+        );
+
+        switch (denoise_method) {
+            case DenoiseMethod::LumaMedian3x3:
+                cuda_kernels::LaunchDenoiseUyvyLumaMedian3x3(d_uyvy_in_, d_uyvy_out_, width_, height_, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaBilateral3x3:
+                cuda_kernels::LaunchDenoiseUyvyLumaBilateral3x3(d_uyvy_in_, d_uyvy_out_, width_, height_, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaBilateral5x5:
+                cuda_kernels::LaunchDenoiseUyvyLumaBilateral5x5(d_uyvy_in_, d_uyvy_out_, width_, height_, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaGaussian3x3:
+            default:
+                cuda_kernels::LaunchDenoiseUyvyLumaGaussian3x3(d_uyvy_in_, d_uyvy_out_, width_, height_, denoise_strength, stream_);
+                break;
+        }
+
+        CheckCuda(
+            cudaMemcpyAsync(host_output_ptr, d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
+            "cudaMemcpyAsync D2H uyvy denoise fast path"
+        );
+        CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize uyvy denoise fast path");
+        return std::string(reinterpret_cast<const char*>(host_output_ptr), uyvy_bytes_);
+    }
+
+    if (enable_placeholder_sr_ && sr_scale > 1 && !deinterlace_enabled && denoise_method == DenoiseMethod::Off) {
+        // Interlaced-safe scaling path: preserve field parity while sampling
+        // UYVY directly to avoid vertical field blending artifacts.
         if (roi_w == width_ && roi_h == height_) {
             int zoom_roi_w = std::max(2, width_ / sr_scale);
             int zoom_roi_h = std::max(2, height_ / sr_scale);
@@ -651,6 +684,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             roi_y,
             roi_w,
             roi_h,
+            true,
             stream_
         );
 
@@ -671,15 +705,64 @@ std::string VideoProcessor::ProcessFrameInternal(
     int crop_roi_y = roi_y;
     int crop_roi_w = roi_w;
     int crop_roi_h = roi_h;
+    const bool denoise_non_temporal_active =
+        denoise_method != DenoiseMethod::Off &&
+        denoise_method != DenoiseMethod::FieldTemporalLuma &&
+        denoise_strength > 0.001f;
+    const bool sr_enabled = enable_placeholder_sr_ && sr_scale > 1;
+    const bool roi_smaller_than_full = roi_w < width_ || roi_h < height_;
+    const bool preprocess_active = deinterlace_enabled || denoise_method != DenoiseMethod::Off;
+    const bool use_roi_preprocess_for_scaling = !deinterlace_only && sr_enabled && preprocess_active && roi_smaller_than_full;
+
+    if (use_roi_preprocess_for_scaling) {
+        cuda_kernels::LaunchCropCopyRgb(
+            d_rgb_full_,
+            width_,
+            height_,
+            d_rgb_zoom_,
+            roi_x,
+            roi_y,
+            roi_w,
+            roi_h,
+            stream_
+        );
+        crop_input = d_rgb_zoom_;
+        crop_src_w = roi_w;
+        crop_src_h = roi_h;
+        crop_roi_x = 0;
+        crop_roi_y = 0;
+        crop_roi_w = roi_w;
+        crop_roi_h = roi_h;
+    }
+
+    int preprocess_w = use_roi_preprocess_for_scaling ? roi_w : width_;
+    int preprocess_h = use_roi_preprocess_for_scaling ? roi_h : height_;
+    const int preprocess_field_phase = use_roi_preprocess_for_scaling ? (roi_y & 1) : 0;
 
     if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
-        if (has_prev_rgb_full_) {
-            cuda_kernels::LaunchDenoiseFieldTemporalLuma(
-                d_rgb_full_,
+        const uchar3* temporal_prev = d_rgb_prev_full_;
+        if (use_roi_preprocess_for_scaling) {
+            cuda_kernels::LaunchCropCopyRgb(
                 d_rgb_prev_full_,
-                d_rgb_denoise_,
                 width_,
                 height_,
+                d_rgb_sr_,
+                roi_x,
+                roi_y,
+                roi_w,
+                roi_h,
+                stream_
+            );
+            temporal_prev = d_rgb_sr_;
+        }
+
+        if (has_prev_rgb_full_) {
+            cuda_kernels::LaunchDenoiseFieldTemporalLuma(
+                crop_input,
+                temporal_prev,
+                d_rgb_denoise_,
+                preprocess_w,
+                preprocess_h,
                 denoise_strength,
                 stream_
             );
@@ -687,8 +770,8 @@ std::string VideoProcessor::ProcessFrameInternal(
             CheckCuda(
                 cudaMemcpyAsync(
                     d_rgb_denoise_,
-                    d_rgb_full_,
-                    rgb_pixels_ * kRgbBytesPerPixel,
+                    crop_input,
+                    static_cast<size_t>(preprocess_w) * static_cast<size_t>(preprocess_h) * kRgbBytesPerPixel,
                     cudaMemcpyDeviceToDevice,
                     stream_
                 ),
@@ -701,40 +784,71 @@ std::string VideoProcessor::ProcessFrameInternal(
     if (deinterlace_enabled) {
         switch (deinterlace_method) {
             case DeinterlaceMethod::Blend:
-                cuda_kernels::LaunchBlendDeinterlace(crop_input, d_rgb_bob_, width_, height_, stream_);
+                cuda_kernels::LaunchBlendDeinterlace(crop_input, d_rgb_bob_, preprocess_w, preprocess_h, stream_);
                 break;
             case DeinterlaceMethod::EdgeAdaptive:
-                cuda_kernels::LaunchEdgeAdaptiveDeinterlace(crop_input, d_rgb_bob_, width_, height_, stream_);
+                cuda_kernels::LaunchEdgeAdaptiveDeinterlace(
+                    crop_input,
+                    d_rgb_bob_,
+                    preprocess_w,
+                    preprocess_h,
+                    preprocess_field_phase,
+                    stream_
+                );
                 break;
             case DeinterlaceMethod::Bob:
             default:
-                cuda_kernels::LaunchBobDeinterlace(crop_input, d_rgb_bob_, width_, height_, stream_);
+                cuda_kernels::LaunchBobDeinterlace(
+                    crop_input,
+                    d_rgb_bob_,
+                    preprocess_w,
+                    preprocess_h,
+                    preprocess_field_phase,
+                    stream_
+                );
                 break;
         }
         crop_input = d_rgb_bob_;
     }
 
-    if (denoise_method != DenoiseMethod::Off && denoise_method != DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+    if (denoise_non_temporal_active) {
         switch (denoise_method) {
             case DenoiseMethod::LumaMedian3x3:
-                cuda_kernels::LaunchDenoiseLumaMedian3x3(crop_input, d_rgb_denoise_, width_, height_, denoise_strength, stream_);
+                cuda_kernels::LaunchDenoiseLumaMedian3x3(crop_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
                 break;
             case DenoiseMethod::LumaBilateral3x3:
-                cuda_kernels::LaunchDenoiseLumaBilateral3x3(crop_input, d_rgb_denoise_, width_, height_, denoise_strength, stream_);
+                cuda_kernels::LaunchDenoiseLumaBilateral3x3(crop_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
                 break;
             case DenoiseMethod::LumaBilateral5x5:
-                cuda_kernels::LaunchDenoiseLumaBilateral5x5(crop_input, d_rgb_denoise_, width_, height_, denoise_strength, stream_);
+                cuda_kernels::LaunchDenoiseLumaBilateral5x5(crop_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
                 break;
             case DenoiseMethod::LumaGaussian3x3:
             default:
-                cuda_kernels::LaunchDenoiseLumaGaussian3x3(crop_input, d_rgb_denoise_, width_, height_, denoise_strength, stream_);
+                cuda_kernels::LaunchDenoiseLumaGaussian3x3(crop_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
                 break;
         }
         crop_input = d_rgb_denoise_;
     }
 
     if (deinterlace_only) {
-        cuda_kernels::LaunchRgbToUyvy(crop_input, d_uyvy_out_, width_, height_, stream_);
+        if (use_roi_preprocess_for_scaling) {
+            cuda_kernels::LaunchCropZoomBilinear(
+                crop_input,
+                crop_src_w,
+                crop_src_h,
+                d_rgb_zoom_,
+                width_,
+                height_,
+                crop_roi_x,
+                crop_roi_y,
+                crop_roi_w,
+                crop_roi_h,
+                stream_
+            );
+            cuda_kernels::LaunchRgbToUyvy(d_rgb_zoom_, d_uyvy_out_, width_, height_, stream_);
+        } else {
+            cuda_kernels::LaunchRgbToUyvy(crop_input, d_uyvy_out_, width_, height_, stream_);
+        }
 
         CheckCuda(
             cudaMemcpyAsync(host_output_ptr, d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
@@ -765,77 +879,96 @@ std::string VideoProcessor::ProcessFrameInternal(
         if (!sr_pass_is_redundant) {
             const uchar3* sr_output = d_rgb_sr_;
 
-            // Upscale only the selected ROI region rather than the full frame.
-            switch (sr_flavor) {
-                case SrFlavor::Bilinear:
-                    cuda_kernels::LaunchCropZoomBilinear(
-                        crop_input,
-                        width_,
-                        height_,
-                        d_rgb_sr_,
-                        sr_roi_w,
-                        sr_roi_h,
-                        roi_x,
-                        roi_y,
-                        roi_w,
-                        roi_h,
-                        stream_
-                    );
-                    break;
-                case SrFlavor::BilinearSharp:
-                    cuda_kernels::LaunchCropZoomBilinearSharp(
-                        crop_input,
-                        width_,
-                        height_,
-                        d_rgb_sr_,
-                        sr_roi_w,
-                        sr_roi_h,
-                        roi_x,
-                        roi_y,
-                        roi_w,
-                        roi_h,
-                        stream_
-                    );
-                    break;
-                case SrFlavor::Bicubic:
-                    cuda_kernels::LaunchCropZoomBicubic(
-                        crop_input,
-                        width_,
-                        height_,
-                        d_rgb_sr_,
-                        sr_roi_w,
-                        sr_roi_h,
-                        roi_x,
-                        roi_y,
-                        roi_w,
-                        roi_h,
-                        stream_
-                    );
-                    break;
-                case SrFlavor::BicubicSharpen:
-                    cuda_kernels::LaunchCropZoomBicubic(
-                        crop_input,
-                        width_,
-                        height_,
-                        d_rgb_sr_,
-                        sr_roi_w,
-                        sr_roi_h,
-                        roi_x,
-                        roi_y,
-                        roi_w,
-                        roi_h,
-                        stream_
-                    );
-                    // Reuse d_rgb_bob_ as scratch for sharpened ROI before final zoom-to-output.
-                    cuda_kernels::LaunchSharpen3x3(
-                        d_rgb_sr_,
-                        d_rgb_bob_,
-                        sr_roi_w,
-                        sr_roi_h,
-                        stream_
-                    );
-                    sr_output = d_rgb_bob_;
-                    break;
+            if (use_roi_preprocess_for_scaling) {
+                switch (sr_flavor) {
+                    case SrFlavor::Bilinear:
+                        cuda_kernels::LaunchUpscaleBilinear(crop_input, crop_src_w, crop_src_h, d_rgb_sr_, sr_roi_w, sr_roi_h, stream_);
+                        break;
+                    case SrFlavor::BilinearSharp:
+                        cuda_kernels::LaunchUpscaleBilinearSharp(crop_input, crop_src_w, crop_src_h, d_rgb_sr_, sr_roi_w, sr_roi_h, stream_);
+                        break;
+                    case SrFlavor::Bicubic:
+                        cuda_kernels::LaunchUpscaleBicubic(crop_input, crop_src_w, crop_src_h, d_rgb_sr_, sr_roi_w, sr_roi_h, stream_);
+                        break;
+                    case SrFlavor::BicubicSharpen:
+                        cuda_kernels::LaunchUpscaleBicubic(crop_input, crop_src_w, crop_src_h, d_rgb_sr_, sr_roi_w, sr_roi_h, stream_);
+                        cuda_kernels::LaunchSharpen3x3(d_rgb_sr_, d_rgb_bob_, sr_roi_w, sr_roi_h, stream_);
+                        sr_output = d_rgb_bob_;
+                        break;
+                }
+            } else {
+                // Upscale only the selected ROI region rather than the full frame.
+                switch (sr_flavor) {
+                    case SrFlavor::Bilinear:
+                        cuda_kernels::LaunchCropZoomBilinear(
+                            crop_input,
+                            width_,
+                            height_,
+                            d_rgb_sr_,
+                            sr_roi_w,
+                            sr_roi_h,
+                            roi_x,
+                            roi_y,
+                            roi_w,
+                            roi_h,
+                            stream_
+                        );
+                        break;
+                    case SrFlavor::BilinearSharp:
+                        cuda_kernels::LaunchCropZoomBilinearSharp(
+                            crop_input,
+                            width_,
+                            height_,
+                            d_rgb_sr_,
+                            sr_roi_w,
+                            sr_roi_h,
+                            roi_x,
+                            roi_y,
+                            roi_w,
+                            roi_h,
+                            stream_
+                        );
+                        break;
+                    case SrFlavor::Bicubic:
+                        cuda_kernels::LaunchCropZoomBicubic(
+                            crop_input,
+                            width_,
+                            height_,
+                            d_rgb_sr_,
+                            sr_roi_w,
+                            sr_roi_h,
+                            roi_x,
+                            roi_y,
+                            roi_w,
+                            roi_h,
+                            stream_
+                        );
+                        break;
+                    case SrFlavor::BicubicSharpen:
+                        cuda_kernels::LaunchCropZoomBicubic(
+                            crop_input,
+                            width_,
+                            height_,
+                            d_rgb_sr_,
+                            sr_roi_w,
+                            sr_roi_h,
+                            roi_x,
+                            roi_y,
+                            roi_w,
+                            roi_h,
+                            stream_
+                        );
+                        // Reuse d_rgb_bob_ as scratch for sharpened ROI before final zoom-to-output.
+                        cuda_kernels::LaunchSharpen3x3(
+                            d_rgb_sr_,
+                            d_rgb_bob_,
+                            sr_roi_w,
+                            sr_roi_h,
+                            stream_
+                        );
+                        sr_output = d_rgb_bob_;
+                        break;
+                }
             }
 
             crop_input = sr_output;

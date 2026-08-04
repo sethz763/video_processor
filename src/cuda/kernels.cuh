@@ -25,6 +25,7 @@ void LaunchUyvyCropZoomNearest(
     int roi_y,
     int roi_w,
     int roi_h,
+    bool preserve_field_parity,
     cudaStream_t stream
 );
 
@@ -33,6 +34,7 @@ void LaunchBobDeinterlace(
     uchar3* d_rgb_out,
     int width,
     int height,
+    int field_phase,
     cudaStream_t stream
 );
 
@@ -49,6 +51,7 @@ void LaunchEdgeAdaptiveDeinterlace(
     uchar3* d_rgb_out,
     int width,
     int height,
+    int field_phase,
     cudaStream_t stream
 );
 
@@ -124,6 +127,18 @@ void LaunchCropZoomBicubic(
     cudaStream_t stream
 );
 
+void LaunchCropCopyRgb(
+    const uchar3* d_rgb_in,
+    int src_width,
+    int src_height,
+    uchar3* d_rgb_out,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    cudaStream_t stream
+);
+
 void LaunchSharpen3x3(
     const uchar3* d_rgb_in,
     uchar3* d_rgb_out,
@@ -162,6 +177,42 @@ void LaunchDenoiseLumaBilateral3x3(
 void LaunchDenoiseLumaBilateral5x5(
     const uchar3* d_rgb_in,
     uchar3* d_rgb_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseUyvyLumaGaussian3x3(
+    const uint8_t* d_uyvy_in,
+    uint8_t* d_uyvy_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseUyvyLumaMedian3x3(
+    const uint8_t* d_uyvy_in,
+    uint8_t* d_uyvy_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseUyvyLumaBilateral3x3(
+    const uint8_t* d_uyvy_in,
+    uint8_t* d_uyvy_out,
+    int width,
+    int height,
+    float strength,
+    cudaStream_t stream
+);
+
+void LaunchDenoiseUyvyLumaBilateral5x5(
+    const uint8_t* d_uyvy_in,
+    uint8_t* d_uyvy_out,
     int width,
     int height,
     float strength,

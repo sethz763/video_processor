@@ -12,8 +12,8 @@
   "basic_scaling_auto_max": "4",
   "basic_scaling_enabled": true,
   "basic_scaling_manual": "4",
-  "basic_scaling_method": "Bilinear (Fast)",
-  "basic_scaling_mode": "Auto",
+  "basic_scaling_method": "Bilinear + Edge Boost (Realtime)",
+  "basic_scaling_mode": "Manual",
   "decklink_auto_detect": true,
   "decklink_enable_format_detection": true,
   "decklink_input_device": 1,
@@ -21,9 +21,9 @@
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "deinterlace_enabled": false,
-  "deinterlace_method": "Bob (Fast)",
+  "deinterlace_method": "Edge Adaptive (Field Aware)",
   "denoise_method": "Off",
-  "denoise_strength": 0.35,
+  "denoise_strength": 1.0,
   "display_splitter_sizes": [
     421,
     388

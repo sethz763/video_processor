@@ -552,13 +552,14 @@ class RoiCanvas(QWidget):
         p.drawText(12, 24, f"ROI: x={self._roi.x} y={self._roi.y} w={self._roi.w} h={self._roi.h}")
         p.drawText(12, 44, f"Scale: {scale:.2f}x")
 
-        handle_size = 8
+        # Keep the resize handle fully inside the ROI and make it easier to grab.
+        handle_size = 48
         p.fillRect(
             QRectF(
                 roi_rect_w.right() - handle_size,
                 roi_rect_w.bottom() - handle_size,
-                handle_size * 2,
-                handle_size * 2,
+                handle_size,
+                handle_size,
             ),
             Qt.yellow,
         )
@@ -612,7 +613,13 @@ class RoiCanvas(QWidget):
         self._drag_start_roi = self._roi
 
         roi_rect = self._frame_to_widget_rect(self._roi)
-        handle_rect = QRectF(roi_rect.right() - 12, roi_rect.bottom() - 12, 24, 24)
+        handle_size = 48
+        handle_rect = QRectF(
+            roi_rect.right() - handle_size,
+            roi_rect.bottom() - handle_size,
+            handle_size,
+            handle_size,
+        )
 
         if handle_rect.contains(event.position()):
             self._drag_mode = "resize"
@@ -646,11 +653,14 @@ class RoiCanvas(QWidget):
             dw_x = int(round(dx * sx))
             dw_y = int(round(dy * sy * (16.0 / 9.0)))
             dw = dw_x if abs(dw_x) >= abs(dw_y) else dw_y
-            new_w = self._drag_start_roi.w + dw
+            # Resize around center so the whole ROI scales symmetrically.
+            new_w = self._drag_start_roi.w + (2 * dw)
             new_h = int(round(new_w * 9.0 / 16.0))
+            center_x = self._drag_start_roi.x + (self._drag_start_roi.w / 2.0)
+            center_y = self._drag_start_roi.y + (self._drag_start_roi.h / 2.0)
             new_roi = Roi(
-                self._drag_start_roi.x,
-                self._drag_start_roi.y,
+                int(round(center_x - (new_w / 2.0))),
+                int(round(center_y - (new_h / 2.0))),
                 new_w,
                 new_h,
             )
