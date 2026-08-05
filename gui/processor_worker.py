@@ -168,6 +168,73 @@ RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
 }
 
 
+def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray) -> np.ndarray:
+    if yuv422.ndim != 3 or yuv422.shape[2] != 2:
+        raise RuntimeError(f"Expected UYVY array shape [H, W, 2], got {tuple(yuv422.shape)}")
+
+    h, w, _ = yuv422.shape
+    if (w & 1) != 0:
+        raise RuntimeError(f"UYVY width must be even, got {w}")
+
+    packed = yuv422.reshape(h, w // 2, 4)
+    u = packed[:, :, 0].astype(np.float32)
+    y0 = packed[:, :, 1].astype(np.float32)
+    v = packed[:, :, 2].astype(np.float32)
+    y1 = packed[:, :, 3].astype(np.float32)
+
+    d = u - 128.0
+    e = v - 128.0
+
+    c0 = y0 - 16.0
+    c1 = y1 - 16.0
+
+    r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+    g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+    b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+
+    r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+    g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+    b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+
+    rgb = np.empty((h, w, 3), dtype=np.uint8)
+    rgb[:, 0::2, 0] = r0
+    rgb[:, 0::2, 1] = g0
+    rgb[:, 0::2, 2] = b0
+    rgb[:, 1::2, 0] = r1
+    rgb[:, 1::2, 1] = g1
+    rgb[:, 1::2, 2] = b1
+    return rgb
+
+
+def _rgb_to_uyvy_bt709_limited(rgb: np.ndarray) -> np.ndarray:
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise RuntimeError(f"Expected RGB array shape [H, W, 3], got {tuple(rgb.shape)}")
+
+    h, w, _ = rgb.shape
+    if (w & 1) != 0:
+        raise RuntimeError(f"RGB width must be even for UYVY conversion, got {w}")
+
+    r = rgb[:, :, 0].astype(np.float32)
+    g = rgb[:, :, 1].astype(np.float32)
+    b = rgb[:, :, 2].astype(np.float32)
+
+    y = np.clip(16.0 + 0.182586 * r + 0.614231 * g + 0.062007 * b, 0.0, 255.0).astype(np.uint8)
+    u = np.clip(128.0 - 0.100644 * r - 0.338572 * g + 0.439216 * b, 0.0, 255.0)
+    v = np.clip(128.0 + 0.439216 * r - 0.398942 * g - 0.040274 * b, 0.0, 255.0)
+
+    y0 = y[:, 0::2]
+    y1 = y[:, 1::2]
+    u_pair = ((u[:, 0::2] + u[:, 1::2]) * 0.5).astype(np.uint8)
+    v_pair = ((v[:, 0::2] + v[:, 1::2]) * 0.5).astype(np.uint8)
+
+    packed = np.empty((h, w // 2, 4), dtype=np.uint8)
+    packed[:, :, 0] = u_pair
+    packed[:, :, 1] = y0
+    packed[:, :, 2] = v_pair
+    packed[:, :, 3] = y1
+    return packed.reshape(h, w, 2)
+
+
 class AiSrOnnxEngine:
     def __init__(
         self,
@@ -317,19 +384,22 @@ class AiSrOnnxEngine:
 
     def _normalize_roi(self, roi: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         roi_x, roi_y, roi_w, roi_h = [int(v) for v in roi]
-        roi_x = max(0, min(roi_x, FRAME_W - 2))
-        roi_y = max(0, min(roi_y, FRAME_H - 2))
-        roi_w = max(2, min(roi_w, FRAME_W - roi_x))
-        roi_h = max(2, min(roi_h, FRAME_H - roi_y))
+        roi_w = max(2, min(roi_w, FRAME_W))
+        roi_h = max(2, min(roi_h, FRAME_H))
 
         # UYVY is 4:2:2 packed, so x and width must remain even.
-        roi_x &= ~1
         roi_w &= ~1
         if roi_w < 2:
             roi_w = 2
-        if roi_x + roi_w > FRAME_W:
-            roi_x = max(0, FRAME_W - roi_w)
-            roi_x &= ~1
+
+        max_x = max(0, FRAME_W - roi_w)
+        max_y = max(0, FRAME_H - roi_h)
+        roi_x = max(0, min(roi_x, max_x))
+        roi_y = max(0, min(roi_y, max_y))
+
+        roi_x &= ~1
+        if roi_x > max_x:
+            roi_x = max(0, max_x & ~1)
 
         return roi_x, roi_y, roi_w, roi_h
 
@@ -475,7 +545,7 @@ class AiSrOnnxEngine:
             raise RuntimeError(f"Unexpected UYVY frame size: {len(frame_bytes)}")
 
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
-        rgb = cv2.cvtColor(yuv422, cv2.COLOR_YUV2RGB_UYVY)
+        rgb = _uyvy_to_rgb_bt709_limited(yuv422)
 
         # For x2/x4/x8 models, run inference on proportionally downscaled input so output
         # naturally returns near FRAME_W x FRAME_H instead of exploding to 4K/8K.
@@ -499,7 +569,7 @@ class AiSrOnnxEngine:
             preserve = self._detail_preserve_percent / 100.0
             sr_rgb = cv2.addWeighted(sr_rgb, 1.0 - preserve, rgb, preserve, 0.0)
 
-        sr_yuv422 = cv2.cvtColor(sr_rgb, cv2.COLOR_RGB2YUV_UYVY)
+        sr_yuv422 = _rgb_to_uyvy_bt709_limited(sr_rgb)
         return sr_yuv422.tobytes()
 
     def process_uyvy_frame_roi(self, frame_bytes: bytes, roi: tuple[int, int, int, int]) -> bytes:
@@ -523,7 +593,7 @@ class AiSrOnnxEngine:
 
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
         roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
-        roi_rgb = cv2.cvtColor(roi_yuv, cv2.COLOR_YUV2RGB_UYVY)
+        roi_rgb = _uyvy_to_rgb_bt709_limited(roi_yuv)
 
         model_rgb = roi_rgb
         if self._model_scale > 1:
@@ -546,7 +616,7 @@ class AiSrOnnxEngine:
             preserve = self._detail_preserve_percent / 100.0
             sr_roi_rgb = cv2.addWeighted(sr_roi_rgb, 1.0 - preserve, roi_rgb, preserve, 0.0)
 
-        sr_roi_yuv = cv2.cvtColor(sr_roi_rgb, cv2.COLOR_RGB2YUV_UYVY)
+        sr_roi_yuv = _rgb_to_uyvy_bt709_limited(sr_roi_rgb)
         yuv_out = np.array(yuv422, copy=True)
         yuv_out[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :] = sr_roi_yuv
         return yuv_out.tobytes()
@@ -572,7 +642,7 @@ class AiSrOnnxEngine:
 
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
         roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
-        roi_rgb = cv2.cvtColor(roi_yuv, cv2.COLOR_YUV2RGB_UYVY)
+        roi_rgb = _uyvy_to_rgb_bt709_limited(roi_yuv)
 
         target_w = FRAME_W
         target_h = FRAME_H
@@ -608,7 +678,7 @@ class AiSrOnnxEngine:
             preserve = self._detail_preserve_percent / 100.0
             sr_rgb = cv2.addWeighted(sr_rgb, 1.0 - preserve, baseline_rgb, preserve, 0.0)
 
-        sr_yuv422 = cv2.cvtColor(sr_rgb, cv2.COLOR_RGB2YUV_UYVY)
+        sr_yuv422 = _rgb_to_uyvy_bt709_limited(sr_rgb)
         return sr_yuv422.tobytes()
 
 
@@ -761,19 +831,21 @@ def _clear_output_schedule_state(out: object | None) -> None:
 
 
 def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
-    roi_x = max(0, min(int(x), FRAME_W - 2))
-    roi_y = max(0, min(int(y), FRAME_H - 2))
-    roi_w = max(2, min(int(w), FRAME_W - roi_x))
-    roi_h = max(2, min(int(h), FRAME_H - roi_y))
+    roi_w = max(2, min(int(w), FRAME_W))
+    roi_h = max(2, min(int(h), FRAME_H))
 
-    roi_x &= ~1
     roi_w &= ~1
     if roi_w < 2:
         roi_w = 2
 
-    if roi_x + roi_w > FRAME_W:
-        roi_x = max(0, FRAME_W - roi_w)
-        roi_x &= ~1
+    max_x = max(0, FRAME_W - roi_w)
+    max_y = max(0, FRAME_H - roi_h)
+    roi_x = max(0, min(int(x), max_x))
+    roi_y = max(0, min(int(y), max_y))
+
+    roi_x &= ~1
+    if roi_x > max_x:
+        roi_x = max(0, max_x & ~1)
 
     return roi_x, roi_y, roi_w, roi_h
 
@@ -1056,7 +1128,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         roi_x, roi_y, roi_w, roi_h = _normalize_worker_roi(int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
         roi_yuv = np.ascontiguousarray(yuv422[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w, :])
-        roi_rgb = cv2.cvtColor(roi_yuv, cv2.COLOR_YUV2RGB_UYVY)
+        roi_rgb = _uyvy_to_rgb_bt709_limited(roi_yuv)
         roi_rgba = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2RGBA)
 
         engine_in_w = max(2, int(getattr(rtx_vsr_engine, "input_width", roi_w)) & ~1)
@@ -1075,7 +1147,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             sr_rgba = cv2.resize(sr_rgba, (FRAME_W, FRAME_H), interpolation=interpolation)
 
         sr_rgb = cv2.cvtColor(sr_rgba, cv2.COLOR_RGBA2RGB)
-        sr_yuv422 = cv2.cvtColor(sr_rgb, cv2.COLOR_RGB2YUV_UYVY)
+        sr_yuv422 = _rgb_to_uyvy_bt709_limited(sr_rgb)
         return sr_yuv422.tobytes()
 
     def _apply_ai_sr_performance_profile() -> None:
@@ -1897,6 +1969,16 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         rtx_vsr_error = _refresh_rtx_vsr_engine()
                     elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
                         _schedule_rtx_roi_rebuild()
+                continue
+
+            if command == "set_roi_position":
+                current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
+                    int(message["x"]),
+                    int(message["y"]),
+                    current_roi_w,
+                    current_roi_h,
+                )
+                processor.set_roi_position(current_roi_x, current_roi_y)
                 continue
 
             if command in {"set_basic_scaling_mode_auto", "set_sr_mode_auto"}:

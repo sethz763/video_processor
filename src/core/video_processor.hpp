@@ -129,6 +129,9 @@ private:
     int sr_width_;
     int sr_height_;
     int sr_buffer_scale_capacity_;
+    int auto_sr_pending_scale_;
+    int auto_sr_pending_frames_;
+    int auto_sr_settle_frames_;
 
     size_t uyvy_bytes_;
     size_t rgb_pixels_;

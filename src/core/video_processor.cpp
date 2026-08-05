@@ -15,6 +15,7 @@ constexpr int kExpectedHeight = 1080;
 constexpr int kUyvyBytesPerPixel = 2;
 constexpr size_t kRgbBytesPerPixel = sizeof(uchar3);
 constexpr std::array<int, 4> kSupportedSrScales = {16, 8, 4, 2};
+constexpr int kAutoSrScaleSettleFrames = 6;
 
 inline void CheckCuda(cudaError_t err, const char* operation) {
     if (err != cudaSuccess) {
@@ -213,6 +214,9 @@ VideoProcessor::VideoProcessor(
       sr_width_(width),
       sr_height_(height),
     sr_buffer_scale_capacity_(0),
+            auto_sr_pending_scale_(-1),
+            auto_sr_pending_frames_(0),
+            auto_sr_settle_frames_(kAutoSrScaleSettleFrames),
       uyvy_bytes_(static_cast<size_t>(width) * static_cast<size_t>(height) * kUyvyBytesPerPixel),
       rgb_pixels_(static_cast<size_t>(width) * static_cast<size_t>(height)),
       stream_(nullptr),
@@ -262,17 +266,23 @@ void VideoProcessor::ClampRoi() {
         roi_h_ = height_;
     }
 
-    roi_x_ = std::clamp(roi_x_, 0, width_ - 2);
-    roi_y_ = std::clamp(roi_y_, 0, height_ - 2);
-
-    roi_w_ = std::clamp(roi_w_, 2, width_ - roi_x_);
-    roi_h_ = std::clamp(roi_h_, 2, height_ - roi_y_);
+    roi_w_ = std::clamp(roi_w_, 2, width_);
+    roi_h_ = std::clamp(roi_h_, 2, height_);
 
     // UYVY packs chroma for 2 horizontal pixels, so enforce even start and width.
-    roi_x_ &= ~1;
     roi_w_ &= ~1;
     if (roi_w_ < 2) {
         roi_w_ = 2;
+    }
+
+    const int max_x = std::max(0, width_ - roi_w_);
+    const int max_y = std::max(0, height_ - roi_h_);
+    roi_x_ = std::clamp(roi_x_, 0, max_x);
+    roi_y_ = std::clamp(roi_y_, 0, max_y);
+
+    roi_x_ &= ~1;
+    if (roi_x_ > max_x) {
+        roi_x_ = std::max(0, max_x & ~1);
     }
 }
 
@@ -315,6 +325,8 @@ void VideoProcessor::SetSrModeAuto() {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
     std::lock_guard<std::mutex> state_lock(state_mutex_);
     CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize SetSrModeAuto");
+    auto_sr_pending_scale_ = -1;
+    auto_sr_pending_frames_ = 0;
     ConfigureSrScaleLocked(0, true);
 }
 
@@ -328,6 +340,8 @@ void VideoProcessor::SetMaxAutoSrScale(int sr_scale) {
     max_auto_sr_scale_ = sr_scale;
     if (enable_placeholder_sr_ && auto_sr_scale_) {
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize SetMaxAutoSrScale");
+        auto_sr_pending_scale_ = -1;
+        auto_sr_pending_frames_ = 0;
         ConfigureSrScaleLocked(0, true);
     }
 }
@@ -367,6 +381,8 @@ void VideoProcessor::SetSrScaleManual(int sr_scale) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
     std::lock_guard<std::mutex> state_lock(state_mutex_);
     CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize SetSrScaleManual");
+    auto_sr_pending_scale_ = -1;
+    auto_sr_pending_frames_ = 0;
     ConfigureSrScaleLocked(sr_scale, false);
 }
 
@@ -480,6 +496,8 @@ void VideoProcessor::ConfigureSrScaleLocked(int requested_scale, bool auto_mode)
         sr_scale_ = 1;
         sr_width_ = width_;
         sr_height_ = height_;
+        auto_sr_pending_scale_ = -1;
+        auto_sr_pending_frames_ = 0;
         return;
     }
 
@@ -500,6 +518,8 @@ void VideoProcessor::ConfigureSrScaleLocked(int requested_scale, bool auto_mode)
             sr_scale_ = candidate_scale;
             sr_width_ = width_ * candidate_scale;
             sr_height_ = height_ * candidate_scale;
+            auto_sr_pending_scale_ = -1;
+            auto_sr_pending_frames_ = 0;
             return;
         }
 
@@ -613,7 +633,19 @@ std::string VideoProcessor::ProcessFrameInternal(
         if (enable_placeholder_sr_ && auto_sr_scale_) {
             const int desired_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_, max_auto_sr_scale_);
             if (desired_scale != sr_scale_) {
-                ConfigureSrScaleLocked(0, true);
+                if (auto_sr_pending_scale_ != desired_scale) {
+                    auto_sr_pending_scale_ = desired_scale;
+                    auto_sr_pending_frames_ = 1;
+                } else {
+                    auto_sr_pending_frames_ += 1;
+                }
+
+                if (auto_sr_pending_frames_ >= auto_sr_settle_frames_) {
+                    ConfigureSrScaleLocked(0, true);
+                }
+            } else {
+                auto_sr_pending_scale_ = -1;
+                auto_sr_pending_frames_ = 0;
             }
         }
 

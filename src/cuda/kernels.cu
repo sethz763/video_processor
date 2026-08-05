@@ -21,14 +21,14 @@ __device__ inline uint8_t ClampToU8(float v) {
 }
 
 __device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v) {
-    // BT.601 limited-range conversion (Y:16-235, U/V:16-240), used by UYVY video feeds.
+    // BT.709 limited-range conversion (Y:16-235, U/V:16-240) for HD 1080 signals.
     const float c = static_cast<float>(y) - 16.0f;
     const float d = static_cast<float>(u) - 128.0f;
     const float e = static_cast<float>(v) - 128.0f;
 
-    const float r = 1.164383f * c + 1.596027f * e;
-    const float g = 1.164383f * c - 0.391762f * d - 0.812968f * e;
-    const float b = 1.164383f * c + 2.017232f * d;
+    const float r = 1.164383f * c + 1.792741f * e;
+    const float g = 1.164383f * c - 0.213249f * d - 0.532909f * e;
+    const float b = 1.164383f * c + 2.112402f * d;
 
     return make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
 }
@@ -44,11 +44,11 @@ __device__ inline YuvF RgbToYuv(const uchar3& rgb) {
     const float g = static_cast<float>(rgb.y);
     const float b = static_cast<float>(rgb.z);
 
-    // BT.601 limited-range conversion (inverse of MakeRgbFromYuv).
+    // BT.709 limited-range conversion (inverse of MakeRgbFromYuv).
     return {
-        16.0f + 0.256788f * r + 0.504129f * g + 0.097906f * b,
-        128.0f - 0.148223f * r - 0.290993f * g + 0.439216f * b,
-        128.0f + 0.439216f * r - 0.367788f * g - 0.071427f * b,
+        16.0f + 0.182586f * r + 0.614231f * g + 0.062007f * b,
+        128.0f - 0.100644f * r - 0.338572f * g + 0.439216f * b,
+        128.0f + 0.439216f * r - 0.398942f * g - 0.040274f * b,
     };
 }
 

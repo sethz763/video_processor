@@ -25,25 +25,27 @@
   "denoise_method": "Off",
   "denoise_strength": 1.0,
   "display_splitter_sizes": [
-    421,
-    388
+    367,
+    366
   ],
   "fps": 60,
   "main_splitter_sizes": [
-    733,
-    731
+    698,
+    698
   ],
   "perf_guard_enabled": false,
-  "preview_downsample": "Half (1/2)",
+  "preview_downsample": "Full (1:1)",
   "preview_poll_fps": 15,
   "preview_request_fps": 15,
+  "roi_latency_smoothing_percent": 33,
+  "roi_smoothing_percent": 100,
   "rtx_thdr_contrast": 50,
   "rtx_thdr_enabled": false,
-  "rtx_thdr_max_luminance": 1000,
+  "rtx_thdr_max_luminance": 1043,
   "rtx_thdr_middle_gray": 50,
   "rtx_thdr_saturation": 50,
   "rtx_vsr_enabled": false,
-  "rtx_vsr_post_scale_method": "Bicubic (Balanced)",
+  "rtx_vsr_post_scale_method": "Lanczos (Sharp)",
   "rtx_vsr_quality": "high",
   "rtx_vsr_scale": "2",
   "source_mode": "Blackmagic DeckLink",

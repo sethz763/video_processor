@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -51,6 +52,7 @@ PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR = {
     "Half (1/2)": 0.5,
     "Quarter (1/4)": 0.25,
 }
+PREVIEW_BT709_ACCURATE = os.environ.get("VP_PREVIEW_BT709_ACCURATE", "0") == "1"
 
 SR_FLAVOR_LABEL_TO_NAME = {
     "Bilinear (Fast)": "bilinear",
@@ -118,6 +120,50 @@ else:
 
 _CV2_RGB_RING: list[np.ndarray] = []
 _CV2_RGB_RING_INDEX = 0
+
+
+def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray, dst: np.ndarray | None = None) -> np.ndarray:
+    if yuv422.ndim != 3 or yuv422.shape[2] != 2:
+        raise ValueError(f"Expected UYVY array shape [H, W, 2], got {tuple(yuv422.shape)}")
+
+    h, w, _ = yuv422.shape
+    if (w & 1) != 0:
+        raise ValueError(f"UYVY width must be even, got {w}")
+
+    if dst is None:
+        rgb = np.empty((h, w, 3), dtype=np.uint8)
+    else:
+        if dst.shape != (h, w, 3) or dst.dtype != np.uint8:
+            raise ValueError("Destination RGB buffer must be uint8 with shape [H, W, 3]")
+        rgb = dst
+
+    packed = yuv422.reshape(h, w // 2, 4)
+    u = packed[:, :, 0].astype(np.float32)
+    y0 = packed[:, :, 1].astype(np.float32)
+    v = packed[:, :, 2].astype(np.float32)
+    y1 = packed[:, :, 3].astype(np.float32)
+
+    d = u - 128.0
+    e = v - 128.0
+
+    c0 = y0 - 16.0
+    c1 = y1 - 16.0
+
+    r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+    g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+    b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+
+    r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+    g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+    b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+
+    rgb[:, 0::2, 0] = r0
+    rgb[:, 0::2, 1] = g0
+    rgb[:, 0::2, 2] = b0
+    rgb[:, 1::2, 0] = r1
+    rgb[:, 1::2, 1] = g1
+    rgb[:, 1::2, 2] = b1
+    return rgb
 
 
 def setup_logger() -> logging.Logger:
@@ -241,35 +287,36 @@ class Roi:
 
 
 def clamp_roi(roi: Roi, width: int = FRAME_W, height: int = FRAME_H) -> Roi:
-    x = max(0, min(roi.x, width - 2))
-    y = max(0, min(roi.y, height - 2))
-
-    max_w = max(2, width - x)
-    max_h = max(2, height - y)
+    # Keep ROI size stable while moving: clamp size first, then clamp position.
+    max_w_frame = max(2, width)
+    max_h_frame = max(2, height)
 
     # ROI is locked to 16:9 to match input/output display aspect.
-    w = max(2, min(roi.w, max_w))
+    w = max(2, min(roi.w, max_w_frame))
     w &= ~1
     if w < 2:
         w = 2
 
     h = max(2, int(round(w * 9.0 / 16.0)))
-    if h > max_h:
-        h = max_h
+    if h > max_h_frame:
+        h = max_h_frame
         w = max(2, int(round(h * 16.0 / 9.0)))
-        w = min(w, max_w)
+        w = min(w, max_w_frame)
         w &= ~1
         if w < 2:
             w = 2
         h = max(2, int(round(w * 9.0 / 16.0)))
+        if h > max_h_frame:
+            h = max_h_frame
 
-    if y + h > height:
-        y = max(0, height - h)
+    max_x = max(0, width - w)
+    max_y = max(0, height - h)
+    x = max(0, min(roi.x, max_x))
+    y = max(0, min(roi.y, max_y))
 
     x &= ~1
-    if x + w > width:
-        x = max(0, width - w)
-        x &= ~1
+    if x > max_x:
+        x = max(0, max_x & ~1)
 
     return Roi(x, y, w, h)
 
@@ -300,58 +347,27 @@ def uyvy_to_qimage(
     if len(frame_bytes) != UYVY_FRAME_BYTES:
         raise ValueError("Invalid UYVY frame byte length.")
 
-    if cv2 is not None:
-        global _CV2_RGB_RING_INDEX
-        if not _CV2_RGB_RING:
-            # Two buffers avoid input/output previews aliasing each other within one tick.
-            _CV2_RGB_RING.extend(
-                [
-                    np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8),
-                    np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8),
-                ]
-            )
+    global _CV2_RGB_RING_INDEX
+    if not _CV2_RGB_RING:
+        # Two buffers avoid input/output previews aliasing each other within one tick.
+        _CV2_RGB_RING.extend(
+            [
+                np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8),
+                np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8),
+            ]
+        )
 
-        rgb = _CV2_RGB_RING[_CV2_RGB_RING_INDEX]
-        _CV2_RGB_RING_INDEX = (_CV2_RGB_RING_INDEX + 1) % len(_CV2_RGB_RING)
+    rgb = _CV2_RGB_RING[_CV2_RGB_RING_INDEX]
+    _CV2_RGB_RING_INDEX = (_CV2_RGB_RING_INDEX + 1) % len(_CV2_RGB_RING)
 
-        yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+    yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+
+    # Keep preview interaction responsive by default using OpenCV's optimized
+    # conversion path. Opt in to explicit BT.709 preview conversion if needed.
+    if cv2 is not None and not PREVIEW_BT709_ACCURATE:
         cv2.cvtColor(yuv422, cv2.COLOR_YUV2RGB_UYVY, dst=rgb)
-        image = QImage(rgb.data, FRAME_W, FRAME_H, FRAME_W * 3, QImage.Format_RGB888)
-        if preview_max_w is not None and preview_max_h is not None:
-            target_w = max(1, min(int(preview_max_w), FRAME_W))
-            target_h = max(1, min(int(preview_max_h), FRAME_H))
-            if target_w < FRAME_W or target_h < FRAME_H:
-                return image.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation), None
-        return image, rgb
-
-    data = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W // 2, 4)
-
-    # UYVY packing: U, Y0, V, Y1 per 2 pixels.
-    u = data[:, :, 0].astype(np.float32)
-    y0 = data[:, :, 1].astype(np.float32)
-    v = data[:, :, 2].astype(np.float32)
-    y1 = data[:, :, 3].astype(np.float32)
-
-    y = np.empty((FRAME_H, FRAME_W), dtype=np.float32)
-    y[:, 0::2] = y0
-    y[:, 1::2] = y1
-
-    u_full = np.repeat(u, 2, axis=1)
-    v_full = np.repeat(v, 2, axis=1)
-
-    # BT.709 limited-range YUV->RGB conversion for HD video signals.
-    c = y - 16
-    d = u_full - 128
-    e = v_full - 128
-
-    r = np.clip(1.164383 * c + 1.792741 * e, 0, 255).astype(np.uint8)
-    g = np.clip(1.164383 * c - 0.213249 * d - 0.532909 * e, 0, 255).astype(np.uint8)
-    b = np.clip(1.164383 * c + 2.112402 * d, 0, 255).astype(np.uint8)
-
-    rgb = np.empty((FRAME_H, FRAME_W, 3), dtype=np.uint8)
-    rgb[:, :, 0] = r
-    rgb[:, :, 1] = g
-    rgb[:, :, 2] = b
+    else:
+        _uyvy_to_rgb_bt709_limited(yuv422, dst=rgb)
 
     image = QImage(rgb.data, FRAME_W, FRAME_H, FRAME_W * 3, QImage.Format_RGB888)
     if preview_max_w is not None and preview_max_h is not None:
@@ -511,6 +527,10 @@ class RoiCanvas(QWidget):
         self._touch_emit_interval_s = 1.0 / 45.0
         self._touch_emit_pending = False
         self._touch_emit_pending_scale = False
+        self._smoothing_percent = 60
+        self._latency_smoothing_percent = 0
+        self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        self._interaction_filtered_target_roi: Roi | None = None
         self._interaction_target_roi: Roi | None = None
         self._interaction_target_emit_scale = False
         self._interaction_interp_timer = QTimer(self)
@@ -531,6 +551,12 @@ class RoiCanvas(QWidget):
 
     def roi(self) -> Roi:
         return self._roi
+
+    def set_smoothing_percent(self, value: int) -> None:
+        self._smoothing_percent = max(0, min(100, int(value)))
+
+    def set_latency_smoothing_percent(self, value: int) -> None:
+        self._latency_smoothing_percent = max(0, min(100, int(value)))
 
     def paintEvent(self, event) -> None:
         del event
@@ -727,8 +753,38 @@ class RoiCanvas(QWidget):
         self._set_roi_and_emit(new_roi, emit_scale=emit_scale)
 
     def _queue_interpolated_roi(self, target_roi: Roi, emit_scale: bool = True) -> None:
-        self._interaction_target_roi = clamp_roi(target_roi)
+        raw_target = clamp_roi(target_roi)
+        latency = max(0.0, min(1.0, self._latency_smoothing_percent / 100.0))
+        if latency > 0.0:
+            beta = 1.0 - (0.82 * latency)
+            prev = self._interaction_filtered_target_roi if self._interaction_filtered_target_roi is not None else raw_target
+            filtered = clamp_roi(
+                Roi(
+                    int(round(prev.x + (raw_target.x - prev.x) * beta)),
+                    int(round(prev.y + (raw_target.y - prev.y) * beta)),
+                    int(round(prev.w + (raw_target.w - prev.w) * beta)),
+                    int(round(prev.h + (raw_target.h - prev.h) * beta)),
+                )
+            )
+            self._interaction_filtered_target_roi = filtered
+            self._interaction_target_roi = filtered
+        else:
+            self._interaction_filtered_target_roi = raw_target
+            self._interaction_target_roi = raw_target
         self._interaction_target_emit_scale = self._interaction_target_emit_scale or emit_scale
+        if not self._interaction_interp_timer.isActive():
+            self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        target_scale = roi_scale_from_roi(self._interaction_target_roi)
+        smoothing = max(0.0, min(1.0, self._smoothing_percent / 100.0))
+        if target_scale >= 6.0:
+            base_interval_ms = 8
+        elif target_scale >= 4.0:
+            base_interval_ms = 10
+        else:
+            base_interval_ms = 16
+        interval_scale = 1.20 - (0.60 * smoothing)
+        interval_ms = int(round(base_interval_ms * interval_scale))
+        self._interaction_interp_timer.setInterval(max(6, min(24, interval_ms)))
         if not self._interaction_interp_timer.isActive():
             self._interaction_interp_timer.start()
         self._schedule_interaction_emit_flush()
@@ -745,27 +801,88 @@ class RoiCanvas(QWidget):
 
         if self._is_roi_close(next_roi, target_roi):
             self._set_roi_and_emit_touch_throttled(target_roi, emit_scale=emit_scale)
+            self._interaction_filtered_target_roi = None
             self._interaction_target_roi = None
             self._interaction_target_emit_scale = False
             self._interaction_interp_timer.stop()
 
     def _interpolate_roi_step(self, current: Roi, target: Roi) -> Roi:
-        alpha_pos = 0.24
+        moving_only = current.w == target.w and current.h == target.h
+        zoom_scale = roi_scale_from_roi(target)
+        smoothing = max(0.0, min(1.0, self._smoothing_percent / 100.0))
+        # Use gentler easing for translation-only motion so ROI travel feels smoother.
+        if moving_only:
+            if zoom_scale >= 6.0:
+                alpha_pos = 0.10
+            elif zoom_scale >= 4.0:
+                alpha_pos = 0.13
+            else:
+                alpha_pos = 0.16
+        else:
+            alpha_pos = 0.24
         alpha_size = 0.22
 
-        def _step(c: int, t: int, alpha: float) -> int:
+        # Higher smoothing decreases per-step movement, reducing small-ROI jitter.
+        alpha_scale = 1.20 - (0.60 * smoothing)
+        alpha_pos = max(0.06, min(0.35, alpha_pos * alpha_scale))
+        alpha_size = max(0.08, min(0.40, alpha_size * alpha_scale))
+
+        if zoom_scale >= 6.0:
+            lag_limit = 6
+        elif zoom_scale >= 4.0:
+            lag_limit = 10
+        else:
+            lag_limit = 14
+
+        near_target_deadband = 1 + int(round(smoothing * 2.0))
+
+        def _step(c: int, t: int, alpha: float, key: str, low_latency: bool = False) -> int:
             delta = t - c
             if delta == 0:
+                self._interp_residual[key] = 0.0
                 return c
-            move = int(round(delta * alpha))
+
+            abs_delta = abs(delta)
+            effective_alpha = alpha
+            if low_latency:
+                # Speed up catch-up on large pointer/finger moves while preserving
+                # smoothing on small micro-adjustments.
+                accel = (abs_delta / (abs_delta + 56.0)) * 0.40
+                effective_alpha = min(0.70, alpha + accel)
+
+                # Ignore tiny near-target noise so small hand tremor doesn't jitter ROI.
+                if abs_delta <= near_target_deadband:
+                    self._interp_residual[key] = 0.0
+                    return t
+
+            raw_move = (delta * effective_alpha) + float(self._interp_residual[key])
+            sign = 1 if raw_move > 0 else -1
+            move_abs = int(abs(raw_move))
+            move = sign * move_abs if move_abs > 0 else 0
+            self._interp_residual[key] = raw_move - float(move)
+
+            if low_latency:
+                overshoot = abs_delta - lag_limit
+                if overshoot > 0:
+                    sign = 1 if delta > 0 else -1
+                    min_catch_up = int(math.ceil(overshoot * 0.65))
+                    enforced = sign * max(abs(move), min_catch_up)
+                    if enforced != move:
+                        move = enforced
+                        self._interp_residual[key] = 0.0
+
             if move == 0:
-                move = 1 if delta > 0 else -1
+                if abs_delta >= max(2, near_target_deadband + 1):
+                    move = 1 if delta > 0 else -1
+                    self._interp_residual[key] = 0.0
+                else:
+                    return c
             return c + move
 
-        x = _step(current.x, target.x, alpha_pos)
-        y = _step(current.y, target.y, alpha_pos)
-        w = _step(current.w, target.w, alpha_size)
-        h = _step(current.h, target.h, alpha_size)
+        x = _step(current.x, target.x, alpha_pos, "x", low_latency=moving_only)
+        y = _step(current.y, target.y, alpha_pos, "y", low_latency=moving_only)
+        w = _step(current.w, target.w, alpha_size, "w")
+        h = _step(current.h, target.h, alpha_size, "h")
         return clamp_roi(Roi(x, y, w, h))
 
     def _is_roi_close(self, roi_a: Roi, roi_b: Roi) -> bool:
@@ -783,8 +900,10 @@ class RoiCanvas(QWidget):
     def _cancel_interaction_interpolation(self) -> None:
         self._interaction_interp_timer.stop()
         self._interaction_emit_flush_timer.stop()
+        self._interaction_filtered_target_roi = None
         self._interaction_target_roi = None
         self._interaction_target_emit_scale = False
+        self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
 
     def _set_roi_and_emit(self, roi: Roi, emit_scale: bool = True) -> None:
         self._cancel_interaction_interpolation()
@@ -975,6 +1094,10 @@ class VideoProcessorController:
     def set_roi(self, roi: Roi) -> None:
         if self.processor is not None:
             self.processor.set_roi(roi.x, roi.y, roi.w, roi.h)
+
+    def set_roi_position(self, roi_x: int, roi_y: int) -> None:
+        if self.processor is not None and hasattr(self.processor, "set_roi_position"):
+            self.processor.set_roi_position(int(roi_x), int(roi_y))
 
     def set_auto_basic_scaling(self) -> None:
         self.basic_scaling_auto_mode = True
@@ -1426,6 +1549,7 @@ class ProcessVideoProcessorController:
         cmd = str(command.get("cmd", ""))
         best_effort_cmds = {
             "decklink_tick",
+            "set_roi_position",
         }
 
         try:
@@ -1506,6 +1630,9 @@ class ProcessVideoProcessorController:
 
     def set_roi(self, roi: Roi) -> None:
         self._send_control({"cmd": "set_roi", "x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h})
+
+    def set_roi_position(self, roi_x: int, roi_y: int) -> None:
+        self._send_control({"cmd": "set_roi_position", "x": int(roi_x), "y": int(roi_y)})
 
     def set_auto_basic_scaling(self) -> None:
         self.basic_scaling_auto_mode = True
@@ -1936,6 +2063,15 @@ class MainWindow(QMainWindow):
         self._output_session = None
         self._last_frame_error: str | None = None
         self._no_frame_counter = 0
+        self._roi_smoothing_percent = 60
+        self._roi_latency_smoothing_percent = 0
+        self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        self._controller_filtered_target_roi: Roi | None = None
+        self._last_status_text: str | None = None
+        self._last_status_log_ts = 0.0
+        self._status_repeat_log_interval_s = 5.0
+        self._input_canvas.set_smoothing_percent(self._roi_smoothing_percent)
+        self._input_canvas.set_latency_smoothing_percent(self._roi_latency_smoothing_percent)
 
         self._last_stat_time = time.perf_counter()
         self._frame_count = 0
@@ -2160,6 +2296,8 @@ class MainWindow(QMainWindow):
             self.roi_w_spin,
             self.roi_h_spin,
             self.scale_spin,
+            self.roi_smoothing_slider,
+            self.roi_latency_smoothing_slider,
             self.ai_sr_frame_interval_spin,
             self.ai_sr_overscan_spin,
             self.ai_sr_inference_divisor_spin,
@@ -2189,6 +2327,8 @@ class MainWindow(QMainWindow):
             "preview_request_fps": int(self.preview_request_fps_spin.value()),
             "preview_poll_fps": int(self.preview_poll_fps_spin.value()),
             "preview_downsample": str(self.preview_downsample_combo.currentText()),
+            "roi_smoothing_percent": int(self.roi_smoothing_slider.value()),
+            "roi_latency_smoothing_percent": int(self.roi_latency_smoothing_slider.value()),
             "basic_scaling_mode": str(self.sr_mode_combo.currentText()),
             "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
             "basic_scaling_manual": str(self.sr_manual_combo.currentText()),
@@ -2253,6 +2393,8 @@ class MainWindow(QMainWindow):
             self.fps_spin.setValue(max(1, min(60, int(raw.get("fps", self.fps_spin.value())))))
             self.preview_request_fps_spin.setValue(max(1, min(60, int(raw.get("preview_request_fps", self.preview_request_fps_spin.value())))))
             self.preview_poll_fps_spin.setValue(max(1, min(120, int(raw.get("preview_poll_fps", self.preview_poll_fps_spin.value())))))
+            self.roi_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value())))))
+            self.roi_latency_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_latency_smoothing_percent", self.roi_latency_smoothing_slider.value())))))
 
             self.preview_downsample_combo.setCurrentText(str(raw.get("preview_downsample", self.preview_downsample_combo.currentText())))
             self.sr_mode_combo.setCurrentText(str(raw.get("basic_scaling_mode", self.sr_mode_combo.currentText())))
@@ -2750,6 +2892,38 @@ class MainWindow(QMainWindow):
         self.scale_spin.valueChanged.connect(self._on_scale_spin_changed)
         roi_form.addRow("Scale", self.scale_spin)
 
+        self.roi_smoothing_slider = QSlider(Qt.Horizontal)
+        self.roi_smoothing_slider.setRange(0, 100)
+        self.roi_smoothing_slider.setSingleStep(1)
+        self.roi_smoothing_slider.setPageStep(5)
+        self.roi_smoothing_slider.setValue(int(self._roi_smoothing_percent))
+        self.roi_smoothing_slider.valueChanged.connect(self._on_roi_smoothing_changed)
+
+        self.roi_smoothing_value_label = QLabel(f"{self._roi_smoothing_percent}%")
+        roi_smoothing_row = QWidget()
+        roi_smoothing_layout = QHBoxLayout(roi_smoothing_row)
+        roi_smoothing_layout.setContentsMargins(0, 0, 0, 0)
+        roi_smoothing_layout.setSpacing(8)
+        roi_smoothing_layout.addWidget(self.roi_smoothing_slider, 1)
+        roi_smoothing_layout.addWidget(self.roi_smoothing_value_label)
+        roi_form.addRow("Smoothing", roi_smoothing_row)
+
+        self.roi_latency_smoothing_slider = QSlider(Qt.Horizontal)
+        self.roi_latency_smoothing_slider.setRange(0, 100)
+        self.roi_latency_smoothing_slider.setSingleStep(1)
+        self.roi_latency_smoothing_slider.setPageStep(5)
+        self.roi_latency_smoothing_slider.setValue(int(self._roi_latency_smoothing_percent))
+        self.roi_latency_smoothing_slider.valueChanged.connect(self._on_roi_latency_smoothing_changed)
+
+        self.roi_latency_smoothing_value_label = QLabel(f"{self._roi_latency_smoothing_percent}%")
+        roi_latency_smoothing_row = QWidget()
+        roi_latency_smoothing_layout = QHBoxLayout(roi_latency_smoothing_row)
+        roi_latency_smoothing_layout.setContentsMargins(0, 0, 0, 0)
+        roi_latency_smoothing_layout.setSpacing(8)
+        roi_latency_smoothing_layout.addWidget(self.roi_latency_smoothing_slider, 1)
+        roi_latency_smoothing_layout.addWidget(self.roi_latency_smoothing_value_label)
+        roi_form.addRow("Smoothing+Latency", roi_latency_smoothing_row)
+
         reset_btn = QPushButton("Reset ROI")
         reset_btn.clicked.connect(self._reset_roi)
         roi_form.addRow(reset_btn)
@@ -2839,9 +3013,15 @@ class MainWindow(QMainWindow):
                     if hasattr(self._controller, "decklink_no_frame_reason"):
                         reason = self._controller.decklink_no_frame_reason()
                     if reason == "sessions_not_started":
-                        self._update_status("DeckLink worker sessions not started")
+                        self._update_status(
+                            "DeckLink worker sessions not started",
+                            suppress_repeat_window_s=10.0,
+                        )
                     else:
-                        self._update_status("DeckLink worker active but no input frames yet; check source signal and input mode")
+                        self._update_status(
+                            "DeckLink worker active but no input frames yet; check source signal and input mode",
+                            suppress_repeat_window_s=10.0,
+                        )
                     return
 
                 input_frame, output_frame = decklink_frame
@@ -3291,7 +3471,37 @@ class MainWindow(QMainWindow):
         self._sync_controls_from_roi(self._roi)
 
     def _queue_controller_roi_target(self, roi: Roi) -> None:
-        self._controller_roi_target = clamp_roi(roi)
+        raw_target = clamp_roi(roi)
+        latency = max(0.0, min(1.0, self._roi_latency_smoothing_percent / 100.0))
+        if latency > 0.0:
+            beta = 1.0 - (0.82 * latency)
+            prev = self._controller_filtered_target_roi if self._controller_filtered_target_roi is not None else raw_target
+            filtered = clamp_roi(
+                Roi(
+                    int(round(prev.x + (raw_target.x - prev.x) * beta)),
+                    int(round(prev.y + (raw_target.y - prev.y) * beta)),
+                    int(round(prev.w + (raw_target.w - prev.w) * beta)),
+                    int(round(prev.h + (raw_target.h - prev.h) * beta)),
+                )
+            )
+            self._controller_filtered_target_roi = filtered
+            self._controller_roi_target = filtered
+        else:
+            self._controller_filtered_target_roi = raw_target
+            self._controller_roi_target = raw_target
+        if not self._controller_roi_interp_timer.isActive():
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        target_scale = roi_scale_from_roi(self._controller_roi_target)
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+        if target_scale >= 6.0:
+            base_interval_ms = 8
+        elif target_scale >= 4.0:
+            base_interval_ms = 10
+        else:
+            base_interval_ms = 16
+        interval_scale = 1.20 - (0.60 * smoothing)
+        interval_ms = int(round(base_interval_ms * interval_scale))
+        self._controller_roi_interp_timer.setInterval(max(6, min(24, interval_ms)))
         if not self._controller_roi_interp_timer.isActive():
             self._controller_roi_interp_timer.start()
 
@@ -3299,22 +3509,44 @@ class MainWindow(QMainWindow):
         clamped = clamp_roi(roi)
         self._controller_roi_target = None
         self._controller_roi_interp_timer.stop()
-        self._controller.set_roi(clamped)
+        self._controller_filtered_target_roi = None
+        self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        moving_only = (
+            clamped.w == self._controller_roi_applied.w
+            and clamped.h == self._controller_roi_applied.h
+            and hasattr(self._controller, "set_roi_position")
+        )
+        if moving_only:
+            self._controller.set_roi_position(clamped.x, clamped.y)
+        else:
+            self._controller.set_roi(clamped)
         self._controller_roi_applied = clamped
 
     def _step_controller_roi_interpolation(self) -> None:
         target = self._controller_roi_target
         if target is None:
             self._controller_roi_interp_timer.stop()
+            self._controller_filtered_target_roi = None
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
             return
 
         current = self._controller_roi_applied
         step_roi = self._interpolate_controller_roi_step(current, target)
         try:
-            self._controller.set_roi(step_roi)
+            moving_only = (
+                step_roi.w == current.w
+                and step_roi.h == current.h
+                and hasattr(self._controller, "set_roi_position")
+            )
+            if moving_only:
+                self._controller.set_roi_position(step_roi.x, step_roi.y)
+            else:
+                self._controller.set_roi(step_roi)
         except Exception as exc:
             self._controller_roi_target = None
             self._controller_roi_interp_timer.stop()
+            self._controller_filtered_target_roi = None
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
             self._update_status(f"ROI update failed: {exc}")
             return
         self._controller_roi_applied = step_roi
@@ -3327,35 +3559,113 @@ class MainWindow(QMainWindow):
                 or target.h != step_roi.h
             ):
                 try:
-                    self._controller.set_roi(target)
+                    moving_only_finalize = (
+                        target.w == step_roi.w
+                        and target.h == step_roi.h
+                        and hasattr(self._controller, "set_roi_position")
+                    )
+                    if moving_only_finalize:
+                        self._controller.set_roi_position(target.x, target.y)
+                    else:
+                        self._controller.set_roi(target)
                 except Exception as exc:
                     self._update_status(f"ROI finalize failed: {exc}")
                 else:
                     self._controller_roi_applied = target
             self._controller_roi_target = None
             self._controller_roi_interp_timer.stop()
+            self._controller_filtered_target_roi = None
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
 
     def _interpolate_controller_roi_step(self, current: Roi, target: Roi) -> Roi:
-        alpha_pos = 0.26
+        moving_only = current.w == target.w and current.h == target.h
+        zoom_scale = roi_scale_from_roi(target)
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+        # Keep output translation slightly more eased than resize/scale updates.
+        if moving_only:
+            if zoom_scale >= 6.0:
+                alpha_pos = 0.11
+            elif zoom_scale >= 4.0:
+                alpha_pos = 0.15
+            else:
+                alpha_pos = 0.18
+        else:
+            alpha_pos = 0.26
         alpha_size = 0.24
 
-        def _step(c: int, t: int, alpha: float) -> int:
+        alpha_scale = 1.20 - (0.60 * smoothing)
+        alpha_pos = max(0.07, min(0.38, alpha_pos * alpha_scale))
+        alpha_size = max(0.09, min(0.42, alpha_size * alpha_scale))
+
+        if zoom_scale >= 6.0:
+            lag_limit = 8
+        elif zoom_scale >= 4.0:
+            lag_limit = 12
+        else:
+            lag_limit = 16
+
+        near_target_deadband = 1 + int(round(smoothing * 2.0))
+
+        def _step(c: int, t: int, alpha: float, key: str, low_latency: bool = False) -> int:
             delta = t - c
             if delta == 0:
+                self._controller_interp_residual[key] = 0.0
                 return c
-            move = int(round(delta * alpha))
+
+            abs_delta = abs(delta)
+            effective_alpha = alpha
+            if low_latency:
+                accel = (abs_delta / (abs_delta + 64.0)) * 0.38
+                effective_alpha = min(0.72, alpha + accel)
+
+                if abs_delta <= near_target_deadband:
+                    self._controller_interp_residual[key] = 0.0
+                    return t
+
+            raw_move = (delta * effective_alpha) + float(self._controller_interp_residual[key])
+            sign = 1 if raw_move > 0 else -1
+            move_abs = int(abs(raw_move))
+            move = sign * move_abs if move_abs > 0 else 0
+            self._controller_interp_residual[key] = raw_move - float(move)
+
+            if low_latency:
+                overshoot = abs_delta - lag_limit
+                if overshoot > 0:
+                    sign = 1 if delta > 0 else -1
+                    min_catch_up = int(math.ceil(overshoot * 0.65))
+                    enforced = sign * max(abs(move), min_catch_up)
+                    if enforced != move:
+                        move = enforced
+                        self._controller_interp_residual[key] = 0.0
+
             if move == 0:
-                move = 1 if delta > 0 else -1
+                if abs_delta >= max(2, near_target_deadband + 1):
+                    move = 1 if delta > 0 else -1
+                    self._controller_interp_residual[key] = 0.0
+                else:
+                    return c
             return c + move
 
         return clamp_roi(
             Roi(
-                _step(current.x, target.x, alpha_pos),
-                _step(current.y, target.y, alpha_pos),
-                _step(current.w, target.w, alpha_size),
-                _step(current.h, target.h, alpha_size),
+                _step(current.x, target.x, alpha_pos, "x", low_latency=moving_only),
+                _step(current.y, target.y, alpha_pos, "y", low_latency=moving_only),
+                _step(current.w, target.w, alpha_size, "w"),
+                _step(current.h, target.h, alpha_size, "h"),
             )
         )
+
+    def _on_roi_smoothing_changed(self, value: int) -> None:
+        clamped = max(0, min(100, int(value)))
+        self._roi_smoothing_percent = clamped
+        self.roi_smoothing_value_label.setText(f"{clamped}%")
+        self._input_canvas.set_smoothing_percent(clamped)
+
+    def _on_roi_latency_smoothing_changed(self, value: int) -> None:
+        clamped = max(0, min(100, int(value)))
+        self._roi_latency_smoothing_percent = clamped
+        self.roi_latency_smoothing_value_label.setText(f"{clamped}%")
+        self._input_canvas.set_latency_smoothing_percent(clamped)
 
     def _is_controller_roi_close(self, roi_a: Roi, roi_b: Roi) -> bool:
         return (
@@ -4168,9 +4478,19 @@ class MainWindow(QMainWindow):
         self.scale_spin.setValue(roi_scale_from_roi(roi))
         self._updating_controls = False
 
-    def _update_status(self, text: str) -> None:
+    def _update_status(self, text: str, suppress_repeat_window_s: float | None = None) -> None:
+        now = time.perf_counter()
+        window_s = self._status_repeat_log_interval_s if suppress_repeat_window_s is None else max(0.0, float(suppress_repeat_window_s))
+        unchanged = text == self._last_status_text
+        within_window = (now - self._last_status_log_ts) < window_s
+
+        if unchanged and within_window:
+            return
+
         self.status_label.setText(text)
         LOGGER.info("STATUS: %s", text)
+        self._last_status_text = text
+        self._last_status_log_ts = now
 
 
 def load_video_processor_module():
