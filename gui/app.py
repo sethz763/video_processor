@@ -317,6 +317,13 @@ class Roi:
     h: int
 
 
+@dataclass
+class RoiKeyframe:
+    roi: Roi
+    duration_frames: int
+    interpolation_mode: str
+
+
 def clamp_roi(roi: Roi, width: int = FRAME_W, height: int = FRAME_H) -> Roi:
     # Keep ROI size stable while moving: clamp size first, then clamp position.
     max_w_frame = max(2, width)
@@ -1320,6 +1327,9 @@ class VideoProcessorController:
     def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
         raise RuntimeError("DeckLink worker tick is unavailable for in-process backend")
 
+    def decklink_processed_counter(self) -> int:
+        return 0
+
     def set_preview_fps(self, preview_fps: float) -> None:
         # In-process backend does not use worker tick preview throttling.
         _ = preview_fps
@@ -1895,6 +1905,9 @@ class ProcessVideoProcessorController:
     def decklink_no_frame_reason(self) -> str | None:
         return self._decklink_no_frame_reason
 
+    def decklink_processed_counter(self) -> int:
+        return int(self._decklink_processed_counter)
+
     def decklink_processed_fps(self) -> float:
         return float(self._decklink_processed_fps)
 
@@ -2145,6 +2158,13 @@ class MainWindow(QMainWindow):
         self._no_frame_counter = 0
         self._roi_smoothing_percent = 60
         self._roi_latency_smoothing_percent = 0
+        self._roi_keyframes: dict[int, RoiKeyframe] = {}
+        self._roi_keyframe_slots = (1, 2, 3)
+        self._roi_key_save_armed = False
+        self._roi_keyframe_transition_default_frames = 30
+        self._roi_keyframe_transition: dict[str, object] | None = None
+        self._roi_keyframe_last_step_ts = 0.0
+        self._roi_keyframe_target_fps = 60.0
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         self._controller_filtered_target_roi: Roi | None = None
         self._last_status_text: str | None = None
@@ -2279,8 +2299,13 @@ class MainWindow(QMainWindow):
         self._controller_roi_interp_timer.setInterval(16)
         self._controller_roi_interp_timer.timeout.connect(self._step_controller_roi_interpolation)
 
+        self._roi_keyframe_transition_timer = QTimer(self)
+        self._roi_keyframe_transition_timer.setInterval(16)
+        self._roi_keyframe_transition_timer.timeout.connect(self._step_roi_keyframe_transition)
+
         self._setup_shortcuts()
         self._connect_settings_persistence_signals()
+        self._update_roi_key_buttons()
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
         self._source_mode = self.source_mode_combo.currentText()
@@ -2356,6 +2381,7 @@ class MainWindow(QMainWindow):
             self.decklink_output_device_combo,
             self.decklink_input_mode_combo,
             self.decklink_output_mode_combo,
+            self.roi_interp_mode_combo,
         ]
         for combo in combo_widgets:
             combo.currentTextChanged.connect(self._schedule_settings_save)
@@ -2371,6 +2397,7 @@ class MainWindow(QMainWindow):
             self.rtx_thdr_enable_checkbox,
             self.decklink_auto_detect_devices,
             self.decklink_enable_format_detection,
+            self.roi_keyframe_duration_override_btn,
         ]
         for checkbox in checkbox_widgets:
             checkbox.toggled.connect(self._schedule_settings_save)
@@ -2396,6 +2423,7 @@ class MainWindow(QMainWindow):
             self.rtx_thdr_saturation_spin,
             self.rtx_thdr_middle_gray_spin,
             self.rtx_thdr_max_luminance_spin,
+            self.roi_transition_frames_spin,
         ]
         for spin in spin_widgets:
             spin.valueChanged.connect(self._schedule_settings_save)
@@ -2410,6 +2438,10 @@ class MainWindow(QMainWindow):
         self._settings_save_timer.start()
 
     def _collect_settings_payload(self) -> dict[str, object]:
+        keyframe_payload: dict[str, object] = {}
+        for slot, keyframe in self._roi_keyframes.items():
+            keyframe_payload[str(slot)] = self._serialize_roi_keyframe(keyframe)
+
         return {
             "version": 1,
             "fps": int(self.fps_spin.value()),
@@ -2419,6 +2451,10 @@ class MainWindow(QMainWindow):
             "preview_downsample": str(self.preview_downsample_combo.currentText()),
             "roi_smoothing_percent": int(self.roi_smoothing_slider.value()),
             "roi_latency_smoothing_percent": int(self.roi_latency_smoothing_slider.value()),
+            "roi_transition_duration_frames": int(self.roi_transition_frames_spin.value()),
+            "roi_interpolation_mode": str(self.roi_interp_mode_combo.currentText()),
+            "roi_keyframe_duration_override": bool(self.roi_keyframe_duration_override_btn.isChecked()),
+            "roi_keyframes": keyframe_payload,
             "basic_scaling_mode": str(self.sr_mode_combo.currentText()),
             "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
             "basic_scaling_manual": str(self.sr_manual_combo.currentText()),
@@ -2488,6 +2524,13 @@ class MainWindow(QMainWindow):
             )
             self.roi_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value())))))
             self.roi_latency_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_latency_smoothing_percent", self.roi_latency_smoothing_slider.value())))))
+            self.roi_transition_frames_spin.setValue(
+                max(1, min(600, int(raw.get("roi_transition_duration_frames", self.roi_transition_frames_spin.value()))))
+            )
+            self.roi_interp_mode_combo.setCurrentText(str(raw.get("roi_interpolation_mode", self.roi_interp_mode_combo.currentText())))
+            self.roi_keyframe_duration_override_btn.setChecked(
+                bool(raw.get("roi_keyframe_duration_override", self.roi_keyframe_duration_override_btn.isChecked()))
+            )
 
             self.preview_downsample_combo.setCurrentText(str(raw.get("preview_downsample", self.preview_downsample_combo.currentText())))
             self.sr_mode_combo.setCurrentText(str(raw.get("basic_scaling_mode", self.sr_mode_combo.currentText())))
@@ -2578,6 +2621,9 @@ class MainWindow(QMainWindow):
         main_sizes = raw.get("main_splitter_sizes")
         if isinstance(main_sizes, list) and len(main_sizes) >= 2:
             self._main_splitter.setSizes([int(main_sizes[0]), int(main_sizes[1])])
+
+        self._restore_roi_keyframes(raw.get("roi_keyframes"))
+        self._update_roi_key_buttons()
 
         self._update_timer_interval()
 
@@ -3024,6 +3070,45 @@ class MainWindow(QMainWindow):
         roi_latency_smoothing_layout.addWidget(self.roi_latency_smoothing_slider, 1)
         roi_latency_smoothing_layout.addWidget(self.roi_latency_smoothing_value_label)
         roi_form.addRow("Smoothing+Latency", roi_latency_smoothing_row)
+
+        self.roi_transition_frames_spin = QSpinBox()
+        self.roi_transition_frames_spin.setRange(1, 600)
+        self.roi_transition_frames_spin.setValue(int(self._roi_keyframe_transition_default_frames))
+        roi_form.addRow("Transition (frames)", self.roi_transition_frames_spin)
+
+        self.roi_interp_mode_combo = QComboBox()
+        self.roi_interp_mode_combo.addItems(["Linear", "Ease In/Out", "Ease Out"])
+        self.roi_interp_mode_combo.setCurrentText("Ease In/Out")
+        roi_form.addRow("Interp Mode", self.roi_interp_mode_combo)
+
+        self.roi_keyframe_duration_override_btn = QPushButton("Override Key Duration")
+        self.roi_keyframe_duration_override_btn.setCheckable(True)
+        self.roi_keyframe_duration_override_btn.setToolTip("When enabled, uses Transition (frames) instead of keyframe-stored duration during recall.")
+        roi_form.addRow(self.roi_keyframe_duration_override_btn)
+
+        keyframe_row = QWidget()
+        keyframe_layout = QHBoxLayout(keyframe_row)
+        keyframe_layout.setContentsMargins(0, 0, 0, 0)
+        keyframe_layout.setSpacing(8)
+
+        self.roi_save_key_btn = QPushButton("SAVE KEY")
+        self.roi_save_key_btn.setCheckable(True)
+        self.roi_save_key_btn.toggled.connect(self._on_roi_save_key_toggled)
+        keyframe_layout.addWidget(self.roi_save_key_btn)
+
+        self.roi_key1_btn = QPushButton("KEY 1")
+        self.roi_key1_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(1))
+        keyframe_layout.addWidget(self.roi_key1_btn)
+
+        self.roi_key2_btn = QPushButton("KEY 2")
+        self.roi_key2_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(2))
+        keyframe_layout.addWidget(self.roi_key2_btn)
+
+        self.roi_key3_btn = QPushButton("KEY 3")
+        self.roi_key3_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(3))
+        keyframe_layout.addWidget(self.roi_key3_btn)
+
+        roi_form.addRow(keyframe_row)
 
         reset_btn = QPushButton("Reset ROI")
         reset_btn.clicked.connect(self._reset_roi)
@@ -3604,6 +3689,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
+        self._cancel_roi_keyframe_transition()
         self._roi = clamp_roi(Roi(x, y, w, h))
         self._queue_controller_roi_target(self._roi)
         self._sync_controls_from_roi(self._roi)
@@ -3824,6 +3910,8 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
 
+        self._cancel_roi_keyframe_transition()
+
         sender = self.sender()
         roi_w = self.roi_w_spin.value()
         roi_h = self.roi_h_spin.value()
@@ -3849,6 +3937,8 @@ class MainWindow(QMainWindow):
     def _on_scale_spin_changed(self, value: float) -> None:
         if self._updating_controls:
             return
+
+        self._cancel_roi_keyframe_transition()
 
         center_x = self._roi.x + (self._roi.w / 2.0)
         center_y = self._roi.y + (self._roi.h / 2.0)
@@ -4609,10 +4699,247 @@ class MainWindow(QMainWindow):
         return frame_bytes
 
     def _reset_roi(self) -> None:
+        self._cancel_roi_keyframe_transition()
         self._roi = Roi(0, 0, FRAME_W, FRAME_H)
         self._input_canvas.set_roi(self._roi)
         self._apply_controller_roi_immediate(self._roi)
         self._sync_controls_from_roi(self._roi)
+
+    def _serialize_roi_keyframe(self, keyframe: RoiKeyframe) -> dict[str, object]:
+        return {
+            "roi": [
+                int(keyframe.roi.x),
+                int(keyframe.roi.y),
+                int(keyframe.roi.w),
+                int(keyframe.roi.h),
+            ],
+            "duration_frames": int(keyframe.duration_frames),
+            "interpolation_mode": str(keyframe.interpolation_mode),
+        }
+
+    def _roi_interp_mode_name(self) -> str:
+        label = str(self.roi_interp_mode_combo.currentText()).strip().lower()
+        if label == "ease in/out":
+            return "ease_in_out"
+        if label == "ease out":
+            return "ease_out"
+        return "linear"
+
+    def _roi_interp_mode_label(self, mode_name: str) -> str:
+        if str(mode_name).strip().lower() == "ease_in_out":
+            return "Ease In/Out"
+        if str(mode_name).strip().lower() == "ease_out":
+            return "Ease Out"
+        return "Linear"
+
+    def _restore_roi_keyframes(self, raw: object) -> None:
+        restored: dict[int, RoiKeyframe] = {}
+        if not isinstance(raw, dict):
+            self._roi_keyframes = restored
+            return
+
+        for slot in self._roi_keyframe_slots:
+            slot_raw = raw.get(str(slot))
+            if not isinstance(slot_raw, dict):
+                continue
+            roi_list = slot_raw.get("roi")
+            if not isinstance(roi_list, list) or len(roi_list) != 4:
+                continue
+            try:
+                roi = clamp_roi(
+                    Roi(
+                        int(roi_list[0]),
+                        int(roi_list[1]),
+                        int(roi_list[2]),
+                        int(roi_list[3]),
+                    )
+                )
+                duration = max(1, min(600, int(slot_raw.get("duration_frames", self.roi_transition_frames_spin.value()))))
+                interp_mode = str(slot_raw.get("interpolation_mode", "linear")).strip().lower()
+                if interp_mode not in {"linear", "ease_in_out", "ease_out"}:
+                    interp_mode = "linear"
+            except Exception:
+                continue
+            restored[slot] = RoiKeyframe(roi=roi, duration_frames=duration, interpolation_mode=interp_mode)
+
+        self._roi_keyframes = restored
+
+    def _on_roi_save_key_toggled(self, checked: bool) -> None:
+        self._roi_key_save_armed = bool(checked)
+        self._update_roi_key_buttons()
+
+    def _on_roi_key_slot_pressed(self, slot: int) -> None:
+        if slot not in self._roi_keyframe_slots:
+            return
+
+        if self._roi_key_save_armed:
+            duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
+            interpolation_mode = self._roi_interp_mode_name()
+            self._roi_keyframes[slot] = RoiKeyframe(
+                roi=clamp_roi(self._roi),
+                duration_frames=duration_frames,
+                interpolation_mode=interpolation_mode,
+            )
+            self.roi_save_key_btn.setChecked(False)
+            self._schedule_settings_save()
+            self._update_status(
+                f"Stored ROI KEY {slot} ({duration_frames} frames, {self._roi_interp_mode_label(interpolation_mode)})"
+            )
+            return
+
+        keyframe = self._roi_keyframes.get(slot)
+        if keyframe is None:
+            self._update_status(f"KEY {slot} is empty. Arm SAVE KEY to store it.")
+            return
+
+        override_duration = bool(self.roi_keyframe_duration_override_btn.isChecked())
+        if override_duration:
+            duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
+        else:
+            duration_frames = max(1, min(600, int(keyframe.duration_frames)))
+
+        self._start_roi_keyframe_transition(keyframe.roi, duration_frames, keyframe.interpolation_mode)
+        if override_duration:
+            self._update_status(
+                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}, override)"
+            )
+        else:
+            self._update_status(
+                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)})"
+            )
+
+    def _update_roi_key_buttons(self) -> None:
+        if self._roi_key_save_armed:
+            self.roi_save_key_btn.setStyleSheet("QPushButton { background-color: #f1c40f; font-weight: 700; }")
+            self.roi_key1_btn.setText("KEY 1 (STORE)")
+            self.roi_key2_btn.setText("KEY 2 (STORE)")
+            self.roi_key3_btn.setText("KEY 3 (STORE)")
+        else:
+            self.roi_save_key_btn.setStyleSheet("")
+            self.roi_key1_btn.setText("KEY 1")
+            self.roi_key2_btn.setText("KEY 2")
+            self.roi_key3_btn.setText("KEY 3")
+
+        for slot, button in ((1, self.roi_key1_btn), (2, self.roi_key2_btn), (3, self.roi_key3_btn)):
+            if slot in self._roi_keyframes:
+                button.setStyleSheet("QPushButton { font-weight: 600; }")
+                button.setToolTip(
+                    (
+                        f"Stored ({self._roi_keyframes[slot].duration_frames} frames, "
+                        f"{self._roi_interp_mode_label(self._roi_keyframes[slot].interpolation_mode)}). Click to recall."
+                    )
+                )
+            else:
+                button.setStyleSheet("")
+                button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
+
+    def _cancel_roi_keyframe_transition(self) -> None:
+        self._roi_keyframe_transition = None
+        self._roi_keyframe_transition_timer.stop()
+        self._roi_keyframe_last_step_ts = 0.0
+
+    def _start_roi_keyframe_transition(self, target_roi: Roi, duration_frames: int, interpolation_mode: str) -> None:
+        target = clamp_roi(target_roi)
+        total_frames = max(1, min(600, int(duration_frames)))
+        mode_name = str(interpolation_mode).strip().lower()
+        if mode_name not in {"linear", "ease_in_out", "ease_out"}:
+            mode_name = "linear"
+        self._cancel_roi_keyframe_transition()
+
+        if total_frames <= 1:
+            self._roi = target
+            self._input_canvas.set_roi(target)
+            self._apply_controller_roi_immediate(target)
+            self._sync_controls_from_roi(target)
+            return
+
+        self._roi_keyframe_transition = {
+            "start": clamp_roi(self._roi),
+            "target": target,
+            "total_frames": total_frames,
+            "frame_progress": 0.0,
+            "interpolation_mode": mode_name,
+        }
+        self._roi_keyframe_last_step_ts = time.perf_counter()
+        self._roi_keyframe_transition_timer.start()
+
+    def _apply_roi_interpolation_curve(self, t: float, interpolation_mode: str) -> float:
+        clamped_t = max(0.0, min(1.0, float(t)))
+        if str(interpolation_mode).strip().lower() == "ease_in_out":
+            # Smoothstep for gentle acceleration/deceleration.
+            return clamped_t * clamped_t * (3.0 - (2.0 * clamped_t))
+        if str(interpolation_mode).strip().lower() == "ease_out":
+            return 1.0 - ((1.0 - clamped_t) * (1.0 - clamped_t))
+        return clamped_t
+
+    def _roi_keyframe_transition_fps(self) -> float:
+        if self._source_mode == "Blackmagic DeckLink" and hasattr(self._controller, "decklink_processed_fps"):
+            try:
+                measured = float(self._controller.decklink_processed_fps())
+            except Exception:
+                measured = 0.0
+            if measured >= 1.0:
+                return max(24.0, min(120.0, measured))
+        return float(self._roi_keyframe_target_fps)
+
+    def _step_roi_keyframe_transition(self) -> None:
+        state = self._roi_keyframe_transition
+        if state is None:
+            return
+
+        start_roi = state["start"]
+        target_roi = state["target"]
+        total_frames = int(state["total_frames"])
+        interpolation_mode = str(state.get("interpolation_mode", "linear"))
+
+        now = time.perf_counter()
+        if self._roi_keyframe_last_step_ts <= 0.0:
+            self._roi_keyframe_last_step_ts = now
+
+        dt = max(0.0, now - self._roi_keyframe_last_step_ts)
+        self._roi_keyframe_last_step_ts = now
+
+        frame_progress = float(state.get("frame_progress", 0.0))
+        frame_progress += dt * self._roi_keyframe_transition_fps()
+        frame_progress = min(float(total_frames), frame_progress)
+        state["frame_progress"] = frame_progress
+
+        t = min(1.0, frame_progress / float(max(1, total_frames)))
+        curved_t = self._apply_roi_interpolation_curve(t, interpolation_mode)
+
+        interpolated = clamp_roi(
+            Roi(
+                int(round(start_roi.x + ((target_roi.x - start_roi.x) * curved_t))),
+                int(round(start_roi.y + ((target_roi.y - start_roi.y) * curved_t))),
+                int(round(start_roi.w + ((target_roi.w - start_roi.w) * curved_t))),
+                int(round(start_roi.h + ((target_roi.h - start_roi.h) * curved_t))),
+            )
+        )
+
+        self._roi = interpolated
+        self._input_canvas.set_roi(interpolated)
+        self._apply_controller_roi_immediate(interpolated)
+        self._sync_controls_from_roi(interpolated)
+
+        if frame_progress >= float(total_frames) or (
+            interpolated.x == target_roi.x
+            and interpolated.y == target_roi.y
+            and interpolated.w == target_roi.w
+            and interpolated.h == target_roi.h
+        ):
+            self._roi_keyframe_transition = None
+            self._roi_keyframe_transition_timer.stop()
+            if (
+                interpolated.x != target_roi.x
+                or interpolated.y != target_roi.y
+                or interpolated.w != target_roi.w
+                or interpolated.h != target_roi.h
+            ):
+                self._roi = target_roi
+                self._input_canvas.set_roi(target_roi)
+                self._apply_controller_roi_immediate(target_roi)
+                self._sync_controls_from_roi(target_roi)
+            self._roi_keyframe_last_step_ts = 0.0
 
     def _sync_controls_from_roi(self, roi: Roi) -> None:
         self._updating_controls = True

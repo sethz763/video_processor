@@ -38,8 +38,43 @@
   "preview_downsample": "Full (1:1)",
   "preview_poll_fps": 15,
   "preview_request_fps": 15,
+  "roi_interpolation_mode": "Ease In/Out",
+  "roi_keyframe_duration_override": false,
+  "roi_keyframes": {
+    "1": {
+      "duration_frames": 30,
+      "interpolation_mode": "ease_in_out",
+      "roi": [
+        154,
+        408,
+        820,
+        461
+      ]
+    },
+    "2": {
+      "duration_frames": 30,
+      "interpolation_mode": "ease_in_out",
+      "roi": [
+        892,
+        423,
+        820,
+        461
+      ]
+    },
+    "3": {
+      "duration_frames": 30,
+      "interpolation_mode": "ease_in_out",
+      "roi": [
+        0,
+        0,
+        1920,
+        1080
+      ]
+    }
+  },
   "roi_latency_smoothing_percent": 62,
   "roi_smoothing_percent": 100,
+  "roi_transition_duration_frames": 30,
   "rtx_thdr_contrast": 50,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
