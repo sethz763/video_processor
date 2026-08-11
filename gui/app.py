@@ -166,6 +166,36 @@ def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray, dst: np.ndarray | None = None
     return rgb
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    def __init__(self, *args, rollover_retry_interval_s: float = 15.0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._rollover_retry_interval_s = max(1.0, float(rollover_retry_interval_s))
+        self._skip_rollover_until = 0.0
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        if time.monotonic() < self._skip_rollover_until:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+            self._skip_rollover_until = 0.0
+            return
+        except PermissionError:
+            # On Windows another process may hold app.log open. Keep logging to
+            # the current file and retry rollover after a cooldown.
+            self._skip_rollover_until = time.monotonic() + self._rollover_retry_interval_s
+
+        if self.stream:
+            try:
+                self.stream.flush()
+                self.stream.close()
+            except Exception:
+                pass
+        self.stream = self._open()
+
+
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("video_processor_gui")
     if logger.handlers:
@@ -175,11 +205,12 @@ def setup_logger() -> logging.Logger:
     log_dir = Path(__file__).resolve().parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    file_handler = RotatingFileHandler(
+    file_handler = SafeRotatingFileHandler(
         log_dir / "app.log",
         maxBytes=1_000_000,
         backupCount=5,
         encoding="utf-8",
+        rollover_retry_interval_s=15.0,
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
@@ -1062,6 +1093,7 @@ class VideoProcessorController:
         self.rtx_thdr_saturation = 50
         self.rtx_thdr_middle_gray = 50
         self.rtx_thdr_max_luminance = 1000
+        self.decklink_output_buffer_frames = 2
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
         self.processor = None
@@ -1292,6 +1324,10 @@ class VideoProcessorController:
         # In-process backend does not use worker tick preview throttling.
         _ = preview_fps
 
+    def set_decklink_output_buffer_frames(self, buffer_frames: int) -> None:
+        # In-process backend does not use worker DeckLink output buffering.
+        self.decklink_output_buffer_frames = max(0, min(5, int(buffer_frames)))
+
 
 class ProcessVideoProcessorController:
     def __init__(self) -> None:
@@ -1328,6 +1364,7 @@ class ProcessVideoProcessorController:
         self.rtx_thdr_saturation = max(0, int(os.environ.get("VP_RTX_THDR_SATURATION", "50")))
         self.rtx_thdr_middle_gray = max(0, int(os.environ.get("VP_RTX_THDR_MIDDLE_GRAY", "50")))
         self.rtx_thdr_max_luminance = max(0, int(os.environ.get("VP_RTX_THDR_MAX_LUMINANCE", "1000")))
+        self.decklink_output_buffer_frames = max(0, min(5, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "2"))))
         self.rtx_vsr_active = False
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
@@ -1372,6 +1409,7 @@ class ProcessVideoProcessorController:
             "passthrough": 0,
         }
         self._decklink_tick_pending = False
+        self._decklink_tick_pending_since = 0.0
         self._decklink_preview_interval = max(1, int(os.environ.get("VP_DECKLINK_PREVIEW_INTERVAL", "3")))
         self._decklink_tick_counter = 0
         self._gpu_live_mode = os.environ.get("VP_GPU_LIVE_MODE", "1") == "1"
@@ -1432,6 +1470,7 @@ class ProcessVideoProcessorController:
         self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
         self._decklink_no_frame_reason = None
         self._decklink_tick_pending = False
+        self._decklink_tick_pending_since = 0.0
 
     def create(self, roi: Roi) -> None:
         self.close()
@@ -1478,6 +1517,7 @@ class ProcessVideoProcessorController:
             "rtx_thdr_saturation": self.rtx_thdr_saturation,
             "rtx_thdr_middle_gray": self.rtx_thdr_middle_gray,
             "rtx_thdr_max_luminance": self.rtx_thdr_max_luminance,
+            "decklink_output_buffer_frames": self.decklink_output_buffer_frames,
             "rtx_video_sdk_root": os.environ.get("RTX_VIDEO_SDK_ROOT", r"C:\Coding Projects\sdks\NVidia video SDK"),
         }
 
@@ -1498,6 +1538,7 @@ class ProcessVideoProcessorController:
         self._latest_effective_scale = 1
         self._next_frame_id = 1
         self._decklink_tick_pending = False
+        self._decklink_tick_pending_since = 0.0
         self._reset_decklink_fps_tracking()
         self._wait_for_ready(timeout_seconds=5.0)
 
@@ -1541,7 +1582,7 @@ class ProcessVideoProcessorController:
                 raise RuntimeError("Worker process exited unexpectedly")
             raise RuntimeError(f"Worker process exited unexpectedly (exit_code={exit_code})")
 
-    def _send_control(self, command: dict[str, object]) -> None:
+    def _send_control(self, command: dict[str, object]) -> bool:
         self._assert_worker_alive()
         if self._request_queue is None:
             raise RuntimeError("Worker request queue is not initialized")
@@ -1550,15 +1591,17 @@ class ProcessVideoProcessorController:
         best_effort_cmds = {
             "decklink_tick",
             "set_roi_position",
+            "set_decklink_output_buffer_frames",
         }
 
         try:
             self._request_queue.put_nowait(command)
+            return True
         except queue.Full:
             # Never evict pending critical commands. Drop only the best-effort
             # command itself (e.g. tick) and preserve queued state updates.
             if cmd in best_effort_cmds:
-                return
+                return False
 
             # For critical commands, wait briefly for queue capacity instead of
             # removing existing requests that may contain user settings changes.
@@ -1566,6 +1609,7 @@ class ProcessVideoProcessorController:
                 self._request_queue.put(command, timeout=0.25)
             except queue.Full:
                 raise RuntimeError(f"Worker request queue saturated while sending '{cmd}'")
+            return True
 
     def _drain_responses(self) -> None:
         if self._response_queue is None:
@@ -1592,6 +1636,7 @@ class ProcessVideoProcessorController:
                 self._decklink_frame_updated = False
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
                 self._decklink_tick_pending = False
+                self._decklink_tick_pending_since = 0.0
                 continue
 
             if message_type == "ack":
@@ -1615,6 +1660,11 @@ class ProcessVideoProcessorController:
                     self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
                     self.rtx_vsr_error = message.get("rtx_vsr_error")
                     self.rtx_vsr_info = message.get("rtx_vsr_info")
+                elif ack_cmd == "set_decklink_output_buffer_frames":
+                    self.decklink_output_buffer_frames = max(
+                        0,
+                        min(5, int(message.get("decklink_output_buffer_frames", self.decklink_output_buffer_frames))),
+                    )
                 continue
 
             if message_type == "warning":
@@ -1747,6 +1797,7 @@ class ProcessVideoProcessorController:
                 self._decklink_frame_updated = False
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
                 self._decklink_tick_pending = False
+                self._decklink_tick_pending_since = 0.0
                 continue
             if message_type == "warning":
                 warning_text = str(message.get("warning", ""))
@@ -1762,6 +1813,7 @@ class ProcessVideoProcessorController:
         self._decklink_frame_updated = False
         self._decklink_no_frame_reason = None
         self._decklink_tick_pending = False
+        self._decklink_tick_pending_since = 0.0
         self._decklink_tick_counter = 0
         self._last_preview_request_ts = 0.0
         self._reset_decklink_fps_tracking()
@@ -1773,6 +1825,7 @@ class ProcessVideoProcessorController:
                 "out_device": int(out_device),
                 "out_mode": out_mode,
                 "enable_format_detection": bool(enable_format_detection),
+                "decklink_output_buffer_frames": int(self.decklink_output_buffer_frames),
             }
         )
         self._wait_for_ack("start_decklink")
@@ -1788,12 +1841,20 @@ class ProcessVideoProcessorController:
         self._latest_decklink_frame = None
         self._decklink_frame_updated = False
         self._decklink_tick_pending = False
+        self._decklink_tick_pending_since = 0.0
         self._decklink_tick_counter = 0
         self._last_preview_request_ts = 0.0
         self._reset_decklink_fps_tracking()
 
     def decklink_tick(self, timeout_ms: int = 50) -> tuple[bytes, bytes] | None:
         self._drain_responses()
+
+        if self._decklink_tick_pending and self._decklink_tick_pending_since > 0.0:
+            if (time.perf_counter() - self._decklink_tick_pending_since) >= 0.75:
+                self._decklink_tick_pending = False
+                self._decklink_tick_pending_since = 0.0
+                self._decklink_no_frame_reason = "tick_request_stalled"
+
         if not self._decklink_tick_pending:
             # Keep at most one in-flight tick request so stale tick commands cannot
             # build up and push preview display several seconds behind live processing.
@@ -1812,15 +1873,23 @@ class ProcessVideoProcessorController:
                 include_frames = (self._decklink_tick_counter % self._decklink_preview_interval) == 0
                 if self._latest_decklink_frame is None:
                     include_frames = True
-            self._send_control(
+            sent = self._send_control(
                 {
                     "cmd": "decklink_tick",
                     "timeout_ms": int(timeout_ms),
                     "include_frames": bool(include_frames),
                 }
             )
-            self._decklink_tick_pending = True
+            if sent:
+                self._decklink_tick_pending = True
+                self._decklink_tick_pending_since = time.perf_counter()
+            else:
+                self._decklink_tick_pending = False
+                self._decklink_tick_pending_since = 0.0
+                self._decklink_no_frame_reason = "tick_dropped_queue_full"
         self._drain_responses()
+        if self._decklink_no_frame_reason in {"tick_request_stalled", "tick_dropped_queue_full"}:
+            return None
         return self._latest_decklink_frame
 
     def decklink_no_frame_reason(self) -> str | None:
@@ -1833,6 +1902,15 @@ class ProcessVideoProcessorController:
         self._preview_fps = max(0.0, float(preview_fps))
         # Allow an immediate preview request after a user-adjusted FPS change.
         self._last_preview_request_ts = 0.0
+
+    def set_decklink_output_buffer_frames(self, buffer_frames: int) -> None:
+        self.decklink_output_buffer_frames = max(0, min(5, int(buffer_frames)))
+        self._send_control(
+            {
+                "cmd": "set_decklink_output_buffer_frames",
+                "decklink_output_buffer_frames": int(self.decklink_output_buffer_frames),
+            }
+        )
 
     def consume_decklink_frame_updated(self) -> bool:
         updated = bool(self._decklink_frame_updated)
@@ -1894,6 +1972,7 @@ class ProcessVideoProcessorController:
         self._request_queue = None
         self._response_queue = None
         self._decklink_tick_pending = False
+        self._decklink_tick_pending_since = 0.0
 
     def set_ai_sr_enabled(self, enabled: bool) -> None:
         self.ai_sr_enabled = bool(enabled)
@@ -2061,6 +2140,7 @@ class MainWindow(QMainWindow):
         self._source_mode = "Blackmagic DeckLink"
         self._capture_session = None
         self._output_session = None
+        self._decklink_sessions_running = False
         self._last_frame_error: str | None = None
         self._no_frame_counter = 0
         self._roi_smoothing_percent = 60
@@ -2118,12 +2198,20 @@ class MainWindow(QMainWindow):
         self._settings_save_timer.setSingleShot(True)
         self._settings_save_timer.setInterval(250)
         self._settings_save_timer.timeout.connect(self._save_settings)
+        self._decklink_buffer_reapply_timer = QTimer(self)
+        self._decklink_buffer_reapply_timer.setSingleShot(True)
+        self._decklink_buffer_reapply_timer.setInterval(250)
+        self._decklink_buffer_reapply_timer.timeout.connect(self._reapply_decklink_after_buffer_change)
         self._ai_sr_profiles_path = Path(__file__).resolve().parent / "ai_sr_profiles.json"
         self._ai_sr_profiles = self._load_ai_sr_profiles()
         self._preview_downsample_factor = self._normalize_preview_downsample_factor(
             float(os.environ.get("VP_PREVIEW_DOWNSAMPLE", "0.25"))
         )
         self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "60")))
+        self._decklink_output_buffer_frames = max(
+            0,
+            min(5, int(getattr(self._controller, "decklink_output_buffer_frames", 2))),
+        )
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2291,6 +2379,7 @@ class MainWindow(QMainWindow):
             self.fps_spin,
             self.preview_request_fps_spin,
             self.preview_poll_fps_spin,
+            self.decklink_output_buffer_spin,
             self.roi_x_spin,
             self.roi_y_spin,
             self.roi_w_spin,
@@ -2326,6 +2415,7 @@ class MainWindow(QMainWindow):
             "fps": int(self.fps_spin.value()),
             "preview_request_fps": int(self.preview_request_fps_spin.value()),
             "preview_poll_fps": int(self.preview_poll_fps_spin.value()),
+            "decklink_output_buffer_frames": int(self.decklink_output_buffer_spin.value()),
             "preview_downsample": str(self.preview_downsample_combo.currentText()),
             "roi_smoothing_percent": int(self.roi_smoothing_slider.value()),
             "roi_latency_smoothing_percent": int(self.roi_latency_smoothing_slider.value()),
@@ -2393,6 +2483,9 @@ class MainWindow(QMainWindow):
             self.fps_spin.setValue(max(1, min(60, int(raw.get("fps", self.fps_spin.value())))))
             self.preview_request_fps_spin.setValue(max(1, min(60, int(raw.get("preview_request_fps", self.preview_request_fps_spin.value())))))
             self.preview_poll_fps_spin.setValue(max(1, min(120, int(raw.get("preview_poll_fps", self.preview_poll_fps_spin.value())))))
+            self.decklink_output_buffer_spin.setValue(
+                max(0, min(5, int(raw.get("decklink_output_buffer_frames", self.decklink_output_buffer_spin.value()))))
+            )
             self.roi_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value())))))
             self.roi_latency_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_latency_smoothing_percent", self.roi_latency_smoothing_slider.value())))))
 
@@ -2447,6 +2540,7 @@ class MainWindow(QMainWindow):
             PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.get(self.preview_downsample_combo.currentText(), self._preview_downsample_factor)
         )
         self._decklink_tick_poll_fps = float(max(1, self.preview_poll_fps_spin.value()))
+        self._decklink_output_buffer_frames = int(self.decklink_output_buffer_spin.value())
 
         persisted_in_device = raw.get("decklink_input_device")
         persisted_out_device = raw.get("decklink_output_device")
@@ -2571,6 +2665,13 @@ class MainWindow(QMainWindow):
         self.preview_poll_fps_spin.setValue(int(round(self._decklink_tick_poll_fps)))
         self.preview_poll_fps_spin.valueChanged.connect(self._on_preview_poll_fps_changed)
         settings_form.addRow("Preview poll FPS cap", self.preview_poll_fps_spin)
+
+        self.decklink_output_buffer_spin = QSpinBox()
+        self.decklink_output_buffer_spin.setRange(0, 5)
+        self.decklink_output_buffer_spin.setValue(int(self._decklink_output_buffer_frames))
+        self.decklink_output_buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames; larger values can smooth short stalls with added latency.")
+        self.decklink_output_buffer_spin.valueChanged.connect(self._on_decklink_output_buffer_changed)
+        settings_form.addRow("DeckLink output buffer (frames)", self.decklink_output_buffer_spin)
 
         self.preview_downsample_combo = QComboBox()
         self.preview_downsample_combo.addItems(list(PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.keys()))
@@ -3016,6 +3117,16 @@ class MainWindow(QMainWindow):
                         self._update_status(
                             "DeckLink worker sessions not started",
                             suppress_repeat_window_s=10.0,
+                        )
+                    elif reason == "tick_dropped_queue_full":
+                        self._update_status(
+                            "DeckLink worker queue is saturated; dropping preview tick requests",
+                            suppress_repeat_window_s=3.0,
+                        )
+                    elif reason == "tick_request_stalled":
+                        self._update_status(
+                            "DeckLink worker tick request stalled; retrying",
+                            suppress_repeat_window_s=3.0,
                         )
                     else:
                         self._update_status(
@@ -3464,6 +3575,33 @@ class MainWindow(QMainWindow):
         self._decklink_tick_poll_fps = float(max(1, self.preview_poll_fps_spin.value()))
         self._update_timer_interval()
         self._update_status(f"Preview poll FPS cap set to {int(self._decklink_tick_poll_fps)}")
+
+    def _on_decklink_output_buffer_changed(self) -> None:
+        buffer_frames = max(0, min(5, int(self.decklink_output_buffer_spin.value())))
+        self._decklink_output_buffer_frames = buffer_frames
+        if hasattr(self._controller, "decklink_output_buffer_frames"):
+            self._controller.decklink_output_buffer_frames = buffer_frames
+        if self._updating_controls:
+            return
+        if self._source_mode == "Blackmagic DeckLink":
+            self._decklink_buffer_reapply_timer.start()
+        elif hasattr(self._controller, "set_decklink_output_buffer_frames"):
+            self._controller.set_decklink_output_buffer_frames(buffer_frames)
+        self._update_status(f"DeckLink output buffer set to {buffer_frames} frame(s); applying")
+
+    def _reapply_decklink_after_buffer_change(self) -> None:
+        if self._source_mode != "Blackmagic DeckLink":
+            return
+        try:
+            if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                self._controller.set_decklink_output_buffer_frames(int(self._decklink_output_buffer_frames))
+        except Exception as exc:
+            LOGGER.exception("Failed to apply DeckLink output buffer change")
+            self._update_status(f"DeckLink buffer apply failed: {exc}")
+            return
+        self._update_status(
+            f"DeckLink output buffer applied: {int(self._decklink_output_buffer_frames)} frame(s)"
+        )
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._roi = clamp_roi(Roi(x, y, w, h))
@@ -4180,6 +4318,8 @@ class MainWindow(QMainWindow):
 
         input_fps = self._resolve_mode_fps(in_device, in_mode, input_side=True)
         output_fps = self._resolve_mode_fps(out_device, out_mode, input_side=False)
+        if hasattr(self._controller, "decklink_output_buffer_frames"):
+            self._controller.decklink_output_buffer_frames = int(self.decklink_output_buffer_spin.value())
 
         if self._controller_backend == "worker-process":
             self._controller.start_decklink(
@@ -4238,6 +4378,7 @@ class MainWindow(QMainWindow):
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
             f"fps={fps_text}; backend={backend_text}"
         )
+        self._decklink_sessions_running = True
         LOGGER.info(
             "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s",
             input_name,
@@ -4415,6 +4556,8 @@ class MainWindow(QMainWindow):
         return combo.currentData()
 
     def _stop_decklink_sessions(self) -> None:
+        if self._decklink_buffer_reapply_timer.isActive():
+            self._decklink_buffer_reapply_timer.stop()
         if self._controller_backend == "worker-process":
             try:
                 self._controller.stop_decklink()
@@ -4435,6 +4578,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._capture_session = None
+
+        self._decklink_sessions_running = False
 
         LOGGER.info("DeckLink sessions stopped")
 

@@ -149,6 +149,7 @@ FRAME_W = 1920
 FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
+_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES: dict[int, int] = {}
 
 
 def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
@@ -759,7 +760,7 @@ def _tight_uyvy_bytes(frame: object) -> bytes:
     return bytes(out)
 
 
-def _write_frame_to_output(out: object, frame_bytes: bytes) -> None:
+def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
     if out.row_bytes == UYVY_ROW_BYTES:
         payload = frame_bytes
     else:
@@ -777,57 +778,133 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> None:
         schedule_fn = getattr(out, "schedule_frame_copy", None)
         start_fn = getattr(out, "start_scheduled_playback", None)
         buffered_fn = getattr(out, "buffered_video_frame_count", None)
+        frame_duration = int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0
+        time_scale = int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0
+        frame_period_s = (float(frame_duration) / float(time_scale)) if frame_duration > 0 and time_scale > 0 else 0.0
+        target_buffer_frames = max(0, min(5, int(_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.get(out_id, 2))))
         state = {
             "enabled": callable(schedule_fn) and callable(start_fn),
             "can_query_buffered": callable(buffered_fn),
             "started": False,
+            "queued_before_start": 0,
             "display_time": 0,
-            "frame_duration": int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0,
-            "time_scale": int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0,
+            "frame_duration": frame_duration,
+            "time_scale": time_scale,
+            "frame_period_s": frame_period_s,
+            "sync_next_emit_ts": 0.0,
+            "schedule_epoch_perf_ts": 0.0,
+            "target_buffer_frames": target_buffer_frames,
         }
         _OUTPUT_SCHEDULE_STATE[out_id] = state
+
+    now = time.perf_counter()
+    frame_period_s = float(state.get("frame_period_s", 0.0))
+    jitter_tolerance_s = min(0.0015, frame_period_s * 0.35) if frame_period_s > 0.0 else 0.001
 
     if bool(state.get("enabled", False)):
         frame_duration = int(state.get("frame_duration", 0))
         time_scale = int(state.get("time_scale", 0))
         if frame_duration > 0 and time_scale > 0:
             try:
+                epoch_ts = float(state.get("schedule_epoch_perf_ts", 0.0))
+                if epoch_ts <= 0.0:
+                    epoch_ts = now
+                    state["schedule_epoch_perf_ts"] = epoch_ts
+
+                elapsed_units = max(0.0, (now - epoch_ts) * float(time_scale))
+                display_time = int(state.get("display_time", 0))
+
+                # Keep scheduled preroll bounded so enqueue rate cannot run above the mode frame rate.
+                max_preroll_frames = max(0, min(5, int(state.get("target_buffer_frames", 2))))
+                max_preroll_units = max_preroll_frames * frame_duration
+                if display_time > (elapsed_units + max_preroll_units):
+                    return False
+
                 out.schedule_frame_copy(
                     payload,
-                    int(state.get("display_time", 0)),
+                    display_time,
                     frame_duration,
                     time_scale,
                 )
                 state["display_time"] = int(state.get("display_time", 0)) + frame_duration
 
                 if not bool(state.get("started", False)):
+                    state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
                     should_start = False
+                    target_start_frames = max(0, min(5, int(state.get("target_buffer_frames", 2))))
+                    if target_start_frames <= 0:
+                        should_start = True
                     if bool(state.get("can_query_buffered", False)):
                         try:
                             buffered_count = int(out.buffered_video_frame_count())
-                            # Small preroll avoids startup underflow with low added latency.
-                            should_start = buffered_count >= 2
+                            queued_before_start = int(state.get("queued_before_start", 0))
+                            effective_buffered = max(buffered_count, queued_before_start)
+                            should_start = effective_buffered >= target_start_frames
                         except Exception:
                             state["can_query_buffered"] = False
-                            should_start = True
                     else:
-                        should_start = True
+                        should_start = int(state.get("queued_before_start", 0)) >= target_start_frames
 
                     if should_start:
                         out.start_scheduled_playback(0, time_scale, 1.0)
                         state["started"] = True
-                return
+                        state["queued_before_start"] = 0
+                return True
             except Exception:
                 # Fall back to blocking output if scheduling path errors at runtime.
                 state["enabled"] = False
 
+    next_emit_ts = float(state.get("sync_next_emit_ts", 0.0))
+    if frame_period_s > 0.0:
+        if next_emit_ts <= 0.0:
+            next_emit_ts = now
+        elif now + jitter_tolerance_s < next_emit_ts:
+            return False
+
+        # If processing was delayed for multiple frame intervals, re-anchor pacing to "now".
+        if now - next_emit_ts > (frame_period_s * 3.0):
+            next_emit_ts = now
+
     out.display_frame_sync(payload)
+    if frame_period_s > 0.0:
+        state["sync_next_emit_ts"] = next_emit_ts + frame_period_s
+    return True
 
 
 def _clear_output_schedule_state(out: object | None) -> None:
     if out is None:
         return
-    _OUTPUT_SCHEDULE_STATE.pop(id(out), None)
+    out_id = id(out)
+    _OUTPUT_SCHEDULE_STATE.pop(out_id, None)
+    _OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.pop(out_id, None)
+
+
+def _set_output_schedule_buffer_frames(out: object, buffer_frames: int) -> None:
+    out_id = id(out)
+    clamped = max(0, min(5, int(buffer_frames)))
+    _OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES[out_id] = clamped
+    state = _OUTPUT_SCHEDULE_STATE.get(out_id)
+    if state is not None:
+        state["target_buffer_frames"] = clamped
+
+
+def _reprime_output_schedule(out: object) -> None:
+    state = _OUTPUT_SCHEDULE_STATE.get(id(out))
+    if state is None:
+        return
+
+    stop_fn = getattr(out, "stop_scheduled_playback", None)
+    if callable(stop_fn):
+        try:
+            stop_fn()
+        except Exception:
+            pass
+
+    state["started"] = False
+    state["queued_before_start"] = 0
+    state["display_time"] = 0
+    state["schedule_epoch_perf_ts"] = 0.0
+    state["sync_next_emit_ts"] = 0.0
 
 
 def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -1025,6 +1102,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
     current_denoise_method = str(startup_config.get("denoise_method", "off"))
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
+    current_output_buffer_frames = max(0, min(5, int(startup_config.get("decklink_output_buffer_frames", 2))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
     state_lock = threading.Lock()
 
@@ -1419,7 +1497,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     # In zero-processing mode, avoid staged queueing and preserve output cadence.
                     try:
                         if output_session is not None:
-                            _write_frame_to_output(output_session, input_bytes)
+                            emitted = _write_frame_to_output(output_session, input_bytes)
+                        else:
+                            emitted = False
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
                         continue
@@ -1430,7 +1510,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         latest_effective_sr_scale = 1
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
-                        processed_frame_counter += 1
+                        if emitted:
+                            processed_frame_counter += 1
                     continue
 
                 if _is_live_basic_scaling_fast_mode():
@@ -1444,7 +1525,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                     try:
                         if output_session is not None:
-                            _write_frame_to_output(output_session, output_bytes)
+                            emitted = _write_frame_to_output(output_session, output_bytes)
+                        else:
+                            emitted = False
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
                         continue
@@ -1466,7 +1549,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         latest_effective_sr_scale = int(processor.get_effective_sr_scale())
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
-                        processed_frame_counter += 1
+                        if emitted:
+                            processed_frame_counter += 1
                     continue
 
                 frame_id_counter += 1
@@ -1562,7 +1646,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                 try:
                     if output_session is not None:
-                        _write_frame_to_output(output_session, output_bytes)
+                        emitted = _write_frame_to_output(output_session, output_bytes)
+                    else:
+                        emitted = False
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
                     continue
@@ -1573,7 +1659,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     latest_effective_sr_scale = int(processor.get_effective_sr_scale())
                     latest_rtx_vsr_applied = bool(item.rtx_applied)
                     latest_rtx_effect_mean_abs_luma = sampled_delta
-                    processed_frame_counter += 1
+                    if emitted:
+                        processed_frame_counter += 1
 
         capture_thread = threading.Thread(target=_capture_worker, name="vp-capture", daemon=True)
         preprocess_thread = None
@@ -1783,11 +1870,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             capture_session = None
 
     def _start_sessions(message: dict[str, Any]) -> None:
-        nonlocal capture_session, output_session
+        nonlocal capture_session, output_session, current_output_buffer_frames
         if d is None:
             raise RuntimeError("decklink_wrapper is not available in worker process")
 
         _stop_sessions()
+        current_output_buffer_frames = max(
+            0,
+            min(5, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
+        )
 
         capture_session = d.CaptureSession(
             device_index=int(message["in_device"]),
@@ -1804,6 +1895,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
         capture_session.start()
         output_session.start()
+        _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
 
         _start_live_pipeline()
     try:
@@ -1855,6 +1947,23 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             if command == "start_decklink":
                 _start_sessions(message)
                 _safe_put({"type": "ack", "cmd": "start_decklink"})
+                continue
+
+            if command == "set_decklink_output_buffer_frames":
+                current_output_buffer_frames = max(
+                    0,
+                    min(5, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
+                )
+                if output_session is not None:
+                    _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
+                    _reprime_output_schedule(output_session)
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_decklink_output_buffer_frames",
+                        "decklink_output_buffer_frames": int(current_output_buffer_frames),
+                    }
+                )
                 continue
 
             if command == "stop_decklink":
