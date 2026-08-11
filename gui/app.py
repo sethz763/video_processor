@@ -3011,6 +3011,10 @@ class MainWindow(QMainWindow):
         roi_box = QGroupBox("ROI")
         roi_form = QFormLayout(roi_box)
 
+        reset_btn = QPushButton("Reset ROI")
+        reset_btn.clicked.connect(self._reset_roi)
+        roi_form.addRow(reset_btn)
+
         self.roi_x_spin = QSpinBox()
         self.roi_x_spin.setRange(0, FRAME_W - 2)
         self.roi_x_spin.valueChanged.connect(self._on_roi_spin_changed)
@@ -3090,29 +3094,34 @@ class MainWindow(QMainWindow):
         keyframe_layout = QHBoxLayout(keyframe_row)
         keyframe_layout.setContentsMargins(0, 0, 0, 0)
         keyframe_layout.setSpacing(8)
+        key_button_min_height = 120
 
         self.roi_save_key_btn = QPushButton("SAVE KEY")
         self.roi_save_key_btn.setCheckable(True)
+        self.roi_save_key_btn.setMinimumHeight(key_button_min_height)
         self.roi_save_key_btn.toggled.connect(self._on_roi_save_key_toggled)
         keyframe_layout.addWidget(self.roi_save_key_btn)
 
         self.roi_key1_btn = QPushButton("KEY 1")
+        self.roi_key1_btn.setMinimumHeight(key_button_min_height)
         self.roi_key1_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(1))
         keyframe_layout.addWidget(self.roi_key1_btn)
 
         self.roi_key2_btn = QPushButton("KEY 2")
+        self.roi_key2_btn.setMinimumHeight(key_button_min_height)
         self.roi_key2_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(2))
         keyframe_layout.addWidget(self.roi_key2_btn)
 
         self.roi_key3_btn = QPushButton("KEY 3")
+        self.roi_key3_btn.setMinimumHeight(key_button_min_height)
         self.roi_key3_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(3))
         keyframe_layout.addWidget(self.roi_key3_btn)
 
         roi_form.addRow(keyframe_row)
 
-        reset_btn = QPushButton("Reset ROI")
-        reset_btn.clicked.connect(self._reset_roi)
-        roi_form.addRow(reset_btn)
+        keyframe_spacing_row = QWidget()
+        keyframe_spacing_row.setFixedHeight(16)
+        roi_form.addRow(keyframe_spacing_row)
 
         post_vsr_scaling_box = QGroupBox("Post VSR Scaling")
         post_vsr_scaling_form = QFormLayout(post_vsr_scaling_box)
