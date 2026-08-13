@@ -556,6 +556,7 @@ class RoiCanvas(QWidget):
         self._image: QImage | None = None
         self._image_backing: np.ndarray | None = None
         self._roi = Roi(0, 0, FRAME_W, FRAME_H)
+        self._visual_roi_overlay: tuple[float, float, float, float] | None = None
 
         self._drag_mode = "none"
         self._drag_start_pos = QPointF()
@@ -585,7 +586,18 @@ class RoiCanvas(QWidget):
 
     def set_roi(self, roi: Roi) -> None:
         self._cancel_interaction_interpolation()
+        self._visual_roi_overlay = None
         self._apply_roi_local(roi)
+
+    def set_visual_roi_overlay(self, x: float, y: float, w: float, h: float) -> None:
+        self._visual_roi_overlay = (float(x), float(y), float(w), float(h))
+        self.update()
+
+    def clear_visual_roi_overlay(self) -> None:
+        if self._visual_roi_overlay is None:
+            return
+        self._visual_roi_overlay = None
+        self.update()
 
     def roi(self) -> Roi:
         return self._roi
@@ -605,7 +617,11 @@ class RoiCanvas(QWidget):
         if self._image is not None:
             p.drawImage(image_rect, self._image)
 
-        roi_rect_w = self._frame_to_widget_rect(self._roi)
+        if self._visual_roi_overlay is not None:
+            overlay_x, overlay_y, overlay_w, overlay_h = self._visual_roi_overlay
+            roi_rect_w = self._frame_to_widget_rect_float(overlay_x, overlay_y, overlay_w, overlay_h)
+        else:
+            roi_rect_w = self._frame_to_widget_rect(self._roi)
         p.setRenderHint(QPainter.Antialiasing, True)
 
         p.setPen(QPen(Qt.yellow, 2))
@@ -1016,14 +1032,17 @@ class RoiCanvas(QWidget):
         return QPointF(x, y)
 
     def _frame_to_widget_rect(self, roi: Roi) -> QRectF:
+        return self._frame_to_widget_rect_float(float(roi.x), float(roi.y), float(roi.w), float(roi.h))
+
+    def _frame_to_widget_rect_float(self, x: float, y: float, w: float, h: float) -> QRectF:
         image_rect = self._image_rect()
         sx = image_rect.width() / FRAME_W
         sy = image_rect.height() / FRAME_H
         return QRectF(
-            image_rect.left() + (roi.x * sx),
-            image_rect.top() + (roi.y * sy),
-            max(1.0, roi.w * sx),
-            max(1.0, roi.h * sy),
+            image_rect.left() + (float(x) * sx),
+            image_rect.top() + (float(y) * sy),
+            max(1.0, float(w) * sx),
+            max(1.0, float(h) * sy),
         )
 
 
@@ -1336,7 +1355,28 @@ class VideoProcessorController:
 
     def set_decklink_output_buffer_frames(self, buffer_frames: int) -> None:
         # In-process backend does not use worker DeckLink output buffering.
-        self.decklink_output_buffer_frames = max(0, min(5, int(buffer_frames)))
+        self.decklink_output_buffer_frames = max(0, min(10, int(buffer_frames)))
+
+    def set_roi_subpixel_shift(self, shift_x: float, shift_y: float) -> None:
+        _ = (shift_x, shift_y)
+
+    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float) -> None:
+        _ = (roi, shift_x, shift_y)
+
+    def start_roi_microstep_transition(
+        self,
+        start_roi: Roi,
+        target_roi: Roi,
+        duration_frames: int,
+        interpolation_mode: str,
+        overscan_percent: float,
+        start_from_current: bool = False,
+    ) -> None:
+        _ = (start_roi, target_roi, duration_frames, interpolation_mode, overscan_percent, start_from_current)
+
+    def cancel_roi_microstep_transition(self, reset_subpixel_shift: bool = True) -> None:
+        _ = reset_subpixel_shift
+        return
 
 
 class ProcessVideoProcessorController:
@@ -1374,7 +1414,7 @@ class ProcessVideoProcessorController:
         self.rtx_thdr_saturation = max(0, int(os.environ.get("VP_RTX_THDR_SATURATION", "50")))
         self.rtx_thdr_middle_gray = max(0, int(os.environ.get("VP_RTX_THDR_MIDDLE_GRAY", "50")))
         self.rtx_thdr_max_luminance = max(0, int(os.environ.get("VP_RTX_THDR_MAX_LUMINANCE", "1000")))
-        self.decklink_output_buffer_frames = max(0, min(5, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "2"))))
+        self.decklink_output_buffer_frames = max(0, min(10, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "2"))))
         self.rtx_vsr_active = False
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
@@ -1600,7 +1640,6 @@ class ProcessVideoProcessorController:
         cmd = str(command.get("cmd", ""))
         best_effort_cmds = {
             "decklink_tick",
-            "set_roi_position",
             "set_decklink_output_buffer_frames",
         }
 
@@ -1673,7 +1712,7 @@ class ProcessVideoProcessorController:
                 elif ack_cmd == "set_decklink_output_buffer_frames":
                     self.decklink_output_buffer_frames = max(
                         0,
-                        min(5, int(message.get("decklink_output_buffer_frames", self.decklink_output_buffer_frames))),
+                        min(10, int(message.get("decklink_output_buffer_frames", self.decklink_output_buffer_frames))),
                     )
                 continue
 
@@ -1693,6 +1732,63 @@ class ProcessVideoProcessorController:
 
     def set_roi_position(self, roi_x: int, roi_y: int) -> None:
         self._send_control({"cmd": "set_roi_position", "x": int(roi_x), "y": int(roi_y)})
+
+    def set_roi_subpixel_shift(self, shift_x: float, shift_y: float) -> None:
+        self._send_control(
+            {
+                "cmd": "set_roi_subpixel_shift",
+                "shift_x": float(shift_x),
+                "shift_y": float(shift_y),
+            }
+        )
+
+    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float) -> None:
+        self._send_control(
+            {
+                "cmd": "set_roi_with_subpixel",
+                "x": int(roi.x),
+                "y": int(roi.y),
+                "w": int(roi.w),
+                "h": int(roi.h),
+                "shift_x": float(shift_x),
+                "shift_y": float(shift_y),
+            }
+        )
+
+    def start_roi_microstep_transition(
+        self,
+        start_roi: Roi,
+        target_roi: Roi,
+        duration_frames: int,
+        interpolation_mode: str,
+        overscan_percent: float,
+        start_from_current: bool = False,
+    ) -> None:
+        self._send_control(
+            {
+                "cmd": "start_roi_microstep_transition",
+                "start_x": int(start_roi.x),
+                "start_y": int(start_roi.y),
+                "start_w": int(start_roi.w),
+                "start_h": int(start_roi.h),
+                "target_x": int(target_roi.x),
+                "target_y": int(target_roi.y),
+                "target_w": int(target_roi.w),
+                "target_h": int(target_roi.h),
+                "duration_frames": int(duration_frames),
+                "interpolation_mode": str(interpolation_mode),
+                "overscan_percent": float(overscan_percent),
+                "start_from_current": bool(start_from_current),
+            }
+        )
+
+    def cancel_roi_microstep_transition(self, reset_subpixel_shift: bool = True) -> None:
+        self._send_control(
+            {
+                "cmd": "cancel_roi_microstep_transition",
+                "reset_subpixel_shift": bool(reset_subpixel_shift),
+            }
+        )
 
     def set_auto_basic_scaling(self) -> None:
         self.basic_scaling_auto_mode = True
@@ -1917,7 +2013,7 @@ class ProcessVideoProcessorController:
         self._last_preview_request_ts = 0.0
 
     def set_decklink_output_buffer_frames(self, buffer_frames: int) -> None:
-        self.decklink_output_buffer_frames = max(0, min(5, int(buffer_frames)))
+        self.decklink_output_buffer_frames = max(0, min(10, int(buffer_frames)))
         self._send_control(
             {
                 "cmd": "set_decklink_output_buffer_frames",
@@ -2165,6 +2261,7 @@ class MainWindow(QMainWindow):
         self._roi_keyframe_transition: dict[str, object] | None = None
         self._roi_keyframe_last_step_ts = 0.0
         self._roi_keyframe_target_fps = 60.0
+        self._roi_keyframe_transition_overscan_percent = 2.0
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         self._controller_filtered_target_roi: Roi | None = None
         self._last_status_text: str | None = None
@@ -2227,10 +2324,10 @@ class MainWindow(QMainWindow):
         self._preview_downsample_factor = self._normalize_preview_downsample_factor(
             float(os.environ.get("VP_PREVIEW_DOWNSAMPLE", "0.25"))
         )
-        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "60")))
+        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "30")))
         self._decklink_output_buffer_frames = max(
             0,
-            min(5, int(getattr(self._controller, "decklink_output_buffer_frames", 2))),
+            min(10, int(getattr(self._controller, "decklink_output_buffer_frames", 2))),
         )
 
         central = QWidget()
@@ -2300,7 +2397,8 @@ class MainWindow(QMainWindow):
         self._controller_roi_interp_timer.timeout.connect(self._step_controller_roi_interpolation)
 
         self._roi_keyframe_transition_timer = QTimer(self)
-        self._roi_keyframe_transition_timer.setInterval(16)
+        self._roi_keyframe_transition_timer.setInterval(8)
+        self._roi_keyframe_transition_timer.setTimerType(Qt.PreciseTimer)
         self._roi_keyframe_transition_timer.timeout.connect(self._step_roi_keyframe_transition)
 
         self._setup_shortcuts()
@@ -2520,7 +2618,7 @@ class MainWindow(QMainWindow):
             self.preview_request_fps_spin.setValue(max(1, min(60, int(raw.get("preview_request_fps", self.preview_request_fps_spin.value())))))
             self.preview_poll_fps_spin.setValue(max(1, min(120, int(raw.get("preview_poll_fps", self.preview_poll_fps_spin.value())))))
             self.decklink_output_buffer_spin.setValue(
-                max(0, min(5, int(raw.get("decklink_output_buffer_frames", self.decklink_output_buffer_spin.value()))))
+                max(0, min(10, int(raw.get("decklink_output_buffer_frames", self.decklink_output_buffer_spin.value()))))
             )
             self.roi_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value())))))
             self.roi_latency_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_latency_smoothing_percent", self.roi_latency_smoothing_slider.value())))))
@@ -2713,7 +2811,7 @@ class MainWindow(QMainWindow):
         settings_form.addRow("Preview poll FPS cap", self.preview_poll_fps_spin)
 
         self.decklink_output_buffer_spin = QSpinBox()
-        self.decklink_output_buffer_spin.setRange(0, 5)
+        self.decklink_output_buffer_spin.setRange(0, 10)
         self.decklink_output_buffer_spin.setValue(int(self._decklink_output_buffer_frames))
         self.decklink_output_buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames; larger values can smooth short stalls with added latency.")
         self.decklink_output_buffer_spin.valueChanged.connect(self._on_decklink_output_buffer_changed)
@@ -3671,7 +3769,7 @@ class MainWindow(QMainWindow):
         self._update_status(f"Preview poll FPS cap set to {int(self._decklink_tick_poll_fps)}")
 
     def _on_decklink_output_buffer_changed(self) -> None:
-        buffer_frames = max(0, min(5, int(self.decklink_output_buffer_spin.value())))
+        buffer_frames = max(0, min(10, int(self.decklink_output_buffer_spin.value())))
         self._decklink_output_buffer_frames = buffer_frames
         if hasattr(self._controller, "decklink_output_buffer_frames"):
             self._controller.decklink_output_buffer_frames = buffer_frames
@@ -3738,12 +3836,14 @@ class MainWindow(QMainWindow):
         if not self._controller_roi_interp_timer.isActive():
             self._controller_roi_interp_timer.start()
 
-    def _apply_controller_roi_immediate(self, roi: Roi) -> None:
+    def _apply_controller_roi_immediate(self, roi: Roi, reset_subpixel_shift: bool = True) -> None:
         clamped = clamp_roi(roi)
         self._controller_roi_target = None
         self._controller_roi_interp_timer.stop()
         self._controller_filtered_target_roi = None
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        if reset_subpixel_shift and hasattr(self._controller, "set_roi_subpixel_shift"):
+            self._controller.set_roi_subpixel_shift(0.0, 0.0)
         moving_only = (
             clamped.w == self._controller_roi_applied.w
             and clamped.h == self._controller_roi_applied.h
@@ -4842,22 +4942,37 @@ class MainWindow(QMainWindow):
                 button.setStyleSheet("")
                 button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
 
-    def _cancel_roi_keyframe_transition(self) -> None:
+    def _cancel_roi_keyframe_transition(self, reset_subpixel_shift: bool = True) -> None:
         self._roi_keyframe_transition = None
         self._roi_keyframe_transition_timer.stop()
         self._roi_keyframe_last_step_ts = 0.0
+        self._input_canvas.clear_visual_roi_overlay()
+        if hasattr(self._controller, "cancel_roi_microstep_transition"):
+            try:
+                self._controller.cancel_roi_microstep_transition(reset_subpixel_shift=reset_subpixel_shift)
+            except Exception:
+                pass
+        if reset_subpixel_shift and hasattr(self._controller, "set_roi_subpixel_shift"):
+            self._controller.set_roi_subpixel_shift(0.0, 0.0)
 
     def _start_roi_keyframe_transition(self, target_roi: Roi, duration_frames: int, interpolation_mode: str) -> None:
+        previous_state = self._roi_keyframe_transition
+        if isinstance(previous_state, dict):
+            current_estimate = previous_state.get("current_roi_estimate")
+            if isinstance(current_estimate, Roi):
+                self._roi = clamp_roi(current_estimate)
+
         target = clamp_roi(target_roi)
         total_frames = max(1, min(600, int(duration_frames)))
         mode_name = str(interpolation_mode).strip().lower()
         if mode_name not in {"linear", "ease_in_out", "ease_out"}:
             mode_name = "linear"
-        self._cancel_roi_keyframe_transition()
+        self._cancel_roi_keyframe_transition(reset_subpixel_shift=False)
 
         if total_frames <= 1:
             self._roi = target
             self._input_canvas.set_roi(target)
+            self._input_canvas.clear_visual_roi_overlay()
             self._apply_controller_roi_immediate(target)
             self._sync_controls_from_roi(target)
             return
@@ -4868,8 +4983,56 @@ class MainWindow(QMainWindow):
             "total_frames": total_frames,
             "frame_progress": 0.0,
             "interpolation_mode": mode_name,
+            "quant_residual": {"x": 0.0, "y": 0.0, "w": 0.0},
+            "last_roi": clamp_roi(self._roi),
+            "last_subpixel_shift": {"x": 0.0, "y": 0.0},
+            "pending_frame_advance": 0.0,
         }
+
+        backend_driven = bool(
+            self._source_mode == "Blackmagic DeckLink"
+            and self._controller_backend == "worker-process"
+            and hasattr(self._controller, "start_roi_microstep_transition")
+        )
+        self._roi_keyframe_transition["backend_driven"] = backend_driven
+
+        # Ensure no background controller interpolation remains active while
+        # keyframe transition drives ROI updates directly.
+        self._controller_roi_target = None
+        self._controller_filtered_target_roi = None
+        self._controller_roi_interp_timer.stop()
+        self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
+        use_worker_clock = bool(
+            self._source_mode == "Blackmagic DeckLink"
+            and self._controller_backend == "worker-process"
+            and hasattr(self._controller, "decklink_processed_counter")
+            and hasattr(self._controller, "decklink_tick")
+        )
+        self._roi_keyframe_transition["use_worker_clock"] = use_worker_clock
+        if use_worker_clock:
+            try:
+                self._roi_keyframe_transition["last_frame_counter"] = int(self._controller.decklink_processed_counter())
+            except Exception:
+                self._roi_keyframe_transition["last_frame_counter"] = None
+        else:
+            self._roi_keyframe_transition["last_frame_counter"] = None
+
         self._roi_keyframe_last_step_ts = time.perf_counter()
+
+        if backend_driven:
+            try:
+                self._controller.start_roi_microstep_transition(
+                    start_roi=clamp_roi(self._roi),
+                    target_roi=target,
+                    duration_frames=total_frames,
+                    interpolation_mode=mode_name,
+                    overscan_percent=float(self._roi_keyframe_transition_overscan_percent),
+                    start_from_current=True,
+                )
+            except Exception as exc:
+                self._update_status(f"Worker ROI microstep transition start failed: {exc}")
+                self._roi_keyframe_transition["backend_driven"] = False
         self._roi_keyframe_transition_timer.start()
 
     def _apply_roi_interpolation_curve(self, t: float, interpolation_mode: str) -> float:
@@ -4882,19 +5045,16 @@ class MainWindow(QMainWindow):
         return clamped_t
 
     def _roi_keyframe_transition_fps(self) -> float:
-        if self._source_mode == "Blackmagic DeckLink" and hasattr(self._controller, "decklink_processed_fps"):
-            try:
-                measured = float(self._controller.decklink_processed_fps())
-            except Exception:
-                measured = 0.0
-            if measured >= 1.0:
-                return max(24.0, min(120.0, measured))
+        # Keep transition cadence deterministic; modulating by live worker FPS can
+        # introduce subtle speed wobble that appears as jitter.
         return float(self._roi_keyframe_target_fps)
 
     def _step_roi_keyframe_transition(self) -> None:
         state = self._roi_keyframe_transition
         if state is None:
             return
+
+        backend_driven = bool(state.get("backend_driven", False))
 
         start_roi = state["start"]
         target_roi = state["target"]
@@ -4909,35 +5069,231 @@ class MainWindow(QMainWindow):
         self._roi_keyframe_last_step_ts = now
 
         frame_progress = float(state.get("frame_progress", 0.0))
-        frame_progress += dt * self._roi_keyframe_transition_fps()
+        frame_advance = 0.0
+
+        if bool(state.get("use_worker_clock", False)):
+            # Keep worker telemetry fresh while a transition is active so
+            # processed_frame_counter deltas reflect output cadence.
+            try:
+                self._controller.decklink_tick(timeout_ms=0)
+            except Exception:
+                pass
+
+            current_counter = None
+            try:
+                current_counter = int(self._controller.decklink_processed_counter())
+            except Exception:
+                current_counter = None
+
+            last_counter = state.get("last_frame_counter")
+            if isinstance(current_counter, int):
+                state["last_frame_counter"] = current_counter
+                if isinstance(last_counter, int) and current_counter >= last_counter:
+                    state["pending_frame_advance"] = float(state.get("pending_frame_advance", 0.0)) + float(current_counter - last_counter)
+
+            pending = max(0.0, float(state.get("pending_frame_advance", 0.0)))
+            if pending > 0.0:
+                # Consume at most one frame-worth per transition tick to avoid
+                # visible jumps when GUI polling misses one or more frame-count updates.
+                frame_advance = min(1.0, pending)
+                state["pending_frame_advance"] = pending - frame_advance
+
+        if frame_advance <= 0.0:
+            if bool(state.get("use_worker_clock", False)):
+                frame_advance = 0.0
+            else:
+                frame_advance = dt * self._roi_keyframe_transition_fps()
+
+        frame_progress += frame_advance
         frame_progress = min(float(total_frames), frame_progress)
         state["frame_progress"] = frame_progress
 
         t = min(1.0, frame_progress / float(max(1, total_frames)))
         curved_t = self._apply_roi_interpolation_curve(t, interpolation_mode)
 
+        # Subpixel interpolation in center/width space reduces coupled x/y/w/h
+        # quantization jitter, especially at high zoom where ROI dimensions are small.
+        start_cx = float(start_roi.x) + (float(start_roi.w) * 0.5)
+        start_cy = float(start_roi.y) + (float(start_roi.h) * 0.5)
+        target_cx = float(target_roi.x) + (float(target_roi.w) * 0.5)
+        target_cy = float(target_roi.y) + (float(target_roi.h) * 0.5)
+
+        ideal_cx = start_cx + ((target_cx - start_cx) * curved_t)
+        ideal_cy = start_cy + ((target_cy - start_cy) * curved_t)
+        ideal_w = float(start_roi.w) + ((float(target_roi.w) - float(start_roi.w)) * curved_t)
+
+        if backend_driven:
+            display_w = max(2.0, float(ideal_w))
+            display_h = max(2.0, float(display_w * 9.0 / 16.0))
+            display_x = float(ideal_cx - (display_w * 0.5))
+            display_y = float(ideal_cy - (display_h * 0.5))
+            self._input_canvas.set_visual_roi_overlay(display_x, display_y, display_w, display_h)
+
+            estimated_scale = FRAME_W / max(1.0, display_w)
+            estimated_roi = clamp_roi(roi_from_scale(estimated_scale, ideal_cx, ideal_cy))
+            state["current_roi_estimate"] = estimated_roi
+            self._roi = estimated_roi
+
+            transition_complete = frame_progress >= float(total_frames)
+            if transition_complete:
+                self._roi_keyframe_transition = None
+                self._roi_keyframe_transition_timer.stop()
+                self._input_canvas.clear_visual_roi_overlay()
+                self._roi = target_roi
+                self._input_canvas.set_roi(target_roi)
+                self._sync_controls_from_roi(target_roi)
+                self._roi_keyframe_last_step_ts = 0.0
+            return
+
+        residual = state.get("quant_residual")
+        if not isinstance(residual, dict):
+            residual = {"x": 0.0, "y": 0.0, "w": 0.0}
+            state["quant_residual"] = residual
+
+        desired_cx = ideal_cx + float(residual.get("x", 0.0))
+        desired_cy = ideal_cy + float(residual.get("y", 0.0))
+        desired_w = ideal_w + float(residual.get("w", 0.0))
+
+        display_w = max(2.0, float(desired_w))
+        display_h = max(2.0, float(display_w * 9.0 / 16.0))
+        display_x = float(desired_cx - (display_w * 0.5))
+        display_y = float(desired_cy - (display_h * 0.5))
+        self._input_canvas.set_visual_roi_overlay(display_x, display_y, display_w, display_h)
+
+        # Apply slight temporary overscan in the backend ROI path to make high-zoom
+        # motion feel less quantized while keeping final framing exact.
+        target_scale = roi_scale_from_roi(target_roi)
+        overscan_pct = float(self._roi_keyframe_transition_overscan_percent)
+        if target_scale >= 4.0 and overscan_pct > 0.0:
+            # Fade overscan to zero by transition end to avoid a final snap.
+            overscan_weight = max(0.0, 1.0 - float(curved_t))
+            desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
+        else:
+            desired_w_backend = desired_w
+
+        dx = int(target_roi.x) - int(start_roi.x)
+        dy = int(target_roi.y) - int(start_roi.y)
+        dw = int(target_roi.w) - int(start_roi.w)
+
+        def _quantize_directional(value: float, delta: int, quantum: int) -> int:
+            q = max(1, int(quantum))
+            scaled = value / float(q)
+            if delta > 0:
+                return int(math.floor(scaled)) * q
+            if delta < 0:
+                return int(math.ceil(scaled)) * q
+            return int(round(scaled)) * q
+
+        quant_w = _quantize_directional(desired_w_backend, dw, 2)
+        quant_w = max(2, quant_w & ~1)
+        quant_h = max(2, int(round(quant_w * 9.0 / 16.0)))
+
+        desired_x = desired_cx - (quant_w * 0.5)
+        desired_y = desired_cy - (quant_h * 0.5)
+
+        quant_x = _quantize_directional(desired_x, dx, 2)
+        quant_y = _quantize_directional(desired_y, dy, 1)
+
         interpolated = clamp_roi(
             Roi(
-                int(round(start_roi.x + ((target_roi.x - start_roi.x) * curved_t))),
-                int(round(start_roi.y + ((target_roi.y - start_roi.y) * curved_t))),
-                int(round(start_roi.w + ((target_roi.w - start_roi.w) * curved_t))),
-                int(round(start_roi.h + ((target_roi.h - start_roi.h) * curved_t))),
+                quant_x,
+                quant_y,
+                quant_w,
+                quant_h,
             )
         )
 
-        self._roi = interpolated
-        self._input_canvas.set_roi(interpolated)
-        self._apply_controller_roi_immediate(interpolated)
-        self._sync_controls_from_roi(interpolated)
+        last_roi = state.get("last_roi")
+        if not isinstance(last_roi, Roi):
+            last_roi = self._roi
 
-        if frame_progress >= float(total_frames) or (
+        mono_x = interpolated.x
+        mono_y = interpolated.y
+        mono_w = interpolated.w
+        mono_h = interpolated.h
+
+        if dx > 0:
+            mono_x = max(mono_x, last_roi.x)
+        elif dx < 0:
+            mono_x = min(mono_x, last_roi.x)
+
+        if dy > 0:
+            mono_y = max(mono_y, last_roi.y)
+        elif dy < 0:
+            mono_y = min(mono_y, last_roi.y)
+
+        if dw > 0:
+            mono_w = max(mono_w, last_roi.w)
+        elif dw < 0:
+            mono_w = min(mono_w, last_roi.w)
+
+        target_h_delta = int(target_roi.h) - int(start_roi.h)
+        if target_h_delta > 0:
+            mono_h = max(mono_h, last_roi.h)
+        elif target_h_delta < 0:
+            mono_h = min(mono_h, last_roi.h)
+
+        interpolated = clamp_roi(Roi(mono_x, mono_y, mono_w, mono_h))
+        state["last_roi"] = interpolated
+
+        # Compute residual/compensation from the final carrier ROI that will be
+        # sent to backend. Doing this before monotonic/clamp introduces mismatch
+        # and visible staircase artifacts at very slow transitions.
+        interp_cx = float(interpolated.x) + (float(interpolated.w) * 0.5)
+        interp_cy = float(interpolated.y) + (float(interpolated.h) * 0.5)
+        residual["x"] = desired_cx - interp_cx
+        residual["y"] = desired_cy - interp_cy
+        residual["w"] = desired_w_backend - float(interpolated.w)
+
+        if hasattr(self._controller, "set_roi_subpixel_shift"):
+            source_dx = ideal_cx - interp_cx
+            source_dy = ideal_cy - interp_cy
+            sx = FRAME_W / max(1.0, float(interpolated.w))
+            sy = FRAME_H / max(1.0, float(interpolated.h))
+            # ROI moving right shifts scene content left in output.
+            max_shift_x = max(2.0, min(48.0, sx * 1.5))
+            max_shift_y = max(2.0, min(48.0, sy * 1.5))
+            target_shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
+            target_shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
+        else:
+            target_shift_x = 0.0
+            target_shift_y = 0.0
+
+        roi_changed = (
+            interpolated.x != self._roi.x
+            or interpolated.y != self._roi.y
+            or interpolated.w != self._roi.w
+            or interpolated.h != self._roi.h
+        )
+
+        transition_complete = frame_progress >= float(total_frames) or (
             interpolated.x == target_roi.x
             and interpolated.y == target_roi.y
             and interpolated.w == target_roi.w
             and interpolated.h == target_roi.h
-        ):
+        )
+
+        if roi_changed:
+            self._roi = interpolated
+            self._input_canvas.set_roi(interpolated)
+
+        if not backend_driven:
+            if hasattr(self._controller, "set_roi_with_subpixel"):
+                self._controller.set_roi_with_subpixel(interpolated, target_shift_x, target_shift_y)
+                self._controller_roi_applied = interpolated
+            elif hasattr(self._controller, "set_roi_subpixel_shift"):
+                self._controller.set_roi_subpixel_shift(target_shift_x, target_shift_y)
+                if roi_changed:
+                    self._apply_controller_roi_immediate(interpolated, reset_subpixel_shift=False)
+            elif roi_changed:
+                self._apply_controller_roi_immediate(interpolated, reset_subpixel_shift=False)
+
+        if transition_complete:
             self._roi_keyframe_transition = None
             self._roi_keyframe_transition_timer.stop()
+            self._input_canvas.clear_visual_roi_overlay()
+            if hasattr(self._controller, "set_roi_subpixel_shift"):
+                self._controller.set_roi_subpixel_shift(0.0, 0.0)
             if (
                 interpolated.x != target_roi.x
                 or interpolated.y != target_roi.y
@@ -4946,8 +5302,13 @@ class MainWindow(QMainWindow):
             ):
                 self._roi = target_roi
                 self._input_canvas.set_roi(target_roi)
-                self._apply_controller_roi_immediate(target_roi)
-                self._sync_controls_from_roi(target_roi)
+            # Always finalize backend ROI and control values at transition end.
+            if backend_driven and hasattr(self._controller, "set_roi_with_subpixel"):
+                self._controller.set_roi_with_subpixel(self._roi, 0.0, 0.0)
+                self._controller_roi_applied = self._roi
+            else:
+                self._apply_controller_roi_immediate(self._roi)
+            self._sync_controls_from_roi(self._roi)
             self._roi_keyframe_last_step_ts = 0.0
 
     def _sync_controls_from_roi(self, roi: Roi) -> None:

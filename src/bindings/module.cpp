@@ -258,6 +258,23 @@ PYBIND11_MODULE(video_processor, m) {
             &vp::VideoProcessor::GetDenoiseStrength,
             "Get denoise strength in [0.0, 1.0]."
         )
+        .def(
+            "set_subpixel_shift",
+            &vp::VideoProcessor::SetSubpixelShift,
+            py::arg("shift_x"),
+            py::arg("shift_y"),
+            "Set native UYVY output subpixel shift in pixels."
+        )
+        .def(
+            "get_subpixel_shift",
+            [](const vp::VideoProcessor& self) {
+                float shift_x = 0.0f;
+                float shift_y = 0.0f;
+                self.GetSubpixelShift(shift_x, shift_y);
+                return py::make_tuple(shift_x, shift_y);
+            },
+            "Get native UYVY output subpixel shift as (shift_x, shift_y)."
+        )
         .def_property_readonly("width", &vp::VideoProcessor::width)
         .def_property_readonly("height", &vp::VideoProcessor::height)
         .def_property_readonly("sr_scale", &vp::VideoProcessor::sr_scale)
@@ -271,5 +288,20 @@ PYBIND11_MODULE(video_processor, m) {
         .def_property("deinterlace_enabled", &vp::VideoProcessor::IsDeinterlaceEnabled, &vp::VideoProcessor::SetDeinterlaceEnabled)
         .def_property("deinterlace_method", &vp::VideoProcessor::GetDeinterlaceMethodName, &vp::VideoProcessor::SetDeinterlaceMethodByName)
         .def_property("denoise_method", &vp::VideoProcessor::GetDenoiseMethodName, &vp::VideoProcessor::SetDenoiseMethodByName)
-        .def_property("denoise_strength", &vp::VideoProcessor::GetDenoiseStrength, &vp::VideoProcessor::SetDenoiseStrength);
+        .def_property("denoise_strength", &vp::VideoProcessor::GetDenoiseStrength, &vp::VideoProcessor::SetDenoiseStrength)
+        .def_property(
+            "subpixel_shift",
+            [](const vp::VideoProcessor& self) {
+                float shift_x = 0.0f;
+                float shift_y = 0.0f;
+                self.GetSubpixelShift(shift_x, shift_y);
+                return py::make_tuple(shift_x, shift_y);
+            },
+            [](vp::VideoProcessor& self, py::tuple value) {
+                if (value.size() != 2) {
+                    throw py::value_error("subpixel_shift expects a 2-item tuple (shift_x, shift_y)");
+                }
+                self.SetSubpixelShift(value[0].cast<float>(), value[1].cast<float>());
+            }
+        );
 }

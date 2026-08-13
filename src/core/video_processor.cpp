@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <stdexcept>
 
 #include "cuda/kernels.cuh"
@@ -16,6 +17,7 @@ constexpr int kUyvyBytesPerPixel = 2;
 constexpr size_t kRgbBytesPerPixel = sizeof(uchar3);
 constexpr std::array<int, 4> kSupportedSrScales = {16, 8, 4, 2};
 constexpr int kAutoSrScaleSettleFrames = 6;
+constexpr float kSubpixelShiftEpsilon = 1e-4f;
 
 inline void CheckCuda(cudaError_t err, const char* operation) {
     if (err != cudaSuccess) {
@@ -65,6 +67,10 @@ inline int SelectAutoSrScale(int width, int height, int roi_w, int roi_h, int ma
 
     selected = std::min(selected, capped_max);
     return ClampToSupportedSrScale(selected);
+}
+
+inline bool HasSubpixelShift(float shift_x, float shift_y) {
+    return std::fabs(shift_x) >= kSubpixelShiftEpsilon || std::fabs(shift_y) >= kSubpixelShiftEpsilon;
 }
 
 inline const char* ToSrFlavorName(SrFlavor sr_flavor) {
@@ -217,6 +223,8 @@ VideoProcessor::VideoProcessor(
             auto_sr_pending_scale_(-1),
             auto_sr_pending_frames_(0),
             auto_sr_settle_frames_(kAutoSrScaleSettleFrames),
+        subpixel_shift_x_(0.0f),
+        subpixel_shift_y_(0.0f),
       uyvy_bytes_(static_cast<size_t>(width) * static_cast<size_t>(height) * kUyvyBytesPerPixel),
       rgb_pixels_(static_cast<size_t>(width) * static_cast<size_t>(height)),
       stream_(nullptr),
@@ -454,6 +462,18 @@ float VideoProcessor::GetDenoiseStrength() const {
     return denoise_strength_;
 }
 
+void VideoProcessor::SetSubpixelShift(float shift_x, float shift_y) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    subpixel_shift_x_ = std::fabs(shift_x) < kSubpixelShiftEpsilon ? 0.0f : shift_x;
+    subpixel_shift_y_ = std::fabs(shift_y) < kSubpixelShiftEpsilon ? 0.0f : shift_y;
+}
+
+void VideoProcessor::GetSubpixelShift(float& shift_x, float& shift_y) const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    shift_x = subpixel_shift_x_;
+    shift_y = subpixel_shift_y_;
+}
+
 int VideoProcessor::sr_scale() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return sr_scale_;
@@ -628,6 +648,8 @@ std::string VideoProcessor::ProcessFrameInternal(
     DeinterlaceMethod deinterlace_method = DeinterlaceMethod::Bob;
     DenoiseMethod denoise_method = DenoiseMethod::Off;
     float denoise_strength = 0.0f;
+    float subpixel_shift_x = 0.0f;
+    float subpixel_shift_y = 0.0f;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (enable_placeholder_sr_ && auto_sr_scale_) {
@@ -661,6 +683,8 @@ std::string VideoProcessor::ProcessFrameInternal(
         deinterlace_method = deinterlace_method_;
         denoise_method = denoise_method_;
         denoise_strength = denoise_strength_;
+        subpixel_shift_x = subpixel_shift_x_;
+        subpixel_shift_y = subpixel_shift_y_;
 
         if (force_deinterlace) {
             deinterlace_enabled = true;
@@ -674,7 +698,8 @@ std::string VideoProcessor::ProcessFrameInternal(
     // skip GPU work entirely.
     if (!deinterlace_only && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
         (!enable_placeholder_sr_ || sr_scale <= 1) &&
-        roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_) {
+        roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_ &&
+        !HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
         return std::string(reinterpret_cast<const char*>(input_frame), uyvy_bytes_);
     }
 
@@ -712,8 +737,22 @@ std::string VideoProcessor::ProcessFrameInternal(
                 break;
         }
 
+        const uint8_t* final_uyvy = d_uyvy_out_;
+        if (HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+            cuda_kernels::LaunchUyvySubpixelShift(
+                d_uyvy_out_,
+                d_uyvy_in_,
+                width_,
+                height_,
+                subpixel_shift_x,
+                subpixel_shift_y,
+                stream_
+            );
+            final_uyvy = d_uyvy_in_;
+        }
+
         CheckCuda(
-            cudaMemcpyAsync(host_output_ptr, d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
+            cudaMemcpyAsync(host_output_ptr, final_uyvy, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
             "cudaMemcpyAsync D2H uyvy denoise fast path"
         );
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize uyvy denoise fast path");
@@ -760,8 +799,22 @@ std::string VideoProcessor::ProcessFrameInternal(
             stream_
         );
 
+        const uint8_t* final_uyvy = d_uyvy_out_;
+        if (HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+            cuda_kernels::LaunchUyvySubpixelShift(
+                d_uyvy_out_,
+                d_uyvy_in_,
+                width_,
+                height_,
+                subpixel_shift_x,
+                subpixel_shift_y,
+                stream_
+            );
+            final_uyvy = d_uyvy_in_;
+        }
+
         CheckCuda(
-            cudaMemcpyAsync(host_output_ptr, d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
+            cudaMemcpyAsync(host_output_ptr, final_uyvy, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
             "cudaMemcpyAsync D2H fast path"
         );
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize fast path");
@@ -922,8 +975,22 @@ std::string VideoProcessor::ProcessFrameInternal(
             cuda_kernels::LaunchRgbToUyvy(crop_input, d_uyvy_out_, width_, height_, stream_);
         }
 
+        const uint8_t* final_uyvy = d_uyvy_out_;
+        if (HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+            cuda_kernels::LaunchUyvySubpixelShift(
+                d_uyvy_out_,
+                d_uyvy_in_,
+                width_,
+                height_,
+                subpixel_shift_x,
+                subpixel_shift_y,
+                stream_
+            );
+            final_uyvy = d_uyvy_in_;
+        }
+
         CheckCuda(
-            cudaMemcpyAsync(host_output_ptr, d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
+            cudaMemcpyAsync(host_output_ptr, final_uyvy, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
             "cudaMemcpyAsync D2H"
         );
 
@@ -1117,8 +1184,22 @@ std::string VideoProcessor::ProcessFrameInternal(
 
     cuda_kernels::LaunchRgbToUyvy(final_output, d_uyvy_out_, width_, height_, stream_);
 
+    const uint8_t* final_uyvy = d_uyvy_out_;
+    if (HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+        cuda_kernels::LaunchUyvySubpixelShift(
+            d_uyvy_out_,
+            d_uyvy_in_,
+            width_,
+            height_,
+            subpixel_shift_x,
+            subpixel_shift_y,
+            stream_
+        );
+        final_uyvy = d_uyvy_in_;
+    }
+
     CheckCuda(
-        cudaMemcpyAsync(host_output_ptr, d_uyvy_out_, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
+        cudaMemcpyAsync(host_output_ptr, final_uyvy, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_),
         "cudaMemcpyAsync D2H"
     );
 

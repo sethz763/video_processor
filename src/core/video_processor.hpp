@@ -86,6 +86,8 @@ public:
     std::string GetDenoiseMethodName() const;
     void SetDenoiseStrength(float strength);
     float GetDenoiseStrength() const;
+    void SetSubpixelShift(float shift_x, float shift_y);
+    void GetSubpixelShift(float& shift_x, float& shift_y) const;
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -132,6 +134,8 @@ private:
     int auto_sr_pending_scale_;
     int auto_sr_pending_frames_;
     int auto_sr_settle_frames_;
+    float subpixel_shift_x_;
+    float subpixel_shift_y_;
 
     size_t uyvy_bytes_;
     size_t rgb_pixels_;

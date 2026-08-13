@@ -167,6 +167,114 @@ __global__ void UyvyCropZoomNearestKernel(
     uyvy_out[out_base + 3] = y1;
 }
 
+__device__ inline uint8_t SampleUyvyLumaBilinear(const uint8_t* uyvy, int width, int height, float fx, float fy) {
+    fx = fminf(static_cast<float>(width - 1), fmaxf(0.0f, fx));
+    fy = fminf(static_cast<float>(height - 1), fmaxf(0.0f, fy));
+
+    const int x0 = static_cast<int>(floorf(fx));
+    const int y0 = static_cast<int>(floorf(fy));
+    const int x1 = min(width - 1, x0 + 1);
+    const int y1 = min(height - 1, y0 + 1);
+
+    const float tx = fx - static_cast<float>(x0);
+    const float ty = fy - static_cast<float>(y0);
+
+    uint8_t l00, u00, v00;
+    uint8_t l10, u10, v10;
+    uint8_t l01, u01, v01;
+    uint8_t l11, u11, v11;
+    SampleUyvyPixel(uyvy, width, height, x0, y0, l00, u00, v00);
+    SampleUyvyPixel(uyvy, width, height, x1, y0, l10, u10, v10);
+    SampleUyvyPixel(uyvy, width, height, x0, y1, l01, u01, v01);
+    SampleUyvyPixel(uyvy, width, height, x1, y1, l11, u11, v11);
+
+    const float v0 = static_cast<float>(l00) + tx * (static_cast<float>(l10) - static_cast<float>(l00));
+    const float v1 = static_cast<float>(l01) + tx * (static_cast<float>(l11) - static_cast<float>(l01));
+    return ClampToU8(v0 + ty * (v1 - v0));
+}
+
+__device__ inline void SampleUyvyUvBilinear(
+    const uint8_t* uyvy,
+    int width,
+    int height,
+    float pair_fx,
+    float fy,
+    uint8_t& out_u,
+    uint8_t& out_v
+) {
+    const int pairs = width >> 1;
+    pair_fx = fminf(static_cast<float>(pairs - 1), fmaxf(0.0f, pair_fx));
+    fy = fminf(static_cast<float>(height - 1), fmaxf(0.0f, fy));
+
+    const int x0 = static_cast<int>(floorf(pair_fx));
+    const int y0 = static_cast<int>(floorf(fy));
+    const int x1 = min(pairs - 1, x0 + 1);
+    const int y1 = min(height - 1, y0 + 1);
+
+    const float tx = pair_fx - static_cast<float>(x0);
+    const float ty = fy - static_cast<float>(y0);
+
+    const int base00 = (y0 * pairs + x0) * 4;
+    const int base10 = (y0 * pairs + x1) * 4;
+    const int base01 = (y1 * pairs + x0) * 4;
+    const int base11 = (y1 * pairs + x1) * 4;
+
+    const float u00 = static_cast<float>(uyvy[base00 + 0]);
+    const float u10 = static_cast<float>(uyvy[base10 + 0]);
+    const float u01 = static_cast<float>(uyvy[base01 + 0]);
+    const float u11 = static_cast<float>(uyvy[base11 + 0]);
+
+    const float v00 = static_cast<float>(uyvy[base00 + 2]);
+    const float v10 = static_cast<float>(uyvy[base10 + 2]);
+    const float v01 = static_cast<float>(uyvy[base01 + 2]);
+    const float v11 = static_cast<float>(uyvy[base11 + 2]);
+
+    const float u0 = u00 + tx * (u10 - u00);
+    const float u1 = u01 + tx * (u11 - u01);
+    const float v0 = v00 + tx * (v10 - v00);
+    const float v1 = v01 + tx * (v11 - v01);
+
+    out_u = ClampToU8(u0 + ty * (u1 - u0));
+    out_v = ClampToU8(v0 + ty * (v1 - v0));
+}
+
+__global__ void UyvySubpixelShiftKernel(
+    const uint8_t* uyvy_in,
+    uint8_t* uyvy_out,
+    int width,
+    int height,
+    float shift_x,
+    float shift_y
+) {
+    const int pair_x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int pairs = width >> 1;
+    if (pair_x >= pairs || y >= height) {
+        return;
+    }
+
+    const int x0 = pair_x << 1;
+    const int x1 = x0 + 1;
+
+    const float src_y = static_cast<float>(y) - shift_y;
+    const float src_x0 = static_cast<float>(x0) - shift_x;
+    const float src_x1 = static_cast<float>(x1) - shift_x;
+    const float src_pair_x = static_cast<float>(pair_x) - (shift_x * 0.5f);
+
+    const uint8_t y0 = SampleUyvyLumaBilinear(uyvy_in, width, height, src_x0, src_y);
+    const uint8_t y1 = SampleUyvyLumaBilinear(uyvy_in, width, height, src_x1, src_y);
+
+    uint8_t u = 128;
+    uint8_t v = 128;
+    SampleUyvyUvBilinear(uyvy_in, width, height, src_pair_x, src_y, u, v);
+
+    const int base = (y * pairs + pair_x) * 4;
+    uyvy_out[base + 0] = u;
+    uyvy_out[base + 1] = y0;
+    uyvy_out[base + 2] = v;
+    uyvy_out[base + 3] = y1;
+}
+
 __global__ void BobDeinterlaceKernel(const uchar3* rgb_in, uchar3* rgb_out, int width, int height, int field_phase) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1094,6 +1202,30 @@ void LaunchUyvyCropZoomNearest(
         preserve_field_parity ? 1 : 0
     );
     CheckKernelLaunch("UyvyCropZoomNearestKernel launch");
+}
+
+void LaunchUyvySubpixelShift(
+    const uint8_t* d_uyvy_in,
+    uint8_t* d_uyvy_out,
+    int width,
+    int height,
+    float shift_x,
+    float shift_y,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const dim3 grid((((width >> 1) + kBlockX - 1) / kBlockX), ((height + kBlockY - 1) / kBlockY), 1);
+    const dim3 block(kBlockX, kBlockY, 1);
+    UyvySubpixelShiftKernel<<<grid, block, 0, stream>>>(
+        d_uyvy_in,
+        d_uyvy_out,
+        width,
+        height,
+        shift_x,
+        shift_y
+    );
+    CheckKernelLaunch("UyvySubpixelShiftKernel launch");
 }
 
 void LaunchBobDeinterlace(

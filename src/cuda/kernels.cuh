@@ -29,6 +29,16 @@ void LaunchUyvyCropZoomNearest(
     cudaStream_t stream
 );
 
+void LaunchUyvySubpixelShift(
+    const uint8_t* d_uyvy_in,
+    uint8_t* d_uyvy_out,
+    int width,
+    int height,
+    float shift_x,
+    float shift_y,
+    cudaStream_t stream
+);
+
 void LaunchBobDeinterlace(
     const uchar3* d_rgb_in,
     uchar3* d_rgb_out,

@@ -8,6 +8,7 @@ import time
 import traceback
 import os
 import importlib
+import math
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -234,6 +235,49 @@ def _rgb_to_uyvy_bt709_limited(rgb: np.ndarray) -> np.ndarray:
     packed[:, :, 2] = v_pair
     packed[:, :, 3] = y1
     return packed.reshape(h, w, 2)
+
+def _apply_subpixel_shift_uyvy(frame_bytes: bytes, shift_x: float, shift_y: float) -> bytes:
+    if cv2 is None:
+        return frame_bytes
+    if abs(float(shift_x)) < 1e-4 and abs(float(shift_y)) < 1e-4:
+        return frame_bytes
+    if len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
+        return frame_bytes
+
+    yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+    packed = yuv422.reshape(FRAME_H, FRAME_W // 2, 4)
+
+    y_plane = np.empty((FRAME_H, FRAME_W), dtype=np.uint8)
+    y_plane[:, 0::2] = packed[:, :, 1]
+    y_plane[:, 1::2] = packed[:, :, 3]
+    uv_plane = np.empty((FRAME_H, FRAME_W // 2, 2), dtype=np.uint8)
+    uv_plane[:, :, 0] = packed[:, :, 0]
+    uv_plane[:, :, 1] = packed[:, :, 2]
+
+    mat_y = np.array([[1.0, 0.0, float(shift_x)], [0.0, 1.0, float(shift_y)]], dtype=np.float32)
+    mat_uv = np.array([[1.0, 0.0, float(shift_x) * 0.5], [0.0, 1.0, float(shift_y)]], dtype=np.float32)
+
+    y_shifted = cv2.warpAffine(
+        y_plane,
+        mat_y,
+        (FRAME_W, FRAME_H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    uv_shifted = cv2.warpAffine(
+        uv_plane,
+        mat_uv,
+        (FRAME_W // 2, FRAME_H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+    out = np.empty((FRAME_H, FRAME_W // 2, 4), dtype=np.uint8)
+    out[:, :, 0] = uv_shifted[:, :, 0]
+    out[:, :, 1] = y_shifted[:, 0::2]
+    out[:, :, 2] = uv_shifted[:, :, 1]
+    out[:, :, 3] = y_shifted[:, 1::2]
+    return out.tobytes()
 
 
 class AiSrOnnxEngine:
@@ -781,7 +825,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
         frame_duration = int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0
         time_scale = int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0
         frame_period_s = (float(frame_duration) / float(time_scale)) if frame_duration > 0 and time_scale > 0 else 0.0
-        target_buffer_frames = max(0, min(5, int(_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.get(out_id, 2))))
+        target_buffer_frames = max(0, min(10, int(_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.get(out_id, 2))))
         state = {
             "enabled": callable(schedule_fn) and callable(start_fn),
             "can_query_buffered": callable(buffered_fn),
@@ -815,7 +859,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                 display_time = int(state.get("display_time", 0))
 
                 # Keep scheduled preroll bounded so enqueue rate cannot run above the mode frame rate.
-                max_preroll_frames = max(0, min(5, int(state.get("target_buffer_frames", 2))))
+                max_preroll_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                 max_preroll_units = max_preroll_frames * frame_duration
                 if display_time > (elapsed_units + max_preroll_units):
                     return False
@@ -831,7 +875,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                 if not bool(state.get("started", False)):
                     state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
                     should_start = False
-                    target_start_frames = max(0, min(5, int(state.get("target_buffer_frames", 2))))
+                    target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                     if target_start_frames <= 0:
                         should_start = True
                     if bool(state.get("can_query_buffered", False)):
@@ -881,7 +925,7 @@ def _clear_output_schedule_state(out: object | None) -> None:
 
 def _set_output_schedule_buffer_frames(out: object, buffer_frames: int) -> None:
     out_id = id(out)
-    clamped = max(0, min(5, int(buffer_frames)))
+    clamped = max(0, min(10, int(buffer_frames)))
     _OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES[out_id] = clamped
     state = _OUTPUT_SCHEDULE_STATE.get(out_id)
     if state is not None:
@@ -936,6 +980,7 @@ class _StageFrame:
     output_bytes: bytes | None = None
     ai_applied: bool = False
     rtx_applied: bool = False
+    native_shift_applied: bool = False
 
 
 def run_processor_worker(request_queue, response_queue, startup_config: dict[str, Any]) -> None:
@@ -1078,6 +1123,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     ai_sr_passthrough_frames = 0
     zeroed_output_warning_emitted = False
     preprocess_noop_warning_emitted = False
+    native_subpixel_warning_emitted = False
     rtx_vsr_enabled = bool(startup_config.get("rtx_vsr_enabled", False))
     rtx_vsr_quality = str(startup_config.get("rtx_vsr_quality", "high")).strip().lower() or "high"
     rtx_vsr_scale = max(1, int(startup_config.get("rtx_vsr_scale", 2)))
@@ -1098,11 +1144,22 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     current_roi_y = int(startup_config.get("roi_y", 0))
     current_roi_w = int(startup_config.get("roi_w", FRAME_W))
     current_roi_h = int(startup_config.get("roi_h", FRAME_H))
+    roi_shift_target_x = float(startup_config.get("roi_subpixel_shift_x", 0.0))
+    roi_shift_target_y = float(startup_config.get("roi_subpixel_shift_y", 0.0))
+    roi_shift_target_lpf_x = float(roi_shift_target_x)
+    roi_shift_target_lpf_y = float(roi_shift_target_y)
+    roi_shift_applied_x = float(roi_shift_target_x)
+    roi_shift_applied_y = float(roi_shift_target_y)
+    roi_shift_velocity_x = 0.0
+    roi_shift_velocity_y = 0.0
+    roi_shift_accel_x = 0.0
+    roi_shift_accel_y = 0.0
+    roi_microstep_transition: dict[str, object] | None = None
     current_deinterlace_enabled = bool(startup_config.get("deinterlace_enabled", True))
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
     current_denoise_method = str(startup_config.get("denoise_method", "off"))
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
-    current_output_buffer_frames = max(0, min(5, int(startup_config.get("decklink_output_buffer_frames", 2))))
+    current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 2))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
     state_lock = threading.Lock()
 
@@ -1128,6 +1185,367 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             and (not ai_sr_enabled)
             and (not rtx_vsr_enabled)
         )
+
+    def _step_smoothed_roi_shift() -> tuple[float, float]:
+        nonlocal roi_shift_applied_x, roi_shift_applied_y
+        nonlocal roi_shift_velocity_x, roi_shift_velocity_y
+        nonlocal roi_shift_target_lpf_x, roi_shift_target_lpf_y
+        nonlocal roi_shift_accel_x, roi_shift_accel_y
+        nonlocal roi_microstep_transition
+
+        # During active keyframe transitions, apply the exact per-frame shift
+        # target to remove follower lag and achieve dolly-like smoothness.
+        if roi_microstep_transition is not None:
+            roi_shift_target_lpf_x = float(roi_shift_target_x)
+            roi_shift_target_lpf_y = float(roi_shift_target_y)
+            roi_shift_applied_x = float(roi_shift_target_x)
+            roi_shift_applied_y = float(roi_shift_target_y)
+            roi_shift_velocity_x = 0.0
+            roi_shift_velocity_y = 0.0
+            roi_shift_accel_x = 0.0
+            roi_shift_accel_y = 0.0
+            return float(roi_shift_applied_x), float(roi_shift_applied_y)
+
+        # Deterministic microstep follower: predictable per-frame motion with
+        # very small minimum steps to avoid perceptible stair-stepping.
+        target_alpha = 0.34
+        follow_alpha_x = 0.22
+        follow_alpha_y = 0.20
+        min_step_x = 0.0040
+        min_step_y = 0.0035
+        max_step_x = 0.30
+        max_step_y = 0.26
+        settle_eps_x = 0.0012
+        settle_eps_y = 0.0010
+
+        roi_shift_target_lpf_x += (float(roi_shift_target_x) - roi_shift_target_lpf_x) * target_alpha
+        roi_shift_target_lpf_y += (float(roi_shift_target_y) - roi_shift_target_lpf_y) * target_alpha
+
+        err_x = float(roi_shift_target_lpf_x - roi_shift_applied_x)
+        err_y = float(roi_shift_target_lpf_y - roi_shift_applied_y)
+
+        abs_err_x = abs(err_x)
+        abs_err_y = abs(err_y)
+
+        if abs_err_x <= settle_eps_x:
+            roi_shift_applied_x = float(roi_shift_target_lpf_x)
+            roi_shift_velocity_x = 0.0
+        else:
+            step_x = max(min_step_x, min(max_step_x, abs_err_x * follow_alpha_x))
+            roi_shift_applied_x += step_x if err_x > 0.0 else -step_x
+            roi_shift_velocity_x = step_x if err_x > 0.0 else -step_x
+
+        if abs_err_y <= settle_eps_y:
+            roi_shift_applied_y = float(roi_shift_target_lpf_y)
+            roi_shift_velocity_y = 0.0
+        else:
+            step_y = max(min_step_y, min(max_step_y, abs_err_y * follow_alpha_y))
+            roi_shift_applied_y += step_y if err_y > 0.0 else -step_y
+            roi_shift_velocity_y = step_y if err_y > 0.0 else -step_y
+
+        roi_shift_accel_x = 0.0
+        roi_shift_accel_y = 0.0
+
+        return float(roi_shift_applied_x), float(roi_shift_applied_y)
+
+    def _set_roi_shift_target(next_target_x: float, next_target_y: float) -> None:
+        nonlocal roi_shift_target_x, roi_shift_target_y
+        nonlocal roi_shift_target_lpf_x, roi_shift_target_lpf_y
+        nonlocal roi_shift_applied_x, roi_shift_applied_y
+        nonlocal roi_shift_velocity_x, roi_shift_velocity_y
+        nonlocal roi_shift_accel_x, roi_shift_accel_y
+
+        clamped_x = max(-48.0, min(48.0, float(next_target_x)))
+        clamped_y = max(-48.0, min(48.0, float(next_target_y)))
+        delta_target_x = clamped_x - roi_shift_target_x
+        delta_target_y = clamped_y - roi_shift_target_y
+        roi_shift_target_x = clamped_x
+        roi_shift_target_y = clamped_y
+
+        # On larger compensation steps, pre-bias but do not hard snap.
+        if abs(delta_target_x) >= 1.0 or abs(delta_target_y) >= 0.8:
+            roi_shift_target_lpf_x += max(-0.92, min(0.92, delta_target_x * 0.70))
+            roi_shift_target_lpf_y += max(-0.82, min(0.82, delta_target_y * 0.68))
+            roi_shift_applied_x += (delta_target_x * 0.18)
+            roi_shift_applied_y += (delta_target_y * 0.16)
+            roi_shift_applied_x = max(-48.0, min(48.0, roi_shift_applied_x))
+            roi_shift_applied_y = max(-48.0, min(48.0, roi_shift_applied_y))
+            roi_shift_velocity_x *= 0.25
+            roi_shift_velocity_y *= 0.25
+            roi_shift_accel_x = 0.0
+            roi_shift_accel_y = 0.0
+
+        # Ensure end-of-move recenter settles immediately to avoid a lingering tail.
+        if abs(clamped_x) <= 1e-4 and abs(clamped_y) <= 1e-4:
+            roi_shift_target_lpf_x = 0.0
+            roi_shift_target_lpf_y = 0.0
+            roi_shift_applied_x *= 0.45
+            roi_shift_applied_y *= 0.45
+
+    def _set_roi_shift_immediate(next_target_x: float, next_target_y: float) -> None:
+        nonlocal roi_shift_target_x, roi_shift_target_y
+        nonlocal roi_shift_target_lpf_x, roi_shift_target_lpf_y
+        nonlocal roi_shift_applied_x, roi_shift_applied_y
+        nonlocal roi_shift_velocity_x, roi_shift_velocity_y
+        nonlocal roi_shift_accel_x, roi_shift_accel_y
+
+        clamped_x = max(-48.0, min(48.0, float(next_target_x)))
+        clamped_y = max(-48.0, min(48.0, float(next_target_y)))
+        roi_shift_target_x = clamped_x
+        roi_shift_target_y = clamped_y
+        roi_shift_target_lpf_x = clamped_x
+        roi_shift_target_lpf_y = clamped_y
+        roi_shift_applied_x = clamped_x
+        roi_shift_applied_y = clamped_y
+        roi_shift_velocity_x = 0.0
+        roi_shift_velocity_y = 0.0
+        roi_shift_accel_x = 0.0
+        roi_shift_accel_y = 0.0
+
+    def _apply_roi_curve(t: float, mode: str) -> float:
+        clamped_t = max(0.0, min(1.0, float(t)))
+        mode_name = str(mode).strip().lower()
+        if mode_name == "ease_in_out":
+            # Smootherstep: gentler accel/decel than cubic smoothstep.
+            return clamped_t * clamped_t * clamped_t * (clamped_t * ((6.0 * clamped_t) - 15.0) + 10.0)
+        if mode_name == "ease_out":
+            inv = 1.0 - clamped_t
+            return 1.0 - (inv * inv)
+        return clamped_t
+
+    def _start_roi_microstep_transition(
+        start_roi: tuple[int, int, int, int],
+        target_roi: tuple[int, int, int, int],
+        duration_frames: int,
+        interpolation_mode: str,
+        overscan_percent: float,
+    ) -> None:
+        nonlocal roi_microstep_transition
+
+        s_x, s_y, s_w, s_h = _normalize_worker_roi(*start_roi)
+        t_x, t_y, t_w, t_h = _normalize_worker_roi(*target_roi)
+        total_frames = max(1, min(600, int(duration_frames)))
+        mode_name = str(interpolation_mode).strip().lower()
+        if mode_name not in {"linear", "ease_in_out", "ease_out"}:
+            mode_name = "linear"
+
+        roi_microstep_transition = {
+            "start": (s_x, s_y, s_w, s_h),
+            "target": (t_x, t_y, t_w, t_h),
+            "total_frames": total_frames,
+            "frame_progress": 0,
+            "interpolation_mode": mode_name,
+            "residual": {"x": 0.0, "y": 0.0, "w": 0.0},
+            "last_roi": (s_x, s_y, s_w, s_h),
+            "overscan_percent": max(0.0, float(overscan_percent)),
+        }
+
+    def _cancel_roi_microstep_transition(reset_shift: bool = True) -> None:
+        nonlocal roi_microstep_transition
+        roi_microstep_transition = None
+        if reset_shift:
+            _set_roi_shift_target(0.0, 0.0)
+
+    def _apply_manual_roi_with_subpixel_compensation(
+        req_x: int,
+        req_y: int,
+        req_w: int,
+        req_h: int,
+    ) -> None:
+        nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, rtx_vsr_error
+
+        prev_roi_w = current_roi_w
+        prev_roi_h = current_roi_h
+
+        # Desired ROI center uses command-space values before UYVY quantization.
+        desired_w = float(max(2, min(int(req_w), FRAME_W)))
+        desired_h = float(max(2, min(int(req_h), FRAME_H)))
+        desired_cx = float(req_x) + (desired_w * 0.5)
+        desired_cy = float(req_y) + (desired_h * 0.5)
+
+        current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
+            int(req_x),
+            int(req_y),
+            int(req_w),
+            int(req_h),
+        )
+
+        if current_roi_w == prev_roi_w and current_roi_h == prev_roi_h:
+            processor.set_roi_position(current_roi_x, current_roi_y)
+        else:
+            processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+            if rtx_vsr_enabled:
+                if rtx_vsr_engine is None:
+                    rtx_vsr_error = _refresh_rtx_vsr_engine()
+                elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
+                    _schedule_rtx_roi_rebuild()
+
+        interp_cx = float(current_roi_x) + (float(current_roi_w) * 0.5)
+        interp_cy = float(current_roi_y) + (float(current_roi_h) * 0.5)
+        source_dx = desired_cx - interp_cx
+        source_dy = desired_cy - interp_cy
+
+        sx = FRAME_W / max(1.0, float(current_roi_w))
+        sy = FRAME_H / max(1.0, float(current_roi_h))
+        max_shift_x = max(2.0, min(48.0, sx * 1.5))
+        max_shift_y = max(2.0, min(48.0, sy * 1.5))
+        shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
+        shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
+        _set_roi_shift_immediate(shift_x, shift_y)
+
+    def _advance_roi_microstep_transition_one_frame() -> None:
+        nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition
+
+        state = roi_microstep_transition
+        if state is None:
+            return
+
+        start_roi = tuple(state["start"])
+        target_roi = tuple(state["target"])
+        total_frames = int(state["total_frames"])
+        mode_name = str(state.get("interpolation_mode", "linear"))
+        residual = state.get("residual")
+        if not isinstance(residual, dict):
+            residual = {"x": 0.0, "y": 0.0, "w": 0.0}
+            state["residual"] = residual
+
+        frame_progress = min(total_frames, int(state.get("frame_progress", 0)) + 1)
+        state["frame_progress"] = frame_progress
+
+        t = float(frame_progress) / float(max(1, total_frames))
+        curved_t = _apply_roi_curve(t, mode_name)
+
+        s_x, s_y, s_w, s_h = [float(v) for v in start_roi]
+        t_x, t_y, t_w, t_h = [float(v) for v in target_roi]
+
+        start_cx = s_x + (s_w * 0.5)
+        start_cy = s_y + (s_h * 0.5)
+        target_cx = t_x + (t_w * 0.5)
+        target_cy = t_y + (t_h * 0.5)
+
+        ideal_cx = start_cx + ((target_cx - start_cx) * curved_t)
+        ideal_cy = start_cy + ((target_cy - start_cy) * curved_t)
+        ideal_w = s_w + ((t_w - s_w) * curved_t)
+
+        desired_cx = ideal_cx + float(residual.get("x", 0.0))
+        desired_cy = ideal_cy + float(residual.get("y", 0.0))
+        desired_w = ideal_w + float(residual.get("w", 0.0))
+
+        target_scale = FRAME_W / max(1.0, t_w)
+        overscan_pct = float(state.get("overscan_percent", 0.0))
+        if target_scale >= 4.0 and overscan_pct > 0.0:
+            overscan_weight = max(0.0, 1.0 - curved_t)
+            desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
+        else:
+            desired_w_backend = desired_w
+
+        d_x = int(target_roi[0]) - int(start_roi[0])
+        d_y = int(target_roi[1]) - int(start_roi[1])
+        d_w = int(target_roi[2]) - int(start_roi[2])
+
+        def _quantize_directional(value: float, delta: int, quantum: int) -> int:
+            q = max(1, int(quantum))
+            scaled = value / float(q)
+            if delta > 0:
+                return int(math.floor(scaled)) * q
+            if delta < 0:
+                return int(math.ceil(scaled)) * q
+            return int(round(scaled)) * q
+
+        quant_w = _quantize_directional(desired_w_backend, d_w, 2)
+        quant_w = max(2, quant_w & ~1)
+        quant_h = max(2, int(round(quant_w * 9.0 / 16.0)))
+
+        desired_x = desired_cx - (quant_w * 0.5)
+        desired_y = desired_cy - (quant_h * 0.5)
+
+        quant_x = _quantize_directional(desired_x, d_x, 2)
+        quant_y = _quantize_directional(desired_y, d_y, 1)
+
+        i_x, i_y, i_w, i_h = _normalize_worker_roi(quant_x, quant_y, quant_w, quant_h)
+
+        last_roi = state.get("last_roi")
+        if not isinstance(last_roi, tuple) or len(last_roi) != 4:
+            last_roi = (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+
+        mono_x, mono_y, mono_w, mono_h = i_x, i_y, i_w, i_h
+        if d_x > 0:
+            mono_x = max(mono_x, int(last_roi[0]))
+        elif d_x < 0:
+            mono_x = min(mono_x, int(last_roi[0]))
+        if d_y > 0:
+            mono_y = max(mono_y, int(last_roi[1]))
+        elif d_y < 0:
+            mono_y = min(mono_y, int(last_roi[1]))
+        if d_w > 0:
+            mono_w = max(mono_w, int(last_roi[2]))
+        elif d_w < 0:
+            mono_w = min(mono_w, int(last_roi[2]))
+
+        target_h_delta = int(target_roi[3]) - int(start_roi[3])
+        if target_h_delta > 0:
+            mono_h = max(mono_h, int(last_roi[3]))
+        elif target_h_delta < 0:
+            mono_h = min(mono_h, int(last_roi[3]))
+
+        i_x, i_y, i_w, i_h = _normalize_worker_roi(mono_x, mono_y, mono_w, mono_h)
+        state["last_roi"] = (i_x, i_y, i_w, i_h)
+
+        interp_cx = float(i_x) + (float(i_w) * 0.5)
+        interp_cy = float(i_y) + (float(i_h) * 0.5)
+        residual["x"] = desired_cx - interp_cx
+        residual["y"] = desired_cy - interp_cy
+        residual["w"] = desired_w_backend - float(i_w)
+
+        source_dx = ideal_cx - interp_cx
+        source_dy = ideal_cy - interp_cy
+        sx = FRAME_W / max(1.0, float(i_w))
+        sy = FRAME_H / max(1.0, float(i_h))
+        max_shift_x = max(2.0, min(48.0, sx * 1.5))
+        max_shift_y = max(2.0, min(48.0, sy * 1.5))
+        shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
+        shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
+        _set_roi_shift_target(shift_x, shift_y)
+
+        roi_changed = (
+            i_x != current_roi_x
+            or i_y != current_roi_y
+            or i_w != current_roi_w
+            or i_h != current_roi_h
+        )
+        if roi_changed:
+            prev_roi_w = current_roi_w
+            prev_roi_h = current_roi_h
+            current_roi_x, current_roi_y, current_roi_w, current_roi_h = i_x, i_y, i_w, i_h
+            if current_roi_w == prev_roi_w and current_roi_h == prev_roi_h:
+                processor.set_roi_position(current_roi_x, current_roi_y)
+            else:
+                processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                if rtx_vsr_enabled:
+                    if rtx_vsr_engine is None:
+                        _ = _refresh_rtx_vsr_engine()
+                    elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
+                        _schedule_rtx_roi_rebuild()
+
+        transition_complete = frame_progress >= total_frames or (
+            current_roi_x == int(target_roi[0])
+            and current_roi_y == int(target_roi[1])
+            and current_roi_w == int(target_roi[2])
+            and current_roi_h == int(target_roi[3])
+        )
+        if transition_complete:
+            current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
+                int(target_roi[0]), int(target_roi[1]), int(target_roi[2]), int(target_roi[3])
+            )
+            if (
+                current_roi_x != i_x
+                or current_roi_y != i_y
+                or current_roi_w != i_w
+                or current_roi_h != i_h
+            ):
+                processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+            _set_roi_shift_target(0.0, 0.0)
+            roi_microstep_transition = None
 
     def _cleanup_ai_async() -> None:
         nonlocal ai_sr_executor, ai_sr_future
@@ -1282,6 +1700,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     def _is_valid_uyvy_frame(frame_bytes: bytes) -> bool:
         return isinstance(frame_bytes, (bytes, bytearray)) and len(frame_bytes) == (UYVY_ROW_BYTES * FRAME_H)
 
+    def _set_native_subpixel_shift(shift_x: float, shift_y: float) -> bool:
+        nonlocal native_subpixel_warning_emitted
+        if not hasattr(processor, "set_subpixel_shift"):
+            return False
+        try:
+            processor.set_subpixel_shift(float(shift_x), float(shift_y))
+            return True
+        except Exception as exc:
+            if not native_subpixel_warning_emitted:
+                _safe_put({"type": "warning", "warning": f"Native subpixel shift unavailable, using OpenCV fallback: {exc}"})
+                native_subpixel_warning_emitted = True
+            return False
+
     def _is_preprocess_enabled() -> bool:
         return bool(current_deinterlace_enabled) or _denoise_enabled()
 
@@ -1315,10 +1746,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
         return native_out, True
 
-    def _apply_basic_scaling_stage(frame_bytes: bytes, preprocess_already_applied: bool) -> tuple[bytes, bool]:
+    def _apply_basic_scaling_stage(
+        frame_bytes: bytes,
+        preprocess_already_applied: bool,
+        shift_x: float,
+        shift_y: float,
+    ) -> tuple[bytes, bool, bool]:
         nonlocal zeroed_output_warning_emitted
         if not _basic_scaling_enabled():
-            return frame_bytes, False
+            return frame_bytes, False, False
+
+        native_shift_applied = False
+        if _set_native_subpixel_shift(shift_x, shift_y):
+            native_shift_applied = abs(float(shift_x)) > 1e-4 or abs(float(shift_y)) > 1e-4
 
         if preprocess_already_applied and hasattr(processor, "process_frame_no_deinterlace"):
             scaled = processor.process_frame_no_deinterlace(frame_bytes)
@@ -1335,9 +1775,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     }
                 )
                 zeroed_output_warning_emitted = True
-            return frame_bytes, False
+            return frame_bytes, False, False
 
-        return scaled, True
+        return scaled, True, native_shift_applied
 
     def _apply_rtx_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
         if not (rtx_vsr_enabled and rtx_vsr_engine is not None):
@@ -1370,18 +1810,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             stack.append("basic_scaling")
         return stack
 
-    def _process_pipeline_frame(frame_bytes: bytes) -> tuple[bytes, bool, bool, bool, bool]:
+    def _process_pipeline_frame(frame_bytes: bytes, shift_x: float, shift_y: float) -> tuple[bytes, bool, bool, bool, bool, bool]:
         # Canonical plugin chain:
         # preprocess (deinterlace/denoise) -> AI SR -> RTX VSR -> basic scaling.
         stage_stack = _build_stage_stack()
         if not stage_stack:
-            return frame_bytes, False, False, False, False
+            return frame_bytes, False, False, False, False, False
 
         preprocess_applied = False
         working = frame_bytes
         ai_applied = False
         rtx_applied = False
         basic_applied = False
+        native_shift_applied = False
 
         for stage_name in stage_stack:
             if stage_name == "preprocess":
@@ -1405,10 +1846,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if stage_name == "basic_scaling":
-                working, basic_applied = _apply_basic_scaling_stage(working, preprocess_applied)
+                working, basic_applied, native_shift_applied = _apply_basic_scaling_stage(
+                    working,
+                    preprocess_applied,
+                    shift_x,
+                    shift_y,
+                )
                 continue
 
-        return working, preprocess_applied, basic_applied, ai_applied, rtx_applied
+        return working, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied
 
     def _stop_live_pipeline() -> None:
         nonlocal pipeline_running, capture_thread, preprocess_thread, upscale_thread, output_thread
@@ -1431,7 +1877,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
-        nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted
+        nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
         nonlocal rtx_effect_sample_counter
         nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
         nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
@@ -1467,6 +1913,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         last_stage_rtx_applied = False
         last_stage_stack = []
         preprocess_noop_warning_emitted = False
+        native_subpixel_warning_emitted = False
 
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
@@ -1495,9 +1942,18 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                 if _is_live_passthrough_mode():
                     # In zero-processing mode, avoid staged queueing and preserve output cadence.
+                    output_bytes = input_bytes
+                    shift_x, shift_y = _step_smoothed_roi_shift()
+                    native_shift_applied = False
+                    if _set_native_subpixel_shift(shift_x, shift_y):
+                        native_shift_applied = abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4
+                    if native_shift_applied and hasattr(processor, "process_frame_no_deinterlace"):
+                        output_bytes = processor.process_frame_no_deinterlace(output_bytes)
+                    elif abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4:
+                        output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                     try:
                         if output_session is not None:
-                            emitted = _write_frame_to_output(output_session, input_bytes)
+                            emitted = _write_frame_to_output(output_session, output_bytes)
                         else:
                             emitted = False
                     except Exception as exc:
@@ -1506,22 +1962,33 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                     with state_lock:
                         latest_input_frame = input_bytes
-                        latest_output_frame = input_bytes
+                        latest_output_frame = output_bytes
                         latest_effective_sr_scale = 1
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
                         if emitted:
                             processed_frame_counter += 1
+                    if emitted:
+                        _advance_roi_microstep_transition_one_frame()
                     continue
 
                 if _is_live_basic_scaling_fast_mode():
                     # Keep basic-scaling-only path off the staged queue graph to
                     # reduce Python scheduling overhead at 1080p60.
+                    shift_x, shift_y = _step_smoothed_roi_shift()
                     try:
-                        output_bytes, basic_applied = _apply_basic_scaling_stage(input_bytes, False)
+                        output_bytes, basic_applied, native_shift_applied = _apply_basic_scaling_stage(
+                            input_bytes,
+                            False,
+                            shift_x,
+                            shift_y,
+                        )
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Basic scaling fast path failed: {exc}"})
                         continue
+
+                    if (not native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
+                        output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
 
                     try:
                         if output_session is not None:
@@ -1551,6 +2018,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         latest_rtx_effect_mean_abs_luma = 0.0
                         if emitted:
                             processed_frame_counter += 1
+                    if emitted:
+                        _advance_roi_microstep_transition_one_frame()
                     continue
 
                 frame_id_counter += 1
@@ -1580,7 +2049,12 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
-                    output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied = _process_pipeline_frame(preprocessed)
+                    shift_x, shift_y = _step_smoothed_roi_shift()
+                    output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
+                        preprocessed,
+                        shift_x,
+                        shift_y,
+                    )
                     stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Upscale stage failed: {exc}"})
@@ -1609,6 +2083,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 item.output_bytes = output_bytes
                 item.ai_applied = bool(ai_applied)
                 item.rtx_applied = bool(rtx_applied)
+                item.native_shift_applied = bool(native_shift_applied)
                 if _put_latest_stage_frame(q_upscale_to_output, item):
                     upscale_drop_count += 1
 
@@ -1624,6 +2099,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     continue
 
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
+                shift_x, shift_y = _step_smoothed_roi_shift()
+                if (not item.native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
+                    output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                 sampled_delta = 0.0
                 if item.rtx_applied:
                     rtx_effect_sample_counter += 1
@@ -1661,6 +2139,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     latest_rtx_effect_mean_abs_luma = sampled_delta
                     if emitted:
                         processed_frame_counter += 1
+                if emitted:
+                    _advance_roi_microstep_transition_one_frame()
 
         capture_thread = threading.Thread(target=_capture_worker, name="vp-capture", daemon=True)
         preprocess_thread = None
@@ -1877,7 +2357,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         _stop_sessions()
         current_output_buffer_frames = max(
             0,
-            min(5, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
+            min(10, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
         )
 
         capture_session = d.CaptureSession(
@@ -1952,7 +2432,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             if command == "set_decklink_output_buffer_frames":
                 current_output_buffer_frames = max(
                     0,
-                    min(5, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
+                    min(10, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
                 )
                 if output_session is not None:
                     _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
@@ -2043,7 +2523,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             if command == "process_frame":
                 frame_id = int(message["frame_id"])
                 frame_bytes = message["frame_bytes"]
-                output_bytes, _, basic_applied, ai_applied, rtx_applied = _process_pipeline_frame(frame_bytes)
+                _advance_roi_microstep_transition_one_frame()
+                shift_x, shift_y = _step_smoothed_roi_shift()
+                output_bytes, _, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
+                    frame_bytes,
+                    shift_x,
+                    shift_y,
+                )
+                if (not native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
+                    output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
 
                 if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
                     ai_sr_dropped_frames += 1
@@ -2064,30 +2552,90 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if command == "set_roi":
-                prev_roi_w = current_roi_w
-                prev_roi_h = current_roi_h
-                current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
+                _cancel_roi_microstep_transition(reset_shift=False)
+                _apply_manual_roi_with_subpixel_compensation(
                     int(message["x"]),
                     int(message["y"]),
                     int(message["w"]),
                     int(message["h"]),
                 )
-                processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
-                if rtx_vsr_enabled:
-                    if rtx_vsr_engine is None:
-                        rtx_vsr_error = _refresh_rtx_vsr_engine()
-                    elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
-                        _schedule_rtx_roi_rebuild()
                 continue
 
             if command == "set_roi_position":
-                current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
+                _cancel_roi_microstep_transition(reset_shift=False)
+                _apply_manual_roi_with_subpixel_compensation(
                     int(message["x"]),
                     int(message["y"]),
                     current_roi_w,
                     current_roi_h,
                 )
-                processor.set_roi_position(current_roi_x, current_roi_y)
+                continue
+
+            if command == "start_roi_microstep_transition":
+                start_from_current = bool(message.get("start_from_current", False))
+                if start_from_current:
+                    start_roi = (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                else:
+                    start_roi = (
+                        int(message.get("start_x", current_roi_x)),
+                        int(message.get("start_y", current_roi_y)),
+                        int(message.get("start_w", current_roi_w)),
+                        int(message.get("start_h", current_roi_h)),
+                    )
+                _start_roi_microstep_transition(
+                    start_roi=start_roi,
+                    target_roi=(
+                        int(message["target_x"]),
+                        int(message["target_y"]),
+                        int(message["target_w"]),
+                        int(message["target_h"]),
+                    ),
+                    duration_frames=int(message.get("duration_frames", 1)),
+                    interpolation_mode=str(message.get("interpolation_mode", "linear")),
+                    overscan_percent=float(message.get("overscan_percent", 0.0)),
+                )
+                continue
+
+            if command == "cancel_roi_microstep_transition":
+                _cancel_roi_microstep_transition(reset_shift=bool(message.get("reset_subpixel_shift", True)))
+                continue
+
+            if command == "set_roi_with_subpixel":
+                _cancel_roi_microstep_transition(reset_shift=False)
+                next_roi_x, next_roi_y, next_roi_w, next_roi_h = _normalize_worker_roi(
+                    int(message["x"]),
+                    int(message["y"]),
+                    int(message["w"]),
+                    int(message["h"]),
+                )
+                prev_roi_w = current_roi_w
+                prev_roi_h = current_roi_h
+                current_roi_x, current_roi_y, current_roi_w, current_roi_h = (
+                    next_roi_x,
+                    next_roi_y,
+                    next_roi_w,
+                    next_roi_h,
+                )
+                if current_roi_w == prev_roi_w and current_roi_h == prev_roi_h:
+                    processor.set_roi_position(current_roi_x, current_roi_y)
+                else:
+                    processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                    if rtx_vsr_enabled:
+                        if rtx_vsr_engine is None:
+                            rtx_vsr_error = _refresh_rtx_vsr_engine()
+                        elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
+                            _schedule_rtx_roi_rebuild()
+                _set_roi_shift_target(
+                    float(message.get("shift_x", 0.0)),
+                    float(message.get("shift_y", 0.0)),
+                )
+                continue
+
+            if command == "set_roi_subpixel_shift":
+                _set_roi_shift_target(
+                    float(message.get("shift_x", 0.0)),
+                    float(message.get("shift_y", 0.0)),
+                )
                 continue
 
             if command in {"set_basic_scaling_mode_auto", "set_sr_mode_auto"}:
