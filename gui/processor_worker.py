@@ -838,6 +838,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
             "sync_next_emit_ts": 0.0,
             "schedule_epoch_perf_ts": 0.0,
             "target_buffer_frames": target_buffer_frames,
+            "last_clock_resync_ts": 0.0,
         }
         _OUTPUT_SCHEDULE_STATE[out_id] = state
 
@@ -857,12 +858,43 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
 
                 elapsed_units = max(0.0, (now - epoch_ts) * float(time_scale))
                 display_time = int(state.get("display_time", 0))
+                target_buffer_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
 
-                # Keep scheduled preroll bounded so enqueue rate cannot run above the mode frame rate.
-                max_preroll_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
-                max_preroll_units = max_preroll_frames * frame_duration
-                if display_time > (elapsed_units + max_preroll_units):
-                    return False
+                # Prefer device-reported buffered depth for steady-state pacing.
+                # This avoids long-run drift from local-clock estimates.
+                can_query_buffered = bool(state.get("can_query_buffered", False))
+                if can_query_buffered and bool(state.get("started", False)) and target_buffer_frames > 0:
+                    try:
+                        buffered_count = int(out.buffered_video_frame_count())
+
+                        # Self-heal long-run pacing drift by re-anchoring the local
+                        # perf-counter epoch to DeckLink's observed buffered depth.
+                        lead_frames_est = (float(display_time) - elapsed_units) / float(frame_duration)
+                        drift_frames = abs(lead_frames_est - float(buffered_count))
+                        last_resync_ts = float(state.get("last_clock_resync_ts", 0.0))
+                        should_resync = (
+                            drift_frames >= 2.5
+                            or (last_resync_ts <= 0.0)
+                            or ((now - last_resync_ts) >= 10.0)
+                        )
+                        if should_resync:
+                            desired_elapsed_units = float(display_time) - (float(buffered_count) * float(frame_duration))
+                            state["schedule_epoch_perf_ts"] = now - (desired_elapsed_units / float(time_scale))
+                            state["last_clock_resync_ts"] = now
+                            elapsed_units = max(0.0, (now - float(state["schedule_epoch_perf_ts"])) * float(time_scale))
+
+                        if buffered_count >= target_buffer_frames:
+                            return False
+                    except Exception:
+                        state["can_query_buffered"] = False
+                        can_query_buffered = False
+
+                # Fallback pacing when buffered depth cannot be queried.
+                if not can_query_buffered:
+                    max_preroll_frames = target_buffer_frames
+                    max_preroll_units = max_preroll_frames * frame_duration
+                    if display_time > (elapsed_units + max_preroll_units):
+                        return False
 
                 out.schedule_frame_copy(
                     payload,
@@ -875,7 +907,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                 if not bool(state.get("started", False)):
                     state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
                     should_start = False
-                    target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
+                    target_start_frames = target_buffer_frames
                     if target_start_frames <= 0:
                         should_start = True
                     if bool(state.get("can_query_buffered", False)):

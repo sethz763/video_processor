@@ -45,20 +45,20 @@
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        634,
-        379,
-        672,
-        378
+        0,
+        0,
+        1432,
+        806
       ]
     },
     "2": {
-      "duration_frames": 30,
-      "interpolation_mode": "linear",
+      "duration_frames": 40,
+      "interpolation_mode": "ease_in_out",
       "roi": [
-        800,
-        182,
-        658,
-        370
+        716,
+        758,
+        458,
+        258
       ]
     },
     "3": {
@@ -72,7 +72,7 @@
       ]
     }
   },
-  "roi_latency_smoothing_percent": 62,
+  "roi_latency_smoothing_percent": 91,
   "roi_smoothing_percent": 100,
   "roi_transition_duration_frames": 40,
   "rtx_thdr_contrast": 50,
