@@ -2478,7 +2478,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         break
 
                     pending_cmd = pending.get("cmd")
-                    if pending_cmd in {"set_roi", "set_roi_position"}:
+                    if pending_cmd in {"set_roi", "set_roi_position", "set_roi_with_subpixel"}:
                         latest_roi_message = pending
                         continue
                     if pending_cmd == "decklink_tick":
@@ -2491,9 +2491,49 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     except queue.Full:
                         break
 
+                # Keep one latest ROI update queued, but always service this tick.
+                # Replacing tick with ROI here can leave GUI tick requests pending
+                # until timeout, collapsing preview FPS while output keeps running.
                 if latest_roi_message is not None:
-                    message = latest_roi_message
-                    command = message.get("cmd")
+                    try:
+                        request_queue.put_nowait(latest_roi_message)
+                    except queue.Full:
+                        pass
+
+            if command in {"set_roi", "set_roi_position", "set_roi_with_subpixel", "set_roi_subpixel_shift"}:
+                latest_roi_message = message
+                latest_tick_message: dict[str, object] | None = None
+                preserved_messages: list[dict[str, object]] = []
+
+                while True:
+                    try:
+                        pending = request_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    pending_cmd = pending.get("cmd")
+                    if pending_cmd in {"set_roi", "set_roi_position", "set_roi_with_subpixel", "set_roi_subpixel_shift"}:
+                        latest_roi_message = pending
+                        continue
+                    if pending_cmd == "decklink_tick":
+                        latest_tick_message = pending
+                        continue
+                    preserved_messages.append(pending)
+
+                for pending in preserved_messages:
+                    try:
+                        request_queue.put_nowait(pending)
+                    except queue.Full:
+                        break
+
+                if latest_tick_message is not None:
+                    try:
+                        request_queue.put_nowait(latest_tick_message)
+                    except queue.Full:
+                        pass
+
+                message = latest_roi_message
+                command = message.get("cmd")
 
             if command == "shutdown":
                 _stop_sessions()

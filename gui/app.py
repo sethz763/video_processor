@@ -1158,13 +1158,15 @@ class VideoProcessorController:
         if hasattr(self.processor, "set_denoise_strength"):
             self.processor.set_denoise_strength(self.denoise_strength)
 
-    def set_roi(self, roi: Roi) -> None:
+    def set_roi(self, roi: Roi) -> bool:
         if self.processor is not None:
             self.processor.set_roi(roi.x, roi.y, roi.w, roi.h)
+        return True
 
-    def set_roi_position(self, roi_x: int, roi_y: int) -> None:
+    def set_roi_position(self, roi_x: int, roi_y: int) -> bool:
         if self.processor is not None and hasattr(self.processor, "set_roi_position"):
             self.processor.set_roi_position(int(roi_x), int(roi_y))
+        return True
 
     def set_auto_basic_scaling(self) -> None:
         self.basic_scaling_auto_mode = True
@@ -1474,6 +1476,28 @@ class ProcessVideoProcessorController:
         self._gpu_live_mode = os.environ.get("VP_GPU_LIVE_MODE", "1") == "1"
         self._preview_fps = max(0.0, float(os.environ.get("VP_PREVIEW_FPS", "30")))
         self._last_preview_request_ts = 0.0
+        self._control_send_stats = {
+            "attempted": 0,
+            "sent": 0,
+            "dropped": 0,
+            "queue_full": 0,
+            "compactions": 0,
+            "compaction_roi_dropped": 0,
+            "fast_path_hits": 0,
+            "total_send_ms": 0.0,
+            "max_send_ms": 0.0,
+        }
+        self._control_send_stats_by_cmd: dict[str, dict[str, float]] = {}
+        self._decklink_stage_queue_depths: dict[str, int] = {
+            "capture_to_preprocess": 0,
+            "preprocess_to_upscale": 0,
+            "upscale_to_output": 0,
+        }
+        self._decklink_stage_drop_counts: dict[str, int] = {
+            "capture": 0,
+            "preprocess": 0,
+            "upscale": 0,
+        }
 
     def _reset_decklink_fps_tracking(self) -> None:
         self._decklink_processed_counter = 0
@@ -1527,9 +1551,86 @@ class ProcessVideoProcessorController:
         self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
         self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
         self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
+        self._decklink_stage_queue_depths = dict(message.get("stage_queue_depths", self._decklink_stage_queue_depths))
+        self._decklink_stage_drop_counts = dict(message.get("stage_drop_counts", self._decklink_stage_drop_counts))
         self._decklink_no_frame_reason = None
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
+
+    def _record_control_send_result(
+        self,
+        cmd: str,
+        sent: bool,
+        elapsed_ms: float,
+        queue_full: bool = False,
+        compaction_run: bool = False,
+        compaction_roi_dropped: int = 0,
+        fast_path_hit: bool = False,
+    ) -> None:
+        stats = self._control_send_stats
+        stats["attempted"] += 1
+        if sent:
+            stats["sent"] += 1
+        else:
+            stats["dropped"] += 1
+        if queue_full:
+            stats["queue_full"] += 1
+        if compaction_run:
+            stats["compactions"] += 1
+            stats["compaction_roi_dropped"] += max(0, int(compaction_roi_dropped))
+        if fast_path_hit:
+            stats["fast_path_hits"] += 1
+
+        elapsed = max(0.0, float(elapsed_ms))
+        stats["total_send_ms"] += elapsed
+        if elapsed > float(stats["max_send_ms"]):
+            stats["max_send_ms"] = elapsed
+
+        cmd_stats = self._control_send_stats_by_cmd.setdefault(
+            cmd,
+            {
+                "attempted": 0.0,
+                "sent": 0.0,
+                "dropped": 0.0,
+                "queue_full": 0.0,
+                "total_send_ms": 0.0,
+                "max_send_ms": 0.0,
+            },
+        )
+        cmd_stats["attempted"] += 1
+        if sent:
+            cmd_stats["sent"] += 1
+        else:
+            cmd_stats["dropped"] += 1
+        if queue_full:
+            cmd_stats["queue_full"] += 1
+        cmd_stats["total_send_ms"] += elapsed
+        if elapsed > cmd_stats["max_send_ms"]:
+            cmd_stats["max_send_ms"] = elapsed
+
+    def control_send_stats_snapshot(self, reset: bool = False) -> dict[str, object]:
+        stats = dict(self._control_send_stats)
+        attempted = max(1, int(stats.get("attempted", 0)))
+        stats["avg_send_ms"] = float(stats.get("total_send_ms", 0.0)) / float(attempted)
+        stats["by_cmd"] = {k: dict(v) for k, v in self._control_send_stats_by_cmd.items()}
+
+        if reset:
+            self._control_send_stats = {
+                "attempted": 0,
+                "sent": 0,
+                "dropped": 0,
+                "queue_full": 0,
+                "compactions": 0,
+                "compaction_roi_dropped": 0,
+                "fast_path_hits": 0,
+                "total_send_ms": 0.0,
+                "max_send_ms": 0.0,
+            }
+            self._control_send_stats_by_cmd = {}
+        return stats
+
+    def decklink_queue_telemetry(self) -> tuple[dict[str, int], dict[str, int]]:
+        return dict(self._decklink_stage_queue_depths), dict(self._decklink_stage_drop_counts)
 
     def create(self, roi: Roi) -> None:
         self.close()
@@ -1646,10 +1747,12 @@ class ProcessVideoProcessorController:
         if self._request_queue is None:
             raise RuntimeError("Worker request queue is not initialized")
 
+        started = time.perf_counter()
         cmd = str(command.get("cmd", ""))
         latest_wins_roi_cmds = {
             "set_roi",
             "set_roi_position",
+            "set_roi_with_subpixel",
         }
         drop_when_roi_cmds = {
             "decklink_tick",
@@ -1657,10 +1760,29 @@ class ProcessVideoProcessorController:
         best_effort_cmds = {
             "decklink_tick",
             "set_decklink_output_buffer_frames",
+            # Live ROI interaction commands should never block the GUI thread.
+            "set_roi",
+            "set_roi_position",
+            "set_roi_subpixel_shift",
+            "set_roi_with_subpixel",
         }
 
         if cmd in latest_wins_roi_cmds:
+            # Fast path: avoid queue compaction work on every ROI update.
+            try:
+                self._request_queue.put_nowait(command)
+                self._record_control_send_result(
+                    cmd,
+                    sent=True,
+                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                    fast_path_hit=True,
+                )
+                return True
+            except queue.Full:
+                pass
+
             preserved_commands: list[dict[str, object]] = []
+            roi_compaction_drops = 0
             while True:
                 try:
                     pending = self._request_queue.get_nowait()
@@ -1669,6 +1791,7 @@ class ProcessVideoProcessorController:
 
                 pending_cmd = str(pending.get("cmd", ""))
                 if pending_cmd in latest_wins_roi_cmds:
+                    roi_compaction_drops += 1
                     continue
                 if pending_cmd in drop_when_roi_cmds:
                     continue
@@ -1681,13 +1804,47 @@ class ProcessVideoProcessorController:
                     # Preserve pipeline control integrity over stale drag events.
                     break
 
+            try:
+                self._request_queue.put_nowait(command)
+                self._record_control_send_result(
+                    cmd,
+                    sent=True,
+                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                    queue_full=True,
+                    compaction_run=True,
+                    compaction_roi_dropped=roi_compaction_drops,
+                )
+                return True
+            except queue.Full:
+                if cmd in best_effort_cmds:
+                    self._record_control_send_result(
+                        cmd,
+                        sent=False,
+                        elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                        queue_full=True,
+                        compaction_run=True,
+                        compaction_roi_dropped=roi_compaction_drops,
+                    )
+                    return False
+
         try:
             self._request_queue.put_nowait(command)
+            self._record_control_send_result(
+                cmd,
+                sent=True,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
             return True
         except queue.Full:
             # Never evict pending critical commands. Drop only the best-effort
             # command itself (e.g. tick) and preserve queued state updates.
             if cmd in best_effort_cmds:
+                self._record_control_send_result(
+                    cmd,
+                    sent=False,
+                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                    queue_full=True,
+                )
                 return False
 
             # For critical commands, wait briefly for queue capacity instead of
@@ -1695,7 +1852,19 @@ class ProcessVideoProcessorController:
             try:
                 self._request_queue.put(command, timeout=0.25)
             except queue.Full:
+                self._record_control_send_result(
+                    cmd,
+                    sent=False,
+                    elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                    queue_full=True,
+                )
                 raise RuntimeError(f"Worker request queue saturated while sending '{cmd}'")
+            self._record_control_send_result(
+                cmd,
+                sent=True,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                queue_full=True,
+            )
             return True
 
     def _drain_responses(self) -> None:
@@ -1765,11 +1934,11 @@ class ProcessVideoProcessorController:
                     f"Worker runtime failure: {message.get('error')}\n{message.get('traceback', '')}"
                 )
 
-    def set_roi(self, roi: Roi) -> None:
-        self._send_control({"cmd": "set_roi", "x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h})
+    def set_roi(self, roi: Roi) -> bool:
+        return self._send_control({"cmd": "set_roi", "x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h})
 
-    def set_roi_position(self, roi_x: int, roi_y: int) -> None:
-        self._send_control({"cmd": "set_roi_position", "x": int(roi_x), "y": int(roi_y)})
+    def set_roi_position(self, roi_x: int, roi_y: int) -> bool:
+        return self._send_control({"cmd": "set_roi_position", "x": int(roi_x), "y": int(roi_y)})
 
     def set_roi_subpixel_shift(self, shift_x: float, shift_y: float) -> None:
         self._send_control(
@@ -2302,8 +2471,6 @@ class MainWindow(QMainWindow):
         self._roi_keyframe_transition_overscan_percent = 2.0
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         self._controller_filtered_target_roi: Roi | None = None
-        self._manual_roi_handoff_until_ts = 0.0
-        self._manual_roi_shift_reset_pending = False
         self._last_status_text: str | None = None
         self._last_status_log_ts = 0.0
         self._status_repeat_log_interval_s = 5.0
@@ -2342,6 +2509,20 @@ class MainWindow(QMainWindow):
         self._updating_controls = False
         self._controller_roi_target: Roi | None = None
         self._controller_roi_applied = self._roi
+        self._manual_live_target_roi: Roi | None = None
+        self._pending_manual_controller_roi: Roi | None = None
+        self._pending_roi_controls_sync: Roi | None = None
+        self._last_manual_roi_update_ts = 0.0
+        self._manual_roi_preview_reduce_scale = max(
+            0.35,
+            min(1.0, float(os.environ.get("VP_MANUAL_ROI_PREVIEW_SCALE", "0.60"))),
+        )
+        self._roi_diag_canvas_events = 0
+        self._roi_diag_controller_send_attempts = 0
+        self._roi_diag_controller_send_success = 0
+        self._roi_diag_controller_send_drops = 0
+        self._roi_diag_controller_send_ms_sum = 0.0
+        self._roi_diag_controller_send_ms_max = 0.0
         self._fullscreen_view_name: str | None = None
         self._splitter_initialized = False
         self._main_splitter_initialized = False
@@ -2442,6 +2623,16 @@ class MainWindow(QMainWindow):
         self._controller_roi_interp_timer = QTimer(self)
         self._controller_roi_interp_timer.setInterval(16)
         self._controller_roi_interp_timer.timeout.connect(self._step_controller_roi_interpolation)
+
+        self._manual_roi_send_timer = QTimer(self)
+        self._manual_roi_send_timer.setSingleShot(True)
+        self._manual_roi_send_timer.setInterval(16)
+        self._manual_roi_send_timer.timeout.connect(self._flush_pending_manual_controller_roi)
+
+        self._roi_controls_sync_timer = QTimer(self)
+        self._roi_controls_sync_timer.setSingleShot(True)
+        self._roi_controls_sync_timer.setInterval(33)
+        self._roi_controls_sync_timer.timeout.connect(self._flush_pending_roi_controls_sync)
 
         self._roi_keyframe_transition_timer = QTimer(self)
         self._roi_keyframe_transition_timer.setInterval(8)
@@ -3423,9 +3614,14 @@ class MainWindow(QMainWindow):
                 if hasattr(self._controller, "consume_decklink_frame_updated"):
                     preview_updated = bool(self._controller.consume_decklink_frame_updated())
 
+                interaction_scale = 1.0
+                if self._manual_roi_interaction_active():
+                    interaction_scale = self._manual_roi_preview_reduce_scale
+
                 self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
 
                 input_preview_size = self._preview_target_for_view("input")
+                input_preview_size = self._scaled_preview_target(input_preview_size, interaction_scale)
                 if input_preview_size is not None and preview_updated:
                     t1 = time.perf_counter()
                     input_image, input_backing = uyvy_to_qimage(
@@ -3437,6 +3633,7 @@ class MainWindow(QMainWindow):
                     self._perf_add("convert_in", (time.perf_counter() - t1) * 1000.0)
 
                 output_preview_size = self._preview_target_for_view("output")
+                output_preview_size = self._scaled_preview_target(output_preview_size, interaction_scale)
                 if output_preview_size is not None and preview_updated:
                     t1 = time.perf_counter()
                     output_image, output_backing = uyvy_to_qimage(
@@ -3551,6 +3748,65 @@ class MainWindow(QMainWindow):
                     self.decklink_status_label.setText(
                         f"DeckLink streaming via worker process | preview_fps={fps:.1f} | output_fps={worker_fps:.1f}"
                     )
+
+                    if self._roi_diag_canvas_events > 0 or self._manual_roi_interaction_active():
+                        send_avg = self._roi_diag_controller_send_ms_sum / max(1, self._roi_diag_controller_send_attempts)
+                        send_max = self._roi_diag_controller_send_ms_max
+
+                        ctrl_stats: dict[str, object] = {}
+                        if hasattr(self._controller, "control_send_stats_snapshot"):
+                            try:
+                                ctrl_stats = dict(self._controller.control_send_stats_snapshot(reset=True))
+                            except Exception:
+                                ctrl_stats = {}
+
+                        queue_depths: dict[str, int] = {}
+                        queue_drops: dict[str, int] = {}
+                        if hasattr(self._controller, "decklink_queue_telemetry"):
+                            try:
+                                queue_depths, queue_drops = self._controller.decklink_queue_telemetry()
+                            except Exception:
+                                queue_depths, queue_drops = {}, {}
+
+                        LOGGER.info(
+                            (
+                                "ROI_DIAG | preview_fps=%.1f | output_fps=%.1f | canvas_events=%d | "
+                                "roi_send_attempts=%d | roi_send_ok=%d | roi_send_drop=%d | roi_send_ms=%.2f/%.2f | "
+                                "ctrl_attempted=%s | ctrl_sent=%s | ctrl_dropped=%s | ctrl_qfull=%s | "
+                                "ctrl_compactions=%s | ctrl_roi_drop=%s | ctrl_send_ms=%.2f/%.2f | "
+                                "qdepth[c2p=%s,p2u=%s,u2o=%s] | qdrop[c=%s,p=%s,u=%s]"
+                            ),
+                            fps,
+                            worker_fps,
+                            self._roi_diag_canvas_events,
+                            self._roi_diag_controller_send_attempts,
+                            self._roi_diag_controller_send_success,
+                            self._roi_diag_controller_send_drops,
+                            send_avg,
+                            send_max,
+                            ctrl_stats.get("attempted", 0),
+                            ctrl_stats.get("sent", 0),
+                            ctrl_stats.get("dropped", 0),
+                            ctrl_stats.get("queue_full", 0),
+                            ctrl_stats.get("compactions", 0),
+                            ctrl_stats.get("compaction_roi_dropped", 0),
+                            float(ctrl_stats.get("avg_send_ms", 0.0)),
+                            float(ctrl_stats.get("max_send_ms", 0.0)),
+                            queue_depths.get("capture_to_preprocess", 0),
+                            queue_depths.get("preprocess_to_upscale", 0),
+                            queue_depths.get("upscale_to_output", 0),
+                            queue_drops.get("capture", 0),
+                            queue_drops.get("preprocess", 0),
+                            queue_drops.get("upscale", 0),
+                        )
+
+                    self._roi_diag_canvas_events = 0
+                    self._roi_diag_controller_send_attempts = 0
+                    self._roi_diag_controller_send_success = 0
+                    self._roi_diag_controller_send_drops = 0
+                    self._roi_diag_controller_send_ms_sum = 0.0
+                    self._roi_diag_controller_send_ms_max = 0.0
+
                     self._refresh_ai_sr_runtime_panel()
                     self._refresh_rtx_vsr_runtime_panel()
                     self._apply_performance_guard(fps)
@@ -3840,7 +4096,9 @@ class MainWindow(QMainWindow):
         fps = max(1, self.fps_spin.value())
         poll_fps = float(fps)
         if self._source_mode == "Blackmagic DeckLink" and self._controller_backend == "worker-process":
-            poll_fps = min(poll_fps, self._decklink_tick_poll_fps)
+            # In worker DeckLink mode, preview cadence should follow the dedicated
+            # GUI poll setting instead of camera/output FPS controls.
+            poll_fps = float(max(1.0, self._decklink_tick_poll_fps))
         self._timer.setInterval(max(1, int(round(1000.0 / max(1.0, poll_fps)))))
 
     def _normalize_preview_downsample_factor(self, value: float) -> float:
@@ -3902,6 +4160,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
+        self._last_manual_roi_update_ts = time.perf_counter()
+        self._roi_diag_canvas_events += 1
         had_active_keyframe_transition = self._roi_keyframe_transition is not None
         if had_active_keyframe_transition:
             transition_state = self._roi_keyframe_transition
@@ -3909,21 +4169,108 @@ class MainWindow(QMainWindow):
                 current_estimate = transition_state.get("current_roi_estimate")
                 if isinstance(current_estimate, Roi):
                     self._controller_roi_applied = clamp_roi(current_estimate)
-        self._cancel_roi_keyframe_transition()
+            self._cancel_roi_keyframe_transition()
         self._roi = clamp_roi(Roi(x, y, w, h))
 
-        if had_active_keyframe_transition:
-            self._manual_roi_handoff_until_ts = time.perf_counter() + 0.35
-            self._manual_roi_shift_reset_pending = True
+        # Canvas interaction already applies smoothing/throttling; avoid a second
+        # controller-side interpolation loop that can keep ROI commands churning
+        # after manual motion and starve preview ticks.
+        self._controller_roi_target = None
+        self._controller_filtered_target_roi = None
+        self._controller_roi_interp_timer.stop()
 
-        if self._manual_roi_shift_reset_pending:
-            self._manual_roi_shift_reset_pending = False
-            if hasattr(self._controller, "set_roi_subpixel_shift"):
-                self._controller.set_roi_subpixel_shift(0.0, 0.0)
+        # Treat manual updates as a continuous live keyframe stream: keep only
+        # the latest target and interpolate from applied ROI on each send tick.
+        if self._manual_live_target_roi is None:
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        self._manual_live_target_roi = self._roi
 
-        self._queue_controller_roi_target(self._roi, anchor_to_current=True)
+        self._pending_manual_controller_roi = self._roi
+        if not self._manual_roi_send_timer.isActive():
+            self._manual_roi_send_timer.start()
 
-        self._sync_controls_from_roi(self._roi)
+        self._schedule_roi_controls_sync(self._roi)
+
+    def _flush_pending_manual_controller_roi(self) -> None:
+        pending = self._pending_manual_controller_roi
+        self._pending_manual_controller_roi = None
+        if pending is not None:
+            self._manual_live_target_roi = pending
+
+        target = self._manual_live_target_roi
+        if target is None:
+            return
+
+        current = self._controller_roi_applied
+        step_roi = self._interpolate_controller_roi_step(current, target)
+        if self._is_controller_roi_close(step_roi, target):
+            step_roi = target
+
+        try:
+            started = time.perf_counter()
+            self._roi_diag_controller_send_attempts += 1
+            moving_only = (
+                step_roi.w == self._controller_roi_applied.w
+                and step_roi.h == self._controller_roi_applied.h
+                and hasattr(self._controller, "set_roi_position")
+            )
+            if moving_only:
+                sent = bool(self._controller.set_roi_position(step_roi.x, step_roi.y))
+            else:
+                sent = bool(self._controller.set_roi(step_roi))
+
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self._roi_diag_controller_send_ms_sum += elapsed_ms
+            if elapsed_ms > self._roi_diag_controller_send_ms_max:
+                self._roi_diag_controller_send_ms_max = elapsed_ms
+
+            if sent:
+                self._roi_diag_controller_send_success += 1
+            else:
+                self._roi_diag_controller_send_drops += 1
+            self._controller_roi_applied = step_roi
+        except Exception as exc:
+            self._roi_diag_controller_send_drops += 1
+            self._update_status(f"ROI update failed: {exc}")
+
+        # Continue stepping while target is not reached, or while new user
+        # updates keep arriving.
+        if self._is_controller_roi_close(self._controller_roi_applied, target):
+            self._manual_live_target_roi = None
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        if self._pending_manual_controller_roi is not None or self._manual_live_target_roi is not None:
+            self._manual_roi_send_timer.start()
+
+    def _schedule_roi_controls_sync(self, roi: Roi) -> None:
+        self._pending_roi_controls_sync = clamp_roi(roi)
+        if not self._roi_controls_sync_timer.isActive():
+            self._roi_controls_sync_timer.start()
+
+    def _flush_pending_roi_controls_sync(self) -> None:
+        pending = self._pending_roi_controls_sync
+        self._pending_roi_controls_sync = None
+        if pending is None:
+            return
+        self._sync_controls_from_roi(pending)
+
+    def _manual_roi_interaction_active(self) -> bool:
+        if self._roi_keyframe_transition is not None:
+            return False
+        now = time.perf_counter()
+        if (now - self._last_manual_roi_update_ts) <= 0.22:
+            return True
+        if self._manual_roi_send_timer.isActive():
+            return True
+        return self._pending_manual_controller_roi is not None
+
+    def _scaled_preview_target(self, target: tuple[int, int] | None, scale: float) -> tuple[int, int] | None:
+        if target is None:
+            return None
+        if scale >= 0.999:
+            return target
+        w = max(160, int(round(target[0] * scale)))
+        h = max(90, int(round(target[1] * scale)))
+        return (w, h)
 
     def _queue_controller_roi_target(self, roi: Roi, anchor_to_current: bool = False) -> None:
         raw_target = clamp_roi(roi)
@@ -5527,11 +5874,17 @@ class MainWindow(QMainWindow):
 
     def _sync_controls_from_roi(self, roi: Roi) -> None:
         self._updating_controls = True
-        self.roi_x_spin.setValue(roi.x)
-        self.roi_y_spin.setValue(roi.y)
-        self.roi_w_spin.setValue(roi.w)
-        self.roi_h_spin.setValue(roi.h)
-        self.scale_spin.setValue(roi_scale_from_roi(roi))
+        if self.roi_x_spin.value() != roi.x:
+            self.roi_x_spin.setValue(roi.x)
+        if self.roi_y_spin.value() != roi.y:
+            self.roi_y_spin.setValue(roi.y)
+        if self.roi_w_spin.value() != roi.w:
+            self.roi_w_spin.setValue(roi.w)
+        if self.roi_h_spin.value() != roi.h:
+            self.roi_h_spin.setValue(roi.h)
+        target_scale = roi_scale_from_roi(roi)
+        if abs(float(self.scale_spin.value()) - float(target_scale)) > 1e-6:
+            self.scale_spin.setValue(target_scale)
         self._updating_controls = False
 
     def _update_status(self, text: str, suppress_repeat_window_s: float | None = None) -> None:
