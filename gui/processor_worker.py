@@ -1477,7 +1477,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         target_scale = FRAME_W / max(1.0, t_w)
         overscan_pct = float(state.get("overscan_percent", 0.0))
         if target_scale >= 4.0 and overscan_pct > 0.0:
-            overscan_weight = max(0.0, 1.0 - curved_t)
+            overscan_weight = max(0.0, 4.0 * curved_t * (1.0 - curved_t))
             desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
         else:
             desired_w_backend = desired_w
@@ -1587,7 +1587,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 or current_roi_h != i_h
             ):
                 processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
-            _set_roi_shift_target(0.0, 0.0)
+            _set_roi_shift_immediate(0.0, 0.0)
             roi_microstep_transition = None
 
     def _cleanup_ai_async() -> None:
@@ -2354,6 +2354,10 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     def _maybe_run_pending_rtx_roi_rebuild() -> None:
         nonlocal rtx_vsr_error, rtx_roi_rebuild_pending
         if not rtx_roi_rebuild_pending:
+            return
+        if roi_microstep_transition is not None:
+            # Avoid rebuilding RTX engine during active ROI keyframe scaling;
+            # defer until transition settles to prevent visible render hitches.
             return
         if not rtx_vsr_enabled:
             rtx_roi_rebuild_pending = False

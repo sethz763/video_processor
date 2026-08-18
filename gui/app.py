@@ -2255,7 +2255,7 @@ class MainWindow(QMainWindow):
         self._roi_smoothing_percent = 60
         self._roi_latency_smoothing_percent = 0
         self._roi_keyframes: dict[int, RoiKeyframe] = {}
-        self._roi_keyframe_slots = (1, 2, 3)
+        self._roi_keyframe_slots = (1, 2, 3, 4)
         self._roi_key_save_armed = False
         self._roi_keyframe_transition_default_frames = 30
         self._roi_keyframe_transition: dict[str, object] | None = None
@@ -2336,6 +2336,9 @@ class MainWindow(QMainWindow):
         root = QHBoxLayout(central)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
+        self._fullscreen_keyframe_toolbars: dict[str, QWidget] = {}
+        self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
         viewers = QWidget()
         viewers_layout = QVBoxLayout(viewers)
         viewers_layout.setContentsMargins(0, 0, 0, 0)
@@ -2348,6 +2351,8 @@ class MainWindow(QMainWindow):
         self._input_title_label = QLabel("Input View (ROI controls are locked to this view)")
         input_layout.addWidget(self._input_title_label)
         input_layout.addWidget(self._input_canvas, 1, alignment=Qt.AlignCenter)
+        self._input_fullscreen_keyframe_toolbar = self._build_fullscreen_keyframe_toolbar("input")
+        input_layout.addWidget(self._input_fullscreen_keyframe_toolbar)
 
         self._output_panel = QWidget()
         output_layout = QVBoxLayout(self._output_panel)
@@ -2356,6 +2361,8 @@ class MainWindow(QMainWindow):
         self._output_title_label = QLabel("Output View (processed result only)")
         output_layout.addWidget(self._output_title_label)
         output_layout.addWidget(self._output_canvas, 1, alignment=Qt.AlignCenter)
+        self._output_fullscreen_keyframe_toolbar = self._build_fullscreen_keyframe_toolbar("output")
+        output_layout.addWidget(self._output_fullscreen_keyframe_toolbar)
 
         self._display_splitter = QSplitter(Qt.Vertical)
         self._display_splitter.setChildrenCollapsible(False)
@@ -3215,6 +3222,11 @@ class MainWindow(QMainWindow):
         self.roi_key3_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(3))
         keyframe_layout.addWidget(self.roi_key3_btn)
 
+        self.roi_key4_btn = QPushButton("KEY 4")
+        self.roi_key4_btn.setMinimumHeight(key_button_min_height)
+        self.roi_key4_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(4))
+        keyframe_layout.addWidget(self.roi_key4_btn)
+
         roi_form.addRow(keyframe_row)
 
         keyframe_spacing_row = QWidget()
@@ -3262,6 +3274,44 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
         layout.addStretch(1)
         return panel
+
+    def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
+        toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(8)
+
+        save_btn = QPushButton("SAVE KEY")
+        save_btn.setCheckable(True)
+        save_btn.setMinimumHeight(120)
+        save_btn.toggled.connect(self._on_roi_save_key_toggled)
+        toolbar_layout.addWidget(save_btn)
+
+        key1_btn = QPushButton("KEY 1")
+        key1_btn.setMinimumHeight(120)
+        key1_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(1))
+        toolbar_layout.addWidget(key1_btn)
+
+        key2_btn = QPushButton("KEY 2")
+        key2_btn.setMinimumHeight(120)
+        key2_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(2))
+        toolbar_layout.addWidget(key2_btn)
+
+        key3_btn = QPushButton("KEY 3")
+        key3_btn.setMinimumHeight(120)
+        key3_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(3))
+        toolbar_layout.addWidget(key3_btn)
+
+        key4_btn = QPushButton("KEY 4")
+        key4_btn.setMinimumHeight(120)
+        key4_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(4))
+        toolbar_layout.addWidget(key4_btn)
+
+        self._fullscreen_keyframe_toolbars[view_name] = toolbar
+        self._fullscreen_roi_save_key_buttons[view_name] = save_btn
+        self._fullscreen_roi_key_slot_buttons[view_name] = (key1_btn, key2_btn, key3_btn, key4_btn)
+        toolbar.setVisible(False)
+        return toolbar
 
     def _setup_shortcuts(self) -> None:
         reset_action = QAction(self)
@@ -3628,14 +3678,22 @@ class MainWindow(QMainWindow):
             panel=self._input_panel,
             title_label=self._input_title_label,
             canvas=self._input_canvas,
+            footer_widget=self._input_fullscreen_keyframe_toolbar,
         )
         self._fit_canvas_in_panel(
             panel=self._output_panel,
             title_label=self._output_title_label,
             canvas=self._output_canvas,
+            footer_widget=self._output_fullscreen_keyframe_toolbar,
         )
 
-    def _fit_canvas_in_panel(self, panel: QWidget, title_label: QLabel, canvas: QWidget) -> None:
+    def _fit_canvas_in_panel(
+        self,
+        panel: QWidget,
+        title_label: QLabel,
+        canvas: QWidget,
+        footer_widget: QWidget | None = None,
+    ) -> None:
         if not panel.isVisible() or panel.width() <= 0 or panel.height() <= 0:
             return
 
@@ -3645,10 +3703,14 @@ class MainWindow(QMainWindow):
 
         margins = layout.contentsMargins()
         spacing = max(0, layout.spacing())
-        label_h = title_label.sizeHint().height() if title_label.isVisible() else 0
+        used_h = 0
+        if title_label.isVisible():
+            used_h += title_label.sizeHint().height() + spacing
+        if footer_widget is not None and footer_widget.isVisible():
+            used_h += footer_widget.sizeHint().height() + spacing
 
         avail_w = panel.width() - margins.left() - margins.right()
-        avail_h = panel.height() - margins.top() - margins.bottom() - label_h - spacing
+        avail_h = panel.height() - margins.top() - margins.bottom() - used_h
 
         # Keep both stacked viewers within the window height budget.
         if self._fullscreen_view_name is None:
@@ -3691,6 +3753,8 @@ class MainWindow(QMainWindow):
             self._controls_scroll.setVisible(True)
             self._input_panel.setVisible(True)
             self._output_panel.setVisible(True)
+            for toolbar in self._fullscreen_keyframe_toolbars.values():
+                toolbar.setVisible(False)
             self._input_canvas.setEnabled(True)
             self._output_canvas.setEnabled(True)
             self.showNormal()
@@ -3701,6 +3765,8 @@ class MainWindow(QMainWindow):
         self._controls_scroll.setVisible(False)
         self._input_panel.setVisible(view_name == "input")
         self._output_panel.setVisible(view_name == "output")
+        for toolbar_view, toolbar in self._fullscreen_keyframe_toolbars.items():
+            toolbar.setVisible(toolbar_view == view_name)
         self._input_canvas.setEnabled(view_name == "input")
         self._output_canvas.setEnabled(view_name == "output")
         self.showFullScreen()
@@ -4877,6 +4943,32 @@ class MainWindow(QMainWindow):
         self._roi_key_save_armed = bool(checked)
         self._update_roi_key_buttons()
 
+    def _all_roi_save_key_buttons(self) -> list[QPushButton]:
+        return [self.roi_save_key_btn, *self._fullscreen_roi_save_key_buttons.values()]
+
+    def _all_roi_slot_buttons(self, slot: int) -> list[QPushButton]:
+        if slot == 1:
+            return [
+                self.roi_key1_btn,
+                *[buttons[0] for buttons in self._fullscreen_roi_key_slot_buttons.values()],
+            ]
+        if slot == 2:
+            return [
+                self.roi_key2_btn,
+                *[buttons[1] for buttons in self._fullscreen_roi_key_slot_buttons.values()],
+            ]
+        if slot == 3:
+            return [
+                self.roi_key3_btn,
+                *[buttons[2] for buttons in self._fullscreen_roi_key_slot_buttons.values()],
+            ]
+        if slot == 4:
+            return [
+                self.roi_key4_btn,
+                *[buttons[3] for buttons in self._fullscreen_roi_key_slot_buttons.values()],
+            ]
+        return []
+
     def _on_roi_key_slot_pressed(self, slot: int) -> None:
         if slot not in self._roi_keyframe_slots:
             return
@@ -4903,44 +4995,81 @@ class MainWindow(QMainWindow):
 
         override_duration = bool(self.roi_keyframe_duration_override_btn.isChecked())
         if override_duration:
-            duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
+            requested_duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
         else:
-            duration_frames = max(1, min(600, int(keyframe.duration_frames)))
+            requested_duration_frames = max(1, min(600, int(keyframe.duration_frames)))
+
+        duration_frames = self._effective_roi_keyframe_duration_frames(keyframe.roi, requested_duration_frames)
+        adaptive_suffix = ""
+        if duration_frames != requested_duration_frames:
+            adaptive_suffix = f", adaptive from {requested_duration_frames}"
 
         self._start_roi_keyframe_transition(keyframe.roi, duration_frames, keyframe.interpolation_mode)
         if override_duration:
             self._update_status(
-                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}, override)"
+                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}, override{adaptive_suffix})"
             )
         else:
             self._update_status(
-                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)})"
+                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}{adaptive_suffix})"
             )
 
-    def _update_roi_key_buttons(self) -> None:
-        if self._roi_key_save_armed:
-            self.roi_save_key_btn.setStyleSheet("QPushButton { background-color: #f1c40f; font-weight: 700; }")
-            self.roi_key1_btn.setText("KEY 1 (STORE)")
-            self.roi_key2_btn.setText("KEY 2 (STORE)")
-            self.roi_key3_btn.setText("KEY 3 (STORE)")
-        else:
-            self.roi_save_key_btn.setStyleSheet("")
-            self.roi_key1_btn.setText("KEY 1")
-            self.roi_key2_btn.setText("KEY 2")
-            self.roi_key3_btn.setText("KEY 3")
+    def _effective_roi_keyframe_duration_frames(self, target_roi: Roi, requested_frames: int) -> int:
+        requested = max(1, min(600, int(requested_frames)))
+        current_roi = clamp_roi(self._roi)
+        target = clamp_roi(target_roi)
 
-        for slot, button in ((1, self.roi_key1_btn), (2, self.roi_key2_btn), (3, self.roi_key3_btn)):
-            if slot in self._roi_keyframes:
-                button.setStyleSheet("QPushButton { font-weight: 600; }")
-                button.setToolTip(
-                    (
-                        f"Stored ({self._roi_keyframes[slot].duration_frames} frames, "
-                        f"{self._roi_interp_mode_label(self._roi_keyframes[slot].interpolation_mode)}). Click to recall."
+        start_scale = max(1.0, roi_scale_from_roi(current_roi))
+        target_scale = max(1.0, roi_scale_from_roi(target))
+        scale_ratio = max(start_scale, target_scale) / max(1e-6, min(start_scale, target_scale))
+        scale_jump = max(0.0, math.log2(max(1.0, scale_ratio)))
+
+        current_cx = float(current_roi.x) + (float(current_roi.w) * 0.5)
+        current_cy = float(current_roi.y) + (float(current_roi.h) * 0.5)
+        target_cx = float(target.x) + (float(target.w) * 0.5)
+        target_cy = float(target.y) + (float(target.h) * 0.5)
+        center_distance = math.hypot(target_cx - current_cx, target_cy - current_cy)
+
+        adaptive_floor = int(math.ceil((scale_jump * 14.0) + (center_distance / 180.0)))
+        if scale_ratio >= 1.75:
+            adaptive_floor = max(adaptive_floor, int(math.ceil(requested * 1.35)))
+        elif scale_ratio >= 1.4:
+            adaptive_floor = max(adaptive_floor, int(math.ceil(requested * 1.15)))
+
+        return max(requested, min(600, adaptive_floor))
+
+    def _update_roi_key_buttons(self) -> None:
+        for save_button in self._all_roi_save_key_buttons():
+            previous_block = save_button.blockSignals(True)
+            save_button.setChecked(self._roi_key_save_armed)
+            save_button.blockSignals(previous_block)
+
+        if self._roi_key_save_armed:
+            for save_button in self._all_roi_save_key_buttons():
+                save_button.setStyleSheet("QPushButton { background-color: #f1c40f; font-weight: 700; }")
+            for slot in self._roi_keyframe_slots:
+                for key_button in self._all_roi_slot_buttons(slot):
+                    key_button.setText(f"KEY {slot} (STORE)")
+        else:
+            for save_button in self._all_roi_save_key_buttons():
+                save_button.setStyleSheet("")
+            for slot in self._roi_keyframe_slots:
+                for key_button in self._all_roi_slot_buttons(slot):
+                    key_button.setText(f"KEY {slot}")
+
+        for slot in self._roi_keyframe_slots:
+            for button in self._all_roi_slot_buttons(slot):
+                if slot in self._roi_keyframes:
+                    button.setStyleSheet("QPushButton { font-weight: 600; }")
+                    button.setToolTip(
+                        (
+                            f"Stored ({self._roi_keyframes[slot].duration_frames} frames, "
+                            f"{self._roi_interp_mode_label(self._roi_keyframes[slot].interpolation_mode)}). Click to recall."
+                        )
                     )
-                )
-            else:
-                button.setStyleSheet("")
-                button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
+                else:
+                    button.setStyleSheet("")
+                    button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
 
     def _cancel_roi_keyframe_transition(self, reset_subpixel_shift: bool = True) -> None:
         self._roi_keyframe_transition = None
@@ -5165,8 +5294,9 @@ class MainWindow(QMainWindow):
         target_scale = roi_scale_from_roi(target_roi)
         overscan_pct = float(self._roi_keyframe_transition_overscan_percent)
         if target_scale >= 4.0 and overscan_pct > 0.0:
-            # Fade overscan to zero by transition end to avoid a final snap.
-            overscan_weight = max(0.0, 1.0 - float(curved_t))
+            # Bell envelope: 0 at start/end, highest mid-transition.
+            # This avoids a first-frame zoom jolt while still reducing quantization in the middle.
+            overscan_weight = max(0.0, 4.0 * float(curved_t) * (1.0 - float(curved_t)))
             desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
         else:
             desired_w_backend = desired_w
