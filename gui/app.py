@@ -747,7 +747,7 @@ class RoiCanvas(QWidget):
 
         target_roi = clamp_roi(new_roi)
         emit_scale = self._drag_mode != "move"
-        self._queue_interpolated_roi(target_roi, emit_scale=emit_scale)
+        self._queue_interpolated_roi(target_roi, emit_scale=emit_scale, anchor_to_current=True)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         del event
@@ -806,12 +806,21 @@ class RoiCanvas(QWidget):
             return
         self._set_roi_and_emit(new_roi, emit_scale=emit_scale)
 
-    def _queue_interpolated_roi(self, target_roi: Roi, emit_scale: bool = True) -> None:
+    def _queue_interpolated_roi(self, target_roi: Roi, emit_scale: bool = True, anchor_to_current: bool = False) -> None:
         raw_target = clamp_roi(target_roi)
         latency = max(0.0, min(1.0, self._latency_smoothing_percent / 100.0))
+        if anchor_to_current:
+            # Treat each manual drag update as a fresh interpolation segment
+            # from the currently displayed ROI to the latest pointer target.
+            self._interaction_filtered_target_roi = self._roi
+            self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
         if latency > 0.0:
             beta = 1.0 - (0.82 * latency)
-            prev = self._interaction_filtered_target_roi if self._interaction_filtered_target_roi is not None else raw_target
+            if anchor_to_current:
+                prev = self._roi
+            else:
+                prev = self._interaction_filtered_target_roi if self._interaction_filtered_target_roi is not None else raw_target
             filtered = clamp_roi(
                 Roi(
                     int(round(prev.x + (raw_target.x - prev.x) * beta)),
@@ -1638,10 +1647,39 @@ class ProcessVideoProcessorController:
             raise RuntimeError("Worker request queue is not initialized")
 
         cmd = str(command.get("cmd", ""))
+        latest_wins_roi_cmds = {
+            "set_roi",
+            "set_roi_position",
+        }
+        drop_when_roi_cmds = {
+            "decklink_tick",
+        }
         best_effort_cmds = {
             "decklink_tick",
             "set_decklink_output_buffer_frames",
         }
+
+        if cmd in latest_wins_roi_cmds:
+            preserved_commands: list[dict[str, object]] = []
+            while True:
+                try:
+                    pending = self._request_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                pending_cmd = str(pending.get("cmd", ""))
+                if pending_cmd in latest_wins_roi_cmds:
+                    continue
+                if pending_cmd in drop_when_roi_cmds:
+                    continue
+                preserved_commands.append(pending)
+
+            for pending in preserved_commands:
+                try:
+                    self._request_queue.put_nowait(pending)
+                except queue.Full:
+                    # Preserve pipeline control integrity over stale drag events.
+                    break
 
         try:
             self._request_queue.put_nowait(command)
@@ -2264,6 +2302,8 @@ class MainWindow(QMainWindow):
         self._roi_keyframe_transition_overscan_percent = 2.0
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         self._controller_filtered_target_roi: Roi | None = None
+        self._manual_roi_handoff_until_ts = 0.0
+        self._manual_roi_shift_reset_pending = False
         self._last_status_text: str | None = None
         self._last_status_log_ts = 0.0
         self._status_repeat_log_interval_s = 5.0
@@ -3862,17 +3902,44 @@ class MainWindow(QMainWindow):
         )
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
+        had_active_keyframe_transition = self._roi_keyframe_transition is not None
+        if had_active_keyframe_transition:
+            transition_state = self._roi_keyframe_transition
+            if isinstance(transition_state, dict):
+                current_estimate = transition_state.get("current_roi_estimate")
+                if isinstance(current_estimate, Roi):
+                    self._controller_roi_applied = clamp_roi(current_estimate)
         self._cancel_roi_keyframe_transition()
         self._roi = clamp_roi(Roi(x, y, w, h))
-        self._queue_controller_roi_target(self._roi)
+
+        if had_active_keyframe_transition:
+            self._manual_roi_handoff_until_ts = time.perf_counter() + 0.35
+            self._manual_roi_shift_reset_pending = True
+
+        if self._manual_roi_shift_reset_pending:
+            self._manual_roi_shift_reset_pending = False
+            if hasattr(self._controller, "set_roi_subpixel_shift"):
+                self._controller.set_roi_subpixel_shift(0.0, 0.0)
+
+        self._queue_controller_roi_target(self._roi, anchor_to_current=True)
+
         self._sync_controls_from_roi(self._roi)
 
-    def _queue_controller_roi_target(self, roi: Roi) -> None:
+    def _queue_controller_roi_target(self, roi: Roi, anchor_to_current: bool = False) -> None:
         raw_target = clamp_roi(roi)
         latency = max(0.0, min(1.0, self._roi_latency_smoothing_percent / 100.0))
+        anchor_roi = clamp_roi(self._controller_roi_applied)
+
+        if anchor_to_current:
+            self._controller_filtered_target_roi = anchor_roi
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
         if latency > 0.0:
             beta = 1.0 - (0.82 * latency)
-            prev = self._controller_filtered_target_roi if self._controller_filtered_target_roi is not None else raw_target
+            if anchor_to_current:
+                prev = anchor_roi
+            else:
+                prev = self._controller_filtered_target_roi if self._controller_filtered_target_roi is not None else raw_target
             filtered = clamp_roi(
                 Roi(
                     int(round(prev.x + (raw_target.x - prev.x) * beta)),
@@ -5072,10 +5139,19 @@ class MainWindow(QMainWindow):
                     button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
 
     def _cancel_roi_keyframe_transition(self, reset_subpixel_shift: bool = True) -> None:
+        previous_state = self._roi_keyframe_transition
+        if isinstance(previous_state, dict):
+            current_estimate = previous_state.get("current_roi_estimate")
+            if isinstance(current_estimate, Roi):
+                self._controller_roi_applied = clamp_roi(current_estimate)
         self._roi_keyframe_transition = None
         self._roi_keyframe_transition_timer.stop()
         self._roi_keyframe_last_step_ts = 0.0
         self._input_canvas.clear_visual_roi_overlay()
+        self._controller_roi_target = None
+        self._controller_filtered_target_roi = None
+        self._controller_roi_interp_timer.stop()
+        self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         if hasattr(self._controller, "cancel_roi_microstep_transition"):
             try:
                 self._controller.cancel_roi_microstep_transition(reset_subpixel_shift=reset_subpixel_shift)
@@ -5131,6 +5207,7 @@ class MainWindow(QMainWindow):
         self._controller_filtered_target_roi = None
         self._controller_roi_interp_timer.stop()
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        self._controller_roi_applied = clamp_roi(self._roi)
 
         use_worker_clock = bool(
             self._source_mode == "Blackmagic DeckLink"
@@ -5262,6 +5339,9 @@ class MainWindow(QMainWindow):
             estimated_roi = clamp_roi(roi_from_scale(estimated_scale, ideal_cx, ideal_cy))
             state["current_roi_estimate"] = estimated_roi
             self._roi = estimated_roi
+            self._controller_roi_applied = estimated_roi
+            self._controller_roi_target = None
+            self._controller_filtered_target_roi = None
 
             transition_complete = frame_progress >= float(total_frames)
             if transition_complete:
@@ -5270,6 +5350,10 @@ class MainWindow(QMainWindow):
                 self._input_canvas.clear_visual_roi_overlay()
                 self._roi = target_roi
                 self._input_canvas.set_roi(target_roi)
+                self._controller_roi_applied = target_roi
+                self._controller_roi_target = None
+                self._controller_filtered_target_roi = None
+                self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
                 self._sync_controls_from_roi(target_roi)
                 self._roi_keyframe_last_step_ts = 0.0
             return

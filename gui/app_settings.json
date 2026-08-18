@@ -45,10 +45,10 @@
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        870,
-        585,
-        362,
-        204
+        678,
+        802,
+        494,
+        278
       ]
     },
     "2": {
@@ -82,7 +82,7 @@
       ]
     }
   },
-  "roi_latency_smoothing_percent": 91,
+  "roi_latency_smoothing_percent": 57,
   "roi_smoothing_percent": 100,
   "roi_transition_duration_frames": 40,
   "rtx_thdr_contrast": 50,

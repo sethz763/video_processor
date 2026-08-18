@@ -1387,7 +1387,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         nonlocal roi_microstep_transition
         roi_microstep_transition = None
         if reset_shift:
-            _set_roi_shift_target(0.0, 0.0)
+            _set_roi_shift_immediate(0.0, 0.0)
 
     def _apply_manual_roi_with_subpixel_compensation(
         req_x: int,
@@ -2468,6 +2468,33 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             command = message.get("cmd")
+            if command == "decklink_tick":
+                latest_roi_message = None
+                preserved_messages: list[dict[str, object]] = []
+                while True:
+                    try:
+                        pending = request_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    pending_cmd = pending.get("cmd")
+                    if pending_cmd in {"set_roi", "set_roi_position"}:
+                        latest_roi_message = pending
+                        continue
+                    if pending_cmd == "decklink_tick":
+                        continue
+                    preserved_messages.append(pending)
+
+                for pending in preserved_messages:
+                    try:
+                        request_queue.put_nowait(pending)
+                    except queue.Full:
+                        break
+
+                if latest_roi_message is not None:
+                    message = latest_roi_message
+                    command = message.get("cmd")
+
             if command == "shutdown":
                 _stop_sessions()
                 _cleanup_ai_async()
@@ -2602,7 +2629,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if command == "set_roi":
-                _cancel_roi_microstep_transition(reset_shift=False)
+                _cancel_roi_microstep_transition(reset_shift=True)
                 _apply_manual_roi_with_subpixel_compensation(
                     int(message["x"]),
                     int(message["y"]),
@@ -2612,7 +2639,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if command == "set_roi_position":
-                _cancel_roi_microstep_transition(reset_shift=False)
+                _cancel_roi_microstep_transition(reset_shift=True)
                 _apply_manual_roi_with_subpixel_compensation(
                     int(message["x"]),
                     int(message["y"]),
