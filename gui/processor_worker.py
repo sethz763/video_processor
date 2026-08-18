@@ -1010,6 +1010,8 @@ class _StageFrame:
     input_bytes: bytes
     preprocess_bytes: bytes | None = None
     output_bytes: bytes | None = None
+    shift_x: float = 0.0
+    shift_y: float = 0.0
     ai_applied: bool = False
     rtx_applied: bool = False
     native_shift_applied: bool = False
@@ -1353,6 +1355,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         overscan_percent: float,
     ) -> None:
         nonlocal roi_microstep_transition
+        nonlocal roi_shift_applied_x, roi_shift_applied_y
 
         s_x, s_y, s_w, s_h = _normalize_worker_roi(*start_roi)
         t_x, t_y, t_w, t_h = _normalize_worker_roi(*target_roi)
@@ -1361,13 +1364,21 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         if mode_name not in {"linear", "ease_in_out", "ease_out"}:
             mode_name = "linear"
 
+        sx = FRAME_W / max(1.0, float(s_w))
+        sy = FRAME_H / max(1.0, float(s_h))
+        start_source_dx = -(float(roi_shift_applied_x) / sx) if sx > 1e-6 else 0.0
+        start_source_dy = -(float(roi_shift_applied_y) / sy) if sy > 1e-6 else 0.0
+
         roi_microstep_transition = {
             "start": (s_x, s_y, s_w, s_h),
             "target": (t_x, t_y, t_w, t_h),
             "total_frames": total_frames,
             "frame_progress": 0,
             "interpolation_mode": mode_name,
-            "residual": {"x": 0.0, "y": 0.0, "w": 0.0},
+            # Preserve the currently rendered subpixel-compensated center as
+            # the transition start state so the first transition frame is
+            # continuous with the pre-recall frame.
+            "residual": {"x": start_source_dx, "y": start_source_dy, "w": 0.0},
             "last_roi": (s_x, s_y, s_w, s_h),
             "overscan_percent": max(0.0, float(overscan_percent)),
         }
@@ -2113,6 +2124,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 last_stage_stack = _build_stage_stack()
 
                 item.output_bytes = output_bytes
+                item.shift_x = float(shift_x)
+                item.shift_y = float(shift_y)
                 item.ai_applied = bool(ai_applied)
                 item.rtx_applied = bool(rtx_applied)
                 item.native_shift_applied = bool(native_shift_applied)
@@ -2131,7 +2144,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     continue
 
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
-                shift_x, shift_y = _step_smoothed_roi_shift()
+                shift_x = float(item.shift_x)
+                shift_y = float(item.shift_y)
                 if (not item.native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
                     output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                 sampled_delta = 0.0

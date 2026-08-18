@@ -26,13 +26,13 @@
   "denoise_method": "Off",
   "denoise_strength": 0.75,
   "display_splitter_sizes": [
-    367,
-    366
+    421,
+    388
   ],
   "fps": 60,
   "main_splitter_sizes": [
-    698,
-    698
+    733,
+    731
   ],
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
@@ -45,20 +45,20 @@
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        0,
-        0,
-        1432,
-        806
+        110,
+        497,
+        730,
+        411
       ]
     },
     "2": {
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        716,
-        758,
-        458,
-        258
+        1594,
+        7,
+        326,
+        183
       ]
     },
     "3": {

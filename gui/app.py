@@ -2810,13 +2810,6 @@ class MainWindow(QMainWindow):
         self.preview_poll_fps_spin.valueChanged.connect(self._on_preview_poll_fps_changed)
         settings_form.addRow("Preview poll FPS cap", self.preview_poll_fps_spin)
 
-        self.decklink_output_buffer_spin = QSpinBox()
-        self.decklink_output_buffer_spin.setRange(0, 10)
-        self.decklink_output_buffer_spin.setValue(int(self._decklink_output_buffer_frames))
-        self.decklink_output_buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames; larger values can smooth short stalls with added latency.")
-        self.decklink_output_buffer_spin.valueChanged.connect(self._on_decklink_output_buffer_changed)
-        settings_form.addRow("DeckLink output buffer (frames)", self.decklink_output_buffer_spin)
-
         self.preview_downsample_combo = QComboBox()
         self.preview_downsample_combo.addItems(list(PREVIEW_DOWNSAMPLE_LABEL_TO_FACTOR.keys()))
         self.preview_downsample_combo.setCurrentText(
@@ -3088,6 +3081,13 @@ class MainWindow(QMainWindow):
         self.decklink_enable_format_detection = QCheckBox("Enable input format detection")
         self.decklink_enable_format_detection.setChecked(True)
         decklink_form.addRow(self.decklink_enable_format_detection)
+
+        self.decklink_output_buffer_spin = QSpinBox()
+        self.decklink_output_buffer_spin.setRange(0, 10)
+        self.decklink_output_buffer_spin.setValue(int(self._decklink_output_buffer_frames))
+        self.decklink_output_buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames; larger values can smooth short stalls with added latency.")
+        self.decklink_output_buffer_spin.valueChanged.connect(self._on_decklink_output_buffer_changed)
+        decklink_form.addRow("DeckLink output buffer (frames)", self.decklink_output_buffer_spin)
 
         self.decklink_pixel_format_combo = QComboBox()
         self.decklink_pixel_format_combo.addItems(["8-bit YUV (UYVY)"])
