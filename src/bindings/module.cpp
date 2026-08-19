@@ -266,6 +266,28 @@ PYBIND11_MODULE(video_processor, m) {
             "Set native UYVY output subpixel shift in pixels."
         )
         .def(
+            "set_color_space",
+            &vp::VideoProcessor::SetColorSpaceByName,
+            py::arg("color_space"),
+            "Set color space to one of [rec709, rec2020_hlg]."
+        )
+        .def(
+            "get_color_space",
+            &vp::VideoProcessor::GetColorSpaceName,
+            "Get current color space name."
+        )
+        .def(
+            "set_color_range",
+            &vp::VideoProcessor::SetColorRangeByName,
+            py::arg("color_range"),
+            "Set color range to one of [limited, full]."
+        )
+        .def(
+            "get_color_range",
+            &vp::VideoProcessor::GetColorRangeName,
+            "Get current color range name."
+        )
+        .def(
             "get_subpixel_shift",
             [](const vp::VideoProcessor& self) {
                 float shift_x = 0.0f;
@@ -289,6 +311,8 @@ PYBIND11_MODULE(video_processor, m) {
         .def_property("deinterlace_method", &vp::VideoProcessor::GetDeinterlaceMethodName, &vp::VideoProcessor::SetDeinterlaceMethodByName)
         .def_property("denoise_method", &vp::VideoProcessor::GetDenoiseMethodName, &vp::VideoProcessor::SetDenoiseMethodByName)
         .def_property("denoise_strength", &vp::VideoProcessor::GetDenoiseStrength, &vp::VideoProcessor::SetDenoiseStrength)
+        .def_property("color_space", &vp::VideoProcessor::GetColorSpaceName, &vp::VideoProcessor::SetColorSpaceByName)
+        .def_property("color_range", &vp::VideoProcessor::GetColorRangeName, &vp::VideoProcessor::SetColorRangeByName)
         .def_property(
             "subpixel_shift",
             [](const vp::VideoProcessor& self) {

@@ -11,6 +11,8 @@ void LaunchUyvyToRgb(
     uchar3* d_rgb,
     int width,
     int height,
+    int color_matrix,
+    int color_range,
     cudaStream_t stream
 );
 
@@ -245,6 +247,8 @@ void LaunchRgbToUyvy(
     uint8_t* d_uyvy,
     int width,
     int height,
+    int color_matrix,
+    int color_range,
     cudaStream_t stream
 );
 

@@ -32,6 +32,16 @@ enum class DenoiseMethod {
     FieldTemporalLuma,
 };
 
+enum class ColorSpace {
+    Rec709,
+    Rec2020Hlg,
+};
+
+enum class ColorRange {
+    Limited,
+    Full,
+};
+
 class VideoProcessor {
 public:
     VideoProcessor(
@@ -88,6 +98,14 @@ public:
     float GetDenoiseStrength() const;
     void SetSubpixelShift(float shift_x, float shift_y);
     void GetSubpixelShift(float& shift_x, float& shift_y) const;
+    void SetColorSpace(ColorSpace color_space);
+    void SetColorSpaceByName(const std::string& color_space_name);
+    ColorSpace GetColorSpace() const;
+    std::string GetColorSpaceName() const;
+    void SetColorRange(ColorRange color_range);
+    void SetColorRangeByName(const std::string& color_range_name);
+    ColorRange GetColorRange() const;
+    std::string GetColorRangeName() const;
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -136,6 +154,8 @@ private:
     int auto_sr_settle_frames_;
     float subpixel_shift_x_;
     float subpixel_shift_y_;
+    ColorSpace color_space_;
+    ColorRange color_range_;
 
     size_t uyvy_bytes_;
     size_t rgb_pixels_;

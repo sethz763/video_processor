@@ -166,6 +166,68 @@ inline DenoiseMethod ParseDenoiseMethodName(const std::string& method_name) {
     throw std::invalid_argument("Denoise method must be one of [off, luma_gaussian3x3, luma_median3x3, luma_bilateral3x3, luma_bilateral5x5, field_temporal_luma].");
 }
 
+inline const char* ToColorSpaceName(ColorSpace color_space) {
+    switch (color_space) {
+        case ColorSpace::Rec709:
+            return "rec709";
+        case ColorSpace::Rec2020Hlg:
+            return "rec2020_hlg";
+    }
+    return "rec709";
+}
+
+inline ColorSpace ParseColorSpaceName(const std::string& color_space_name) {
+    std::string normalized;
+    normalized.reserve(color_space_name.size());
+    for (char c : color_space_name) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (normalized == "rec709" || normalized == "rec_709" || normalized == "bt709") {
+        return ColorSpace::Rec709;
+    }
+    if (normalized == "rec2020_hlg" || normalized == "rec2020-hlg" || normalized == "bt2020_hlg") {
+        return ColorSpace::Rec2020Hlg;
+    }
+
+    throw std::invalid_argument("Color space must be one of [rec709, rec2020_hlg].");
+}
+
+inline int ToColorMatrixId(ColorSpace color_space) {
+    return color_space == ColorSpace::Rec2020Hlg ? 1 : 0;
+}
+
+inline const char* ToColorRangeName(ColorRange color_range) {
+    switch (color_range) {
+        case ColorRange::Limited:
+            return "limited";
+        case ColorRange::Full:
+            return "full";
+    }
+    return "limited";
+}
+
+inline ColorRange ParseColorRangeName(const std::string& color_range_name) {
+    std::string normalized;
+    normalized.reserve(color_range_name.size());
+    for (char c : color_range_name) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (normalized == "full" || normalized == "data" || normalized == "pc") {
+        return ColorRange::Full;
+    }
+    if (normalized == "limited" || normalized == "video") {
+        return ColorRange::Limited;
+    }
+
+    throw std::invalid_argument("Color range must be one of [limited, full].");
+}
+
+inline int ToColorRangeId(ColorRange color_range) {
+    return color_range == ColorRange::Full ? 1 : 0;
+}
+
 inline SrFlavor ParseSrFlavorName(const std::string& sr_flavor_name) {
     std::string normalized;
     normalized.reserve(sr_flavor_name.size());
@@ -223,8 +285,10 @@ VideoProcessor::VideoProcessor(
             auto_sr_pending_scale_(-1),
             auto_sr_pending_frames_(0),
             auto_sr_settle_frames_(kAutoSrScaleSettleFrames),
-        subpixel_shift_x_(0.0f),
-        subpixel_shift_y_(0.0f),
+                subpixel_shift_x_(0.0f),
+                subpixel_shift_y_(0.0f),
+        color_space_(ColorSpace::Rec709),
+            color_range_(ColorRange::Limited),
       uyvy_bytes_(static_cast<size_t>(width) * static_cast<size_t>(height) * kUyvyBytesPerPixel),
       rgb_pixels_(static_cast<size_t>(width) * static_cast<size_t>(height)),
       stream_(nullptr),
@@ -474,6 +538,44 @@ void VideoProcessor::GetSubpixelShift(float& shift_x, float& shift_y) const {
     shift_y = subpixel_shift_y_;
 }
 
+void VideoProcessor::SetColorSpace(ColorSpace color_space) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    color_space_ = color_space;
+}
+
+void VideoProcessor::SetColorSpaceByName(const std::string& color_space_name) {
+    SetColorSpace(ParseColorSpaceName(color_space_name));
+}
+
+ColorSpace VideoProcessor::GetColorSpace() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return color_space_;
+}
+
+std::string VideoProcessor::GetColorSpaceName() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return ToColorSpaceName(color_space_);
+}
+
+void VideoProcessor::SetColorRange(ColorRange color_range) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    color_range_ = color_range;
+}
+
+void VideoProcessor::SetColorRangeByName(const std::string& color_range_name) {
+    SetColorRange(ParseColorRangeName(color_range_name));
+}
+
+ColorRange VideoProcessor::GetColorRange() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return color_range_;
+}
+
+std::string VideoProcessor::GetColorRangeName() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return ToColorRangeName(color_range_);
+}
+
 int VideoProcessor::sr_scale() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     return sr_scale_;
@@ -650,6 +752,8 @@ std::string VideoProcessor::ProcessFrameInternal(
     float denoise_strength = 0.0f;
     float subpixel_shift_x = 0.0f;
     float subpixel_shift_y = 0.0f;
+    ColorSpace color_space = ColorSpace::Rec709;
+    ColorRange color_range = ColorRange::Limited;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (enable_placeholder_sr_ && auto_sr_scale_) {
@@ -685,6 +789,8 @@ std::string VideoProcessor::ProcessFrameInternal(
         denoise_strength = denoise_strength_;
         subpixel_shift_x = subpixel_shift_x_;
         subpixel_shift_y = subpixel_shift_y_;
+        color_space = color_space_;
+        color_range = color_range_;
 
         if (force_deinterlace) {
             deinterlace_enabled = true;
@@ -821,7 +927,9 @@ std::string VideoProcessor::ProcessFrameInternal(
         return std::string(reinterpret_cast<const char*>(host_output_ptr), uyvy_bytes_);
     }
 
-    cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, stream_);
+    const int color_matrix = ToColorMatrixId(color_space);
+    const int color_range_id = ToColorRangeId(color_range);
+    cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, color_matrix, color_range_id, stream_);
 
     const uchar3* crop_input = d_rgb_full_;
     int crop_src_w = width_;
@@ -970,9 +1078,9 @@ std::string VideoProcessor::ProcessFrameInternal(
                 crop_roi_h,
                 stream_
             );
-            cuda_kernels::LaunchRgbToUyvy(d_rgb_zoom_, d_uyvy_out_, width_, height_, stream_);
+            cuda_kernels::LaunchRgbToUyvy(d_rgb_zoom_, d_uyvy_out_, width_, height_, color_matrix, color_range_id, stream_);
         } else {
-            cuda_kernels::LaunchRgbToUyvy(crop_input, d_uyvy_out_, width_, height_, stream_);
+            cuda_kernels::LaunchRgbToUyvy(crop_input, d_uyvy_out_, width_, height_, color_matrix, color_range_id, stream_);
         }
 
         const uint8_t* final_uyvy = d_uyvy_out_;
@@ -1182,7 +1290,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             break;
     }
 
-    cuda_kernels::LaunchRgbToUyvy(final_output, d_uyvy_out_, width_, height_, stream_);
+    cuda_kernels::LaunchRgbToUyvy(final_output, d_uyvy_out_, width_, height_, color_matrix, color_range_id, stream_);
 
     const uint8_t* final_uyvy = d_uyvy_out_;
     if (HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {

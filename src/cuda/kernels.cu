@@ -20,15 +20,44 @@ __device__ inline uint8_t ClampToU8(float v) {
     return static_cast<uint8_t>(v);
 }
 
-__device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v) {
-    // BT.709 limited-range conversion (Y:16-235, U/V:16-240) for HD 1080 signals.
-    const float c = static_cast<float>(y) - 16.0f;
+__device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v, int color_matrix, int color_range) {
+    // Limited-range conversion (Y:16-235, U/V:16-240).
     const float d = static_cast<float>(u) - 128.0f;
     const float e = static_cast<float>(v) - 128.0f;
+    const float yv = static_cast<float>(y);
 
-    const float r = 1.164383f * c + 1.792741f * e;
-    const float g = 1.164383f * c - 0.213249f * d - 0.532909f * e;
-    const float b = 1.164383f * c + 2.112402f * d;
+    if (color_range == 1) {
+        float r = 0.0f;
+        float g = 0.0f;
+        float b = 0.0f;
+        if (color_matrix == 1) {
+            r = yv + 1.474600f * e;
+            g = yv - 0.164553f * d - 0.571353f * e;
+            b = yv + 1.881400f * d;
+        } else {
+            r = yv + 1.574800f * e;
+            g = yv - 0.187324f * d - 0.468124f * e;
+            b = yv + 1.855600f * d;
+        }
+        return make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
+    }
+
+    const float c = yv - 16.0f;
+
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    if (color_matrix == 1) {
+        // BT.2020 non-constant luminance matrix (used with Rec.2020 HLG content).
+        r = 1.164383f * c + 1.678674f * e;
+        g = 1.164383f * c - 0.187326f * d - 0.650424f * e;
+        b = 1.164383f * c + 2.141772f * d;
+    } else {
+        // BT.709 matrix.
+        r = 1.164383f * c + 1.792741f * e;
+        g = 1.164383f * c - 0.213249f * d - 0.532909f * e;
+        b = 1.164383f * c + 2.112402f * d;
+    }
 
     return make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
 }
@@ -39,10 +68,34 @@ struct YuvF {
     float v;
 };
 
-__device__ inline YuvF RgbToYuv(const uchar3& rgb) {
+__device__ inline YuvF RgbToYuv(const uchar3& rgb, int color_matrix, int color_range) {
     const float r = static_cast<float>(rgb.x);
     const float g = static_cast<float>(rgb.y);
     const float b = static_cast<float>(rgb.z);
+
+    if (color_range == 1) {
+        if (color_matrix == 1) {
+            return {
+                0.262700f * r + 0.678000f * g + 0.059300f * b,
+                128.0f - 0.139630f * r - 0.360370f * g + 0.500000f * b,
+                128.0f + 0.500000f * r - 0.459786f * g - 0.040214f * b,
+            };
+        }
+        return {
+            0.212600f * r + 0.715200f * g + 0.072200f * b,
+            128.0f - 0.114572f * r - 0.385428f * g + 0.500000f * b,
+            128.0f + 0.500000f * r - 0.454153f * g - 0.045847f * b,
+        };
+    }
+
+    if (color_matrix == 1) {
+        // BT.2020 non-constant luminance matrix.
+        return {
+            16.0f + 0.224735f * r + 0.580016f * g + 0.050730f * b,
+            128.0f - 0.122533f * r - 0.316560f * g + 0.439093f * b,
+            128.0f + 0.439093f * r - 0.402915f * g - 0.036178f * b,
+        };
+    }
 
     // BT.709 limited-range conversion (inverse of MakeRgbFromYuv).
     return {
@@ -52,7 +105,7 @@ __device__ inline YuvF RgbToYuv(const uchar3& rgb) {
     };
 }
 
-__global__ void UyvyToRgbKernel(const uint8_t* uyvy, uchar3* rgb, int width, int height) {
+__global__ void UyvyToRgbKernel(const uint8_t* uyvy, uchar3* rgb, int width, int height, int color_matrix, int color_range) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -69,7 +122,7 @@ __global__ void UyvyToRgbKernel(const uint8_t* uyvy, uchar3* rgb, int width, int
     const uint8_t y1 = uyvy[pair_index + 3];
 
     const uint8_t luma = (x & 1) ? y1 : y0;
-    rgb[y * width + x] = MakeRgbFromYuv(luma, u, v);
+    rgb[y * width + x] = MakeRgbFromYuv(luma, u, v, color_matrix, color_range);
 }
 
 __device__ inline void SampleUyvyPixel(
@@ -1121,7 +1174,7 @@ __global__ void DenoiseLumaBilateral5x5Kernel(
     rgb_out[y * width + x] = ApplyLumaDelta(c, y_new - y_center);
 }
 
-__global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int height) {
+__global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int height, int color_matrix, int color_range) {
     const int pair_x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -1136,8 +1189,8 @@ __global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int
     const uchar3 p0 = rgb[y * width + x0];
     const uchar3 p1 = rgb[y * width + x1];
 
-    const YuvF yuv0 = RgbToYuv(p0);
-    const YuvF yuv1 = RgbToYuv(p1);
+    const YuvF yuv0 = RgbToYuv(p0, color_matrix, color_range);
+    const YuvF yuv1 = RgbToYuv(p1, color_matrix, color_range);
 
     const uint8_t y0_u8 = ClampToU8(yuv0.y);
     const uint8_t y1_u8 = ClampToU8(yuv1.y);
@@ -1157,14 +1210,24 @@ inline dim3 Grid2D(int width, int height, int bx = 16, int by = 16) {
 
 } // namespace
 
-void LaunchUyvyToRgb(const uint8_t* d_uyvy, uchar3* d_rgb, int width, int height, cudaStream_t stream) {
+void LaunchUyvyToRgb(
+    const uint8_t* d_uyvy,
+    uchar3* d_rgb,
+    int width,
+    int height,
+    int color_matrix,
+    int color_range,
+    cudaStream_t stream
+) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     UyvyToRgbKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_uyvy,
         d_rgb,
         width,
-        height
+        height,
+        color_matrix,
+        color_range
     );
     CheckKernelLaunch("UyvyToRgbKernel launch");
 }
@@ -1648,13 +1711,21 @@ void LaunchDenoiseFieldTemporalLuma(
     );
 }
 
-void LaunchRgbToUyvy(const uchar3* d_rgb, uint8_t* d_uyvy, int width, int height, cudaStream_t stream) {
+void LaunchRgbToUyvy(
+    const uchar3* d_rgb,
+    uint8_t* d_uyvy,
+    int width,
+    int height,
+    int color_matrix,
+    int color_range,
+    cudaStream_t stream
+) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     const dim3 grid((width / 2 + kBlockX - 1) / kBlockX, (height + kBlockY - 1) / kBlockY, 1);
     const dim3 block(kBlockX, kBlockY, 1);
 
-    RgbToUyvyKernel<<<grid, block, 0, stream>>>(d_rgb, d_uyvy, width, height);
+    RgbToUyvyKernel<<<grid, block, 0, stream>>>(d_rgb, d_uyvy, width, height, color_matrix, color_range);
     CheckKernelLaunch("RgbToUyvyKernel launch");
 }
 

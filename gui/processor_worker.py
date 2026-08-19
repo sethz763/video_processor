@@ -170,7 +170,27 @@ RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
 }
 
 
+def _normalize_color_space_name(color_space: str) -> str:
+    normalized = str(color_space).strip().lower().replace(" ", "").replace("-", "_")
+    if normalized in {"rec709", "rec_709", "bt709"}:
+        return "rec709"
+    if normalized in {"rec2020_hlg", "rec2020hlg", "bt2020_hlg", "bt2020hlg"}:
+        return "rec2020_hlg"
+    return "rec709"
+
+
+def _normalize_color_range_name(color_range: str) -> str:
+    normalized = str(color_range).strip().lower()
+    if normalized in {"full", "data", "pc"}:
+        return "full"
+    return "limited"
+
+
 def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray) -> np.ndarray:
+    return _uyvy_to_rgb_limited(yuv422, "rec709", "limited")
+
+
+def _uyvy_to_rgb_limited(yuv422: np.ndarray, color_space: str, color_range: str = "limited") -> np.ndarray:
     if yuv422.ndim != 3 or yuv422.shape[2] != 2:
         raise RuntimeError(f"Expected UYVY array shape [H, W, 2], got {tuple(yuv422.shape)}")
 
@@ -184,19 +204,48 @@ def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray) -> np.ndarray:
     v = packed[:, :, 2].astype(np.float32)
     y1 = packed[:, :, 3].astype(np.float32)
 
+    cs = _normalize_color_space_name(color_space)
+    cr = _normalize_color_range_name(color_range)
     d = u - 128.0
     e = v - 128.0
+    if cr == "full":
+        c0 = y0
+        c1 = y1
+        if cs == "rec2020_hlg":
+            r0 = np.clip(c0 + 1.474600 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(c0 - 0.164553 * d - 0.571353 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(c0 + 1.881400 * d, 0.0, 255.0).astype(np.uint8)
 
-    c0 = y0 - 16.0
-    c1 = y1 - 16.0
+            r1 = np.clip(c1 + 1.474600 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(c1 - 0.164553 * d - 0.571353 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(c1 + 1.881400 * d, 0.0, 255.0).astype(np.uint8)
+        else:
+            r0 = np.clip(c0 + 1.574800 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(c0 - 0.187324 * d - 0.468124 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(c0 + 1.855600 * d, 0.0, 255.0).astype(np.uint8)
 
-    r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
-    g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
-    b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = np.clip(c1 + 1.574800 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(c1 - 0.187324 * d - 0.468124 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(c1 + 1.855600 * d, 0.0, 255.0).astype(np.uint8)
+    else:
+        c0 = y0 - 16.0
+        c1 = y1 - 16.0
+        if cs == "rec2020_hlg":
+            r0 = np.clip(1.164383 * c0 + 1.678674 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(1.164383 * c0 - 0.187326 * d - 0.650424 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(1.164383 * c0 + 2.141772 * d, 0.0, 255.0).astype(np.uint8)
 
-    r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
-    g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
-    b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = np.clip(1.164383 * c1 + 1.678674 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(1.164383 * c1 - 0.187326 * d - 0.650424 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(1.164383 * c1 + 2.141772 * d, 0.0, 255.0).astype(np.uint8)
+        else:
+            r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+
+            r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
 
     rgb = np.empty((h, w, 3), dtype=np.uint8)
     rgb[:, 0::2, 0] = r0
@@ -209,6 +258,10 @@ def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray) -> np.ndarray:
 
 
 def _rgb_to_uyvy_bt709_limited(rgb: np.ndarray) -> np.ndarray:
+    return _rgb_to_uyvy_limited(rgb, "rec709", "limited")
+
+
+def _rgb_to_uyvy_limited(rgb: np.ndarray, color_space: str, color_range: str = "limited") -> np.ndarray:
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise RuntimeError(f"Expected RGB array shape [H, W, 3], got {tuple(rgb.shape)}")
 
@@ -220,9 +273,26 @@ def _rgb_to_uyvy_bt709_limited(rgb: np.ndarray) -> np.ndarray:
     g = rgb[:, :, 1].astype(np.float32)
     b = rgb[:, :, 2].astype(np.float32)
 
-    y = np.clip(16.0 + 0.182586 * r + 0.614231 * g + 0.062007 * b, 0.0, 255.0).astype(np.uint8)
-    u = np.clip(128.0 - 0.100644 * r - 0.338572 * g + 0.439216 * b, 0.0, 255.0)
-    v = np.clip(128.0 + 0.439216 * r - 0.398942 * g - 0.040274 * b, 0.0, 255.0)
+    cs = _normalize_color_space_name(color_space)
+    cr = _normalize_color_range_name(color_range)
+    if cr == "full":
+        if cs == "rec2020_hlg":
+            y = np.clip(0.262700 * r + 0.678000 * g + 0.059300 * b, 0.0, 255.0).astype(np.uint8)
+            u = np.clip(128.0 - 0.139630 * r - 0.360370 * g + 0.500000 * b, 0.0, 255.0)
+            v = np.clip(128.0 + 0.500000 * r - 0.459786 * g - 0.040214 * b, 0.0, 255.0)
+        else:
+            y = np.clip(0.212600 * r + 0.715200 * g + 0.072200 * b, 0.0, 255.0).astype(np.uint8)
+            u = np.clip(128.0 - 0.114572 * r - 0.385428 * g + 0.500000 * b, 0.0, 255.0)
+            v = np.clip(128.0 + 0.500000 * r - 0.454153 * g - 0.045847 * b, 0.0, 255.0)
+    else:
+        if cs == "rec2020_hlg":
+            y = np.clip(16.0 + 0.224735 * r + 0.580016 * g + 0.050730 * b, 0.0, 255.0).astype(np.uint8)
+            u = np.clip(128.0 - 0.122533 * r - 0.316560 * g + 0.439093 * b, 0.0, 255.0)
+            v = np.clip(128.0 + 0.439093 * r - 0.402915 * g - 0.036178 * b, 0.0, 255.0)
+        else:
+            y = np.clip(16.0 + 0.182586 * r + 0.614231 * g + 0.062007 * b, 0.0, 255.0).astype(np.uint8)
+            u = np.clip(128.0 - 0.100644 * r - 0.338572 * g + 0.439216 * b, 0.0, 255.0)
+            v = np.clip(128.0 + 0.439216 * r - 0.398942 * g - 0.040274 * b, 0.0, 255.0)
 
     y0 = y[:, 0::2]
     y1 = y[:, 1::2]
@@ -290,6 +360,8 @@ class AiSrOnnxEngine:
         roi_overscan_percent: float = 0.0,
         inference_divisor: int = 0,
         detail_preserve_percent: float = 0.0,
+        color_space: str = "rec709",
+        color_range: str = "limited",
     ) -> None:
         if ort is None:
             raise RuntimeError("onnxruntime is not installed")
@@ -413,6 +485,8 @@ class AiSrOnnxEngine:
         self._roi_overscan_percent = max(0.0, min(100.0, float(roi_overscan_percent)))
         self._inference_divisor = max(0, int(inference_divisor))
         self._detail_preserve_percent = max(0.0, min(100.0, float(detail_preserve_percent)))
+        self._color_space = _normalize_color_space_name(color_space)
+        self._color_range = _normalize_color_range_name(color_range)
 
     def _effective_inference_divisor(self) -> int:
         if self._model_scale <= 1:
@@ -590,7 +664,7 @@ class AiSrOnnxEngine:
             raise RuntimeError(f"Unexpected UYVY frame size: {len(frame_bytes)}")
 
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
-        rgb = _uyvy_to_rgb_bt709_limited(yuv422)
+        rgb = _uyvy_to_rgb_limited(yuv422, self._color_space, self._color_range)
 
         # For x2/x4/x8 models, run inference on proportionally downscaled input so output
         # naturally returns near FRAME_W x FRAME_H instead of exploding to 4K/8K.
@@ -614,7 +688,7 @@ class AiSrOnnxEngine:
             preserve = self._detail_preserve_percent / 100.0
             sr_rgb = cv2.addWeighted(sr_rgb, 1.0 - preserve, rgb, preserve, 0.0)
 
-        sr_yuv422 = _rgb_to_uyvy_bt709_limited(sr_rgb)
+        sr_yuv422 = _rgb_to_uyvy_limited(sr_rgb, self._color_space, self._color_range)
         return sr_yuv422.tobytes()
 
     def process_uyvy_frame_roi(self, frame_bytes: bytes, roi: tuple[int, int, int, int]) -> bytes:
@@ -638,7 +712,7 @@ class AiSrOnnxEngine:
 
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
         roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
-        roi_rgb = _uyvy_to_rgb_bt709_limited(roi_yuv)
+        roi_rgb = _uyvy_to_rgb_limited(roi_yuv, self._color_space, self._color_range)
 
         model_rgb = roi_rgb
         if self._model_scale > 1:
@@ -661,7 +735,7 @@ class AiSrOnnxEngine:
             preserve = self._detail_preserve_percent / 100.0
             sr_roi_rgb = cv2.addWeighted(sr_roi_rgb, 1.0 - preserve, roi_rgb, preserve, 0.0)
 
-        sr_roi_yuv = _rgb_to_uyvy_bt709_limited(sr_roi_rgb)
+        sr_roi_yuv = _rgb_to_uyvy_limited(sr_roi_rgb, self._color_space, self._color_range)
         yuv_out = np.array(yuv422, copy=True)
         yuv_out[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :] = sr_roi_yuv
         return yuv_out.tobytes()
@@ -687,7 +761,7 @@ class AiSrOnnxEngine:
 
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
         roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
-        roi_rgb = _uyvy_to_rgb_bt709_limited(roi_yuv)
+        roi_rgb = _uyvy_to_rgb_limited(roi_yuv, self._color_space, self._color_range)
 
         target_w = FRAME_W
         target_h = FRAME_H
@@ -723,7 +797,7 @@ class AiSrOnnxEngine:
             preserve = self._detail_preserve_percent / 100.0
             sr_rgb = cv2.addWeighted(sr_rgb, 1.0 - preserve, baseline_rgb, preserve, 0.0)
 
-        sr_yuv422 = _rgb_to_uyvy_bt709_limited(sr_rgb)
+        sr_yuv422 = _rgb_to_uyvy_limited(sr_rgb, self._color_space, self._color_range)
         return sr_yuv422.tobytes()
 
 
@@ -752,6 +826,8 @@ def _create_processor(module: Any, cfg: dict[str, Any]):
     basic_scaling_manual = int(cfg.get("basic_scaling_manual", cfg.get("sr_manual_scale", 4)))
     basic_scaling_auto_mode = bool(cfg.get("basic_scaling_auto_mode", cfg.get("sr_auto_mode", True)))
     basic_scaling_method = str(cfg.get("basic_scaling_method", cfg.get("sr_flavor", "bilinear_sharp")))
+    color_space = _normalize_color_space_name(str(cfg.get("color_space", "rec709")))
+    color_range = _normalize_color_range_name(str(cfg.get("color_range", "limited")))
     max_auto_basic_scaling = int(cfg.get("max_auto_basic_scaling", cfg.get("max_auto_sr_scale", 4)))
     deinterlace_method = str(cfg.get("deinterlace_method", "bob"))
     denoise_method = str(cfg.get("denoise_method", "off"))
@@ -770,6 +846,10 @@ def _create_processor(module: Any, cfg: dict[str, Any]):
     basic_scaling_method_supported = hasattr(processor, "set_sr_flavor")
     if basic_scaling_method_supported:
         processor.set_sr_flavor(basic_scaling_method)
+    if hasattr(processor, "set_color_space"):
+        processor.set_color_space(color_space)
+    if hasattr(processor, "set_color_range"):
+        processor.set_color_range(color_range)
     processor.set_deinterlace_enabled(bool(cfg["deinterlace_enabled"]))
     if hasattr(processor, "set_deinterlace_method"):
         processor.set_deinterlace_method(deinterlace_method)
@@ -1174,6 +1254,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     rtx_roi_rebuild_due_ts = 0.0
     rtx_roi_rebuild_settle_s = 0.25
     current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bilinear_sharp"))
+    current_color_space = _normalize_color_space_name(str(startup_config.get("color_space", "rec709")))
+    current_color_range = _normalize_color_range_name(str(startup_config.get("color_range", "limited")))
     current_roi_x = int(startup_config.get("roi_x", 0))
     current_roi_y = int(startup_config.get("roi_y", 0))
     current_roi_w = int(startup_config.get("roi_w", FRAME_W))
@@ -1667,7 +1749,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         roi_x, roi_y, roi_w, roi_h = _normalize_worker_roi(int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
         yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
         roi_yuv = np.ascontiguousarray(yuv422[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w, :])
-        roi_rgb = _uyvy_to_rgb_bt709_limited(roi_yuv)
+        roi_rgb = _uyvy_to_rgb_limited(roi_yuv, current_color_space, current_color_range)
         roi_rgba = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2RGBA)
 
         engine_in_w = max(2, int(getattr(rtx_vsr_engine, "input_width", roi_w)) & ~1)
@@ -1686,7 +1768,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             sr_rgba = cv2.resize(sr_rgba, (FRAME_W, FRAME_H), interpolation=interpolation)
 
         sr_rgb = cv2.cvtColor(sr_rgba, cv2.COLOR_RGBA2RGB)
-        sr_yuv422 = _rgb_to_uyvy_bt709_limited(sr_rgb)
+        sr_yuv422 = _rgb_to_uyvy_limited(sr_rgb, current_color_space, current_color_range)
         return sr_yuv422.tobytes()
 
     def _apply_ai_sr_performance_profile() -> None:
@@ -2223,6 +2305,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 roi_overscan_percent=ai_sr_roi_overscan_percent,
                 inference_divisor=ai_sr_inference_divisor,
                 detail_preserve_percent=ai_sr_detail_preserve_percent,
+                color_space=current_color_space,
+                color_range=current_color_range,
             )
             ai_sr_info = ai_sr_engine.info()
             ai_sr_info["strict_mode"] = bool(ai_sr_strict)
@@ -2447,6 +2531,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
                 "rtx_vsr_error": rtx_vsr_error,
                 "rtx_vsr_info": rtx_vsr_info,
+                "color_space": current_color_space,
+                "color_range": current_color_range,
             }
         )
 
@@ -2826,6 +2912,54 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         "cmd": "set_denoise_settings",
                         "denoise_method": current_denoise_method,
                         "denoise_strength": current_denoise_strength,
+                    }
+                )
+                continue
+
+            if command == "set_color_space":
+                current_color_space = _normalize_color_space_name(str(message.get("color_space", current_color_space)))
+                if hasattr(processor, "set_color_space"):
+                    processor.set_color_space(current_color_space)
+                    if hasattr(processor, "get_color_space"):
+                        current_color_space = _normalize_color_space_name(str(processor.get_color_space()))
+                ai_sr_error = _refresh_ai_sr_engine()
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_color_space",
+                        "color_space": current_color_space,
+                        "ai_sr_enabled": bool(ai_sr_enabled),
+                        "ai_sr_active": bool(ai_sr_engine is not None),
+                        "ai_sr_error": ai_sr_error,
+                        "ai_sr_info": ai_sr_info,
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
+                    }
+                )
+                continue
+
+            if command == "set_color_range":
+                current_color_range = _normalize_color_range_name(str(message.get("color_range", current_color_range)))
+                if hasattr(processor, "set_color_range"):
+                    processor.set_color_range(current_color_range)
+                    if hasattr(processor, "get_color_range"):
+                        current_color_range = _normalize_color_range_name(str(processor.get_color_range()))
+                ai_sr_error = _refresh_ai_sr_engine()
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_color_range",
+                        "color_range": current_color_range,
+                        "ai_sr_enabled": bool(ai_sr_enabled),
+                        "ai_sr_active": bool(ai_sr_engine is not None),
+                        "ai_sr_error": ai_sr_error,
+                        "ai_sr_info": ai_sr_info,
+                        "rtx_vsr_enabled": bool(rtx_vsr_enabled),
+                        "rtx_vsr_active": bool(rtx_vsr_engine is not None and not (ai_sr_enabled and ai_sr_engine is not None)),
+                        "rtx_vsr_error": rtx_vsr_error,
+                        "rtx_vsr_info": rtx_vsr_info,
                     }
                 )
                 continue

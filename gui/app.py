@@ -87,6 +87,18 @@ RTX_POST_SCALE_METHOD_LABEL_TO_NAME = {
 }
 RTX_POST_SCALE_METHOD_NAME_TO_LABEL = {value: key for key, value in RTX_POST_SCALE_METHOD_LABEL_TO_NAME.items()}
 
+COLOR_SPACE_LABEL_TO_NAME = {
+    "Rec.709 (SDR)": "rec709",
+    "Rec.2020 HLG (HDR)": "rec2020_hlg",
+}
+COLOR_SPACE_NAME_TO_LABEL = {value: key for key, value in COLOR_SPACE_LABEL_TO_NAME.items()}
+
+COLOR_RANGE_LABEL_TO_NAME = {
+    "Limited (Video)": "limited",
+    "Full (Data)": "full",
+}
+COLOR_RANGE_NAME_TO_LABEL = {value: key for key, value in COLOR_RANGE_LABEL_TO_NAME.items()}
+
 try:
     import decklink_wrapper as d
 except Exception:
@@ -123,6 +135,31 @@ _CV2_RGB_RING_INDEX = 0
 
 
 def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray, dst: np.ndarray | None = None) -> np.ndarray:
+    return _uyvy_to_rgb_limited(yuv422, "rec709", dst=dst)
+
+
+def _normalize_color_space_name(color_space: str) -> str:
+    normalized = str(color_space).strip().lower().replace(" ", "").replace("-", "_")
+    if normalized in {"rec709", "rec_709", "bt709"}:
+        return "rec709"
+    if normalized in {"rec2020_hlg", "rec2020hlg", "bt2020_hlg", "bt2020hlg"}:
+        return "rec2020_hlg"
+    return "rec709"
+
+
+def _normalize_color_range_name(color_range: str) -> str:
+    normalized = str(color_range).strip().lower()
+    if normalized in {"full", "data", "pc"}:
+        return "full"
+    return "limited"
+
+
+def _uyvy_to_rgb_limited(
+    yuv422: np.ndarray,
+    color_space: str,
+    color_range: str = "limited",
+    dst: np.ndarray | None = None,
+) -> np.ndarray:
     if yuv422.ndim != 3 or yuv422.shape[2] != 2:
         raise ValueError(f"Expected UYVY array shape [H, W, 2], got {tuple(yuv422.shape)}")
 
@@ -143,19 +180,49 @@ def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray, dst: np.ndarray | None = None
     v = packed[:, :, 2].astype(np.float32)
     y1 = packed[:, :, 3].astype(np.float32)
 
+    cs = _normalize_color_space_name(color_space)
+    cr = _normalize_color_range_name(color_range)
     d = u - 128.0
     e = v - 128.0
 
-    c0 = y0 - 16.0
-    c1 = y1 - 16.0
+    if cr == "full":
+        c0 = y0
+        c1 = y1
+        if cs == "rec2020_hlg":
+            r0 = np.clip(c0 + 1.474600 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(c0 - 0.164553 * d - 0.571353 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(c0 + 1.881400 * d, 0.0, 255.0).astype(np.uint8)
 
-    r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
-    g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
-    b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = np.clip(c1 + 1.474600 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(c1 - 0.164553 * d - 0.571353 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(c1 + 1.881400 * d, 0.0, 255.0).astype(np.uint8)
+        else:
+            r0 = np.clip(c0 + 1.574800 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(c0 - 0.187324 * d - 0.468124 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(c0 + 1.855600 * d, 0.0, 255.0).astype(np.uint8)
 
-    r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
-    g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
-    b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = np.clip(c1 + 1.574800 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(c1 - 0.187324 * d - 0.468124 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(c1 + 1.855600 * d, 0.0, 255.0).astype(np.uint8)
+    else:
+        c0 = y0 - 16.0
+        c1 = y1 - 16.0
+        if cs == "rec2020_hlg":
+            r0 = np.clip(1.164383 * c0 + 1.678674 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(1.164383 * c0 - 0.187326 * d - 0.650424 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(1.164383 * c0 + 2.141772 * d, 0.0, 255.0).astype(np.uint8)
+
+            r1 = np.clip(1.164383 * c1 + 1.678674 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(1.164383 * c1 - 0.187326 * d - 0.650424 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(1.164383 * c1 + 2.141772 * d, 0.0, 255.0).astype(np.uint8)
+        else:
+            r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+            g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+            b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+
+            r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
+            g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
+            b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
 
     rgb[:, 0::2, 0] = r0
     rgb[:, 0::2, 1] = g0
@@ -377,10 +444,46 @@ def roi_from_scale(scale: float, center_x: float, center_y: float) -> Roi:
     return clamp_roi(Roi(x, y, w, h))
 
 
+def _downsample_uyvy422_safe(yuv422: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+    if cv2 is None:
+        return yuv422
+
+    src_h, src_w, _ = yuv422.shape
+    out_w = max(2, min(int(target_w), src_w))
+    out_h = max(1, min(int(target_h), src_h))
+    if (out_w & 1) != 0:
+        out_w -= 1
+    if out_w < 2:
+        out_w = 2
+
+    if out_w == src_w and out_h == src_h:
+        return yuv422
+
+    packed = yuv422.reshape(src_h, src_w // 2, 4)
+    y_plane = np.empty((src_h, src_w), dtype=np.uint8)
+    y_plane[:, 0::2] = packed[:, :, 1]
+    y_plane[:, 1::2] = packed[:, :, 3]
+    u_plane = packed[:, :, 0]
+    v_plane = packed[:, :, 2]
+
+    out_y = cv2.resize(y_plane, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    out_u = cv2.resize(u_plane, (out_w // 2, out_h), interpolation=cv2.INTER_AREA)
+    out_v = cv2.resize(v_plane, (out_w // 2, out_h), interpolation=cv2.INTER_AREA)
+
+    out_packed = np.empty((out_h, out_w // 2, 4), dtype=np.uint8)
+    out_packed[:, :, 0] = out_u
+    out_packed[:, :, 1] = out_y[:, 0::2]
+    out_packed[:, :, 2] = out_v
+    out_packed[:, :, 3] = out_y[:, 1::2]
+    return out_packed.reshape(out_h, out_w, 2)
+
+
 def uyvy_to_qimage(
     frame_bytes: bytes,
     preview_max_w: int | None = None,
     preview_max_h: int | None = None,
+    color_space: str = "rec709",
+    color_range: str = "limited",
 ) -> tuple[QImage, np.ndarray | None]:
     if len(frame_bytes) != UYVY_FRAME_BYTES:
         raise ValueError("Invalid UYVY frame byte length.")
@@ -395,23 +498,44 @@ def uyvy_to_qimage(
             ]
         )
 
-    rgb = _CV2_RGB_RING[_CV2_RGB_RING_INDEX]
-    _CV2_RGB_RING_INDEX = (_CV2_RGB_RING_INDEX + 1) % len(_CV2_RGB_RING)
-
     yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
 
-    # Keep preview interaction responsive by default using OpenCV's optimized
-    # conversion path. Opt in to explicit BT.709 preview conversion if needed.
-    if cv2 is not None and not PREVIEW_BT709_ACCURATE:
-        cv2.cvtColor(yuv422, cv2.COLOR_YUV2RGB_UYVY, dst=rgb)
-    else:
-        _uyvy_to_rgb_bt709_limited(yuv422, dst=rgb)
+    work_yuv = yuv422
+    work_h = FRAME_H
+    work_w = FRAME_W
 
-    image = QImage(rgb.data, FRAME_W, FRAME_H, FRAME_W * 3, QImage.Format_RGB888)
-    if preview_max_w is not None and preview_max_h is not None:
+    if (
+        cv2 is not None
+        and preview_max_w is not None
+        and preview_max_h is not None
+    ):
         target_w = max(1, min(int(preview_max_w), FRAME_W))
         target_h = max(1, min(int(preview_max_h), FRAME_H))
         if target_w < FRAME_W or target_h < FRAME_H:
+            work_yuv = _downsample_uyvy422_safe(yuv422, target_w, target_h)
+            work_h, work_w = int(work_yuv.shape[0]), int(work_yuv.shape[1])
+
+    if work_h == FRAME_H and work_w == FRAME_W:
+        rgb = _CV2_RGB_RING[_CV2_RGB_RING_INDEX]
+        _CV2_RGB_RING_INDEX = (_CV2_RGB_RING_INDEX + 1) % len(_CV2_RGB_RING)
+    else:
+        rgb = np.empty((work_h, work_w, 3), dtype=np.uint8)
+
+    color_space_name = _normalize_color_space_name(color_space)
+
+    # Keep preview interaction responsive by default using OpenCV's optimized
+    # conversion path for Rec.709. Use explicit matrix conversion for other
+    # color spaces so preview matches processing.
+    if cv2 is not None and not PREVIEW_BT709_ACCURATE and color_space_name == "rec709" and _normalize_color_range_name(color_range) == "limited":
+        cv2.cvtColor(work_yuv, cv2.COLOR_YUV2RGB_UYVY, dst=rgb)
+    else:
+        _uyvy_to_rgb_limited(work_yuv, color_space_name, color_range=color_range, dst=rgb)
+
+    image = QImage(rgb.data, work_w, work_h, work_w * 3, QImage.Format_RGB888)
+    if preview_max_w is not None and preview_max_h is not None:
+        target_w = max(1, min(int(preview_max_w), work_w))
+        target_h = max(1, min(int(preview_max_h), work_h))
+        if target_w < work_w or target_h < work_h:
             return image.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.FastTransformation), None
     return image, rgb
 
@@ -1105,6 +1229,8 @@ class VideoProcessorController:
         self.basic_scaling_manual = 4
         self.basic_scaling_auto_mode = True
         self.basic_scaling_method_supported = False
+        self.color_space = _normalize_color_space_name(os.environ.get("VP_COLOR_SPACE", "rec709"))
+        self.color_range = _normalize_color_range_name(os.environ.get("VP_COLOR_RANGE", "limited"))
         self.ai_sr_enabled = False
         self.ai_sr_active = False
         self.ai_sr_model_path = ""
@@ -1150,6 +1276,10 @@ class VideoProcessorController:
         self.basic_scaling_method_supported = hasattr(self.processor, "set_sr_flavor")
         if self.basic_scaling_method_supported:
             self.processor.set_sr_flavor(self.basic_scaling_method)
+        if hasattr(self.processor, "set_color_space"):
+            self.processor.set_color_space(self.color_space)
+        if hasattr(self.processor, "set_color_range"):
+            self.processor.set_color_range(self.color_range)
         self.processor.set_deinterlace_enabled(self.deinterlace_enabled)
         if hasattr(self.processor, "set_deinterlace_method"):
             self.processor.set_deinterlace_method(self.deinterlace_method)
@@ -1221,6 +1351,16 @@ class VideoProcessorController:
         if self.processor is not None and hasattr(self.processor, "set_sr_flavor"):
             self.basic_scaling_method_supported = True
             self.processor.set_sr_flavor(basic_scaling_method)
+
+    def set_color_space(self, color_space: str) -> None:
+        self.color_space = _normalize_color_space_name(color_space)
+        if self.processor is not None and hasattr(self.processor, "set_color_space"):
+            self.processor.set_color_space(self.color_space)
+
+    def set_color_range(self, color_range: str) -> None:
+        self.color_range = _normalize_color_range_name(color_range)
+        if self.processor is not None and hasattr(self.processor, "set_color_range"):
+            self.processor.set_color_range(self.color_range)
 
     # Backward-compatible aliases for existing call sites.
     def set_auto_sr(self) -> None:
@@ -1402,6 +1542,8 @@ class ProcessVideoProcessorController:
         self.basic_scaling_manual = 4
         self.basic_scaling_auto_mode = True
         self.basic_scaling_method_supported = True
+        self.color_space = _normalize_color_space_name(os.environ.get("VP_COLOR_SPACE", "rec709"))
+        self.color_range = _normalize_color_range_name(os.environ.get("VP_COLOR_RANGE", "limited"))
         self.ai_sr_model_path = os.environ.get("VP_AI_SR_MODEL", "")
         self.ai_sr_enabled = os.environ.get("VP_AI_SR_ENABLE", "0") == "1"
         self.ai_sr_provider = os.environ.get("VP_AI_SR_PROVIDER", "auto")
@@ -1653,6 +1795,8 @@ class ProcessVideoProcessorController:
             "basic_scaling_auto_mode": self.basic_scaling_auto_mode,
             "basic_scaling_manual": self.basic_scaling_manual,
             "basic_scaling_method": self.basic_scaling_method,
+            "color_space": self.color_space,
+            "color_range": self.color_range,
             "max_auto_basic_scaling": self.max_auto_basic_scaling,
             "deinterlace_enabled": self.deinterlace_enabled,
             "deinterlace_method": self.deinterlace_method,
@@ -1725,6 +1869,8 @@ class ProcessVideoProcessorController:
                 self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
                 self.rtx_vsr_error = message.get("rtx_vsr_error")
                 self.rtx_vsr_info = message.get("rtx_vsr_info")
+                self.color_space = _normalize_color_space_name(str(message.get("color_space", self.color_space)))
+                self.color_range = _normalize_color_range_name(str(message.get("color_range", self.color_range)))
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -1916,6 +2062,10 @@ class ProcessVideoProcessorController:
                     self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
                     self.rtx_vsr_error = message.get("rtx_vsr_error")
                     self.rtx_vsr_info = message.get("rtx_vsr_info")
+                elif ack_cmd == "set_color_space":
+                    self.color_space = _normalize_color_space_name(str(message.get("color_space", self.color_space)))
+                elif ack_cmd == "set_color_range":
+                    self.color_range = _normalize_color_range_name(str(message.get("color_range", self.color_range)))
                 elif ack_cmd == "set_decklink_output_buffer_frames":
                     self.decklink_output_buffer_frames = max(
                         0,
@@ -2045,6 +2195,16 @@ class ProcessVideoProcessorController:
             self._send_control({"cmd": "set_basic_scaling_method", "basic_scaling_method": str(basic_scaling_method)})
             self._wait_for_ack("set_basic_scaling_method", timeout_seconds=1.0)
 
+    def set_color_space(self, color_space: str) -> None:
+        self.color_space = _normalize_color_space_name(color_space)
+        self._send_control({"cmd": "set_color_space", "color_space": self.color_space})
+        self._wait_for_ack("set_color_space", timeout_seconds=1.0)
+
+    def set_color_range(self, color_range: str) -> None:
+        self.color_range = _normalize_color_range_name(color_range)
+        self._send_control({"cmd": "set_color_range", "color_range": self.color_range})
+        self._wait_for_ack("set_color_range", timeout_seconds=1.0)
+
     # Backward-compatible aliases for existing call sites.
     def set_auto_sr(self) -> None:
         self.set_auto_basic_scaling()
@@ -2093,6 +2253,10 @@ class ProcessVideoProcessorController:
                     self.rtx_vsr_active = bool(message.get("rtx_vsr_active", self.rtx_vsr_active))
                     self.rtx_vsr_error = message.get("rtx_vsr_error")
                     self.rtx_vsr_info = message.get("rtx_vsr_info")
+                if expected_cmd == "set_color_space":
+                    self.color_space = _normalize_color_space_name(str(message.get("color_space", self.color_space)))
+                if expected_cmd == "set_color_range":
+                    self.color_range = _normalize_color_range_name(str(message.get("color_range", self.color_range)))
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -2701,6 +2865,8 @@ class MainWindow(QMainWindow):
     def _connect_settings_persistence_signals(self) -> None:
         combo_widgets = [
             self.preview_downsample_combo,
+            self.color_space_combo,
+            self.color_range_combo,
             self.sr_mode_combo,
             self.sr_flavor_combo,
             self.sr_manual_combo,
@@ -2785,6 +2951,8 @@ class MainWindow(QMainWindow):
             "preview_poll_fps": int(self.preview_poll_fps_spin.value()),
             "decklink_output_buffer_frames": int(self.decklink_output_buffer_spin.value()),
             "preview_downsample": str(self.preview_downsample_combo.currentText()),
+            "color_space": str(self.color_space_combo.currentText()),
+            "color_range": str(self.color_range_combo.currentText()),
             "roi_smoothing_percent": int(self.roi_smoothing_slider.value()),
             "roi_latency_smoothing_percent": int(self.roi_latency_smoothing_slider.value()),
             "roi_transition_duration_frames": int(self.roi_transition_frames_spin.value()),
@@ -2869,6 +3037,8 @@ class MainWindow(QMainWindow):
             )
 
             self.preview_downsample_combo.setCurrentText(str(raw.get("preview_downsample", self.preview_downsample_combo.currentText())))
+            self.color_space_combo.setCurrentText(str(raw.get("color_space", self.color_space_combo.currentText())))
+            self.color_range_combo.setCurrentText(str(raw.get("color_range", self.color_range_combo.currentText())))
             self.sr_mode_combo.setCurrentText(str(raw.get("basic_scaling_mode", self.sr_mode_combo.currentText())))
             self.sr_flavor_combo.setCurrentText(str(raw.get("basic_scaling_method", self.sr_flavor_combo.currentText())))
             self.sr_manual_combo.setCurrentText(str(raw.get("basic_scaling_manual", self.sr_manual_combo.currentText())))
@@ -3055,6 +3225,22 @@ class MainWindow(QMainWindow):
         )
         self.preview_downsample_combo.currentIndexChanged.connect(self._on_preview_downsample_changed)
         settings_form.addRow("Preview downsample", self.preview_downsample_combo)
+
+        self.color_space_combo = QComboBox()
+        self.color_space_combo.addItems(list(COLOR_SPACE_LABEL_TO_NAME.keys()))
+        self.color_space_combo.setCurrentText(
+            COLOR_SPACE_NAME_TO_LABEL.get(getattr(self._controller, "color_space", "rec709"), "Rec.709 (SDR)")
+        )
+        self.color_space_combo.currentIndexChanged.connect(self._on_color_space_changed)
+        settings_form.addRow("Color space", self.color_space_combo)
+
+        self.color_range_combo = QComboBox()
+        self.color_range_combo.addItems(list(COLOR_RANGE_LABEL_TO_NAME.keys()))
+        self.color_range_combo.setCurrentText(
+            COLOR_RANGE_NAME_TO_LABEL.get(getattr(self._controller, "color_range", "limited"), "Limited (Video)")
+        )
+        self.color_range_combo.currentIndexChanged.connect(self._on_color_range_changed)
+        settings_form.addRow("Color range", self.color_range_combo)
 
         self.sr_mode_combo = QComboBox()
         self.sr_mode_combo.addItems(["Auto", "Manual"])
@@ -3628,6 +3814,8 @@ class MainWindow(QMainWindow):
                         input_frame,
                         preview_max_w=input_preview_size[0],
                         preview_max_h=input_preview_size[1],
+                        color_space=getattr(self._controller, "color_space", "rec709"),
+                        color_range=getattr(self._controller, "color_range", "limited"),
                     )
                     self._input_canvas.set_image(input_image, input_backing)
                     self._perf_add("convert_in", (time.perf_counter() - t1) * 1000.0)
@@ -3640,6 +3828,8 @@ class MainWindow(QMainWindow):
                         output_frame,
                         preview_max_w=output_preview_size[0],
                         preview_max_h=output_preview_size[1],
+                        color_space=getattr(self._controller, "color_space", "rec709"),
+                        color_range=getattr(self._controller, "color_range", "limited"),
                     )
                     self._output_canvas.set_image(output_image, output_backing)
                     self._perf_add("convert_out", (time.perf_counter() - t1) * 1000.0)
@@ -3834,6 +4024,8 @@ class MainWindow(QMainWindow):
                     input_frame,
                     preview_max_w=input_preview_size[0],
                     preview_max_h=input_preview_size[1],
+                    color_space=getattr(self._controller, "color_space", "rec709"),
+                    color_range=getattr(self._controller, "color_range", "limited"),
                 )
                 self._input_canvas.set_image(input_image, input_backing)
                 self._perf_add("convert_in", (time.perf_counter() - t0) * 1000.0)
@@ -3845,6 +4037,8 @@ class MainWindow(QMainWindow):
                     output_frame,
                     preview_max_w=output_preview_size[0],
                     preview_max_h=output_preview_size[1],
+                    color_space=getattr(self._controller, "color_space", "rec709"),
+                    color_range=getattr(self._controller, "color_range", "limited"),
                 )
                 self._output_canvas.set_image(output_image, output_backing)
                 self._perf_add("convert_out", (time.perf_counter() - t0) * 1000.0)
@@ -4121,6 +4315,32 @@ class MainWindow(QMainWindow):
             f"Preview downsample set to {label} ({int(round(self._preview_downsample_factor * 100.0))}% linear size)"
         )
 
+    def _on_color_space_changed(self) -> None:
+        if self._updating_controls:
+            return
+        selected_label = self.color_space_combo.currentText()
+        selected_name = COLOR_SPACE_LABEL_TO_NAME.get(selected_label, "rec709")
+        try:
+            self._controller.set_color_space(selected_name)
+            applied_name = _normalize_color_space_name(getattr(self._controller, "color_space", selected_name))
+            applied_label = COLOR_SPACE_NAME_TO_LABEL.get(applied_name, applied_name)
+            self._update_status(f"Color space applied: {applied_label}")
+        except Exception as exc:
+            self._update_status(f"Color space change failed: {exc}")
+
+    def _on_color_range_changed(self) -> None:
+        if self._updating_controls:
+            return
+        selected_label = self.color_range_combo.currentText()
+        selected_name = COLOR_RANGE_LABEL_TO_NAME.get(selected_label, "limited")
+        try:
+            self._controller.set_color_range(selected_name)
+            applied_name = _normalize_color_range_name(getattr(self._controller, "color_range", selected_name))
+            applied_label = COLOR_RANGE_NAME_TO_LABEL.get(applied_name, applied_name)
+            self._update_status(f"Color range applied: {applied_label}")
+        except Exception as exc:
+            self._update_status(f"Color range change failed: {exc}")
+
     def _on_preview_request_fps_changed(self) -> None:
         preview_fps = int(self.preview_request_fps_spin.value())
         if hasattr(self._controller, "set_preview_fps"):
@@ -4202,22 +4422,39 @@ class MainWindow(QMainWindow):
             return
 
         current = self._controller_roi_applied
-        step_roi = self._interpolate_controller_roi_step(current, target)
+        use_subpixel_microstep = bool(
+            self._controller_backend == "worker-process"
+            and hasattr(self._controller, "set_roi_with_subpixel")
+        )
+        target_scale = roi_scale_from_roi(target)
+        if use_subpixel_microstep:
+            step_roi, step_shift_x, step_shift_y = self._manual_roi_step_with_subpixel(current, target)
+        else:
+            step_roi = self._interpolate_controller_roi_step(current, target)
+            step_shift_x = 0.0
+            step_shift_y = 0.0
+
         if self._is_controller_roi_close(step_roi, target):
             step_roi = target
+            step_shift_x = 0.0
+            step_shift_y = 0.0
 
         try:
             started = time.perf_counter()
             self._roi_diag_controller_send_attempts += 1
-            moving_only = (
-                step_roi.w == self._controller_roi_applied.w
-                and step_roi.h == self._controller_roi_applied.h
-                and hasattr(self._controller, "set_roi_position")
-            )
-            if moving_only:
-                sent = bool(self._controller.set_roi_position(step_roi.x, step_roi.y))
+            if use_subpixel_microstep:
+                self._controller.set_roi_with_subpixel(step_roi, step_shift_x, step_shift_y)
+                sent = True
             else:
-                sent = bool(self._controller.set_roi(step_roi))
+                moving_only = (
+                    step_roi.w == self._controller_roi_applied.w
+                    and step_roi.h == self._controller_roi_applied.h
+                    and hasattr(self._controller, "set_roi_position")
+                )
+                if moving_only:
+                    sent = bool(self._controller.set_roi_position(step_roi.x, step_roi.y))
+                else:
+                    sent = bool(self._controller.set_roi(step_roi))
 
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self._roi_diag_controller_send_ms_sum += elapsed_ms
@@ -4236,10 +4473,81 @@ class MainWindow(QMainWindow):
         # Continue stepping while target is not reached, or while new user
         # updates keep arriving.
         if self._is_controller_roi_close(self._controller_roi_applied, target):
+            if use_subpixel_microstep:
+                try:
+                    self._controller.set_roi_with_subpixel(target, 0.0, 0.0)
+                except Exception:
+                    pass
             self._manual_live_target_roi = None
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         if self._pending_manual_controller_roi is not None or self._manual_live_target_roi is not None:
+            self._manual_roi_send_timer.setInterval(self._manual_roi_send_interval_ms(target_scale))
             self._manual_roi_send_timer.start()
+
+    def _manual_roi_send_interval_ms(self, zoom_scale: float) -> int:
+        z = max(1.0, float(zoom_scale))
+        if z >= 6.0:
+            return 8
+        if z >= 4.0:
+            return 10
+        return 16
+
+    def _manual_roi_step_with_subpixel(self, current: Roi, target: Roi) -> tuple[Roi, float, float]:
+        moving_only = current.w == target.w and current.h == target.h
+        zoom_scale = roi_scale_from_roi(target)
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+
+        if moving_only:
+            if zoom_scale >= 6.0:
+                alpha_pos = 0.09
+            elif zoom_scale >= 4.0:
+                alpha_pos = 0.12
+            else:
+                alpha_pos = 0.16
+        else:
+            alpha_pos = 0.22
+        alpha_size = 0.20
+
+        alpha_scale = 1.15 - (0.55 * smoothing)
+        alpha_pos = max(0.05, min(0.32, alpha_pos * alpha_scale))
+        alpha_size = max(0.07, min(0.36, alpha_size * alpha_scale))
+
+        current_cx = float(current.x) + (float(current.w) * 0.5)
+        current_cy = float(current.y) + (float(current.h) * 0.5)
+        target_cx = float(target.x) + (float(target.w) * 0.5)
+        target_cy = float(target.y) + (float(target.h) * 0.5)
+
+        desired_cx = current_cx + ((target_cx - current_cx) * alpha_pos)
+        desired_cy = current_cy + ((target_cy - current_cy) * alpha_pos)
+        desired_w = float(current.w) + ((float(target.w) - float(current.w)) * alpha_size)
+
+        quant_w = max(2, int(round(desired_w)) & ~1)
+        quant_h = max(2, int(round(quant_w * 9.0 / 16.0)))
+        desired_x = desired_cx - (float(quant_w) * 0.5)
+        desired_y = desired_cy - (float(quant_h) * 0.5)
+
+        carrier_roi = clamp_roi(
+            Roi(
+                int(round(desired_x)),
+                int(round(desired_y)),
+                quant_w,
+                quant_h,
+            )
+        )
+
+        carrier_cx = float(carrier_roi.x) + (float(carrier_roi.w) * 0.5)
+        carrier_cy = float(carrier_roi.y) + (float(carrier_roi.h) * 0.5)
+        source_dx = desired_cx - carrier_cx
+        source_dy = desired_cy - carrier_cy
+
+        sx = FRAME_W / max(1.0, float(carrier_roi.w))
+        sy = FRAME_H / max(1.0, float(carrier_roi.h))
+        max_shift_x = max(2.0, min(48.0, sx * 1.5))
+        max_shift_y = max(2.0, min(48.0, sy * 1.5))
+        shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
+        shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
+
+        return carrier_roi, float(shift_x), float(shift_y)
 
     def _schedule_roi_controls_sync(self, roi: Roi) -> None:
         self._pending_roi_controls_sync = clamp_roi(roi)
@@ -5513,6 +5821,12 @@ class MainWindow(QMainWindow):
             current_estimate = previous_state.get("current_roi_estimate")
             if isinstance(current_estimate, Roi):
                 self._roi = clamp_roi(current_estimate)
+
+        # Clear manual ROI streaming state so stale move/resize commands do not
+        # cancel the worker-side keyframe transition right after recall starts.
+        self._manual_roi_send_timer.stop()
+        self._manual_live_target_roi = None
+        self._pending_manual_controller_roi = None
 
         target = clamp_roi(target_roi)
         total_frames = max(1, min(600, int(duration_frames)))
