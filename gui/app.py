@@ -2842,8 +2842,11 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
         self._fullscreen_keyframe_toolbars: dict[str, QWidget] = {}
+        self._fullscreen_keyframe_side_panels: dict[str, QWidget] = {}
         self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
+        self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
+        self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
         viewers = QWidget()
         viewers_layout = QVBoxLayout(viewers)
         viewers_layout.setContentsMargins(0, 0, 0, 0)
@@ -2855,7 +2858,16 @@ class MainWindow(QMainWindow):
         input_layout.setSpacing(2)
         self._input_title_label = QLabel("Input View (ROI controls are locked to this view)")
         input_layout.addWidget(self._input_title_label)
-        input_layout.addWidget(self._input_canvas, 1, alignment=Qt.AlignCenter)
+
+        self._input_viewer_row = QWidget()
+        input_viewer_row_layout = QHBoxLayout(self._input_viewer_row)
+        input_viewer_row_layout.setContentsMargins(0, 0, 0, 0)
+        input_viewer_row_layout.setSpacing(12)
+        self._input_fullscreen_keyframe_side_panel = self._build_fullscreen_keyframe_side_panel("input")
+        input_viewer_row_layout.addWidget(self._input_fullscreen_keyframe_side_panel, 0, alignment=Qt.AlignTop)
+        input_viewer_row_layout.addWidget(self._input_canvas, 1, alignment=Qt.AlignCenter)
+        input_layout.addWidget(self._input_viewer_row, 1)
+
         self._input_fullscreen_keyframe_toolbar = self._build_fullscreen_keyframe_toolbar("input")
         input_layout.addWidget(self._input_fullscreen_keyframe_toolbar)
 
@@ -2865,7 +2877,16 @@ class MainWindow(QMainWindow):
         output_layout.setSpacing(2)
         self._output_title_label = QLabel("Output View (processed result only)")
         output_layout.addWidget(self._output_title_label)
-        output_layout.addWidget(self._output_canvas, 1, alignment=Qt.AlignCenter)
+
+        self._output_viewer_row = QWidget()
+        output_viewer_row_layout = QHBoxLayout(self._output_viewer_row)
+        output_viewer_row_layout.setContentsMargins(0, 0, 0, 0)
+        output_viewer_row_layout.setSpacing(12)
+        self._output_fullscreen_keyframe_side_panel = self._build_fullscreen_keyframe_side_panel("output")
+        output_viewer_row_layout.addWidget(self._output_fullscreen_keyframe_side_panel, 0, alignment=Qt.AlignTop)
+        output_viewer_row_layout.addWidget(self._output_canvas, 1, alignment=Qt.AlignCenter)
+        output_layout.addWidget(self._output_viewer_row, 1)
+
         self._output_fullscreen_keyframe_toolbar = self._build_fullscreen_keyframe_toolbar("output")
         output_layout.addWidget(self._output_fullscreen_keyframe_toolbar)
 
@@ -2925,7 +2946,11 @@ class MainWindow(QMainWindow):
 
         self._setup_shortcuts()
         self._connect_settings_persistence_signals()
+        self.roi_transition_frames_spin.valueChanged.connect(self._sync_fullscreen_transition_rate_from_main)
+        self.roi_keyframe_duration_override_btn.toggled.connect(self._sync_fullscreen_override_duration_from_main)
         self._update_roi_key_buttons()
+        self._sync_fullscreen_transition_rate_from_main(self.roi_transition_frames_spin.value())
+        self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
         self._sync_ai_sr_basic_scaling_ui(notify=False)
@@ -3999,6 +4024,78 @@ class MainWindow(QMainWindow):
         toolbar.setVisible(False)
         return toolbar
 
+    def _build_fullscreen_keyframe_side_panel(self, view_name: str) -> QWidget:
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(10)
+
+        title = QLabel("KEYFRAME")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("QLabel { font-size: 18px; font-weight: 700; }")
+        panel_layout.addWidget(title)
+
+        transition_label = QLabel("Transition\n(frames)")
+        transition_label.setAlignment(Qt.AlignCenter)
+        transition_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; }")
+        panel_layout.addWidget(transition_label)
+
+        transition_spin = QSpinBox()
+        transition_spin.setRange(1, 600)
+        transition_spin.setValue(int(self._roi_keyframe_transition_default_frames))
+        transition_spin.setMinimumWidth(150)
+        transition_spin.setMinimumHeight(72)
+        transition_spin.setStyleSheet(
+            "QSpinBox { font-size: 22px; font-weight: 700; padding: 8px 12px; }"
+            "QSpinBox::up-button, QSpinBox::down-button { width: 34px; }"
+        )
+        transition_spin.valueChanged.connect(self._on_fullscreen_transition_rate_changed)
+        panel_layout.addWidget(transition_spin)
+
+        override_btn = QPushButton("OVERRIDE\nKEY DURATION")
+        override_btn.setCheckable(True)
+        override_btn.setMinimumWidth(150)
+        override_btn.setMinimumHeight(96)
+        override_btn.setToolTip("Use Transition (frames) as recall duration instead of the keyframe's stored duration.")
+        override_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
+        override_btn.toggled.connect(self._on_fullscreen_override_duration_toggled)
+        panel_layout.addWidget(override_btn)
+        panel_layout.addStretch(1)
+
+        self._fullscreen_keyframe_side_panels[view_name] = panel
+        self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
+        self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
+        panel.setVisible(False)
+        return panel
+
+    def _on_fullscreen_transition_rate_changed(self, value: int) -> None:
+        normalized = max(1, min(600, int(value)))
+        if self.roi_transition_frames_spin.value() != normalized:
+            self.roi_transition_frames_spin.setValue(normalized)
+        else:
+            self._sync_fullscreen_transition_rate_from_main(normalized)
+
+    def _on_fullscreen_override_duration_toggled(self, checked: bool) -> None:
+        target = bool(checked)
+        if self.roi_keyframe_duration_override_btn.isChecked() != target:
+            self.roi_keyframe_duration_override_btn.setChecked(target)
+        else:
+            self._sync_fullscreen_override_duration_from_main(target)
+
+    def _sync_fullscreen_transition_rate_from_main(self, value: int) -> None:
+        normalized = max(1, min(600, int(value)))
+        for spin in self._fullscreen_roi_transition_rate_spins.values():
+            previous_block = spin.blockSignals(True)
+            spin.setValue(normalized)
+            spin.blockSignals(previous_block)
+
+    def _sync_fullscreen_override_duration_from_main(self, checked: bool) -> None:
+        target = bool(checked)
+        for button in self._fullscreen_roi_duration_override_buttons.values():
+            previous_block = button.blockSignals(True)
+            button.setChecked(target)
+            button.blockSignals(previous_block)
+
     def _setup_shortcuts(self) -> None:
         reset_action = QAction(self)
         reset_action.setShortcut("R")
@@ -4476,12 +4573,14 @@ class MainWindow(QMainWindow):
             title_label=self._input_title_label,
             canvas=self._input_canvas,
             footer_widget=self._input_fullscreen_keyframe_toolbar,
+            side_widget=self._input_fullscreen_keyframe_side_panel,
         )
         self._fit_canvas_in_panel(
             panel=self._output_panel,
             title_label=self._output_title_label,
             canvas=self._output_canvas,
             footer_widget=self._output_fullscreen_keyframe_toolbar,
+            side_widget=self._output_fullscreen_keyframe_side_panel,
         )
 
     def _fit_canvas_in_panel(
@@ -4490,6 +4589,7 @@ class MainWindow(QMainWindow):
         title_label: QLabel,
         canvas: QWidget,
         footer_widget: QWidget | None = None,
+        side_widget: QWidget | None = None,
     ) -> None:
         if not panel.isVisible() or panel.width() <= 0 or panel.height() <= 0:
             return
@@ -4508,6 +4608,8 @@ class MainWindow(QMainWindow):
 
         avail_w = panel.width() - margins.left() - margins.right()
         avail_h = panel.height() - margins.top() - margins.bottom() - used_h
+        if side_widget is not None and side_widget.isVisible():
+            avail_w -= side_widget.sizeHint().width() + spacing
 
         # Keep both stacked viewers within the window height budget.
         if self._fullscreen_view_name is None:
@@ -4552,6 +4654,8 @@ class MainWindow(QMainWindow):
             self._output_panel.setVisible(True)
             for toolbar in self._fullscreen_keyframe_toolbars.values():
                 toolbar.setVisible(False)
+            for side_panel in self._fullscreen_keyframe_side_panels.values():
+                side_panel.setVisible(False)
             self._input_canvas.setEnabled(True)
             self._output_canvas.setEnabled(True)
             self.showNormal()
@@ -4564,6 +4668,8 @@ class MainWindow(QMainWindow):
         self._output_panel.setVisible(view_name == "output")
         for toolbar_view, toolbar in self._fullscreen_keyframe_toolbars.items():
             toolbar.setVisible(toolbar_view == view_name)
+        for panel_view, side_panel in self._fullscreen_keyframe_side_panels.items():
+            side_panel.setVisible(panel_view == view_name)
         self._input_canvas.setEnabled(view_name == "input")
         self._output_canvas.setEnabled(view_name == "output")
         self.showFullScreen()

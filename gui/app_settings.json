@@ -35,7 +35,7 @@
   "fps": 60,
   "main_splitter_sizes": [
     716,
-    680
+    693
   ],
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
@@ -87,7 +87,7 @@
   },
   "roi_latency_smoothing_percent": 8,
   "roi_smoothing_percent": 100,
-  "roi_transition_duration_frames": 40,
+  "roi_transition_duration_frames": 50,
   "rtx_thdr_contrast": 50,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
