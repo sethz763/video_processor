@@ -572,6 +572,7 @@ class AiSrOnnxEngine:
         color_space: str = "rec709",
         color_range: str = "limited",
         native_module: Any | None = None,
+        native_processor: Any | None = None,
     ) -> None:
         if ort is None:
             raise RuntimeError("onnxruntime is not installed")
@@ -747,6 +748,13 @@ class AiSrOnnxEngine:
         self._detail_preserve_percent = 0.0
         self._color_space = _normalize_color_space_name(color_space)
         self._color_range = _normalize_color_range_name(color_range)
+        self._native_processor = native_processor
+        self._native_preprocess_available = bool(
+            native_processor is not None and hasattr(native_processor, "process_frame_preprocess_roi_rgb")
+        )
+        self._native_gpu_input_available = bool(
+            native_processor is not None and hasattr(native_processor, "process_frame_preprocess_roi_tensor_cuda")
+        )
 
         if native_module is None or not hasattr(native_module, "AiSrCudaPostProcessor"):
             raise RuntimeError(
@@ -765,6 +773,9 @@ class AiSrOnnxEngine:
         if self._avg_infer_ms is None:
             return None
         return float(self._avg_infer_ms)
+
+    def uses_native_preprocess(self) -> bool:
+        return bool(self._native_preprocess_available)
 
     def timing_info(self) -> dict[str, object]:
         return {
@@ -922,6 +933,8 @@ class AiSrOnnxEngine:
             "timing_samples": int(self._timing_samples),
             "onnx_output_copy_to_cpu": False,
             "onnx_zero_copy_cuda_postprocess": True,
+            "native_gpu_preprocess_enabled": bool(self._native_preprocess_available),
+            "onnx_input_gpu_direct_enabled": bool(self._native_gpu_input_available),
         }
 
     def _record_timing_sample(self, prep_ms: float, infer_ms: float, post_ms: float, total_ms: float) -> None:
@@ -966,6 +979,65 @@ class AiSrOnnxEngine:
         except Exception as exc:
             self._io_binding_error = str(exc)
             raise RuntimeError(f"Zero-copy ONNX output binding failed: {exc}") from exc
+
+    def _run_model_cuda_tensor(self, tensor: Any) -> object:
+        if not self._io_binding_enabled:
+            raise RuntimeError("Zero-copy AI SR requires ONNX Runtime CUDA/TensorRT I/O binding")
+
+        try:
+            tensor_width = int(getattr(tensor, "width"))
+            tensor_height = int(getattr(tensor, "height"))
+            tensor_channels = int(getattr(tensor, "channels"))
+            tensor_layout = str(getattr(tensor, "layout")).strip().lower()
+            tensor_dtype = str(getattr(tensor, "dtype")).strip().lower()
+            tensor_ptr = int(getattr(tensor, "data_ptr"))
+
+            if tensor_ptr == 0:
+                raise RuntimeError("Native CUDA tensor pointer is null")
+            if tensor_layout not in {"nchw", "chw"}:
+                raise RuntimeError(f"Unsupported native CUDA tensor layout for ONNX input: {tensor_layout}")
+            if tensor_channels != 3:
+                raise RuntimeError(f"Unsupported native CUDA tensor channels for ONNX input: {tensor_channels}")
+
+            if tensor_dtype in {"float16", "fp16", "half"}:
+                element_type = np.float16
+            elif tensor_dtype in {"float32", "fp32", "float"}:
+                element_type = np.float32
+            else:
+                raise RuntimeError(f"Unsupported native CUDA tensor dtype for ONNX input: {tensor_dtype}")
+
+            expected_dtype = np.float16 if self._input_dtype == np.float16 else np.float32
+            if element_type is not expected_dtype:
+                raise RuntimeError(
+                    f"Native CUDA tensor dtype ({tensor_dtype}) does not match model input dtype "
+                    f"({'float16' if expected_dtype == np.float16 else 'float32'})"
+                )
+
+            io_binding = self._session.io_binding()
+            io_binding.bind_input(
+                name=self._input_name,
+                device_type="cuda",
+                device_id=0,
+                element_type=element_type,
+                shape=[1, tensor_channels, tensor_height, tensor_width],
+                buffer_ptr=tensor_ptr,
+            )
+            io_binding.bind_output(self._output_name, "cuda", 0)
+            self._session.run_with_iobinding(io_binding)
+
+            get_outputs = getattr(io_binding, "get_outputs", None)
+            if not callable(get_outputs):
+                raise RuntimeError("ONNX Runtime build does not expose io_binding.get_outputs()")
+
+            bound_outputs = get_outputs()
+            if not bound_outputs:
+                raise RuntimeError("I/O binding returned no outputs")
+
+            self._io_binding_error = None
+            return bound_outputs[0]
+        except Exception as exc:
+            self._io_binding_error = str(exc)
+            raise RuntimeError(f"Zero-copy ONNX input/output binding failed: {exc}") from exc
 
     def _ort_output_descriptor(self, output_ort: object) -> dict[str, object]:
         shape_attr = getattr(output_ort, "shape", None)
@@ -1097,6 +1169,37 @@ class AiSrOnnxEngine:
         self._record_timing_sample(prep_ms, infer_ms, post_ms, total_ms)
         return out_uyvy
 
+    def _run_model_on_cuda_tensor(self, model_tensor: Any, method: str) -> bytes:
+        prep_start = time.perf_counter()
+        prep_ms = (time.perf_counter() - prep_start) * 1000.0
+
+        infer_start = time.perf_counter()
+        output_ort = self._run_model_cuda_tensor(model_tensor)
+        infer_ms = (time.perf_counter() - infer_start) * 1000.0
+
+        post_start = time.perf_counter()
+        output_desc = self._ort_output_descriptor(output_ort)
+        data_ptr_fn = getattr(output_ort, "data_ptr", None)
+        if not callable(data_ptr_fn):
+            raise RuntimeError("OrtValue does not expose data_ptr() for zero-copy CUDA postprocessing")
+
+        output_ptr = int(data_ptr_fn())
+        out_uyvy = self._cuda_post.process_onnx_output_cuda(
+            tensor_ptr=output_ptr,
+            tensor_width=int(output_desc["width"]),
+            tensor_height=int(output_desc["height"]),
+            method=str(method).strip().lower(),
+            dtype=str(output_desc["dtype"]),
+            layout=str(output_desc["layout"]),
+            channels=int(output_desc["channels"]),
+            normalized_01=bool(output_desc["normalized_01"]),
+        )
+
+        post_ms = (time.perf_counter() - post_start) * 1000.0
+        total_ms = prep_ms + infer_ms + post_ms
+        self._record_timing_sample(prep_ms, infer_ms, post_ms, total_ms)
+        return out_uyvy
+
     def process_uyvy_frame(self, frame_bytes: bytes) -> bytes:
         return self.process_uyvy_frame_roi_to_output(
             frame_bytes,
@@ -1128,15 +1231,50 @@ class AiSrOnnxEngine:
             proc_x = max(0, FRAME_W - proc_w)
             proc_x &= ~1
 
-        yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
-        roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
-        roi_rgb = _uyvy_to_rgb_limited(roi_yuv, self._color_space, self._color_range)
-
-        model_rgb = roi_rgb
+        model_in_w = proc_w
+        model_in_h = proc_h
         if self._model_scale > 1:
             divisor = self._effective_inference_divisor()
             model_in_w = max(1, (proc_w + divisor - 1) // divisor)
             model_in_h = max(1, (proc_h + divisor - 1) // divisor)
+
+        align = max(1, int(self._input_align))
+        aligned_w = max(align, ((int(model_in_w) + align - 1) // align) * align)
+        aligned_h = max(align, ((int(model_in_h) + align - 1) // align) * align)
+
+        if self._native_gpu_input_available and self._native_processor is not None:
+            model_dtype = "float16" if self._input_dtype == np.float16 else "float32"
+            model_tensor = self._native_processor.process_frame_preprocess_roi_tensor_cuda(
+                frame_bytes,
+                int(proc_x),
+                int(proc_y),
+                int(proc_w),
+                int(proc_h),
+                int(aligned_w),
+                int(aligned_h),
+                model_dtype,
+            )
+            # Keep tensor owner alive through run_with_iobinding by passing the object.
+            return self._run_model_on_cuda_tensor(model_tensor, method)
+
+        model_rgb: np.ndarray
+        if self._native_preprocess_available and self._native_processor is not None:
+            roi_rgb_bytes = self._native_processor.process_frame_preprocess_roi_rgb(
+                frame_bytes,
+                int(proc_x),
+                int(proc_y),
+                int(proc_w),
+                int(proc_h),
+                int(model_in_w),
+                int(model_in_h),
+            )
+            model_rgb = np.frombuffer(roi_rgb_bytes, dtype=np.uint8).reshape(model_in_h, model_in_w, 3)
+        else:
+            yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+            roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
+            roi_rgb = _uyvy_to_rgb_limited(roi_yuv, self._color_space, self._color_range)
+
+            model_rgb = roi_rgb
             if model_in_w != proc_w or model_in_h != proc_h:
                 model_rgb = cv2.resize(roi_rgb, (model_in_w, model_in_h), interpolation=cv2.INTER_CUBIC)
 
@@ -1531,7 +1669,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     )
     ai_sr_max_inflight = max(
         1,
-        min(4, int(startup_config.get("ai_sr_max_inflight", os.environ.get("VP_AI_SR_MAX_INFLIGHT", "2")))),
+        min(4, int(startup_config.get("ai_sr_max_inflight", os.environ.get("VP_AI_SR_MAX_INFLIGHT", "1")))),
     )
     ai_sr_submit_spacing_ms = max(
         0.0,
@@ -1591,24 +1729,26 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     def _is_live_passthrough_mode() -> bool:
         # Passthrough mode is valid only when no stage is expected to modify pixels.
         denoise_enabled = current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
+        ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
+        rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
         return (
             (not current_deinterlace_enabled)
             and (not denoise_enabled)
             and (not basic_scaling_enabled)
-            and (not ai_sr_enabled)
-            and (not rtx_vsr_enabled)
+            and (not ai_stage_active)
+            and (not rtx_stage_active)
         )
 
     def _is_live_basic_scaling_fast_mode() -> bool:
         # Basic scaling fast mode keeps processing in capture thread when the
-        # pipeline is native-only (no Python AI/RTX/preprocess stages).
-        denoise_enabled = current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
+        # pipeline is native-only (no Python AI/RTX stages). Native process_frame
+        # already fuses preprocess, so deinterlace/denoise can remain enabled.
+        ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
+        rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
         return (
-            (not current_deinterlace_enabled)
-            and (not denoise_enabled)
-            and basic_scaling_enabled
-            and (not ai_sr_enabled)
-            and (not rtx_vsr_enabled)
+            basic_scaling_enabled
+            and (not ai_stage_active)
+            and (not rtx_stage_active)
         )
 
     def _step_smoothed_roi_shift() -> tuple[float, float]:
@@ -2174,7 +2314,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         return bool(current_deinterlace_enabled) or _denoise_enabled()
 
     def _is_any_sr_selected() -> bool:
-        return bool(ai_sr_enabled or rtx_vsr_enabled)
+        ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
+        rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
+        return bool(ai_stage_active or rtx_stage_active)
 
     def _should_apply_cpu_subpixel_fallback() -> bool:
         # When any SR path is selected, prioritize throughput over tiny
@@ -2186,6 +2328,20 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             return False
         # Disable native CUDA basic-scaling path whenever an SR path is selected.
         return not _is_any_sr_selected()
+
+    def _is_preprocess_stage_enabled() -> bool:
+        if not _is_preprocess_enabled():
+            return False
+
+        ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
+        if ai_stage_active:
+            return not bool(getattr(ai_sr_engine, "uses_native_preprocess", lambda: False)())
+
+        basic_stage_active = _basic_scaling_enabled() and (not ai_stage_active)
+        # When native basic scaling is active without AI, preprocess is fused into
+        # that stage.
+        fuse_preprocess_into_basic = basic_stage_active and not ai_stage_active
+        return not fuse_preprocess_into_basic
 
     def _preprocess_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
         nonlocal preprocess_noop_warning_emitted
@@ -2268,10 +2424,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         stack: list[str] = []
         ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
         basic_stage_active = _basic_scaling_enabled() and (not ai_stage_active)
-        # When native basic scaling is active without AI, preprocess is fused into
-        # that stage so effects run in the post-ROI/pre-upscale slot.
-        fuse_preprocess_into_basic = basic_stage_active and not ai_stage_active
-        if _is_preprocess_enabled() and not fuse_preprocess_into_basic:
+
+        if _is_preprocess_stage_enabled():
             stack.append("preprocess")
         if ai_stage_active:
             stack.append("ai_sr")
@@ -2663,6 +2817,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 color_space=current_color_space,
                 color_range=current_color_range,
                 native_module=module,
+                native_processor=processor,
             )
             ai_sr_info = ai_sr_engine.info()
             ai_sr_info["strict_mode"] = bool(ai_sr_strict)
@@ -3170,7 +3325,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     "rtx_vsr_applied": current_rtx_applied,
                     "rtx_effect_mean_abs_luma": current_rtx_delta,
                     "stage_enable_flags": {
-                        "preprocess": bool(_is_preprocess_enabled()),
+                        "preprocess": bool(_is_preprocess_stage_enabled()),
                         "basic_scaling": bool(_basic_scaling_enabled()),
                         "ai_sr": bool(ai_sr_enabled and ai_sr_engine is not None),
                         "rtx_vsr": bool(rtx_vsr_enabled and rtx_vsr_engine is not None),

@@ -264,4 +264,16 @@ void LaunchTensorToRgb(
     cudaStream_t stream
 );
 
+void LaunchRgbToTensor(
+    const uchar3* d_rgb,
+    void* d_tensor,
+    int tensor_dtype,
+    int tensor_layout,
+    int channels,
+    bool normalized_01,
+    int width,
+    int height,
+    cudaStream_t stream
+);
+
 } // namespace vp::cuda_kernels

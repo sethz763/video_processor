@@ -251,7 +251,153 @@ inline SrFlavor ParseSrFlavorName(const std::string& sr_flavor_name) {
     throw std::invalid_argument("SR flavor must be one of [bilinear, bilinear_sharp, bicubic, bicubic_sharpen].");
 }
 
+inline int ParseTensorDTypeCode(const std::string& dtype_name) {
+    std::string normalized;
+    normalized.reserve(dtype_name.size());
+    for (char c : dtype_name) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+
+    if (normalized == "float" || normalized == "float32" || normalized == "fp32") {
+        return 0;
+    }
+    if (normalized == "float16" || normalized == "fp16" || normalized == "half") {
+        return 1;
+    }
+    if (normalized == "uint8" || normalized == "u8") {
+        return 2;
+    }
+
+    throw std::invalid_argument("Tensor dtype must be one of [float16, float32, uint8].");
+}
+
+inline std::size_t TensorElementSizeBytes(int tensor_dtype) {
+    switch (tensor_dtype) {
+        case 0:
+            return sizeof(float);
+        case 1:
+            return sizeof(std::uint16_t);
+        case 2:
+            return sizeof(std::uint8_t);
+        default:
+            throw std::invalid_argument("Unsupported tensor dtype code.");
+    }
+}
+
 } // namespace
+
+CudaTensorBuffer::CudaTensorBuffer()
+    : data_(nullptr),
+      bytes_(0),
+      width_(0),
+      height_(0),
+      channels_(0),
+      dtype_(""),
+      layout_(""),
+      normalized_01_(false) {}
+
+CudaTensorBuffer::CudaTensorBuffer(
+    void* data,
+    std::size_t bytes,
+    int width,
+    int height,
+    int channels,
+    const std::string& dtype,
+    const std::string& layout,
+    bool normalized_01
+)
+    : data_(data),
+      bytes_(bytes),
+      width_(width),
+      height_(height),
+      channels_(channels),
+      dtype_(dtype),
+      layout_(layout),
+      normalized_01_(normalized_01) {}
+
+CudaTensorBuffer::~CudaTensorBuffer() {
+    if (data_ != nullptr) {
+        cudaFree(data_);
+        data_ = nullptr;
+    }
+}
+
+CudaTensorBuffer::CudaTensorBuffer(CudaTensorBuffer&& other) noexcept
+    : data_(other.data_),
+      bytes_(other.bytes_),
+      width_(other.width_),
+      height_(other.height_),
+      channels_(other.channels_),
+      dtype_(std::move(other.dtype_)),
+      layout_(std::move(other.layout_)),
+      normalized_01_(other.normalized_01_) {
+    other.data_ = nullptr;
+    other.bytes_ = 0;
+    other.width_ = 0;
+    other.height_ = 0;
+    other.channels_ = 0;
+    other.normalized_01_ = false;
+}
+
+CudaTensorBuffer& CudaTensorBuffer::operator=(CudaTensorBuffer&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    if (data_ != nullptr) {
+        cudaFree(data_);
+    }
+
+    data_ = other.data_;
+    bytes_ = other.bytes_;
+    width_ = other.width_;
+    height_ = other.height_;
+    channels_ = other.channels_;
+    dtype_ = std::move(other.dtype_);
+    layout_ = std::move(other.layout_);
+    normalized_01_ = other.normalized_01_;
+
+    other.data_ = nullptr;
+    other.bytes_ = 0;
+    other.width_ = 0;
+    other.height_ = 0;
+    other.channels_ = 0;
+    other.normalized_01_ = false;
+
+    return *this;
+}
+
+std::uint64_t CudaTensorBuffer::DataPtr() const {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data_));
+}
+
+std::size_t CudaTensorBuffer::Bytes() const {
+    return bytes_;
+}
+
+int CudaTensorBuffer::Width() const {
+    return width_;
+}
+
+int CudaTensorBuffer::Height() const {
+    return height_;
+}
+
+int CudaTensorBuffer::Channels() const {
+    return channels_;
+}
+
+const std::string& CudaTensorBuffer::DType() const {
+    return dtype_;
+}
+
+const std::string& CudaTensorBuffer::Layout() const {
+    return layout_;
+}
+
+bool CudaTensorBuffer::Normalized01() const {
+    return normalized_01_;
+}
 
 VideoProcessor::VideoProcessor(
     int width,
@@ -301,7 +447,9 @@ VideoProcessor::VideoProcessor(
       d_rgb_sr_(nullptr),
             d_rgb_zoom_(nullptr),
         has_prev_rgb_full_(false),
-    h_output_pinned_(nullptr) {
+    h_output_pinned_(nullptr),
+    h_rgb_output_pinned_(nullptr),
+    h_rgb_output_capacity_bytes_(0) {
     ValidateConfiguration();
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -671,6 +819,12 @@ void VideoProcessor::InitializeBuffers() {
         host_output_.resize(uyvy_bytes_);
     }
 
+    h_rgb_output_capacity_bytes_ = rgb_pixels_ * kRgbBytesPerPixel;
+    if (cudaHostAlloc(&h_rgb_output_pinned_, h_rgb_output_capacity_bytes_, cudaHostAllocDefault) != cudaSuccess) {
+        h_rgb_output_pinned_ = nullptr;
+        host_rgb_output_.resize(h_rgb_output_capacity_bytes_);
+    }
+
     if (enable_placeholder_sr_) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         ConfigureSrScaleLocked(sr_requested_scale_, auto_sr_scale_);
@@ -705,6 +859,50 @@ std::string VideoProcessor::ProcessFramePreprocessOnly(const std::string& input_
     );
 }
 
+std::string VideoProcessor::ProcessFramePreprocessRoiRgb(
+    const std::string& input_frame,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    int out_w,
+    int out_h
+) {
+    return ProcessFramePreprocessRoiRgbBuffer(
+        reinterpret_cast<const uint8_t*>(input_frame.data()),
+        input_frame.size(),
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        out_w,
+        out_h
+    );
+}
+
+CudaTensorBuffer VideoProcessor::ProcessFramePreprocessRoiTensorCuda(
+    const std::string& input_frame,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    int out_w,
+    int out_h,
+    const std::string& dtype_name
+) {
+    return ProcessFramePreprocessRoiTensorCudaBuffer(
+        reinterpret_cast<const uint8_t*>(input_frame.data()),
+        input_frame.size(),
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        out_w,
+        out_h,
+        dtype_name
+    );
+}
+
 std::string VideoProcessor::ProcessFrameBuffer(const uint8_t* input_frame, size_t input_size) {
     return ProcessFrameInternal(input_frame, input_size, false, false, false);
 }
@@ -719,6 +917,480 @@ std::string VideoProcessor::ProcessFrameDeinterlaceOnlyBuffer(const uint8_t* inp
 
 std::string VideoProcessor::ProcessFramePreprocessOnlyBuffer(const uint8_t* input_frame, size_t input_size) {
     return ProcessFrameInternal(input_frame, input_size, true, false, false);
+}
+
+std::string VideoProcessor::ProcessFramePreprocessRoiRgbBuffer(
+    const uint8_t* input_frame,
+    size_t input_size,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    int out_w,
+    int out_h
+) {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+
+    if (input_frame == nullptr) {
+        throw std::invalid_argument("Input frame pointer is null.");
+    }
+    if (input_size != uyvy_bytes_) {
+        throw std::invalid_argument("Invalid frame size; expected 1920*1080*2 bytes in UYVY.");
+    }
+    if (out_w <= 0 || out_h <= 0) {
+        throw std::invalid_argument("Output dimensions must be positive.");
+    }
+
+    // UYVY packs chroma for 2 horizontal pixels.
+    if ((roi_w & 1) != 0) {
+        roi_w -= 1;
+    }
+    if ((roi_x & 1) != 0) {
+        roi_x -= 1;
+    }
+    if (roi_w < 2) {
+        roi_w = 2;
+    }
+    if (roi_h < 2) {
+        roi_h = 2;
+    }
+
+    roi_w = std::clamp(roi_w, 2, width_);
+    roi_h = std::clamp(roi_h, 2, height_);
+
+    const int max_x = std::max(0, width_ - roi_w);
+    const int max_y = std::max(0, height_ - roi_h);
+    roi_x = std::clamp(roi_x, 0, max_x);
+    roi_y = std::clamp(roi_y, 0, max_y);
+    roi_x &= ~1;
+
+    out_w = std::clamp(out_w, 1, width_);
+    out_h = std::clamp(out_h, 1, height_);
+
+    bool deinterlace_enabled = true;
+    DeinterlaceMethod deinterlace_method = DeinterlaceMethod::Bob;
+    DenoiseMethod denoise_method = DenoiseMethod::Off;
+    float denoise_strength = 0.0f;
+    ColorSpace color_space = ColorSpace::Rec709;
+    ColorRange color_range = ColorRange::Limited;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        deinterlace_enabled = enable_deinterlace_;
+        deinterlace_method = deinterlace_method_;
+        denoise_method = denoise_method_;
+        denoise_strength = denoise_strength_;
+        color_space = color_space_;
+        color_range = color_range_;
+    }
+
+    CheckCuda(
+        cudaMemcpyAsync(d_uyvy_in_, input_frame, uyvy_bytes_, cudaMemcpyHostToDevice, stream_),
+        "cudaMemcpyAsync H2D preprocess roi rgb"
+    );
+
+    const int color_matrix = ToColorMatrixId(color_space);
+    const int color_range_id = ToColorRangeId(color_range);
+    cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, color_matrix, color_range_id, stream_);
+
+    cuda_kernels::LaunchCropCopyRgb(
+        d_rgb_full_,
+        width_,
+        height_,
+        d_rgb_zoom_,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        stream_
+    );
+
+    const uchar3* pre_input = d_rgb_zoom_;
+    const int preprocess_w = roi_w;
+    const int preprocess_h = roi_h;
+    const int preprocess_field_phase = roi_y & 1;
+
+    if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+        cuda_kernels::LaunchCropCopyRgb(
+            d_rgb_prev_full_,
+            width_,
+            height_,
+            d_rgb_sr_,
+            roi_x,
+            roi_y,
+            roi_w,
+            roi_h,
+            stream_
+        );
+
+        if (has_prev_rgb_full_) {
+            cuda_kernels::LaunchDenoiseFieldTemporalLuma(
+                pre_input,
+                d_rgb_sr_,
+                d_rgb_denoise_,
+                preprocess_w,
+                preprocess_h,
+                denoise_strength,
+                stream_
+            );
+        } else {
+            CheckCuda(
+                cudaMemcpyAsync(
+                    d_rgb_denoise_,
+                    pre_input,
+                    static_cast<size_t>(preprocess_w) * static_cast<size_t>(preprocess_h) * kRgbBytesPerPixel,
+                    cudaMemcpyDeviceToDevice,
+                    stream_
+                ),
+                "cudaMemcpyAsync D2D preprocess temporal warmup"
+            );
+        }
+        pre_input = d_rgb_denoise_;
+    }
+
+    if (deinterlace_enabled) {
+        switch (deinterlace_method) {
+            case DeinterlaceMethod::Blend:
+                cuda_kernels::LaunchBlendDeinterlace(pre_input, d_rgb_bob_, preprocess_w, preprocess_h, stream_);
+                break;
+            case DeinterlaceMethod::EdgeAdaptive:
+                cuda_kernels::LaunchEdgeAdaptiveDeinterlace(
+                    pre_input,
+                    d_rgb_bob_,
+                    preprocess_w,
+                    preprocess_h,
+                    preprocess_field_phase,
+                    stream_
+                );
+                break;
+            case DeinterlaceMethod::Bob:
+            default:
+                cuda_kernels::LaunchBobDeinterlace(
+                    pre_input,
+                    d_rgb_bob_,
+                    preprocess_w,
+                    preprocess_h,
+                    preprocess_field_phase,
+                    stream_
+                );
+                break;
+        }
+        pre_input = d_rgb_bob_;
+    }
+
+    if (denoise_method != DenoiseMethod::Off &&
+        denoise_method != DenoiseMethod::FieldTemporalLuma &&
+        denoise_strength > 0.001f) {
+        switch (denoise_method) {
+            case DenoiseMethod::LumaMedian3x3:
+                cuda_kernels::LaunchDenoiseLumaMedian3x3(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaBilateral3x3:
+                cuda_kernels::LaunchDenoiseLumaBilateral3x3(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaBilateral5x5:
+                cuda_kernels::LaunchDenoiseLumaBilateral5x5(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaGaussian3x3:
+            default:
+                cuda_kernels::LaunchDenoiseLumaGaussian3x3(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+        }
+        pre_input = d_rgb_denoise_;
+    }
+
+    if (out_w != preprocess_w || out_h != preprocess_h) {
+        cuda_kernels::LaunchCropZoomBicubic(
+            pre_input,
+            preprocess_w,
+            preprocess_h,
+            d_rgb_zoom_,
+            out_w,
+            out_h,
+            0,
+            0,
+            preprocess_w,
+            preprocess_h,
+            stream_
+        );
+        pre_input = d_rgb_zoom_;
+    }
+
+    const size_t out_bytes = static_cast<size_t>(out_w) * static_cast<size_t>(out_h) * kRgbBytesPerPixel;
+    if (out_bytes > h_rgb_output_capacity_bytes_) {
+        throw std::runtime_error("RGB output size exceeds preallocated host buffer capacity.");
+    }
+
+    uint8_t* host_rgb_ptr = h_rgb_output_pinned_ != nullptr ? h_rgb_output_pinned_ : host_rgb_output_.data();
+    CheckCuda(
+        cudaMemcpyAsync(host_rgb_ptr, pre_input, out_bytes, cudaMemcpyDeviceToHost, stream_),
+        "cudaMemcpyAsync D2H preprocess roi rgb"
+    );
+
+    CheckCuda(
+        cudaMemcpyAsync(
+            d_rgb_prev_full_,
+            d_rgb_full_,
+            rgb_pixels_ * kRgbBytesPerPixel,
+            cudaMemcpyDeviceToDevice,
+            stream_
+        ),
+        "cudaMemcpyAsync D2D update prev rgb preprocess roi"
+    );
+    has_prev_rgb_full_ = true;
+
+    CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize preprocess roi rgb");
+    return std::string(reinterpret_cast<const char*>(host_rgb_ptr), out_bytes);
+}
+
+CudaTensorBuffer VideoProcessor::ProcessFramePreprocessRoiTensorCudaBuffer(
+    const uint8_t* input_frame,
+    size_t input_size,
+    int roi_x,
+    int roi_y,
+    int roi_w,
+    int roi_h,
+    int out_w,
+    int out_h,
+    const std::string& dtype_name
+) {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+
+    if (input_frame == nullptr) {
+        throw std::invalid_argument("Input frame pointer is null.");
+    }
+    if (input_size != uyvy_bytes_) {
+        throw std::invalid_argument("Invalid frame size; expected 1920*1080*2 bytes in UYVY.");
+    }
+    if (out_w <= 0 || out_h <= 0) {
+        throw std::invalid_argument("Output dimensions must be positive.");
+    }
+
+    const int tensor_dtype = ParseTensorDTypeCode(dtype_name);
+    const int tensor_layout = 0;  // NCHW
+    const int tensor_channels = 3;
+    const bool tensor_normalized_01 = true;
+
+    // UYVY packs chroma for 2 horizontal pixels.
+    if ((roi_w & 1) != 0) {
+        roi_w -= 1;
+    }
+    if ((roi_x & 1) != 0) {
+        roi_x -= 1;
+    }
+    if (roi_w < 2) {
+        roi_w = 2;
+    }
+    if (roi_h < 2) {
+        roi_h = 2;
+    }
+
+    roi_w = std::clamp(roi_w, 2, width_);
+    roi_h = std::clamp(roi_h, 2, height_);
+
+    const int max_x = std::max(0, width_ - roi_w);
+    const int max_y = std::max(0, height_ - roi_h);
+    roi_x = std::clamp(roi_x, 0, max_x);
+    roi_y = std::clamp(roi_y, 0, max_y);
+    roi_x &= ~1;
+
+    out_w = std::clamp(out_w, 1, width_);
+    out_h = std::clamp(out_h, 1, height_);
+
+    bool deinterlace_enabled = true;
+    DeinterlaceMethod deinterlace_method = DeinterlaceMethod::Bob;
+    DenoiseMethod denoise_method = DenoiseMethod::Off;
+    float denoise_strength = 0.0f;
+    ColorSpace color_space = ColorSpace::Rec709;
+    ColorRange color_range = ColorRange::Limited;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        deinterlace_enabled = enable_deinterlace_;
+        deinterlace_method = deinterlace_method_;
+        denoise_method = denoise_method_;
+        denoise_strength = denoise_strength_;
+        color_space = color_space_;
+        color_range = color_range_;
+    }
+
+    CheckCuda(
+        cudaMemcpyAsync(d_uyvy_in_, input_frame, uyvy_bytes_, cudaMemcpyHostToDevice, stream_),
+        "cudaMemcpyAsync H2D preprocess roi tensor"
+    );
+
+    const int color_matrix = ToColorMatrixId(color_space);
+    const int color_range_id = ToColorRangeId(color_range);
+    cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, color_matrix, color_range_id, stream_);
+
+    cuda_kernels::LaunchCropCopyRgb(
+        d_rgb_full_,
+        width_,
+        height_,
+        d_rgb_zoom_,
+        roi_x,
+        roi_y,
+        roi_w,
+        roi_h,
+        stream_
+    );
+
+    const uchar3* pre_input = d_rgb_zoom_;
+    const int preprocess_w = roi_w;
+    const int preprocess_h = roi_h;
+    const int preprocess_field_phase = roi_y & 1;
+
+    if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+        cuda_kernels::LaunchCropCopyRgb(
+            d_rgb_prev_full_,
+            width_,
+            height_,
+            d_rgb_sr_,
+            roi_x,
+            roi_y,
+            roi_w,
+            roi_h,
+            stream_
+        );
+
+        if (has_prev_rgb_full_) {
+            cuda_kernels::LaunchDenoiseFieldTemporalLuma(
+                pre_input,
+                d_rgb_sr_,
+                d_rgb_denoise_,
+                preprocess_w,
+                preprocess_h,
+                denoise_strength,
+                stream_
+            );
+        } else {
+            CheckCuda(
+                cudaMemcpyAsync(
+                    d_rgb_denoise_,
+                    pre_input,
+                    static_cast<size_t>(preprocess_w) * static_cast<size_t>(preprocess_h) * kRgbBytesPerPixel,
+                    cudaMemcpyDeviceToDevice,
+                    stream_
+                ),
+                "cudaMemcpyAsync D2D preprocess temporal warmup tensor"
+            );
+        }
+        pre_input = d_rgb_denoise_;
+    }
+
+    if (deinterlace_enabled) {
+        switch (deinterlace_method) {
+            case DeinterlaceMethod::Blend:
+                cuda_kernels::LaunchBlendDeinterlace(pre_input, d_rgb_bob_, preprocess_w, preprocess_h, stream_);
+                break;
+            case DeinterlaceMethod::EdgeAdaptive:
+                cuda_kernels::LaunchEdgeAdaptiveDeinterlace(
+                    pre_input,
+                    d_rgb_bob_,
+                    preprocess_w,
+                    preprocess_h,
+                    preprocess_field_phase,
+                    stream_
+                );
+                break;
+            case DeinterlaceMethod::Bob:
+            default:
+                cuda_kernels::LaunchBobDeinterlace(
+                    pre_input,
+                    d_rgb_bob_,
+                    preprocess_w,
+                    preprocess_h,
+                    preprocess_field_phase,
+                    stream_
+                );
+                break;
+        }
+        pre_input = d_rgb_bob_;
+    }
+
+    if (denoise_method != DenoiseMethod::Off &&
+        denoise_method != DenoiseMethod::FieldTemporalLuma &&
+        denoise_strength > 0.001f) {
+        switch (denoise_method) {
+            case DenoiseMethod::LumaMedian3x3:
+                cuda_kernels::LaunchDenoiseLumaMedian3x3(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaBilateral3x3:
+                cuda_kernels::LaunchDenoiseLumaBilateral3x3(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaBilateral5x5:
+                cuda_kernels::LaunchDenoiseLumaBilateral5x5(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+            case DenoiseMethod::LumaGaussian3x3:
+            default:
+                cuda_kernels::LaunchDenoiseLumaGaussian3x3(pre_input, d_rgb_denoise_, preprocess_w, preprocess_h, denoise_strength, stream_);
+                break;
+        }
+        pre_input = d_rgb_denoise_;
+    }
+
+    if (out_w != preprocess_w || out_h != preprocess_h) {
+        cuda_kernels::LaunchCropZoomBicubic(
+            pre_input,
+            preprocess_w,
+            preprocess_h,
+            d_rgb_zoom_,
+            out_w,
+            out_h,
+            0,
+            0,
+            preprocess_w,
+            preprocess_h,
+            stream_
+        );
+        pre_input = d_rgb_zoom_;
+    }
+
+    const std::size_t tensor_elements =
+        static_cast<std::size_t>(tensor_channels) * static_cast<std::size_t>(out_w) * static_cast<std::size_t>(out_h);
+    const std::size_t tensor_bytes = tensor_elements * TensorElementSizeBytes(tensor_dtype);
+    void* d_tensor = nullptr;
+    CheckCuda(cudaMalloc(&d_tensor, tensor_bytes), "cudaMalloc preprocess roi tensor");
+
+    try {
+        cuda_kernels::LaunchRgbToTensor(
+            pre_input,
+            d_tensor,
+            tensor_dtype,
+            tensor_layout,
+            tensor_channels,
+            tensor_normalized_01,
+            out_w,
+            out_h,
+            stream_
+        );
+
+        CheckCuda(
+            cudaMemcpyAsync(
+                d_rgb_prev_full_,
+                d_rgb_full_,
+                rgb_pixels_ * kRgbBytesPerPixel,
+                cudaMemcpyDeviceToDevice,
+                stream_
+            ),
+            "cudaMemcpyAsync D2D update prev rgb preprocess roi tensor"
+        );
+        has_prev_rgb_full_ = true;
+
+        CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize preprocess roi tensor");
+    } catch (...) {
+        cudaFree(d_tensor);
+        throw;
+    }
+
+    return CudaTensorBuffer(
+        d_tensor,
+        tensor_bytes,
+        out_w,
+        out_h,
+        tensor_channels,
+        (tensor_dtype == 1 ? std::string("float16") : (tensor_dtype == 0 ? std::string("float32") : std::string("uint8"))),
+        "nchw",
+        tensor_normalized_01
+    );
 }
 
 std::string VideoProcessor::ProcessFrameInternal(
@@ -1329,6 +2001,13 @@ std::string VideoProcessor::ProcessFrameInternal(
 }
 
 void VideoProcessor::Cleanup() {
+    if (h_rgb_output_pinned_ != nullptr) {
+        cudaFreeHost(h_rgb_output_pinned_);
+        h_rgb_output_pinned_ = nullptr;
+    }
+
+    h_rgb_output_capacity_bytes_ = 0;
+
     if (h_output_pinned_ != nullptr) {
         cudaFreeHost(h_output_pinned_);
         h_output_pinned_ = nullptr;

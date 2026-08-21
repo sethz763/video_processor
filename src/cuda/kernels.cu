@@ -1219,6 +1219,65 @@ __device__ inline float TensorElemToFloat(const uint8_t v) {
 }
 
 template <typename T>
+__device__ inline T FloatToTensorElem(float v);
+
+template <>
+__device__ inline float FloatToTensorElem<float>(float v) {
+    return v;
+}
+
+template <>
+__device__ inline __half FloatToTensorElem<__half>(float v) {
+    return __float2half(v);
+}
+
+template <>
+__device__ inline uint8_t FloatToTensorElem<uint8_t>(float v) {
+    return ClampToU8(v);
+}
+
+template <typename T>
+__global__ void RgbToTensorKernel(
+    const uchar3* rgb,
+    int tensor_layout,
+    int channels,
+    float scale,
+    T* tensor,
+    int width,
+    int height
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int pixel_index = y * width + x;
+    const int clamped_channels = max(1, min(4, channels));
+    const uchar3 px = rgb[pixel_index];
+
+    const float values[4] = {
+        static_cast<float>(px.x) * scale,
+        static_cast<float>(px.y) * scale,
+        static_cast<float>(px.z) * scale,
+        0.0f,
+    };
+
+    if (tensor_layout == 0) {
+        const int plane = width * height;
+        for (int c = 0; c < clamped_channels; ++c) {
+            tensor[(c * plane) + pixel_index] = FloatToTensorElem<T>(values[c]);
+        }
+    } else {
+        const int base = pixel_index * clamped_channels;
+        for (int c = 0; c < clamped_channels; ++c) {
+            tensor[base + c] = FloatToTensorElem<T>(values[c]);
+        }
+    }
+}
+
+template <typename T>
 __global__ void TensorToRgbKernel(
     const T* tensor,
     int tensor_layout,
@@ -1847,6 +1906,64 @@ void LaunchTensorToRgb(
     }
 
     CheckKernelLaunch("TensorToRgbKernel launch");
+}
+
+void LaunchRgbToTensor(
+    const uchar3* d_rgb,
+    void* d_tensor,
+    int tensor_dtype,
+    int tensor_layout,
+    int channels,
+    bool normalized_01,
+    int width,
+    int height,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const dim3 grid = Grid2D(width, height, kBlockX, kBlockY);
+    const dim3 block(kBlockX, kBlockY, 1);
+    const float scale = normalized_01 ? (1.0f / 255.0f) : 1.0f;
+
+    switch (tensor_dtype) {
+        case 0:
+            RgbToTensorKernel<float><<<grid, block, 0, stream>>>(
+                d_rgb,
+                tensor_layout,
+                channels,
+                scale,
+                static_cast<float*>(d_tensor),
+                width,
+                height
+            );
+            break;
+        case 1:
+            RgbToTensorKernel<__half><<<grid, block, 0, stream>>>(
+                d_rgb,
+                tensor_layout,
+                channels,
+                scale,
+                static_cast<__half*>(d_tensor),
+                width,
+                height
+            );
+            break;
+        case 2:
+            RgbToTensorKernel<uint8_t><<<grid, block, 0, stream>>>(
+                d_rgb,
+                tensor_layout,
+                channels,
+                normalized_01 ? 255.0f : 1.0f,
+                static_cast<uint8_t*>(d_tensor),
+                width,
+                height
+            );
+            break;
+        default:
+            throw std::runtime_error("Unsupported tensor dtype code for LaunchRgbToTensor");
+    }
+
+    CheckKernelLaunch("RgbToTensorKernel launch");
 }
 
 } // namespace vp::cuda_kernels

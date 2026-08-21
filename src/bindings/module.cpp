@@ -45,6 +45,16 @@ std::pair<const std::uint8_t*, std::size_t> GetContiguousByteBuffer(const py::bu
 PYBIND11_MODULE(video_processor, m) {
     m.doc() = "CUDA video processor module for UYVY deinterlace/crop/zoom basic scaling";
 
+    py::class_<vp::CudaTensorBuffer>(m, "CudaTensorBuffer")
+        .def_property_readonly("data_ptr", &vp::CudaTensorBuffer::DataPtr)
+        .def_property_readonly("bytes", &vp::CudaTensorBuffer::Bytes)
+        .def_property_readonly("width", &vp::CudaTensorBuffer::Width)
+        .def_property_readonly("height", &vp::CudaTensorBuffer::Height)
+        .def_property_readonly("channels", &vp::CudaTensorBuffer::Channels)
+        .def_property_readonly("dtype", &vp::CudaTensorBuffer::DType)
+        .def_property_readonly("layout", &vp::CudaTensorBuffer::Layout)
+        .def_property_readonly("normalized_01", &vp::CudaTensorBuffer::Normalized01);
+
     py::class_<vp::VideoProcessor>(m, "VideoProcessor")
         .def(
             py::init<int, int, int, int, int, int, bool, int>(),
@@ -112,6 +122,81 @@ PYBIND11_MODULE(video_processor, m) {
             },
             py::arg("frame"),
             "Apply enabled preprocess stages (deinterlace/denoise) and return UYVY bytes without ROI scaling."
+        )
+        .def(
+            "process_frame_preprocess_roi_rgb",
+            [](vp::VideoProcessor& self,
+               const py::buffer& frame,
+               int roi_x,
+               int roi_y,
+               int roi_w,
+               int roi_h,
+               int out_w,
+               int out_h) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFramePreprocessRoiRgbBuffer(
+                        frame_ptr,
+                        frame_size,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        out_w,
+                        out_h
+                    );
+                }
+                return py::bytes(output);
+            },
+            py::arg("frame"),
+            py::arg("roi_x"),
+            py::arg("roi_y"),
+            py::arg("roi_w"),
+            py::arg("roi_h"),
+            py::arg("out_w"),
+            py::arg("out_h"),
+            "Apply native preprocess on GPU for the ROI and return RGB bytes sized to out_w/out_h."
+        )
+        .def(
+            "process_frame_preprocess_roi_tensor_cuda",
+            [](vp::VideoProcessor& self,
+               const py::buffer& frame,
+               int roi_x,
+               int roi_y,
+               int roi_w,
+               int roi_h,
+               int out_w,
+               int out_h,
+               const std::string& dtype) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                vp::CudaTensorBuffer output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFramePreprocessRoiTensorCudaBuffer(
+                        frame_ptr,
+                        frame_size,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        out_w,
+                        out_h,
+                        dtype
+                    );
+                }
+                return output;
+            },
+            py::arg("frame"),
+            py::arg("roi_x"),
+            py::arg("roi_y"),
+            py::arg("roi_w"),
+            py::arg("roi_h"),
+            py::arg("out_w"),
+            py::arg("out_h"),
+            py::arg("dtype") = "float16",
+            "Apply native preprocess on GPU for the ROI and return a CUDA NCHW tensor buffer for direct ONNX input binding."
         )
         .def(
             "set_roi",

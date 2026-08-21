@@ -1255,7 +1255,7 @@ class VideoProcessorController:
         self.ai_sr_roi_overscan_percent = 0.0
         self.ai_sr_inference_divisor = 0
         self.ai_sr_detail_preserve_percent = 0.0
-        self.ai_sr_max_inflight = 2
+        self.ai_sr_max_inflight = 1
         self.ai_sr_info: dict[str, object] | None = None
         self.rtx_vsr_enabled = False
         self.rtx_vsr_active = False
@@ -1585,7 +1585,7 @@ class ProcessVideoProcessorController:
         self.ai_sr_detail_preserve_percent = max(0.0, float(os.environ.get("VP_AI_SR_DETAIL_PRESERVE_PCT", "0")))
         self.ai_sr_hold_last_frame = os.environ.get("VP_AI_SR_HOLD_LAST_FRAME", "1") == "1"
         self.ai_sr_max_hold_ms = max(0.0, float(os.environ.get("VP_AI_SR_MAX_HOLD_MS", "0")))
-        self.ai_sr_max_inflight = max(1, min(4, int(os.environ.get("VP_AI_SR_MAX_INFLIGHT", "2"))))
+        self.ai_sr_max_inflight = max(1, min(4, int(os.environ.get("VP_AI_SR_MAX_INFLIGHT", "1"))))
         self.ai_sr_active = False
         self.ai_sr_error: str | None = None
         self.ai_sr_info: dict[str, object] | None = None

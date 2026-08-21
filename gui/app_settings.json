@@ -1,9 +1,9 @@
 {
   "ai_sr_detail_preserve_percent": 0.0,
-  "ai_sr_enabled": true,
+  "ai_sr_enabled": false,
   "ai_sr_inference_divisor": 1,
-  "ai_sr_inference_fps": 5,
-  "ai_sr_input_align": "2",
+  "ai_sr_inference_fps": 10,
+  "ai_sr_input_align": "1",
   "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\2x-spanx2-ch48.onnx",
   "ai_sr_provider": "auto",
   "ai_sr_require_gpu": true,
@@ -11,7 +11,7 @@
   "ai_sr_strict": false,
   "ai_sr_trt_precision": "fp16",
   "basic_scaling_auto_max": "2",
-  "basic_scaling_enabled": false,
+  "basic_scaling_enabled": true,
   "basic_scaling_manual": "2",
   "basic_scaling_method": "Bicubic + Sharpen (Crisp)",
   "basic_scaling_mode": "Manual",
@@ -26,7 +26,7 @@
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "deinterlace_enabled": false,
   "deinterlace_method": "Bob (Fast)",
-  "denoise_method": "Luma Gaussian 3x3 (Balanced)",
+  "denoise_method": "Field Temporal Luma (Advanced)",
   "denoise_strength": 0.5,
   "display_splitter_sizes": [
     421,
@@ -48,20 +48,20 @@
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        760,
-        166,
-        700,
-        394
+        26,
+        342,
+        486,
+        273
       ]
     },
     "2": {
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        624,
-        177,
-        700,
-        394
+        10,
+        375,
+        270,
+        152
       ]
     },
     "3": {

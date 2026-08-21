@@ -42,6 +42,37 @@ enum class ColorRange {
     Full,
 };
 
+class CudaTensorBuffer {
+public:
+    CudaTensorBuffer();
+    CudaTensorBuffer(void* data, std::size_t bytes, int width, int height, int channels, const std::string& dtype, const std::string& layout, bool normalized_01);
+    ~CudaTensorBuffer();
+
+    CudaTensorBuffer(const CudaTensorBuffer&) = delete;
+    CudaTensorBuffer& operator=(const CudaTensorBuffer&) = delete;
+    CudaTensorBuffer(CudaTensorBuffer&& other) noexcept;
+    CudaTensorBuffer& operator=(CudaTensorBuffer&& other) noexcept;
+
+    std::uint64_t DataPtr() const;
+    std::size_t Bytes() const;
+    int Width() const;
+    int Height() const;
+    int Channels() const;
+    const std::string& DType() const;
+    const std::string& Layout() const;
+    bool Normalized01() const;
+
+private:
+    void* data_;
+    std::size_t bytes_;
+    int width_;
+    int height_;
+    int channels_;
+    std::string dtype_;
+    std::string layout_;
+    bool normalized_01_;
+};
+
 class VideoProcessor {
 public:
     VideoProcessor(
@@ -64,10 +95,50 @@ public:
     std::string ProcessFrameNoDeinterlace(const std::string& input_frame);
     std::string ProcessFrameDeinterlaceOnly(const std::string& input_frame);
     std::string ProcessFramePreprocessOnly(const std::string& input_frame);
+    std::string ProcessFramePreprocessRoiRgb(
+        const std::string& input_frame,
+        int roi_x,
+        int roi_y,
+        int roi_w,
+        int roi_h,
+        int out_w,
+        int out_h
+    );
     std::string ProcessFrameBuffer(const uint8_t* input_frame, size_t input_size);
     std::string ProcessFrameNoDeinterlaceBuffer(const uint8_t* input_frame, size_t input_size);
     std::string ProcessFrameDeinterlaceOnlyBuffer(const uint8_t* input_frame, size_t input_size);
     std::string ProcessFramePreprocessOnlyBuffer(const uint8_t* input_frame, size_t input_size);
+    std::string ProcessFramePreprocessRoiRgbBuffer(
+        const uint8_t* input_frame,
+        size_t input_size,
+        int roi_x,
+        int roi_y,
+        int roi_w,
+        int roi_h,
+        int out_w,
+        int out_h
+    );
+    CudaTensorBuffer ProcessFramePreprocessRoiTensorCuda(
+        const std::string& input_frame,
+        int roi_x,
+        int roi_y,
+        int roi_w,
+        int roi_h,
+        int out_w,
+        int out_h,
+        const std::string& dtype_name
+    );
+    CudaTensorBuffer ProcessFramePreprocessRoiTensorCudaBuffer(
+        const uint8_t* input_frame,
+        size_t input_size,
+        int roi_x,
+        int roi_y,
+        int roi_w,
+        int roi_h,
+        int out_w,
+        int out_h,
+        const std::string& dtype_name
+    );
 
     void SetRoi(int roi_x, int roi_y, int roi_w, int roi_h);
     void SetRoiPosition(int roi_x, int roi_y);
@@ -172,8 +243,11 @@ private:
     uchar3* d_rgb_zoom_;
     bool has_prev_rgb_full_;
     uint8_t* h_output_pinned_;
+    uint8_t* h_rgb_output_pinned_;
+    size_t h_rgb_output_capacity_bytes_;
 
     std::vector<uint8_t> host_output_;
+    std::vector<uint8_t> host_rgb_output_;
 };
 
 } // namespace vp
