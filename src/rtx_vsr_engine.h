@@ -41,6 +41,12 @@ public:
     RTXVideoSREngine& operator=(const RTXVideoSREngine&) = delete;
 
     std::vector<std::uint8_t> ProcessRGBA(const std::uint8_t* input_rgba, std::size_t input_bytes);
+    void ProcessRGBAInto(
+        const std::uint8_t* input_rgba,
+        std::size_t input_bytes,
+        std::uint8_t* output_rgba,
+        std::size_t output_bytes
+    );
     void Close();
 
     int input_width() const { return input_width_; }

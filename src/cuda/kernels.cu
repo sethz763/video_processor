@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <cuda_fp16.h>
+
 namespace vp::cuda_kernels {
 namespace {
 
@@ -1204,6 +1206,66 @@ __global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int
     uyvy[base + 3] = y1_u8;
 }
 
+__device__ inline float TensorElemToFloat(const float v) {
+    return v;
+}
+
+__device__ inline float TensorElemToFloat(const __half v) {
+    return __half2float(v);
+}
+
+__device__ inline float TensorElemToFloat(const uint8_t v) {
+    return static_cast<float>(v);
+}
+
+template <typename T>
+__global__ void TensorToRgbKernel(
+    const T* tensor,
+    int tensor_layout,
+    int channels,
+    float scale,
+    uchar3* rgb,
+    int width,
+    int height
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int pixel_index = y * width + x;
+    const int clamped_channels = max(1, min(4, channels));
+
+    const int c0 = 0;
+    const int c1 = (clamped_channels > 1) ? 1 : 0;
+    const int c2 = (clamped_channels > 2) ? 2 : 0;
+
+    int r_index = 0;
+    int g_index = 0;
+    int b_index = 0;
+    if (tensor_layout == 0) {
+        // NCHW
+        const int plane = width * height;
+        r_index = (c0 * plane) + pixel_index;
+        g_index = (c1 * plane) + pixel_index;
+        b_index = (c2 * plane) + pixel_index;
+    } else {
+        // HWC
+        const int base = pixel_index * clamped_channels;
+        r_index = base + c0;
+        g_index = base + c1;
+        b_index = base + c2;
+    }
+
+    const float r = TensorElemToFloat(tensor[r_index]) * scale;
+    const float g = TensorElemToFloat(tensor[g_index]) * scale;
+    const float b = TensorElemToFloat(tensor[b_index]) * scale;
+
+    rgb[pixel_index] = make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
+}
+
 inline dim3 Grid2D(int width, int height, int bx = 16, int by = 16) {
     return dim3((width + bx - 1) / bx, (height + by - 1) / by, 1);
 }
@@ -1727,6 +1789,64 @@ void LaunchRgbToUyvy(
 
     RgbToUyvyKernel<<<grid, block, 0, stream>>>(d_rgb, d_uyvy, width, height, color_matrix, color_range);
     CheckKernelLaunch("RgbToUyvyKernel launch");
+}
+
+void LaunchTensorToRgb(
+    const void* d_tensor,
+    int tensor_dtype,
+    int tensor_layout,
+    int channels,
+    bool normalized_01,
+    uchar3* d_rgb,
+    int width,
+    int height,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const dim3 grid = Grid2D(width, height, kBlockX, kBlockY);
+    const dim3 block(kBlockX, kBlockY, 1);
+    const float scale = normalized_01 ? 255.0f : 1.0f;
+
+    switch (tensor_dtype) {
+        case 0:
+            TensorToRgbKernel<float><<<grid, block, 0, stream>>>(
+                static_cast<const float*>(d_tensor),
+                tensor_layout,
+                channels,
+                scale,
+                d_rgb,
+                width,
+                height
+            );
+            break;
+        case 1:
+            TensorToRgbKernel<__half><<<grid, block, 0, stream>>>(
+                static_cast<const __half*>(d_tensor),
+                tensor_layout,
+                channels,
+                scale,
+                d_rgb,
+                width,
+                height
+            );
+            break;
+        case 2:
+            TensorToRgbKernel<uint8_t><<<grid, block, 0, stream>>>(
+                static_cast<const uint8_t*>(d_tensor),
+                tensor_layout,
+                channels,
+                1.0f,
+                d_rgb,
+                width,
+                height
+            );
+            break;
+        default:
+            throw std::runtime_error("Unsupported tensor dtype code for LaunchTensorToRgb");
+    }
+
+    CheckKernelLaunch("TensorToRgbKernel launch");
 }
 
 } // namespace vp::cuda_kernels

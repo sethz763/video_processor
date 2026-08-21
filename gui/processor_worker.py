@@ -9,6 +9,8 @@ import traceback
 import os
 import importlib
 import math
+import ctypes
+import shutil
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,8 @@ _CUDA_DLL_DIR_HANDLES: list[Any] = []
 _CUDA_DLL_DIR_KEYS: set[str] = set()
 _RTX_DLL_DIR_HANDLES: list[Any] = []
 _RTX_DLL_DIR_KEYS: set[str] = set()
+_TRT_PREFLIGHT_CACHE_OK: bool | None = None
+_TRT_PREFLIGHT_CACHE_ERROR: str | None = None
 
 
 def _candidate_cuda_dll_dirs() -> list[Path]:
@@ -63,6 +67,30 @@ def _candidate_cuda_dll_dirs() -> list[Path]:
         for candidate in sorted(cuda_root.glob("v12*"), reverse=True):
             _add(candidate / "bin")
 
+    # TensorRT runtime DLLs are often deployed with NVIDIA Video Effects.
+    _add(program_files / "NVIDIA Corporation" / "NVIDIA Video Effects")
+
+    # TensorRT installs are commonly rooted under these environment variables.
+    for env_name in ("TENSORRT_PATH", "TENSORRT_ROOT", "TRT_LIBPATH"):
+        env_value = os.environ.get(env_name, "").strip()
+        if not env_value:
+            continue
+        root = Path(env_value)
+        _add(root)
+        _add(root / "lib")
+        _add(root / "bin")
+
+    # Common default TensorRT install roots on Windows.
+    trt_root = program_files / "NVIDIA GPU Computing Toolkit" / "TensorRT"
+    if trt_root.exists():
+        _add(trt_root)
+        _add(trt_root / "lib")
+        _add(trt_root / "bin")
+        for candidate in sorted(trt_root.glob("10*"), reverse=True):
+            _add(candidate)
+            _add(candidate / "lib")
+            _add(candidate / "bin")
+
     # Also support pip-installed NVIDIA runtime packages in this venv.
     project_root = Path(__file__).resolve().parents[1]
     nvidia_site = project_root / "venv" / "Lib" / "site-packages" / "nvidia"
@@ -70,6 +98,21 @@ def _candidate_cuda_dll_dirs() -> list[Path]:
         for pkg_dir in nvidia_site.iterdir():
             if pkg_dir.is_dir():
                 _add(pkg_dir / "bin")
+
+    # Honor caller-provided PATH entries (for example custom TensorRT installs)
+    # so runtime setup stays environment-driven instead of hardcoded.
+    for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_entry:
+            continue
+        try:
+            candidate = Path(path_entry)
+        except Exception:
+            continue
+        if not candidate.exists() or not candidate.is_dir():
+            continue
+        lowered = str(candidate).lower()
+        if "nvidia" in lowered or "tensorrt" in lowered or "cuda" in lowered:
+            _add(candidate)
 
     return dirs
 
@@ -87,9 +130,166 @@ def _prepare_cuda_runtime_dll_paths() -> None:
             handle = add_dll_directory(str(dll_dir))
             _CUDA_DLL_DIR_HANDLES.append(handle)
             _CUDA_DLL_DIR_KEYS.add(key)
+
+            # Some delayed runtime loads still rely on PATH resolution.
+            dll_dir_str = str(dll_dir)
+            path_parts = os.environ.get("PATH", "").split(os.pathsep)
+            path_keys = {part.lower() for part in path_parts if part}
+            if key not in path_keys:
+                os.environ["PATH"] = dll_dir_str + os.pathsep + os.environ.get("PATH", "")
         except Exception:
             # Best effort: continue trying remaining directories.
             continue
+
+
+def _current_windows_dll_search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path) -> None:
+        key = str(path).lower()
+        if key in seen:
+            return
+        if path.exists() and path.is_dir():
+            seen.add(key)
+            dirs.append(path)
+
+    for base_dir in _candidate_cuda_dll_dirs():
+        _add(base_dir)
+
+    if ort is not None:
+        try:
+            ort_root = Path(getattr(ort, "__file__", "")).resolve().parent
+            _add(ort_root)
+            _add(ort_root / "capi")
+        except Exception:
+            pass
+
+    for path_entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_entry:
+            continue
+        try:
+            _add(Path(path_entry))
+        except Exception:
+            continue
+
+    return dirs
+
+
+def _find_dll_in_search_dirs(dll_name: str, search_dirs: list[Path]) -> Path | None:
+    needle = str(dll_name).strip()
+    for base in search_dirs:
+        candidate = base / needle
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _ensure_tensorrt_builder_resource_alias(search_dirs: list[Path]) -> Path | None:
+    expected_name = "nvinfer_builder_resource_10.dll"
+    existing = _find_dll_in_search_dirs(expected_name, search_dirs)
+    if existing is not None:
+        return existing
+
+    alt_names = [
+        "nvinfer_builder_resource_ptx_10.dll",
+    ]
+    source: Path | None = None
+    for alt_name in alt_names:
+        source = _find_dll_in_search_dirs(alt_name, search_dirs)
+        if source is not None:
+            break
+    if source is None:
+        return None
+
+    project_root = Path(__file__).resolve().parents[1]
+    shim_dir = project_root / ".runtime" / "dll_shims"
+    try:
+        shim_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+
+    alias_path = shim_dir / expected_name
+    try:
+        if (not alias_path.exists()) or (alias_path.stat().st_size != source.stat().st_size):
+            shutil.copy2(source, alias_path)
+    except Exception:
+        return None
+
+    shim_key = str(shim_dir).lower()
+    if shim_key not in _CUDA_DLL_DIR_KEYS:
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if callable(add_dll_directory):
+            try:
+                handle = add_dll_directory(str(shim_dir))
+                _CUDA_DLL_DIR_HANDLES.append(handle)
+                _CUDA_DLL_DIR_KEYS.add(shim_key)
+            except Exception:
+                pass
+
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    path_keys = {part.lower() for part in path_parts if part}
+    if shim_key not in path_keys:
+        os.environ["PATH"] = str(shim_dir) + os.pathsep + os.environ.get("PATH", "")
+
+    if all(str(p).lower() != str(shim_dir).lower() for p in search_dirs):
+        search_dirs.insert(0, shim_dir)
+
+    return alias_path
+
+
+def _preflight_tensorrt_runtime() -> None:
+    # Guard the TensorRT path before ORT session creation. Missing builder
+    # resources can trigger a native crash instead of a Python exception.
+    global _TRT_PREFLIGHT_CACHE_OK, _TRT_PREFLIGHT_CACHE_ERROR
+
+    if _TRT_PREFLIGHT_CACHE_OK is True:
+        return
+    if _TRT_PREFLIGHT_CACHE_OK is False:
+        raise RuntimeError(_TRT_PREFLIGHT_CACHE_ERROR or "TensorRT runtime preflight failed")
+
+    if os.name != "nt":
+        _TRT_PREFLIGHT_CACHE_OK = True
+        _TRT_PREFLIGHT_CACHE_ERROR = None
+        return
+
+    search_dirs = _current_windows_dll_search_dirs()
+    _ensure_tensorrt_builder_resource_alias(search_dirs)
+    required = [
+        "nvinfer_10.dll",
+        "nvinfer_plugin_10.dll",
+        "nvinfer_builder_resource_10.dll",
+    ]
+
+    missing: list[str] = []
+    found: dict[str, str] = {}
+    for dll_name in required:
+        resolved = _find_dll_in_search_dirs(dll_name, search_dirs)
+        if resolved is None:
+            missing.append(dll_name)
+        else:
+            found[dll_name] = str(resolved)
+
+    if missing:
+        err = (
+            "TensorRT runtime is incomplete; missing required DLL(s): "
+            f"{', '.join(missing)} | found={found}"
+        )
+        _TRT_PREFLIGHT_CACHE_OK = False
+        _TRT_PREFLIGHT_CACHE_ERROR = err
+        raise RuntimeError(err)
+
+    try:
+        for dll_name in required:
+            ctypes.WinDLL(found[dll_name])
+    except Exception as exc:
+        err = f"TensorRT runtime DLL load preflight failed: {exc}"
+        _TRT_PREFLIGHT_CACHE_OK = False
+        _TRT_PREFLIGHT_CACHE_ERROR = err
+        raise RuntimeError(err) from exc
+
+    _TRT_PREFLIGHT_CACHE_OK = True
+    _TRT_PREFLIGHT_CACHE_ERROR = None
 
 
 def _prepare_rtx_runtime_dll_paths(sdk_root: str, project_root: Path) -> None:
@@ -149,6 +349,8 @@ except Exception:
 FRAME_W = 1920
 FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
+_SUBPIXEL_SHIFT_APPLY_EPS = max(0.0, float(os.environ.get("VP_SUBPIXEL_SHIFT_APPLY_EPS", "0.03")))
+_AI_SR_TIMING_WARMUP_FRAMES = max(0, int(os.environ.get("VP_AI_SR_TIMING_WARMUP_FRAMES", "8")))
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 _OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES: dict[int, int] = {}
 
@@ -161,6 +363,11 @@ def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
     # Sample sparsely to keep per-frame validation cheap in live mode.
     sample = np.frombuffer(frame_bytes, dtype=np.uint8)[::4096]
     return sample.size > 0 and int(np.count_nonzero(sample)) == 0
+
+
+def _has_effective_subpixel_shift(shift_x: float, shift_y: float) -> bool:
+    eps = float(_SUBPIXEL_SHIFT_APPLY_EPS)
+    return abs(float(shift_x)) >= eps or abs(float(shift_y)) >= eps
 
 RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
     "nearest": cv2.INTER_NEAREST if cv2 is not None else 0,
@@ -309,7 +516,7 @@ def _rgb_to_uyvy_limited(rgb: np.ndarray, color_space: str, color_range: str = "
 def _apply_subpixel_shift_uyvy(frame_bytes: bytes, shift_x: float, shift_y: float) -> bytes:
     if cv2 is None:
         return frame_bytes
-    if abs(float(shift_x)) < 1e-4 and abs(float(shift_y)) < 1e-4:
+    if not _has_effective_subpixel_shift(shift_x, shift_y):
         return frame_bytes
     if len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
         return frame_bytes
@@ -355,6 +562,8 @@ class AiSrOnnxEngine:
         self,
         model_path: str,
         provider: str = "cpu",
+        trt_precision: str = "fp16",
+        trt_engine_cache_path: str | None = None,
         require_gpu: bool = False,
         input_align: int = 2,
         roi_overscan_percent: float = 0.0,
@@ -362,6 +571,7 @@ class AiSrOnnxEngine:
         detail_preserve_percent: float = 0.0,
         color_space: str = "rec709",
         color_range: str = "limited",
+        native_module: Any | None = None,
     ) -> None:
         if ort is None:
             raise RuntimeError("onnxruntime is not installed")
@@ -375,6 +585,15 @@ class AiSrOnnxEngine:
             raise RuntimeError(f"AI SR model file not found: {model_file}")
 
         provider_name = provider.lower()
+        trt_precision_name = str(trt_precision).strip().lower()
+        if provider_name == "trt_int8":
+            provider_name = "trt"
+            trt_precision_name = "int8"
+        elif provider_name == "trt_fp16":
+            provider_name = "trt"
+            trt_precision_name = "fp16"
+        if trt_precision_name not in {"fp16", "int8"}:
+            trt_precision_name = "fp16"
 
         if require_gpu or provider_name in {"cuda", "auto", "trt", "tensorrt"}:
             _prepare_cuda_runtime_dll_paths()
@@ -392,19 +611,27 @@ class AiSrOnnxEngine:
         trt_available = "TensorrtExecutionProvider" in available_providers
 
         cuda_provider_options = {
-            "do_copy_in_default_stream": "1",
-            "cudnn_conv_use_max_workspace": "1",
+            "do_copy_in_default_stream": "True",
+            "cudnn_conv_use_max_workspace": "True",
         }
         trt_provider_options = {
-            "trt_fp16_enable": "1",
-            "trt_engine_cache_enable": "1",
-            "trt_timing_cache_enable": "1",
+            "trt_fp16_enable": "True" if trt_precision_name != "int8" else "False",
+            "trt_int8_enable": "True" if trt_precision_name == "int8" else "False",
+            "trt_engine_cache_enable": "True",
+            "trt_timing_cache_enable": "True",
         }
+        if trt_engine_cache_path:
+            trt_cache_dir = Path(trt_engine_cache_path)
+            trt_cache_dir.mkdir(parents=True, exist_ok=True)
+            trt_provider_options["trt_engine_cache_path"] = str(trt_cache_dir)
 
         if provider_name in {"trt", "tensorrt"} and not trt_available:
             raise RuntimeError(
                 f"TensorrtExecutionProvider is not available in onnxruntime. Available providers: {available_providers_sorted}"
             )
+
+        if provider_name in {"trt", "tensorrt"}:
+            _preflight_tensorrt_runtime()
 
         if provider_name == "cuda" and not cuda_available:
             raise RuntimeError(
@@ -417,32 +644,27 @@ class AiSrOnnxEngine:
             )
 
         if require_gpu:
-            # Enforce CUDA-only session creation when GPU is mandatory so ORT cannot
-            # silently initialize a CPU session as a fallback.
+            # Enforce single-provider GPU session creation to prevent hidden fallback.
             if provider_name in {"trt", "tensorrt"} and trt_available:
-                providers = [
-                    ("TensorrtExecutionProvider", trt_provider_options),
-                    ("CUDAExecutionProvider", cuda_provider_options),
-                ]
+                providers = [("TensorrtExecutionProvider", trt_provider_options)]
             else:
                 providers = [("CUDAExecutionProvider", cuda_provider_options)]
         elif provider_name in {"trt", "tensorrt"}:
-            providers = [
-                ("TensorrtExecutionProvider", trt_provider_options),
-                ("CUDAExecutionProvider", cuda_provider_options),
-                "CPUExecutionProvider",
-            ]
+            providers = [("TensorrtExecutionProvider", trt_provider_options)]
         elif provider_name == "auto":
             if trt_available:
-                providers = [
-                    ("TensorrtExecutionProvider", trt_provider_options),
-                    ("CUDAExecutionProvider", cuda_provider_options),
-                    "CPUExecutionProvider",
-                ]
+                _preflight_tensorrt_runtime()
+                providers = [("TensorrtExecutionProvider", trt_provider_options)]
             elif cuda_available:
-                providers = [("CUDAExecutionProvider", cuda_provider_options), "CPUExecutionProvider"]
+                providers = [("CUDAExecutionProvider", cuda_provider_options)]
+            else:
+                raise RuntimeError(
+                    f"No GPU execution provider is available for AI SR auto mode. Available providers: {available_providers_sorted}"
+                )
         elif provider_name == "cuda" and cuda_available:
-            providers = [("CUDAExecutionProvider", cuda_provider_options), "CPUExecutionProvider"]
+            providers = [("CUDAExecutionProvider", cuda_provider_options)]
+        elif provider_name == "cpu":
+            raise RuntimeError("CPU provider is not supported: legacy CPU ONNX output path has been removed")
 
         first_provider = providers[0]
         first_provider_name = first_provider[0] if isinstance(first_provider, tuple) else str(first_provider)
@@ -465,6 +687,21 @@ class AiSrOnnxEngine:
             self._input_dtype = np.float32
         else:
             raise RuntimeError(f"Unsupported AI SR input tensor type: {input_type}")
+
+        outputs = self._session.get_outputs()
+        if not outputs:
+            raise RuntimeError("AI SR model has no outputs")
+        self._output_name = outputs[0].name
+        output_type = str(getattr(outputs[0], "type", "")).lower()
+        if "float16" in output_type:
+            self._output_dtype = np.float16
+        elif "float" in output_type:
+            self._output_dtype = np.float32
+        elif "uint8" in output_type:
+            self._output_dtype = np.uint8
+        else:
+            self._output_dtype = np.float32
+
         self._model_path = str(model_file)
         session_providers = self._session.get_providers()
         self._provider = session_providers[0] if session_providers else "CPUExecutionProvider"
@@ -474,29 +711,99 @@ class AiSrOnnxEngine:
                 f"requested_providers={providers}, session_providers={session_providers}"
             )
 
+        if self._provider not in {"CUDAExecutionProvider", "TensorrtExecutionProvider"}:
+            raise RuntimeError(
+                "Legacy CPU ONNX output path has been removed. "
+                f"Selected provider '{self._provider}' is not GPU-backed."
+            )
+
         self._model_scale = self._detect_model_scale()
         self._input_w = max(1, FRAME_W // self._model_scale)
         self._input_h = max(1, FRAME_H // self._model_scale)
+        self._io_binding_enabled = self._provider in {"CUDAExecutionProvider", "TensorrtExecutionProvider"}
+        self._io_binding_error: str | None = None
         self._avg_infer_ms: float | None = None
+        self._avg_prep_ms: float | None = None
+        self._avg_post_ms: float | None = None
+        self._avg_total_ms: float | None = None
+        self._last_stage_ms: dict[str, float] = {
+            "prep": 0.0,
+            "infer": 0.0,
+            "post": 0.0,
+            "total": 0.0,
+        }
+        self._timing_warmup_frames = int(_AI_SR_TIMING_WARMUP_FRAMES)
+        self._timing_warmup_remaining = int(_AI_SR_TIMING_WARMUP_FRAMES)
+        self._timing_samples = 0
         self._available_providers = available_providers_sorted
         self._requested_provider = provider_name
+        self._trt_precision = trt_precision_name
+        self._trt_engine_cache_path = trt_provider_options.get("trt_engine_cache_path", "")
         self._require_gpu = bool(require_gpu)
         self._input_align = max(1, int(input_align))
         self._roi_overscan_percent = max(0.0, min(100.0, float(roi_overscan_percent)))
         self._inference_divisor = max(0, int(inference_divisor))
-        self._detail_preserve_percent = max(0.0, min(100.0, float(detail_preserve_percent)))
+        self._detail_preserve_requested_percent = max(0.0, min(100.0, float(detail_preserve_percent)))
+        self._detail_preserve_percent = 0.0
         self._color_space = _normalize_color_space_name(color_space)
         self._color_range = _normalize_color_range_name(color_range)
+
+        if native_module is None or not hasattr(native_module, "AiSrCudaPostProcessor"):
+            raise RuntimeError(
+                "video_processor.AiSrCudaPostProcessor is required for zero-copy AI SR output path. "
+                "Rebuild the native module with the updated architecture."
+            )
+
+        self._cuda_post = native_module.AiSrCudaPostProcessor(
+            output_width=FRAME_W,
+            output_height=FRAME_H,
+            color_space=self._color_space,
+            color_range=self._color_range,
+        )
+
+    def avg_infer_ms(self) -> float | None:
+        if self._avg_infer_ms is None:
+            return None
+        return float(self._avg_infer_ms)
+
+    def timing_info(self) -> dict[str, object]:
+        return {
+            "avg_prep_ms": None if self._avg_prep_ms is None else float(self._avg_prep_ms),
+            "avg_infer_ms": None if self._avg_infer_ms is None else float(self._avg_infer_ms),
+            "avg_post_ms": None if self._avg_post_ms is None else float(self._avg_post_ms),
+            "avg_total_ms": None if self._avg_total_ms is None else float(self._avg_total_ms),
+            "last_prep_ms": float(self._last_stage_ms.get("prep", 0.0)),
+            "last_infer_ms": float(self._last_stage_ms.get("infer", 0.0)),
+            "last_post_ms": float(self._last_stage_ms.get("post", 0.0)),
+            "last_total_ms": float(self._last_stage_ms.get("total", 0.0)),
+            "io_binding_enabled": bool(self._io_binding_enabled),
+            "io_binding_error": self._io_binding_error,
+            "timing_warmup_frames": int(self._timing_warmup_frames),
+            "timing_warmup_remaining": int(self._timing_warmup_remaining),
+            "timing_samples": int(self._timing_samples),
+        }
+
+    def _update_ema(self, attr_name: str, sample_ms: float) -> None:
+        value = max(0.0, float(sample_ms))
+        prev = getattr(self, attr_name)
+        if prev is None:
+            setattr(self, attr_name, value)
+            return
+        setattr(self, attr_name, (0.9 * float(prev)) + (0.1 * value))
 
     def _effective_inference_divisor(self) -> int:
         if self._model_scale <= 1:
             return 1
         if self._inference_divisor <= 0:
-            # Quality-first auto mode: avoid collapsing x4/x8 models to very small
-            # inference inputs, which often looks similar to basic interpolation.
+            # Auto mode must still keep x2/x4/x8 models usable at real-time frame rates.
+            # Full-res x2 inference is the current throughput killer; it collapses the
+            # frame rate by running the model on ~1920x1080 RGB data instead of a
+            # 960x540 (or smaller) working input.
             if self._model_scale >= 8:
                 return 4
             if self._model_scale >= 4:
+                return 2
+            if self._model_scale >= 2:
                 return 2
             return 1
         return max(1, min(self._model_scale, self._inference_divisor))
@@ -591,20 +898,152 @@ class AiSrOnnxEngine:
             "model_path": self._model_path,
             "provider": self._provider,
             "requested_provider": self._requested_provider,
+            "trt_precision": self._trt_precision,
+            "trt_engine_cache_path": self._trt_engine_cache_path,
             "available_providers": self._available_providers,
             "gpu_required": self._require_gpu,
             "input_dtype": "float16" if self._input_dtype == np.float16 else "float32",
             "model_scale": int(self._model_scale),
             "model_input_w": int(self._input_w),
             "model_input_h": int(self._input_h),
+            "io_binding_enabled": bool(self._io_binding_enabled),
+            "io_binding_error": self._io_binding_error,
+            "avg_prep_ms": None if self._avg_prep_ms is None else float(self._avg_prep_ms),
             "avg_infer_ms": None if self._avg_infer_ms is None else float(self._avg_infer_ms),
+            "avg_post_ms": None if self._avg_post_ms is None else float(self._avg_post_ms),
+            "avg_total_ms": None if self._avg_total_ms is None else float(self._avg_total_ms),
             "input_align": int(self._input_align),
             "roi_overscan_percent": float(self._roi_overscan_percent),
             "inference_divisor": int(self._effective_inference_divisor()),
             "detail_preserve_percent": float(self._detail_preserve_percent),
+            "detail_preserve_requested_percent": float(self._detail_preserve_requested_percent),
+            "timing_warmup_frames": int(self._timing_warmup_frames),
+            "timing_warmup_remaining": int(self._timing_warmup_remaining),
+            "timing_samples": int(self._timing_samples),
+            "onnx_output_copy_to_cpu": False,
+            "onnx_zero_copy_cuda_postprocess": True,
         }
 
-    def _run_model_on_rgb(self, model_rgb: np.ndarray) -> np.ndarray:
+    def _record_timing_sample(self, prep_ms: float, infer_ms: float, post_ms: float, total_ms: float) -> None:
+        self._last_stage_ms = {
+            "prep": float(prep_ms),
+            "infer": float(infer_ms),
+            "post": float(post_ms),
+            "total": float(total_ms),
+        }
+
+        self._timing_samples += 1
+        if self._timing_warmup_remaining > 0:
+            self._timing_warmup_remaining -= 1
+            return
+
+        self._update_ema("_avg_prep_ms", prep_ms)
+        self._update_ema("_avg_infer_ms", infer_ms)
+        self._update_ema("_avg_post_ms", post_ms)
+        self._update_ema("_avg_total_ms", total_ms)
+
+    def _run_model_tensor(self, x: np.ndarray) -> object:
+        if not self._io_binding_enabled:
+            raise RuntimeError("Zero-copy AI SR requires ONNX Runtime CUDA/TensorRT I/O binding")
+
+        try:
+            input_ort = ort.OrtValue.ortvalue_from_numpy(x, "cuda", 0)
+            io_binding = self._session.io_binding()
+            io_binding.bind_ortvalue_input(self._input_name, input_ort)
+            io_binding.bind_output(self._output_name, "cuda", 0)
+            self._session.run_with_iobinding(io_binding)
+
+            get_outputs = getattr(io_binding, "get_outputs", None)
+            if not callable(get_outputs):
+                raise RuntimeError("ONNX Runtime build does not expose io_binding.get_outputs()")
+
+            bound_outputs = get_outputs()
+            if not bound_outputs:
+                raise RuntimeError("I/O binding returned no outputs")
+
+            self._io_binding_error = None
+            return bound_outputs[0]
+        except Exception as exc:
+            self._io_binding_error = str(exc)
+            raise RuntimeError(f"Zero-copy ONNX output binding failed: {exc}") from exc
+
+    def _ort_output_descriptor(self, output_ort: object) -> dict[str, object]:
+        shape_attr = getattr(output_ort, "shape", None)
+        if callable(shape_attr):
+            shape = tuple(int(v) for v in shape_attr())
+        elif isinstance(shape_attr, (list, tuple)):
+            shape = tuple(int(v) for v in shape_attr)
+        else:
+            raise RuntimeError("Unable to inspect ONNX output shape from OrtValue")
+
+        if not shape:
+            raise RuntimeError("ONNX output shape is empty")
+
+        layout = "nchw"
+        channels = 3
+        out_h = 0
+        out_w = 0
+
+        if len(shape) == 4:
+            n, c, h, w = [int(v) for v in shape]
+            if n != 1:
+                raise RuntimeError(f"Unsupported ONNX batch size for zero-copy path: {shape}")
+            if c in (1, 3):
+                layout = "nchw"
+                channels = c
+                out_h = h
+                out_w = w
+            elif int(shape[3]) in (1, 3):
+                layout = "hwc"
+                channels = int(shape[3])
+                out_h = int(shape[1])
+                out_w = int(shape[2])
+            else:
+                raise RuntimeError(f"Unsupported ONNX output shape for zero-copy path: {shape}")
+        elif len(shape) == 3:
+            if int(shape[0]) in (1, 3) and int(shape[2]) not in (1, 3):
+                layout = "nchw"
+                channels = int(shape[0])
+                out_h = int(shape[1])
+                out_w = int(shape[2])
+            elif int(shape[2]) in (1, 3):
+                layout = "hwc"
+                channels = int(shape[2])
+                out_h = int(shape[0])
+                out_w = int(shape[1])
+            else:
+                raise RuntimeError(f"Unsupported ONNX output shape for zero-copy path: {shape}")
+        else:
+            raise RuntimeError(f"Unsupported ONNX output rank for zero-copy path: {shape}")
+
+        dtype_name = "float32"
+        normalized_01 = True
+        if self._output_dtype == np.float16:
+            dtype_name = "float16"
+            normalized_01 = True
+        elif self._output_dtype == np.float32:
+            dtype_name = "float32"
+            normalized_01 = True
+        elif self._output_dtype == np.uint8:
+            dtype_name = "uint8"
+            normalized_01 = False
+
+        if out_w <= 0 or out_h <= 0:
+            raise RuntimeError(f"Invalid ONNX output dimensions for zero-copy path: {shape}")
+
+        return {
+            "shape": shape,
+            "layout": layout,
+            "channels": channels,
+            "width": int(out_w),
+            "height": int(out_h),
+            "dtype": dtype_name,
+            "normalized_01": bool(normalized_01),
+        }
+
+    def _run_model_on_rgb(self, model_rgb: np.ndarray, method: str) -> bytes:
+        prep_start = time.perf_counter()
+
         # Some SR models contain reshape/pixel-unshuffle paths that require specific
         # spatial alignment. Align to configured multiples before inference.
         in_h, in_w = int(model_rgb.shape[0]), int(model_rgb.shape[1])
@@ -614,131 +1053,61 @@ class AiSrOnnxEngine:
         if aligned_w != in_w or aligned_h != in_h:
             model_rgb = cv2.resize(model_rgb, (aligned_w, aligned_h), interpolation=cv2.INTER_AREA)
 
-        x = model_rgb.astype(self._input_dtype, copy=False)
+        x = cv2.dnn.blobFromImage(
+            model_rgb,
+            scalefactor=(1.0 / 255.0),
+            size=(aligned_w, aligned_h),
+            mean=(0.0, 0.0, 0.0),
+            swapRB=False,
+            crop=False,
+            ddepth=cv2.CV_32F,
+        )
         if self._input_dtype == np.float16:
-            x = x * np.float16(1.0 / 255.0)
+            x = x.astype(np.float16, copy=False)
         else:
-            x = x * np.float32(1.0 / 255.0)
-        x = np.transpose(x, (2, 0, 1))[None, ...]
+            x = x.astype(np.float32, copy=False)
+
+        prep_ms = (time.perf_counter() - prep_start) * 1000.0
 
         infer_start = time.perf_counter()
-        outputs = self._session.run(None, {self._input_name: x})
+        output_ort = self._run_model_tensor(x)
         infer_ms = (time.perf_counter() - infer_start) * 1000.0
-        if self._avg_infer_ms is None:
-            self._avg_infer_ms = infer_ms
-        else:
-            self._avg_infer_ms = (0.9 * self._avg_infer_ms) + (0.1 * infer_ms)
 
-        if not outputs:
-            raise RuntimeError("AI SR model returned no outputs")
+        post_start = time.perf_counter()
 
-        y = outputs[0]
-        if not isinstance(y, np.ndarray):
-            y = np.asarray(y)
+        output_desc = self._ort_output_descriptor(output_ort)
+        data_ptr_fn = getattr(output_ort, "data_ptr", None)
+        if not callable(data_ptr_fn):
+            raise RuntimeError("OrtValue does not expose data_ptr() for zero-copy CUDA postprocessing")
 
-        if y.ndim == 4:
-            y = y[0]
-        if y.ndim != 3:
-            raise RuntimeError(f"Unexpected AI SR output shape: {tuple(y.shape)}")
+        output_ptr = int(data_ptr_fn())
+        out_uyvy = self._cuda_post.process_onnx_output_cuda(
+            tensor_ptr=output_ptr,
+            tensor_width=int(output_desc["width"]),
+            tensor_height=int(output_desc["height"]),
+            method=str(method).strip().lower(),
+            dtype=str(output_desc["dtype"]),
+            layout=str(output_desc["layout"]),
+            channels=int(output_desc["channels"]),
+            normalized_01=bool(output_desc["normalized_01"]),
+        )
 
-        # Expect CHW or HWC; convert to HWC uint8 RGB.
-        if y.shape[0] in (1, 3) and y.shape[-1] not in (1, 3):
-            y = np.transpose(y, (1, 2, 0))
-
-        if y.shape[2] == 1:
-            y = np.repeat(y, 3, axis=2)
-
-        if y.dtype == np.uint8:
-            return y
-
-        y = y.astype(np.float32)
-        y_max = float(np.max(y)) if y.size else 0.0
-        if y_max <= 1.5:
-            y = np.clip(y, 0.0, 1.0)
-            return (y * 255.0).astype(np.uint8)
-
-        return np.clip(y, 0.0, 255.0).astype(np.uint8)
+        post_ms = (time.perf_counter() - post_start) * 1000.0
+        total_ms = prep_ms + infer_ms + post_ms
+        self._record_timing_sample(prep_ms, infer_ms, post_ms, total_ms)
+        return out_uyvy
 
     def process_uyvy_frame(self, frame_bytes: bytes) -> bytes:
-        if len(frame_bytes) != UYVY_ROW_BYTES * FRAME_H:
-            raise RuntimeError(f"Unexpected UYVY frame size: {len(frame_bytes)}")
-
-        yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
-        rgb = _uyvy_to_rgb_limited(yuv422, self._color_space, self._color_range)
-
-        # For x2/x4/x8 models, run inference on proportionally downscaled input so output
-        # naturally returns near FRAME_W x FRAME_H instead of exploding to 4K/8K.
-        model_rgb = rgb
-        if self._model_scale > 1:
-            divisor = self._effective_inference_divisor()
-            model_in_w = max(1, (FRAME_W + divisor - 1) // divisor)
-            model_in_h = max(1, (FRAME_H + divisor - 1) // divisor)
-            model_rgb = cv2.resize(rgb, (model_in_w, model_in_h), interpolation=cv2.INTER_CUBIC)
-
-        sr_rgb = self._run_model_on_rgb(model_rgb)
-
-        if sr_rgb.shape[0] != FRAME_H or sr_rgb.shape[1] != FRAME_W:
-            if sr_rgb.shape[1] > FRAME_W or sr_rgb.shape[0] > FRAME_H:
-                resize_interp = cv2.INTER_LANCZOS4
-            else:
-                resize_interp = cv2.INTER_CUBIC
-            sr_rgb = cv2.resize(sr_rgb, (FRAME_W, FRAME_H), interpolation=resize_interp)
-
-        if self._detail_preserve_percent > 0.0:
-            preserve = self._detail_preserve_percent / 100.0
-            sr_rgb = cv2.addWeighted(sr_rgb, 1.0 - preserve, rgb, preserve, 0.0)
-
-        sr_yuv422 = _rgb_to_uyvy_limited(sr_rgb, self._color_space, self._color_range)
-        return sr_yuv422.tobytes()
+        return self.process_uyvy_frame_roi_to_output(
+            frame_bytes,
+            (0, 0, FRAME_W, FRAME_H),
+            "bicubic",
+        )
 
     def process_uyvy_frame_roi(self, frame_bytes: bytes, roi: tuple[int, int, int, int]) -> bytes:
-        if len(frame_bytes) != UYVY_ROW_BYTES * FRAME_H:
-            raise RuntimeError(f"Unexpected UYVY frame size: {len(frame_bytes)}")
-
-        roi_x, roi_y, roi_w, roi_h = self._expand_roi_to_model_safe_min(roi)
-
-        overscan_scale = max(0.0, float(self._roi_overscan_percent)) / 100.0
-        pad_x = int(round((roi_w * overscan_scale) * 0.5))
-        pad_y = int(round((roi_h * overscan_scale) * 0.5))
-
-        proc_x = max(0, roi_x - pad_x)
-        proc_y = max(0, roi_y - pad_y)
-        proc_w = min(FRAME_W - proc_x, roi_w + (pad_x * 2))
-        proc_h = min(FRAME_H - proc_y, roi_h + (pad_y * 2))
-        proc_w = max(2, proc_w & ~1)
-        if proc_x + proc_w > FRAME_W:
-            proc_x = max(0, FRAME_W - proc_w)
-            proc_x &= ~1
-
-        yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
-        roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
-        roi_rgb = _uyvy_to_rgb_limited(roi_yuv, self._color_space, self._color_range)
-
-        model_rgb = roi_rgb
-        if self._model_scale > 1:
-            # Round up so AI SR does not run on a smaller-than-requested effective ROI.
-            divisor = self._effective_inference_divisor()
-            model_in_w = max(1, (proc_w + divisor - 1) // divisor)
-            model_in_h = max(1, (proc_h + divisor - 1) // divisor)
-            model_rgb = cv2.resize(roi_rgb, (model_in_w, model_in_h), interpolation=cv2.INTER_CUBIC)
-
-        sr_roi_rgb = self._run_model_on_rgb(model_rgb)
-
-        if sr_roi_rgb.shape[0] != proc_h or sr_roi_rgb.shape[1] != proc_w:
-            if sr_roi_rgb.shape[1] > proc_w or sr_roi_rgb.shape[0] > proc_h:
-                resize_interp = cv2.INTER_LANCZOS4
-            else:
-                resize_interp = cv2.INTER_CUBIC
-            sr_roi_rgb = cv2.resize(sr_roi_rgb, (proc_w, proc_h), interpolation=resize_interp)
-
-        if self._detail_preserve_percent > 0.0:
-            preserve = self._detail_preserve_percent / 100.0
-            sr_roi_rgb = cv2.addWeighted(sr_roi_rgb, 1.0 - preserve, roi_rgb, preserve, 0.0)
-
-        sr_roi_yuv = _rgb_to_uyvy_limited(sr_roi_rgb, self._color_space, self._color_range)
-        yuv_out = np.array(yuv422, copy=True)
-        yuv_out[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :] = sr_roi_yuv
-        return yuv_out.tobytes()
+        # Legacy ROI-only AI SR path removed. Keep method for compatibility and
+        # force direct ROI-to-output rendering through the zero-copy path.
+        return self.process_uyvy_frame_roi_to_output(frame_bytes, roi, "bicubic")
 
     def process_uyvy_frame_roi_to_output(self, frame_bytes: bytes, roi: tuple[int, int, int, int], method: str) -> bytes:
         if len(frame_bytes) != UYVY_ROW_BYTES * FRAME_H:
@@ -763,43 +1132,17 @@ class AiSrOnnxEngine:
         roi_yuv = np.ascontiguousarray(yuv422[proc_y : proc_y + proc_h, proc_x : proc_x + proc_w, :])
         roi_rgb = _uyvy_to_rgb_limited(roi_yuv, self._color_space, self._color_range)
 
-        target_w = FRAME_W
-        target_h = FRAME_H
-        method_name = str(method).strip().lower()
-        upscale_interp = cv2.INTER_LANCZOS4
-        if method_name in {"bilinear", "bilinear_sharp"}:
-            upscale_interp = cv2.INTER_LINEAR
-        elif method_name in {"bicubic", "bicubic_sharpen"}:
-            upscale_interp = cv2.INTER_CUBIC
-
-        # Build a baseline zoom from the source ROI so optional detail preserve
-        # can retain source edge character while still letting AI drive output.
-        baseline_rgb = cv2.resize(roi_rgb, (target_w, target_h), interpolation=upscale_interp)
-
         model_rgb = roi_rgb
         if self._model_scale > 1:
             divisor = self._effective_inference_divisor()
             model_in_w = max(1, (proc_w + divisor - 1) // divisor)
             model_in_h = max(1, (proc_h + divisor - 1) // divisor)
-            model_rgb = cv2.resize(roi_rgb, (model_in_w, model_in_h), interpolation=cv2.INTER_CUBIC)
+            if model_in_w != proc_w or model_in_h != proc_h:
+                model_rgb = cv2.resize(roi_rgb, (model_in_w, model_in_h), interpolation=cv2.INTER_CUBIC)
 
-        sr_rgb = self._run_model_on_rgb(model_rgb)
-
-        if sr_rgb.shape[0] != target_h or sr_rgb.shape[1] != target_w:
-            sr_rgb = cv2.resize(sr_rgb, (target_w, target_h), interpolation=upscale_interp)
-
-        if method_name == "bicubic_sharpen":
-            sr_rgb = cv2.addWeighted(sr_rgb, 1.35, cv2.GaussianBlur(sr_rgb, (0, 0), 1.0), -0.35, 0)
-        elif method_name == "bilinear_sharp":
-            sr_rgb = cv2.addWeighted(sr_rgb, 1.20, cv2.GaussianBlur(sr_rgb, (0, 0), 0.8), -0.20, 0)
-
-        if self._detail_preserve_percent > 0.0:
-            preserve = self._detail_preserve_percent / 100.0
-            sr_rgb = cv2.addWeighted(sr_rgb, 1.0 - preserve, baseline_rgb, preserve, 0.0)
-
-        sr_yuv422 = _rgb_to_uyvy_limited(sr_rgb, self._color_space, self._color_range)
-        return sr_yuv422.tobytes()
-
+        # ONNX output stays on GPU and is fed to native CUDA postprocess without
+        # CPU tensor copy or OpenCV-based output conversion.
+        return self._run_model_on_rgb(model_rgb, method)
 
 def _load_video_processor_module(project_root: Path):
     venv_site = project_root / "venv" / "Lib" / "site-packages"
@@ -922,60 +1265,12 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
         }
         _OUTPUT_SCHEDULE_STATE[out_id] = state
 
-    now = time.perf_counter()
-    frame_period_s = float(state.get("frame_period_s", 0.0))
-    jitter_tolerance_s = min(0.0015, frame_period_s * 0.35) if frame_period_s > 0.0 else 0.001
-
     if bool(state.get("enabled", False)):
         frame_duration = int(state.get("frame_duration", 0))
         time_scale = int(state.get("time_scale", 0))
         if frame_duration > 0 and time_scale > 0:
             try:
-                epoch_ts = float(state.get("schedule_epoch_perf_ts", 0.0))
-                if epoch_ts <= 0.0:
-                    epoch_ts = now
-                    state["schedule_epoch_perf_ts"] = epoch_ts
-
-                elapsed_units = max(0.0, (now - epoch_ts) * float(time_scale))
                 display_time = int(state.get("display_time", 0))
-                target_buffer_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
-
-                # Prefer device-reported buffered depth for steady-state pacing.
-                # This avoids long-run drift from local-clock estimates.
-                can_query_buffered = bool(state.get("can_query_buffered", False))
-                if can_query_buffered and bool(state.get("started", False)) and target_buffer_frames > 0:
-                    try:
-                        buffered_count = int(out.buffered_video_frame_count())
-
-                        # Self-heal long-run pacing drift by re-anchoring the local
-                        # perf-counter epoch to DeckLink's observed buffered depth.
-                        lead_frames_est = (float(display_time) - elapsed_units) / float(frame_duration)
-                        drift_frames = abs(lead_frames_est - float(buffered_count))
-                        last_resync_ts = float(state.get("last_clock_resync_ts", 0.0))
-                        should_resync = (
-                            drift_frames >= 2.5
-                            or (last_resync_ts <= 0.0)
-                            or ((now - last_resync_ts) >= 10.0)
-                        )
-                        if should_resync:
-                            desired_elapsed_units = float(display_time) - (float(buffered_count) * float(frame_duration))
-                            state["schedule_epoch_perf_ts"] = now - (desired_elapsed_units / float(time_scale))
-                            state["last_clock_resync_ts"] = now
-                            elapsed_units = max(0.0, (now - float(state["schedule_epoch_perf_ts"])) * float(time_scale))
-
-                        if buffered_count >= target_buffer_frames:
-                            return False
-                    except Exception:
-                        state["can_query_buffered"] = False
-                        can_query_buffered = False
-
-                # Fallback pacing when buffered depth cannot be queried.
-                if not can_query_buffered:
-                    max_preroll_frames = target_buffer_frames
-                    max_preroll_units = max_preroll_frames * frame_duration
-                    if display_time > (elapsed_units + max_preroll_units):
-                        return False
-
                 out.schedule_frame_copy(
                     payload,
                     display_time,
@@ -985,9 +1280,9 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                 state["display_time"] = int(state.get("display_time", 0)) + frame_duration
 
                 if not bool(state.get("started", False)):
+                    target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                     state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
                     should_start = False
-                    target_start_frames = target_buffer_frames
                     if target_start_frames <= 0:
                         should_start = True
                     if bool(state.get("can_query_buffered", False)):
@@ -1010,20 +1305,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                 # Fall back to blocking output if scheduling path errors at runtime.
                 state["enabled"] = False
 
-    next_emit_ts = float(state.get("sync_next_emit_ts", 0.0))
-    if frame_period_s > 0.0:
-        if next_emit_ts <= 0.0:
-            next_emit_ts = now
-        elif now + jitter_tolerance_s < next_emit_ts:
-            return False
-
-        # If processing was delayed for multiple frame intervals, re-anchor pacing to "now".
-        if now - next_emit_ts > (frame_period_s * 3.0):
-            next_emit_ts = now
-
     out.display_frame_sync(payload)
-    if frame_period_s > 0.0:
-        state["sync_next_emit_ts"] = next_emit_ts + frame_period_s
     return True
 
 
@@ -1218,8 +1500,12 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     ai_sr_enabled = bool(startup_config.get("ai_sr_enabled", False))
     ai_sr_model_path = str(startup_config.get("ai_sr_model_path", ""))
     ai_sr_provider = str(startup_config.get("ai_sr_provider", "cuda"))
+    ai_sr_trt_precision = str(startup_config.get("ai_sr_trt_precision", os.environ.get("VP_AI_SR_TRT_PRECISION", "fp16"))).strip().lower()
+    if ai_sr_trt_precision not in {"fp16", "int8"}:
+        ai_sr_trt_precision = "fp16"
+    trt_cache_root = Path(startup_config.get("project_root", str(Path(__file__).resolve().parents[1]))) / "build" / "trt_engine_cache"
     ai_sr_require_gpu = bool(startup_config.get("ai_sr_require_gpu", False))
-    ai_sr_frame_interval = max(1, int(startup_config.get("ai_sr_frame_interval", 2)))
+    ai_sr_frame_interval = max(1, min(60, int(startup_config.get("ai_sr_inference_fps", startup_config.get("ai_sr_frame_interval", 1)))))
     ai_sr_strict = bool(startup_config.get("ai_sr_strict", False))
     ai_sr_input_align = max(1, int(startup_config.get("ai_sr_input_align", 2)))
     ai_sr_roi_overscan_percent = float(startup_config.get("ai_sr_roi_overscan_percent", 0.0))
@@ -1230,10 +1516,33 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     ai_sr_info: dict[str, object] | None = None
     ai_sr_frame_counter = 0
     ai_sr_latest_output_frame: bytes | None = None
+    ai_sr_latest_output_ts = 0.0
+    ai_sr_completed_frames = 0
+    ai_sr_warmup_pending = False
+    ai_sr_hold_last_frame = bool(
+        startup_config.get(
+            "ai_sr_hold_last_frame",
+            os.environ.get("VP_AI_SR_HOLD_LAST_FRAME", "1") == "1",
+        )
+    )
+    ai_sr_max_hold_ms = max(
+        0.0,
+        float(startup_config.get("ai_sr_max_hold_ms", os.environ.get("VP_AI_SR_MAX_HOLD_MS", "0"))),
+    )
+    ai_sr_max_inflight = max(
+        1,
+        min(4, int(startup_config.get("ai_sr_max_inflight", os.environ.get("VP_AI_SR_MAX_INFLIGHT", "2")))),
+    )
+    ai_sr_submit_spacing_ms = max(
+        0.0,
+        float(startup_config.get("ai_sr_submit_spacing_ms", os.environ.get("VP_AI_SR_SUBMIT_SPACING_MS", "0"))),
+    )
+    ai_sr_last_submit_ts = 0.0
     ai_sr_executor: ThreadPoolExecutor | None = None
-    ai_sr_future: Future[bytes] | None = None
+    ai_sr_futures: list[Future[bytes]] = []
     ai_sr_dropped_frames = 0
     ai_sr_applied_frames = 0
+    ai_sr_reused_frames = 0
     ai_sr_passthrough_frames = 0
     zeroed_output_warning_emitted = False
     preprocess_noop_warning_emitted = False
@@ -1673,60 +1982,106 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             roi_microstep_transition = None
 
     def _cleanup_ai_async() -> None:
-        nonlocal ai_sr_executor, ai_sr_future
-        if ai_sr_future is not None:
-            ai_sr_future.cancel()
-            ai_sr_future = None
+        nonlocal ai_sr_executor, ai_sr_futures
+        if ai_sr_futures:
+            for ai_future in ai_sr_futures:
+                ai_future.cancel()
+            ai_sr_futures = []
         if ai_sr_executor is not None:
             ai_sr_executor.shutdown(wait=False, cancel_futures=True)
             ai_sr_executor = None
 
-    def _collect_ai_future_result() -> None:
-        nonlocal ai_sr_latest_output_frame, ai_sr_future
-        if ai_sr_future is not None and ai_sr_future.done():
+    def _collect_ai_future_result() -> bool:
+        nonlocal ai_sr_latest_output_frame, ai_sr_latest_output_ts, ai_sr_completed_frames, ai_sr_futures
+        new_result_ready = False
+        if not ai_sr_futures:
+            return False
+
+        pending_futures: list[Future[bytes]] = []
+        for ai_future in ai_sr_futures:
+            if not ai_future.done():
+                pending_futures.append(ai_future)
+                continue
             try:
-                ai_sr_latest_output_frame = ai_sr_future.result()
+                ai_sr_latest_output_frame = ai_future.result()
+                ai_sr_latest_output_ts = time.perf_counter()
+                ai_sr_completed_frames += 1
+                new_result_ready = True
             except Exception as ai_exc:
                 _safe_put({"type": "warning", "warning": f"AI SR inference failed: {ai_exc}"})
-            finally:
-                ai_sr_future = None
+
+        ai_sr_futures = pending_futures
+        return new_result_ready
 
     def _ai_inference_busy() -> bool:
-        return ai_sr_future is not None and not ai_sr_future.done()
-
-    def _apply_ai_sr_non_blocking(frame_bytes: bytes, roi: tuple[int, int, int, int], method: str) -> tuple[bytes, bool]:
-        nonlocal ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_future
-        if ai_sr_engine is None:
-            return frame_bytes, True
-
         _collect_ai_future_result()
+        return len(ai_sr_futures) > 0
+
+    def _ai_submit_due(now: float) -> bool:
+        target_spacing_ms = 1000.0 / max(1.0, float(ai_sr_frame_interval))
+        if ai_sr_submit_spacing_ms > 0.0:
+            target_spacing_ms = max(target_spacing_ms, float(ai_sr_submit_spacing_ms))
+        if ai_sr_last_submit_ts <= 0.0:
+            return True
+        return ((now - ai_sr_last_submit_ts) * 1000.0) >= target_spacing_ms
+
+    def _apply_ai_sr_non_blocking(frame_bytes: bytes, roi: tuple[int, int, int, int], method: str) -> tuple[bytes, bool, bool]:
+        nonlocal ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_latest_output_ts, ai_sr_completed_frames, ai_sr_warmup_pending, ai_sr_futures
+        nonlocal ai_sr_hold_last_frame, ai_sr_max_hold_ms, ai_sr_max_inflight
+        nonlocal ai_sr_submit_spacing_ms, ai_sr_last_submit_ts
+        if ai_sr_engine is None:
+            return frame_bytes, False, False
+
+        new_ai_result_ready = _collect_ai_future_result()
 
         ai_sr_frame_counter += 1
-        run_ai_inference = (ai_sr_frame_counter % ai_sr_frame_interval == 0)
-        if run_ai_inference and ai_sr_future is None and ai_sr_executor is not None:
-            ai_input_bytes = bytes(frame_bytes)
-            ai_roi = tuple(roi)
-            ai_method = str(method)
-            ai_sr_future = ai_sr_executor.submit(ai_sr_engine.process_uyvy_frame_roi_to_output, ai_input_bytes, ai_roi, ai_method)
+        now = time.perf_counter()
+        run_ai_inference = _ai_submit_due(now)
 
-        # Keep showing the latest completed AI frame until the next one is ready.
-        # This makes AI SR effect persistent on live output rather than one-frame pulses.
+        if run_ai_inference and len(ai_sr_futures) < ai_sr_max_inflight and ai_sr_executor is not None:
+            ai_input_bytes = frame_bytes if isinstance(frame_bytes, bytes) else bytes(frame_bytes)
+            ai_roi = roi if isinstance(roi, tuple) else tuple(roi)
+            ai_method = method if isinstance(method, str) else str(method)
+            ai_future = ai_sr_executor.submit(ai_sr_engine.process_uyvy_frame_roi_to_output, ai_input_bytes, ai_roi, ai_method)
+            ai_sr_futures.append(ai_future)
+            ai_sr_last_submit_ts = now
+
+        # Keep pipeline cadence stable: do not run a synchronous warmup frame.
+        # Until the first async result arrives, render a live baseline resize.
+        if ai_sr_warmup_pending and ai_sr_latest_output_frame is not None:
+            ai_sr_warmup_pending = False
+
         if ai_sr_latest_output_frame is not None:
-            return ai_sr_latest_output_frame, True
-        return frame_bytes, False
+            ai_sr_warmup_pending = False
+            if new_ai_result_ready:
+                return ai_sr_latest_output_frame, True, True
+
+            # Reuse stale AI output only when explicitly requested.
+            if ai_sr_hold_last_frame:
+                if ai_sr_max_hold_ms > 0.0 and ai_sr_latest_output_ts > 0.0:
+                    age_ms = max(0.0, (time.perf_counter() - float(ai_sr_latest_output_ts)) * 1000.0)
+                    if age_ms > float(ai_sr_max_hold_ms):
+                        return frame_bytes, False, False
+                return ai_sr_latest_output_frame, True, False
+
+        # No implicit fallback path: until async AI output exists, pass through.
+        return frame_bytes, False, False
 
     def _apply_ai_sr(frame_bytes: bytes, roi: tuple[int, int, int, int], method: str) -> tuple[bytes, bool]:
-        nonlocal ai_sr_frame_counter, ai_sr_applied_frames, ai_sr_passthrough_frames
+        nonlocal ai_sr_frame_counter, ai_sr_applied_frames, ai_sr_reused_frames, ai_sr_passthrough_frames
+        nonlocal ai_sr_last_submit_ts
         if ai_sr_engine is None:
             return frame_bytes, False
 
         if ai_sr_strict:
             ai_sr_frame_counter += 1
-            run_ai_inference = (ai_sr_frame_counter % ai_sr_frame_interval == 0)
+            now = time.perf_counter()
+            run_ai_inference = _ai_submit_due(now)
             if not run_ai_inference:
                 ai_sr_passthrough_frames += 1
                 return frame_bytes, False
             try:
+                ai_sr_last_submit_ts = now
                 out = ai_sr_engine.process_uyvy_frame_roi_to_output(frame_bytes, roi, method)
                 ai_sr_applied_frames += 1
                 return out, True
@@ -1735,12 +2090,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 _safe_put({"type": "warning", "warning": f"AI SR strict inference failed: {ai_exc}"})
                 return frame_bytes, False
 
-        output_frame, ai_applied = _apply_ai_sr_non_blocking(frame_bytes, roi, method)
-        if ai_applied:
-            ai_sr_applied_frames += 1
+        output_frame, ai_output_used, ai_fresh_output = _apply_ai_sr_non_blocking(frame_bytes, roi, method)
+        if ai_output_used:
+            if ai_fresh_output:
+                ai_sr_applied_frames += 1
+            else:
+                ai_sr_reused_frames += 1
         else:
             ai_sr_passthrough_frames += 1
-        return output_frame, ai_applied
+        return output_frame, ai_output_used
 
     def _apply_rtx_vsr(frame_bytes: bytes, roi: tuple[int, int, int, int]) -> bytes:
         if rtx_vsr_engine is None:
@@ -1772,36 +2130,10 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         return sr_yuv422.tobytes()
 
     def _apply_ai_sr_performance_profile() -> None:
-        nonlocal ai_sr_strict, ai_sr_frame_interval, ai_sr_inference_divisor, ai_sr_runtime_note
+        nonlocal ai_sr_runtime_note
         ai_sr_runtime_note = None
-
-        model_name = Path(ai_sr_model_path).name.lower()
-        profile_changes: list[str] = []
-
-        # Quality-first throughput policy for heavy models:
-        # 1) Never force lower inference resolution automatically.
-        # 2) Keep async submission so output cadence stays responsive.
-        # 3) Use only a mild cadence adjustment for very heavy models.
-        if "x4_fp16" in model_name or "x8" in model_name:
-            if ai_sr_strict:
-                ai_sr_strict = False
-                profile_changes.append("strict->async")
-
-            # Keep high per-frame detail by avoiding forced divisor changes.
-            # If the user explicitly set a divisor, preserve it as-is.
-
-            target_interval = 8 if "x8" in model_name else 6
-            if ai_sr_frame_interval < target_interval:
-                ai_sr_frame_interval = target_interval
-                profile_changes.append(f"frame_interval={target_interval}")
-
-            if ai_sr_inference_divisor > 0:
-                profile_changes.append(f"inference_divisor=user:{ai_sr_inference_divisor}")
-            else:
-                profile_changes.append("inference_divisor=auto-quality")
-
-        if profile_changes:
-            ai_sr_runtime_note = "; ".join(profile_changes)
+        # Intentionally no automatic overrides: strict mode, frame interval,
+        # and inference divisor remain exactly as configured by the user.
 
     def _put_latest_stage_frame(stage_queue: queue.Queue[_StageFrame], item: _StageFrame) -> bool:
         # Keep newest frames and drop oldest when saturated to bound latency.
@@ -1841,8 +2173,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     def _is_preprocess_enabled() -> bool:
         return bool(current_deinterlace_enabled) or _denoise_enabled()
 
+    def _is_any_sr_selected() -> bool:
+        return bool(ai_sr_enabled or rtx_vsr_enabled)
+
+    def _should_apply_cpu_subpixel_fallback() -> bool:
+        # When any SR path is selected, prioritize throughput over tiny
+        # subpixel compensation shifts in Python/OpenCV.
+        return not _is_any_sr_selected()
+
     def _basic_scaling_enabled() -> bool:
-        return bool(basic_scaling_enabled)
+        if not bool(basic_scaling_enabled):
+            return False
+        # Disable native CUDA basic-scaling path whenever an SR path is selected.
+        return not _is_any_sr_selected()
 
     def _preprocess_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
         nonlocal preprocess_noop_warning_emitted
@@ -1883,7 +2226,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
         native_shift_applied = False
         if _set_native_subpixel_shift(shift_x, shift_y):
-            native_shift_applied = abs(float(shift_x)) > 1e-4 or abs(float(shift_y)) > 1e-4
+            native_shift_applied = _has_effective_subpixel_shift(shift_x, shift_y)
 
         if preprocess_already_applied and hasattr(processor, "process_frame_no_deinterlace"):
             scaled = processor.process_frame_no_deinterlace(frame_bytes)
@@ -1923,15 +2266,20 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         # Plugin-style stage ordering: each enabled filter is appended in order,
         # and output of one stage becomes input to the next stage.
         stack: list[str] = []
-        # When native basic scaling is active, preprocess is fused into that
-        # stage so effects run in the post-ROI/pre-upscale slot.
-        if _is_preprocess_enabled() and not _basic_scaling_enabled():
+        ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
+        basic_stage_active = _basic_scaling_enabled() and (not ai_stage_active)
+        # When native basic scaling is active without AI, preprocess is fused into
+        # that stage so effects run in the post-ROI/pre-upscale slot.
+        fuse_preprocess_into_basic = basic_stage_active and not ai_stage_active
+        if _is_preprocess_enabled() and not fuse_preprocess_into_basic:
             stack.append("preprocess")
-        if ai_sr_enabled and ai_sr_engine is not None:
+        if ai_stage_active:
             stack.append("ai_sr")
         if rtx_vsr_enabled and rtx_vsr_engine is not None:
             stack.append("rtx_vsr")
-        if _basic_scaling_enabled():
+        # In AI basic-cuda chain mode, basic scaling is intentionally kept after
+        # AI so final output sizing is handled by native CUDA path.
+        if basic_stage_active:
             stack.append("basic_scaling")
         return stack
 
@@ -2071,10 +2419,10 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     native_shift_applied = False
                     if _set_native_subpixel_shift(shift_x, shift_y):
-                        native_shift_applied = abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4
+                        native_shift_applied = _has_effective_subpixel_shift(shift_x, shift_y)
                     if native_shift_applied and hasattr(processor, "process_frame_no_deinterlace"):
                         output_bytes = processor.process_frame_no_deinterlace(output_bytes)
-                    elif abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4:
+                    elif _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                         output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                     try:
                         if output_session is not None:
@@ -2112,7 +2460,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         _safe_put({"type": "warning", "warning": f"Basic scaling fast path failed: {exc}"})
                         continue
 
-                    if (not native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
+                    if (not native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                         output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
 
                     try:
@@ -2228,7 +2576,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
                 shift_x = float(item.shift_x)
                 shift_y = float(item.shift_y)
-                if (not item.native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
+                if (not item.native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                     output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                 sampled_delta = 0.0
                 if item.rtx_applied:
@@ -2281,7 +2629,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         pipeline_running = True
 
     def _refresh_ai_sr_engine() -> str | None:
-        nonlocal ai_sr_engine, ai_sr_info, ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_executor, ai_sr_future, ai_sr_dropped_frames, ai_sr_applied_frames, ai_sr_passthrough_frames, ai_sr_runtime_note
+        nonlocal ai_sr_engine, ai_sr_info, ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_latest_output_ts, ai_sr_completed_frames, ai_sr_warmup_pending, ai_sr_executor, ai_sr_futures, ai_sr_dropped_frames, ai_sr_applied_frames, ai_sr_reused_frames, ai_sr_passthrough_frames, ai_sr_runtime_note, ai_sr_max_inflight
+        nonlocal ai_sr_submit_spacing_ms, ai_sr_last_submit_ts
         _cleanup_ai_async()
 
         if not ai_sr_enabled:
@@ -2289,8 +2638,12 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_info = None
             ai_sr_frame_counter = 0
             ai_sr_latest_output_frame = None
+            ai_sr_latest_output_ts = 0.0
+            ai_sr_completed_frames = 0
+            ai_sr_warmup_pending = False
             ai_sr_dropped_frames = 0
             ai_sr_applied_frames = 0
+            ai_sr_reused_frames = 0
             ai_sr_passthrough_frames = 0
             return None
 
@@ -2300,6 +2653,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_engine = AiSrOnnxEngine(
                 ai_sr_model_path,
                 provider=ai_sr_provider,
+                trt_precision=ai_sr_trt_precision,
+                trt_engine_cache_path=str(trt_cache_root),
                 require_gpu=ai_sr_require_gpu,
                 input_align=ai_sr_input_align,
                 roi_overscan_percent=ai_sr_roi_overscan_percent,
@@ -2307,22 +2662,41 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 detail_preserve_percent=ai_sr_detail_preserve_percent,
                 color_space=current_color_space,
                 color_range=current_color_range,
+                native_module=module,
             )
             ai_sr_info = ai_sr_engine.info()
             ai_sr_info["strict_mode"] = bool(ai_sr_strict)
             ai_sr_info["async_mode"] = not bool(ai_sr_strict)
             ai_sr_info["frame_interval"] = int(ai_sr_frame_interval)
+            ai_sr_info["inference_fps"] = int(ai_sr_frame_interval)
             ai_sr_info["discard_while_busy"] = False
             ai_sr_info["requested_provider"] = str(ai_sr_provider)
+            ai_sr_info["trt_precision"] = str(ai_sr_trt_precision)
             ai_sr_info["gpu_required"] = bool(ai_sr_require_gpu)
             ai_sr_info["runtime_profile_note"] = ai_sr_runtime_note
+            ai_sr_info["max_hold_ms"] = float(ai_sr_max_hold_ms)
+            ai_sr_info["hold_last_frame"] = bool(ai_sr_hold_last_frame)
+            ai_sr_info["max_inflight"] = int(ai_sr_max_inflight)
+            ai_sr_info["submit_spacing_ms"] = float(ai_sr_submit_spacing_ms)
+            ai_sr_info["basic_cuda_post_scale_enabled"] = False
+            ai_sr_info["basic_cuda_post_scale_active"] = False
+            ai_sr_info["pipeline_order"] = "crop/preprocess -> onnx(cuda) -> cuda_postprocess -> uyvy"
+            if float(ai_sr_detail_preserve_percent) > 0.0:
+                ai_sr_info["detail_preserve_note"] = (
+                    "detail_preserve is disabled in zero-copy mode to keep output fully GPU-resident"
+                )
             ai_sr_frame_counter = 0
             ai_sr_latest_output_frame = None
+            ai_sr_latest_output_ts = 0.0
+            ai_sr_completed_frames = 0
+            ai_sr_warmup_pending = True
+            ai_sr_last_submit_ts = 0.0
             ai_sr_dropped_frames = 0
             ai_sr_applied_frames = 0
+            ai_sr_reused_frames = 0
             ai_sr_passthrough_frames = 0
-            ai_sr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-sr")
-            ai_sr_future = None
+            ai_sr_executor = ThreadPoolExecutor(max_workers=ai_sr_max_inflight, thread_name_prefix="ai-sr")
+            ai_sr_futures = []
             if ai_sr_strict:
                 _cleanup_ai_async()
             if ai_sr_runtime_note is not None:
@@ -2333,8 +2707,12 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_info = None
             ai_sr_frame_counter = 0
             ai_sr_latest_output_frame = None
+            ai_sr_latest_output_ts = 0.0
+            ai_sr_completed_frames = 0
+            ai_sr_warmup_pending = False
             ai_sr_dropped_frames = 0
             ai_sr_applied_frames = 0
+            ai_sr_reused_frames = 0
             ai_sr_passthrough_frames = 0
             error_text = str(ai_exc)
             if ort is not None:
@@ -2488,30 +2866,107 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         if d is None:
             raise RuntimeError("decklink_wrapper is not available in worker process")
 
-        _stop_sessions()
+        requested_format_detection = bool(message["enable_format_detection"])
+        requested_in_mode = message["in_mode"]
+        requested_out_mode = message["out_mode"]
         current_output_buffer_frames = max(
             0,
             min(10, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
         )
 
-        capture_session = d.CaptureSession(
-            device_index=int(message["in_device"]),
-            display_mode=message["in_mode"],
-            pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-            max_queue_frames=8,
-            enable_format_detection=bool(message["enable_format_detection"]),
-        )
-        output_session = d.OutputSession(
-            device_index=int(message["out_device"]),
-            display_mode=message["out_mode"],
-            pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-        )
+        def _normalize_mode_key(value: object) -> str:
+            if value is None:
+                return ""
+            try:
+                return str(int(value))
+            except Exception:
+                pass
+            return str(value).strip().lower()
 
-        capture_session.start()
-        output_session.start()
-        _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
+        def _resolve_display_mode(device_index: int, requested_mode: object, input_side: bool) -> object:
+            list_modes = d.list_input_display_modes if input_side else d.list_output_display_modes
+            mode_entries = list(list_modes(int(device_index)))
+            if not mode_entries:
+                side = "input" if input_side else "output"
+                raise RuntimeError(f"No DeckLink {side} display modes found for device index={device_index}")
 
-        _start_live_pipeline()
+            requested_key = _normalize_mode_key(requested_mode)
+            requested_text = str(requested_mode).strip().lower()
+
+            for entry in mode_entries:
+                entry_mode = getattr(entry, "mode", None)
+                if entry_mode == requested_mode:
+                    return entry_mode
+                if requested_key and _normalize_mode_key(entry_mode) == requested_key:
+                    return entry_mode
+                if requested_text and str(getattr(entry, "name", "")).strip().lower() == requested_text:
+                    return entry_mode
+
+            side = "input" if input_side else "output"
+            available = [
+                {
+                    "name": str(getattr(entry, "name", "")),
+                    "mode": str(getattr(entry, "mode", "")),
+                    "w": int(getattr(entry, "width", 0)),
+                    "h": int(getattr(entry, "height", 0)),
+                }
+                for entry in mode_entries
+            ]
+            raise RuntimeError(
+                f"Requested DeckLink {side} mode was not found on worker side | "
+                f"requested={requested_mode!r} | available={available}"
+            )
+
+        resolved_in_mode = _resolve_display_mode(int(message["in_device"]), requested_in_mode, input_side=True)
+        resolved_out_mode = _resolve_display_mode(int(message["out_device"]), requested_out_mode, input_side=False)
+
+        def _open_sessions(enable_format_detection: bool) -> None:
+            nonlocal capture_session, output_session
+            _stop_sessions()
+
+            capture_session = d.CaptureSession(
+                device_index=int(message["in_device"]),
+                display_mode=resolved_in_mode,
+                pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
+                max_queue_frames=8,
+                enable_format_detection=bool(enable_format_detection),
+            )
+            output_session = d.OutputSession(
+                device_index=int(message["out_device"]),
+                display_mode=resolved_out_mode,
+                pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
+            )
+
+            try:
+                capture_session.start()
+                output_session.start()
+                _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
+                _start_live_pipeline()
+            except Exception:
+                _stop_sessions()
+                raise
+
+        try:
+            _open_sessions(requested_format_detection)
+        except Exception as first_exc:
+            first_text = str(first_exc)
+            should_retry_without_detection = (
+                requested_format_detection
+                and "EnableVideoInput" in first_text
+            )
+            if not should_retry_without_detection:
+                raise
+
+            _safe_put(
+                {
+                    "type": "warning",
+                    "warning": (
+                        "DeckLink start retry: EnableVideoInput failed with format detection enabled; "
+                        "retrying with format detection disabled"
+                    ),
+                }
+            )
+            _open_sessions(False)
     try:
         project_root = Path(startup_config["project_root"])
         module = _load_video_processor_module(project_root)
@@ -2628,8 +3083,26 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 return
 
             if command == "start_decklink":
-                _start_sessions(message)
-                _safe_put({"type": "ack", "cmd": "start_decklink"})
+                try:
+                    _start_sessions(message)
+                    _safe_put(
+                        {
+                            "type": "ack",
+                            "cmd": "start_decklink",
+                            "decklink_started": True,
+                            "decklink_error": None,
+                        }
+                    )
+                except Exception as decklink_exc:
+                    _stop_sessions()
+                    _safe_put(
+                        {
+                            "type": "ack",
+                            "cmd": "start_decklink",
+                            "decklink_started": False,
+                            "decklink_error": str(decklink_exc),
+                        }
+                    )
                 continue
 
             if command == "set_decklink_output_buffer_frames":
@@ -2680,13 +3153,20 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     "preprocess_to_upscale": 0 if q_preprocess_to_upscale is None else q_preprocess_to_upscale.qsize(),
                     "upscale_to_output": 0 if q_upscale_to_output is None else q_upscale_to_output.qsize(),
                 }
+                ai_sr_timing_ms = ai_sr_engine.timing_info() if ai_sr_engine is not None else {}
                 payload: dict[str, object] = {
                     "type": "decklink_frame",
                     "effective_sr_scale": current_scale,
                     "processed_frame_counter": current_counter,
                     "processed_fps": processed_fps,
                     "ai_sr_applied_frames": int(ai_sr_applied_frames),
+                    "ai_sr_reused_frames": int(ai_sr_reused_frames),
                     "ai_sr_passthrough_frames": int(ai_sr_passthrough_frames),
+                    "ai_sr_completed_frames": int(ai_sr_completed_frames),
+                    "ai_sr_latest_age_ms": max(0.0, (time.perf_counter() - float(ai_sr_latest_output_ts)) * 1000.0)
+                    if ai_sr_latest_output_ts > 0.0
+                    else -1.0,
+                    "ai_sr_timing_ms": ai_sr_timing_ms,
                     "rtx_vsr_applied": current_rtx_applied,
                     "rtx_effect_mean_abs_luma": current_rtx_delta,
                     "stage_enable_flags": {
@@ -2733,7 +3213,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     shift_x,
                     shift_y,
                 )
-                if (not native_shift_applied) and (abs(shift_x) > 1e-4 or abs(shift_y) > 1e-4):
+                if (not native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                     output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
 
                 if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
@@ -3010,13 +3490,17 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
             if command == "set_ai_sr_settings":
                 ai_sr_provider = str(message.get("provider", ai_sr_provider))
+                ai_sr_trt_precision = str(message.get("trt_precision", ai_sr_trt_precision)).strip().lower()
+                if ai_sr_trt_precision not in {"fp16", "int8"}:
+                    ai_sr_trt_precision = "fp16"
                 ai_sr_require_gpu = bool(message.get("require_gpu", ai_sr_require_gpu))
-                ai_sr_frame_interval = max(1, int(message.get("frame_interval", ai_sr_frame_interval)))
+                ai_sr_frame_interval = max(1, min(60, int(message.get("inference_fps", message.get("frame_interval", ai_sr_frame_interval)))))
                 ai_sr_strict = bool(message.get("strict", ai_sr_strict))
                 ai_sr_input_align = max(1, int(message.get("input_align", ai_sr_input_align)))
                 ai_sr_roi_overscan_percent = float(message.get("roi_overscan_percent", ai_sr_roi_overscan_percent))
                 ai_sr_inference_divisor = max(0, int(message.get("inference_divisor", ai_sr_inference_divisor)))
                 ai_sr_detail_preserve_percent = float(message.get("detail_preserve_percent", ai_sr_detail_preserve_percent))
+                ai_sr_max_inflight = max(1, min(4, int(message.get("max_inflight", ai_sr_max_inflight))))
                 ai_sr_error = _refresh_ai_sr_engine()
                 _safe_put(
                     {

@@ -339,11 +339,29 @@ std::uint32_t RTXVideoSREngine::ResolveQualityLevel(const std::string& quality) 
 }
 
 std::vector<std::uint8_t> RTXVideoSREngine::ProcessRGBA(const std::uint8_t* input_rgba, std::size_t input_bytes) {
+    const std::size_t out_row_bytes = static_cast<std::size_t>(output_width_) * 4;
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(output_height_) * out_row_bytes);
+    ProcessRGBAInto(input_rgba, input_bytes, out.data(), out.size());
+    return out;
+}
+
+void RTXVideoSREngine::ProcessRGBAInto(
+    const std::uint8_t* input_rgba,
+    std::size_t input_bytes,
+    std::uint8_t* output_rgba,
+    std::size_t output_bytes
+) {
     ThrowIfClosed();
 
     const std::size_t expected_input_bytes = static_cast<std::size_t>(input_width_) * static_cast<std::size_t>(input_height_) * 4;
     if (input_rgba == nullptr || input_bytes != expected_input_bytes) {
         throw std::invalid_argument("Invalid input buffer size for RGBA frame");
+    }
+
+    const std::size_t out_row_bytes = static_cast<std::size_t>(output_width_) * 4;
+    const std::size_t expected_output_bytes = static_cast<std::size_t>(output_height_) * out_row_bytes;
+    if (output_rgba == nullptr || output_bytes != expected_output_bytes) {
+        throw std::invalid_argument("Invalid output buffer size for RGBA frame");
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped_in = {};
@@ -352,8 +370,12 @@ std::vector<std::uint8_t> RTXVideoSREngine::ProcessRGBA(const std::uint8_t* inpu
     const std::size_t src_row_bytes = static_cast<std::size_t>(input_width_) * 4;
     auto* src = input_rgba;
     auto* dst = static_cast<std::uint8_t*>(mapped_in.pData);
-    for (int y = 0; y < input_height_; ++y) {
-        std::memcpy(dst + static_cast<std::size_t>(y) * mapped_in.RowPitch, src + static_cast<std::size_t>(y) * src_row_bytes, src_row_bytes);
+    if (mapped_in.RowPitch == src_row_bytes) {
+        std::memcpy(dst, src, expected_input_bytes);
+    } else {
+        for (int y = 0; y < input_height_; ++y) {
+            std::memcpy(dst + static_cast<std::size_t>(y) * mapped_in.RowPitch, src + static_cast<std::size_t>(y) * src_row_bytes, src_row_bytes);
+        }
     }
 
     context_->Unmap(input_staging_, 0);
@@ -387,17 +409,18 @@ std::vector<std::uint8_t> RTXVideoSREngine::ProcessRGBA(const std::uint8_t* inpu
     D3D11_MAPPED_SUBRESOURCE mapped_out = {};
     ThrowIfFailed(context_->Map(output_staging_, 0, D3D11_MAP_READ, 0, &mapped_out), "Map(output_staging)");
 
-    const std::size_t out_row_bytes = static_cast<std::size_t>(output_width_) * 4;
-    std::vector<std::uint8_t> out(static_cast<std::size_t>(output_height_) * out_row_bytes);
     auto* src_out = static_cast<const std::uint8_t*>(mapped_out.pData);
-    for (int y = 0; y < output_height_; ++y) {
-        std::memcpy(out.data() + static_cast<std::size_t>(y) * out_row_bytes,
-                    src_out + static_cast<std::size_t>(y) * mapped_out.RowPitch,
-                    out_row_bytes);
+    if (mapped_out.RowPitch == out_row_bytes) {
+        std::memcpy(output_rgba, src_out, expected_output_bytes);
+    } else {
+        for (int y = 0; y < output_height_; ++y) {
+            std::memcpy(output_rgba + static_cast<std::size_t>(y) * out_row_bytes,
+                        src_out + static_cast<std::size_t>(y) * mapped_out.RowPitch,
+                        out_row_bytes);
+        }
     }
 
     context_->Unmap(output_staging_, 0);
-    return out;
 }
 
 void RTXVideoSREngine::Close() {

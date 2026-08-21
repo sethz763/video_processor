@@ -1,9 +1,39 @@
 {
+  "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x2_fp16.onnx": {
+    "detail_preserve_percent": 0.0,
+    "frame_interval": 6,
+    "inference_divisor": 2,
+    "input_align": 2,
+    "provider": "auto",
+    "require_gpu": true,
+    "roi_overscan_percent": 0.0,
+    "strict": false
+  },
   "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x8.onnx": {
     "detail_preserve_percent": 75.0,
     "frame_interval": 10,
     "inference_divisor": 1,
     "input_align": 4,
+    "provider": "auto",
+    "require_gpu": true,
+    "roi_overscan_percent": 0.0,
+    "strict": false
+  },
+  "C:\\Coding Projects\\video_processor\\models\\efrlfn_x2.onnx": {
+    "detail_preserve_percent": 0.0,
+    "frame_interval": 2,
+    "inference_divisor": 2,
+    "input_align": 1,
+    "provider": "auto",
+    "require_gpu": true,
+    "roi_overscan_percent": 0.0,
+    "strict": false
+  },
+  "C:\\Coding Projects\\video_processor\\models\\realesrgan_x2plus.onnx": {
+    "detail_preserve_percent": 0.0,
+    "frame_interval": 4,
+    "inference_divisor": 2,
+    "input_align": 2,
     "provider": "auto",
     "require_gpu": true,
     "roi_overscan_percent": 0.0,

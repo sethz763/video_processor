@@ -61,15 +61,16 @@ PYBIND11_MODULE(rtx_vsr, m) {
                  }
 
                  const std::size_t input_bytes = static_cast<std::size_t>(self.input_width()) * static_cast<std::size_t>(self.input_height()) * 4;
-                 std::vector<std::uint8_t> out = self.ProcessRGBA(input.data(), input_bytes);
-
                  py::array_t<std::uint8_t> result({self.output_height(), self.output_width(), 4});
-                 auto result_buf = result.request();
-                 if (result_buf.size != static_cast<py::ssize_t>(out.size())) {
-                     throw std::runtime_error("Output size mismatch");
+                 {
+                     py::gil_scoped_release release;
+                     self.ProcessRGBAInto(
+                         input.data(),
+                         input_bytes,
+                         result.mutable_data(),
+                         static_cast<std::size_t>(result.nbytes())
+                     );
                  }
-
-                 std::memcpy(result.mutable_data(), out.data(), out.size());
                  return result;
              },
              py::arg("frame"),

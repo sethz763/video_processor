@@ -252,4 +252,16 @@ void LaunchRgbToUyvy(
     cudaStream_t stream
 );
 
+void LaunchTensorToRgb(
+    const void* d_tensor,
+    int tensor_dtype,
+    int tensor_layout,
+    int channels,
+    bool normalized_01,
+    uchar3* d_rgb,
+    int width,
+    int height,
+    cudaStream_t stream
+);
+
 } // namespace vp::cuda_kernels

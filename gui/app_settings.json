@@ -1,19 +1,20 @@
 {
-  "ai_sr_detail_preserve_percent": 85.0,
-  "ai_sr_enabled": false,
-  "ai_sr_frame_interval": 1,
+  "ai_sr_detail_preserve_percent": 0.0,
+  "ai_sr_enabled": true,
   "ai_sr_inference_divisor": 1,
+  "ai_sr_inference_fps": 5,
   "ai_sr_input_align": "2",
-  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x2_fp16.onnx",
+  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\2x-spanx2-ch48.onnx",
   "ai_sr_provider": "auto",
   "ai_sr_require_gpu": true,
   "ai_sr_roi_overscan_percent": 0.0,
-  "ai_sr_strict": true,
-  "basic_scaling_auto_max": "4",
-  "basic_scaling_enabled": true,
-  "basic_scaling_manual": "4",
+  "ai_sr_strict": false,
+  "ai_sr_trt_precision": "fp16",
+  "basic_scaling_auto_max": "2",
+  "basic_scaling_enabled": false,
+  "basic_scaling_manual": "2",
   "basic_scaling_method": "Bicubic + Sharpen (Crisp)",
-  "basic_scaling_mode": "Auto",
+  "basic_scaling_mode": "Manual",
   "color_range": "Limited (Video)",
   "color_space": "Rec.709 (SDR)",
   "decklink_auto_detect": true,
@@ -24,9 +25,9 @@
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "deinterlace_enabled": false,
-  "deinterlace_method": "Edge Adaptive (Field Aware)",
-  "denoise_method": "Off",
-  "denoise_strength": 0.75,
+  "deinterlace_method": "Bob (Fast)",
+  "denoise_method": "Luma Gaussian 3x3 (Balanced)",
+  "denoise_strength": 0.5,
   "display_splitter_sizes": [
     421,
     388
@@ -47,18 +48,18 @@
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1254,
-        429,
-        572,
-        322
+        760,
+        166,
+        700,
+        394
       ]
     },
     "2": {
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        612,
-        421,
+        624,
+        177,
         700,
         394
       ]
@@ -84,7 +85,7 @@
       ]
     }
   },
-  "roi_latency_smoothing_percent": 72,
+  "roi_latency_smoothing_percent": 8,
   "roi_smoothing_percent": 100,
   "roi_transition_duration_frames": 40,
   "rtx_thdr_contrast": 50,

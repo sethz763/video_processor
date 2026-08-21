@@ -1,9 +1,11 @@
 #include <pybind11/pybind11.h>
 
 #include <cstdint>
+#include <cctype>
 #include <string>
 #include <utility>
 
+#include "core/ai_sr_cuda_post_processor.hpp"
 #include "core/video_processor.hpp"
 
 namespace py = pybind11;
@@ -328,4 +330,89 @@ PYBIND11_MODULE(video_processor, m) {
                 self.SetSubpixelShift(value[0].cast<float>(), value[1].cast<float>());
             }
         );
+
+    py::class_<vp::AiSrCudaPostProcessor>(m, "AiSrCudaPostProcessor")
+        .def(
+            py::init<int, int, const std::string&, const std::string&>(),
+            py::arg("output_width") = 1920,
+            py::arg("output_height") = 1080,
+            py::arg("color_space") = "rec709",
+            py::arg("color_range") = "limited"
+        )
+        .def(
+            "process_onnx_output_cuda",
+            [](vp::AiSrCudaPostProcessor& self,
+               std::uint64_t tensor_ptr,
+               int tensor_width,
+               int tensor_height,
+               const std::string& method,
+               const std::string& dtype,
+               const std::string& layout,
+               int channels,
+               bool normalized_01) {
+                const std::string dtype_name = [&dtype]() {
+                    std::string out;
+                    out.reserve(dtype.size());
+                    for (char c : dtype) {
+                        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                    }
+                    return out;
+                }();
+                const std::string layout_name = [&layout]() {
+                    std::string out;
+                    out.reserve(layout.size());
+                    for (char c : layout) {
+                        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                    }
+                    return out;
+                }();
+
+                vp::AiSrCudaPostProcessor::TensorDType tensor_dtype = vp::AiSrCudaPostProcessor::TensorDType::Float32;
+                if (dtype_name == "float16" || dtype_name == "fp16") {
+                    tensor_dtype = vp::AiSrCudaPostProcessor::TensorDType::Float16;
+                } else if (dtype_name == "uint8" || dtype_name == "u8") {
+                    tensor_dtype = vp::AiSrCudaPostProcessor::TensorDType::UInt8;
+                } else if (dtype_name != "float32" && dtype_name != "fp32") {
+                    throw py::value_error("dtype must be one of [float32, float16, uint8]");
+                }
+
+                vp::AiSrCudaPostProcessor::TensorLayout tensor_layout = vp::AiSrCudaPostProcessor::TensorLayout::NCHW;
+                if (layout_name == "hwc" || layout_name == "nhwc") {
+                    tensor_layout = vp::AiSrCudaPostProcessor::TensorLayout::HWC;
+                } else if (layout_name != "chw" && layout_name != "nchw") {
+                    throw py::value_error("layout must be one of [nchw, hwc]");
+                }
+
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessOnnxOutputCudaPtr(
+                        tensor_ptr,
+                        tensor_width,
+                        tensor_height,
+                        channels,
+                        tensor_layout,
+                        tensor_dtype,
+                        normalized_01,
+                        method
+                    );
+                }
+                return py::bytes(output);
+            },
+            py::arg("tensor_ptr"),
+            py::arg("tensor_width"),
+            py::arg("tensor_height"),
+            py::arg("method") = "bicubic",
+            py::arg("dtype") = "float32",
+            py::arg("layout") = "nchw",
+            py::arg("channels") = 3,
+            py::arg("normalized_01") = true,
+            "Convert ONNX CUDA tensor output to UYVY bytes via GPU-only resize and color conversion."
+        )
+        .def("set_color_space", &vp::AiSrCudaPostProcessor::SetColorSpaceByName, py::arg("color_space"))
+        .def("set_color_range", &vp::AiSrCudaPostProcessor::SetColorRangeByName, py::arg("color_range"))
+        .def("get_color_space", &vp::AiSrCudaPostProcessor::GetColorSpaceName)
+        .def("get_color_range", &vp::AiSrCudaPostProcessor::GetColorRangeName)
+        .def_property_readonly("output_width", &vp::AiSrCudaPostProcessor::output_width)
+        .def_property_readonly("output_height", &vp::AiSrCudaPostProcessor::output_height);
 }

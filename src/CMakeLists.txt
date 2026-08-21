@@ -1,5 +1,6 @@
 set(SRC_FILES
     bindings/module.cpp
+    core/ai_sr_cuda_post_processor.cpp
     core/video_processor.cpp
     cuda/kernels.cu
 )
