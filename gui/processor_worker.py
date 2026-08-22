@@ -393,6 +393,10 @@ def _normalize_color_range_name(color_range: str) -> str:
     return "limited"
 
 
+def _clip_u8_round(values: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(values), 0.0, 255.0).astype(np.uint8)
+
+
 def _uyvy_to_rgb_bt709_limited(yuv422: np.ndarray) -> np.ndarray:
     return _uyvy_to_rgb_limited(yuv422, "rec709", "limited")
 
@@ -419,40 +423,40 @@ def _uyvy_to_rgb_limited(yuv422: np.ndarray, color_space: str, color_range: str 
         c0 = y0
         c1 = y1
         if cs == "rec2020_hlg":
-            r0 = np.clip(c0 + 1.474600 * e, 0.0, 255.0).astype(np.uint8)
-            g0 = np.clip(c0 - 0.164553 * d - 0.571353 * e, 0.0, 255.0).astype(np.uint8)
-            b0 = np.clip(c0 + 1.881400 * d, 0.0, 255.0).astype(np.uint8)
+            r0 = _clip_u8_round(c0 + 1.474600 * e)
+            g0 = _clip_u8_round(c0 - 0.164553 * d - 0.571353 * e)
+            b0 = _clip_u8_round(c0 + 1.881400 * d)
 
-            r1 = np.clip(c1 + 1.474600 * e, 0.0, 255.0).astype(np.uint8)
-            g1 = np.clip(c1 - 0.164553 * d - 0.571353 * e, 0.0, 255.0).astype(np.uint8)
-            b1 = np.clip(c1 + 1.881400 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = _clip_u8_round(c1 + 1.474600 * e)
+            g1 = _clip_u8_round(c1 - 0.164553 * d - 0.571353 * e)
+            b1 = _clip_u8_round(c1 + 1.881400 * d)
         else:
-            r0 = np.clip(c0 + 1.574800 * e, 0.0, 255.0).astype(np.uint8)
-            g0 = np.clip(c0 - 0.187324 * d - 0.468124 * e, 0.0, 255.0).astype(np.uint8)
-            b0 = np.clip(c0 + 1.855600 * d, 0.0, 255.0).astype(np.uint8)
+            r0 = _clip_u8_round(c0 + 1.574800 * e)
+            g0 = _clip_u8_round(c0 - 0.187324 * d - 0.468124 * e)
+            b0 = _clip_u8_round(c0 + 1.855600 * d)
 
-            r1 = np.clip(c1 + 1.574800 * e, 0.0, 255.0).astype(np.uint8)
-            g1 = np.clip(c1 - 0.187324 * d - 0.468124 * e, 0.0, 255.0).astype(np.uint8)
-            b1 = np.clip(c1 + 1.855600 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = _clip_u8_round(c1 + 1.574800 * e)
+            g1 = _clip_u8_round(c1 - 0.187324 * d - 0.468124 * e)
+            b1 = _clip_u8_round(c1 + 1.855600 * d)
     else:
         c0 = y0 - 16.0
         c1 = y1 - 16.0
         if cs == "rec2020_hlg":
-            r0 = np.clip(1.164383 * c0 + 1.678674 * e, 0.0, 255.0).astype(np.uint8)
-            g0 = np.clip(1.164383 * c0 - 0.187326 * d - 0.650424 * e, 0.0, 255.0).astype(np.uint8)
-            b0 = np.clip(1.164383 * c0 + 2.141772 * d, 0.0, 255.0).astype(np.uint8)
+            r0 = _clip_u8_round(1.164383 * c0 + 1.678674 * e)
+            g0 = _clip_u8_round(1.164383 * c0 - 0.187326 * d - 0.650424 * e)
+            b0 = _clip_u8_round(1.164383 * c0 + 2.141772 * d)
 
-            r1 = np.clip(1.164383 * c1 + 1.678674 * e, 0.0, 255.0).astype(np.uint8)
-            g1 = np.clip(1.164383 * c1 - 0.187326 * d - 0.650424 * e, 0.0, 255.0).astype(np.uint8)
-            b1 = np.clip(1.164383 * c1 + 2.141772 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = _clip_u8_round(1.164383 * c1 + 1.678674 * e)
+            g1 = _clip_u8_round(1.164383 * c1 - 0.187326 * d - 0.650424 * e)
+            b1 = _clip_u8_round(1.164383 * c1 + 2.141772 * d)
         else:
-            r0 = np.clip(1.164383 * c0 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
-            g0 = np.clip(1.164383 * c0 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
-            b0 = np.clip(1.164383 * c0 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+            r0 = _clip_u8_round(1.164383 * c0 + 1.792741 * e)
+            g0 = _clip_u8_round(1.164383 * c0 - 0.213249 * d - 0.532909 * e)
+            b0 = _clip_u8_round(1.164383 * c0 + 2.112402 * d)
 
-            r1 = np.clip(1.164383 * c1 + 1.792741 * e, 0.0, 255.0).astype(np.uint8)
-            g1 = np.clip(1.164383 * c1 - 0.213249 * d - 0.532909 * e, 0.0, 255.0).astype(np.uint8)
-            b1 = np.clip(1.164383 * c1 + 2.112402 * d, 0.0, 255.0).astype(np.uint8)
+            r1 = _clip_u8_round(1.164383 * c1 + 1.792741 * e)
+            g1 = _clip_u8_round(1.164383 * c1 - 0.213249 * d - 0.532909 * e)
+            b1 = _clip_u8_round(1.164383 * c1 + 2.112402 * d)
 
     rgb = np.empty((h, w, 3), dtype=np.uint8)
     rgb[:, 0::2, 0] = r0
@@ -484,27 +488,27 @@ def _rgb_to_uyvy_limited(rgb: np.ndarray, color_space: str, color_range: str = "
     cr = _normalize_color_range_name(color_range)
     if cr == "full":
         if cs == "rec2020_hlg":
-            y = np.clip(0.262700 * r + 0.678000 * g + 0.059300 * b, 0.0, 255.0).astype(np.uint8)
+            y = _clip_u8_round(0.262700 * r + 0.678000 * g + 0.059300 * b)
             u = np.clip(128.0 - 0.139630 * r - 0.360370 * g + 0.500000 * b, 0.0, 255.0)
             v = np.clip(128.0 + 0.500000 * r - 0.459786 * g - 0.040214 * b, 0.0, 255.0)
         else:
-            y = np.clip(0.212600 * r + 0.715200 * g + 0.072200 * b, 0.0, 255.0).astype(np.uint8)
+            y = _clip_u8_round(0.212600 * r + 0.715200 * g + 0.072200 * b)
             u = np.clip(128.0 - 0.114572 * r - 0.385428 * g + 0.500000 * b, 0.0, 255.0)
             v = np.clip(128.0 + 0.500000 * r - 0.454153 * g - 0.045847 * b, 0.0, 255.0)
     else:
         if cs == "rec2020_hlg":
-            y = np.clip(16.0 + 0.224735 * r + 0.580016 * g + 0.050730 * b, 0.0, 255.0).astype(np.uint8)
-            u = np.clip(128.0 - 0.122533 * r - 0.316560 * g + 0.439093 * b, 0.0, 255.0)
-            v = np.clip(128.0 + 0.439093 * r - 0.402915 * g - 0.036178 * b, 0.0, 255.0)
+            y = _clip_u8_round(16.0 + 0.225613 * r + 0.582282 * g + 0.050928 * b)
+            u = np.clip(128.0 - 0.122655 * r - 0.316561 * g + 0.439216 * b, 0.0, 255.0)
+            v = np.clip(128.0 + 0.439216 * r - 0.403890 * g - 0.035325 * b, 0.0, 255.0)
         else:
-            y = np.clip(16.0 + 0.182586 * r + 0.614231 * g + 0.062007 * b, 0.0, 255.0).astype(np.uint8)
+            y = _clip_u8_round(16.0 + 0.182586 * r + 0.614231 * g + 0.062007 * b)
             u = np.clip(128.0 - 0.100644 * r - 0.338572 * g + 0.439216 * b, 0.0, 255.0)
             v = np.clip(128.0 + 0.439216 * r - 0.398942 * g - 0.040274 * b, 0.0, 255.0)
 
     y0 = y[:, 0::2]
     y1 = y[:, 1::2]
-    u_pair = ((u[:, 0::2] + u[:, 1::2]) * 0.5).astype(np.uint8)
-    v_pair = ((v[:, 0::2] + v[:, 1::2]) * 0.5).astype(np.uint8)
+    u_pair = _clip_u8_round((u[:, 0::2] + u[:, 1::2]) * 0.5)
+    v_pair = _clip_u8_round((v[:, 0::2] + v[:, 1::2]) * 0.5)
 
     packed = np.empty((h, w // 2, 4), dtype=np.uint8)
     packed[:, :, 0] = u_pair

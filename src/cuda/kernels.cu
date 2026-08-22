@@ -19,7 +19,7 @@ inline void CheckKernelLaunch(const char* op) {
 
 __device__ inline uint8_t ClampToU8(float v) {
     v = fminf(255.0f, fmaxf(0.0f, v));
-    return static_cast<uint8_t>(v);
+    return static_cast<uint8_t>(v + 0.5f);
 }
 
 __device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v, int color_matrix, int color_range) {
@@ -93,9 +93,9 @@ __device__ inline YuvF RgbToYuv(const uchar3& rgb, int color_matrix, int color_r
     if (color_matrix == 1) {
         // BT.2020 non-constant luminance matrix.
         return {
-            16.0f + 0.224735f * r + 0.580016f * g + 0.050730f * b,
-            128.0f - 0.122533f * r - 0.316560f * g + 0.439093f * b,
-            128.0f + 0.439093f * r - 0.402915f * g - 0.036178f * b,
+            16.0f + 0.225613f * r + 0.582282f * g + 0.050928f * b,
+            128.0f - 0.122655f * r - 0.316561f * g + 0.439216f * b,
+            128.0f + 0.439216f * r - 0.403890f * g - 0.035325f * b,
         };
     }
 

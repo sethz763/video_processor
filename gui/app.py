@@ -2824,6 +2824,10 @@ class MainWindow(QMainWindow):
         self._decklink_buffer_reapply_timer.setSingleShot(True)
         self._decklink_buffer_reapply_timer.setInterval(250)
         self._decklink_buffer_reapply_timer.timeout.connect(self._reapply_decklink_after_buffer_change)
+        self._decklink_color_reapply_timer = QTimer(self)
+        self._decklink_color_reapply_timer.setSingleShot(True)
+        self._decklink_color_reapply_timer.setInterval(300)
+        self._decklink_color_reapply_timer.timeout.connect(self._reapply_decklink_after_color_change)
         self._ai_sr_profiles_path = Path(__file__).resolve().parent / "ai_sr_profiles.json"
         self._ai_sr_profiles = self._load_ai_sr_profiles()
         self._preview_downsample_factor = self._normalize_preview_downsample_factor(
@@ -2995,7 +2999,17 @@ class MainWindow(QMainWindow):
         self._controller.create(self._roi)
         self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
+        self._apply_controller_color_settings_from_ui()
         LOGGER.info("Worker controller recreated after unexpected worker exit")
+
+    def _apply_controller_color_settings_from_ui(self) -> None:
+        selected_space_label = self.color_space_combo.currentText()
+        selected_space_name = COLOR_SPACE_LABEL_TO_NAME.get(selected_space_label, "rec709")
+        self._controller.set_color_space(selected_space_name)
+
+        selected_range_label = self.color_range_combo.currentText()
+        selected_range_name = COLOR_RANGE_LABEL_TO_NAME.get(selected_range_label, "limited")
+        self._controller.set_color_range(selected_range_name)
 
     def _default_ai_sr_model_path(self) -> str:
         return str(Path(__file__).resolve().parents[1] / "models" / "efrlfn_x2.onnx")
@@ -3501,22 +3515,6 @@ class MainWindow(QMainWindow):
         self.preview_downsample_combo.currentIndexChanged.connect(self._on_preview_downsample_changed)
         settings_form.addRow("Preview downsample", self.preview_downsample_combo)
 
-        self.color_space_combo = QComboBox()
-        self.color_space_combo.addItems(list(COLOR_SPACE_LABEL_TO_NAME.keys()))
-        self.color_space_combo.setCurrentText(
-            COLOR_SPACE_NAME_TO_LABEL.get(getattr(self._controller, "color_space", "rec709"), "Rec.709 (SDR)")
-        )
-        self.color_space_combo.currentIndexChanged.connect(self._on_color_space_changed)
-        settings_form.addRow("Color space", self.color_space_combo)
-
-        self.color_range_combo = QComboBox()
-        self.color_range_combo.addItems(list(COLOR_RANGE_LABEL_TO_NAME.keys()))
-        self.color_range_combo.setCurrentText(
-            COLOR_RANGE_NAME_TO_LABEL.get(getattr(self._controller, "color_range", "limited"), "Limited (Video)")
-        )
-        self.color_range_combo.currentIndexChanged.connect(self._on_color_range_changed)
-        settings_form.addRow("Color range", self.color_range_combo)
-
         self.sr_mode_combo = QComboBox()
         self.sr_mode_combo.addItems(["Auto", "Manual"])
         self.sr_mode_combo.currentIndexChanged.connect(self._on_sr_mode_changed)
@@ -3774,7 +3772,7 @@ class MainWindow(QMainWindow):
 
         self.source_mode_combo = QComboBox()
         self.source_mode_combo.addItems(["Synthetic", "Blackmagic DeckLink"])
-        self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
+        self.source_mode_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
         decklink_form.addRow("Input source", self.source_mode_combo)
 
         self.decklink_input_device_combo = QComboBox()
@@ -3791,10 +3789,28 @@ class MainWindow(QMainWindow):
         decklink_form.addRow(self.decklink_auto_detect_devices)
 
         self.decklink_input_mode_combo = QComboBox()
+        self.decklink_input_mode_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
         decklink_form.addRow("Input mode", self.decklink_input_mode_combo)
 
         self.decklink_output_mode_combo = QComboBox()
+        self.decklink_output_mode_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
         decklink_form.addRow("Output mode", self.decklink_output_mode_combo)
+
+        self.color_space_combo = QComboBox()
+        self.color_space_combo.addItems(list(COLOR_SPACE_LABEL_TO_NAME.keys()))
+        self.color_space_combo.setCurrentText(
+            COLOR_SPACE_NAME_TO_LABEL.get(getattr(self._controller, "color_space", "rec709"), "Rec.709 (SDR)")
+        )
+        self.color_space_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
+        decklink_form.addRow("Output color space", self.color_space_combo)
+
+        self.color_range_combo = QComboBox()
+        self.color_range_combo.addItems(list(COLOR_RANGE_LABEL_TO_NAME.keys()))
+        self.color_range_combo.setCurrentText(
+            COLOR_RANGE_NAME_TO_LABEL.get(getattr(self._controller, "color_range", "limited"), "Limited (Video)")
+        )
+        self.color_range_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
+        decklink_form.addRow("Output color range", self.color_range_combo)
 
         self.decklink_enable_format_detection = QCheckBox("Enable input format detection")
         self.decklink_enable_format_detection.setChecked(True)
@@ -4737,7 +4753,7 @@ class MainWindow(QMainWindow):
             self._controller.set_color_space(selected_name)
             applied_name = _normalize_color_space_name(getattr(self._controller, "color_space", selected_name))
             applied_label = COLOR_SPACE_NAME_TO_LABEL.get(applied_name, applied_name)
-            self._update_status(f"Color space applied: {applied_label}")
+            self._restart_blackmagic_sessions_for_color_update(f"Color space applied: {applied_label}")
         except Exception as exc:
             self._update_status(f"Color space change failed: {exc}")
 
@@ -4750,9 +4766,29 @@ class MainWindow(QMainWindow):
             self._controller.set_color_range(selected_name)
             applied_name = _normalize_color_range_name(getattr(self._controller, "color_range", selected_name))
             applied_label = COLOR_RANGE_NAME_TO_LABEL.get(applied_name, applied_name)
-            self._update_status(f"Color range applied: {applied_label}")
+            self._restart_blackmagic_sessions_for_color_update(f"Color range applied: {applied_label}")
         except Exception as exc:
             self._update_status(f"Color range change failed: {exc}")
+
+    def _restart_blackmagic_sessions_for_color_update(self, success_message: str) -> None:
+        if self._source_mode != "Blackmagic DeckLink":
+            self._update_status(success_message)
+            return
+
+        if not self._decklink_sessions_running:
+            self._update_status(f"{success_message} | DeckLink restart will apply on next session start")
+            return
+
+        self._decklink_color_reapply_timer.start()
+        self._update_status(f"{success_message} | DeckLink restart queued...")
+
+    def _reapply_decklink_after_color_change(self) -> None:
+        if self._source_mode != "Blackmagic DeckLink":
+            return
+        if not self._decklink_sessions_running:
+            return
+        self._update_status("Applying color change: restarting DeckLink I/O...")
+        self._on_apply_decklink_settings()
 
     def _on_preview_request_fps_changed(self) -> None:
         preview_fps = int(self.preview_request_fps_spin.value())
@@ -5820,6 +5856,13 @@ class MainWindow(QMainWindow):
         self._refresh_decklink_catalog()
         self._on_apply_decklink_settings()
 
+    def _on_blackmagic_combo_changed(self) -> None:
+        if self._updating_controls:
+            return
+        self._sync_blackmagic_controls_enabled_state()
+        self._update_fps_control_lock()
+        self._update_status("DeckLink settings changed. Click Apply DeckLink Settings to apply.")
+
     def _sync_blackmagic_controls_enabled_state(self) -> None:
         blackmagic_selected = self.source_mode_combo.currentText() == "Blackmagic DeckLink"
         for widget in [
@@ -5828,6 +5871,8 @@ class MainWindow(QMainWindow):
             self.decklink_auto_detect_devices,
             self.decklink_input_mode_combo,
             self.decklink_output_mode_combo,
+            self.color_space_combo,
+            self.color_range_combo,
             self.decklink_enable_format_detection,
             self.decklink_apply_btn,
             self.decklink_refresh_btn,
@@ -5839,7 +5884,22 @@ class MainWindow(QMainWindow):
         self.fps_spin.setEnabled(not blackmagic_selected)
 
     def _on_apply_decklink_settings(self) -> None:
+        selected_source_mode = self.source_mode_combo.currentText()
+        self._source_mode = selected_source_mode
+        self._sync_blackmagic_controls_enabled_state()
+        self._update_timer_interval()
+        self._update_fps_control_lock()
+
         if self._source_mode != "Blackmagic DeckLink":
+            self._stop_decklink_sessions()
+            self.decklink_status_label.setText("Synthetic mode active")
+            self._update_status("Applied source mode: Synthetic")
+            return
+
+        try:
+            self._apply_controller_color_settings_from_ui()
+        except Exception as exc:
+            self._update_status(f"DeckLink color settings apply failed: {exc}")
             return
 
         if d is None:
@@ -5889,9 +5949,13 @@ class MainWindow(QMainWindow):
                 )
             except RuntimeError as exc:
                 error_text = str(exc)
-                if "Worker process exited unexpectedly" not in error_text:
+                recoverable_start_failure = (
+                    "Worker process exited unexpectedly" in error_text
+                    or "Timed out waiting for worker ack: start_decklink" in error_text
+                )
+                if not recoverable_start_failure:
                     raise
-                LOGGER.warning("DeckLink start hit dead worker; recreating worker and retrying once: %s", error_text)
+                LOGGER.warning("DeckLink start hit recoverable worker failure; recreating worker and retrying once: %s", error_text)
                 self._recreate_worker_controller()
                 self._controller.start_decklink(
                     in_device=in_device,
@@ -6059,6 +6123,7 @@ class MainWindow(QMainWindow):
 
     def _on_decklink_device_changed(self) -> None:
         self._populate_mode_combos()
+        self._on_blackmagic_combo_changed()
 
     def _populate_mode_combos(self) -> None:
         if d is None:
@@ -6129,6 +6194,8 @@ class MainWindow(QMainWindow):
     def _stop_decklink_sessions(self) -> None:
         if self._decklink_buffer_reapply_timer.isActive():
             self._decklink_buffer_reapply_timer.stop()
+        if self._decklink_color_reapply_timer.isActive():
+            self._decklink_color_reapply_timer.stop()
         if self._controller_backend == "worker-process":
             try:
                 self._controller.stop_decklink()
