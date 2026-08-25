@@ -79,6 +79,24 @@ DENOISE_METHOD_LABEL_TO_NAME = {
 }
 DENOISE_METHOD_NAME_TO_LABEL = {value: key for key, value in DENOISE_METHOD_LABEL_TO_NAME.items()}
 
+AI_SR_POST_DENOISE_LABEL_TO_NAME = {
+    "Off": "off",
+    "Luma Gaussian 3x3": "luma_gaussian3x3",
+    "Luma Median 3x3": "luma_median3x3",
+    "Luma Bilateral 3x3": "luma_bilateral3x3",
+    "Luma Bilateral 5x5": "luma_bilateral5x5",
+}
+AI_SR_POST_DENOISE_NAME_TO_LABEL = {value: key for key, value in AI_SR_POST_DENOISE_LABEL_TO_NAME.items()}
+
+AI_SR_POST_ARTIFACT_REDUCTION_LABEL_TO_NAME = {
+    "Off": "off",
+    "Luma Bilateral 3x3": "luma_bilateral3x3",
+    "Luma Bilateral 5x5": "luma_bilateral5x5",
+}
+AI_SR_POST_ARTIFACT_REDUCTION_NAME_TO_LABEL = {
+    value: key for key, value in AI_SR_POST_ARTIFACT_REDUCTION_LABEL_TO_NAME.items()
+}
+
 RTX_POST_SCALE_METHOD_LABEL_TO_NAME = {
     "Nearest (Pixelated)": "nearest",
     "Bilinear (Fast)": "bilinear",
@@ -98,6 +116,13 @@ COLOR_RANGE_LABEL_TO_NAME = {
     "Full (Data)": "full",
 }
 COLOR_RANGE_NAME_TO_LABEL = {value: key for key, value in COLOR_RANGE_LABEL_TO_NAME.items()}
+
+WORKER_PRIORITY_LABEL_TO_NAME = {
+    "Normal": "normal",
+    "Above Normal": "above_normal",
+    "High": "high",
+}
+WORKER_PRIORITY_NAME_TO_LABEL = {value: key for key, value in WORKER_PRIORITY_LABEL_TO_NAME.items()}
 
 try:
     import decklink_wrapper as d
@@ -163,6 +188,17 @@ def _legacy_ai_frame_interval_to_fps(interval_frames: int) -> int:
     # uses explicit target inference FPS. Map old defaults to a practical rate.
     interval = max(1, int(interval_frames))
     return _clamp_ai_inference_fps(int(round(30.0 / float(interval))))
+
+
+def _normalize_worker_priority_name(priority_name: str) -> str:
+    normalized = str(priority_name).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"normal", "default"}:
+        return "normal"
+    if normalized in {"above_normal", "abovenormal", "high_normal", "highnormal"}:
+        return "above_normal"
+    if normalized in {"high", "high_priority", "highpriority"}:
+        return "high"
+    return "above_normal"
 
 
 def _uyvy_to_rgb_limited(
@@ -724,6 +760,13 @@ class RoiCanvas(QWidget):
         self._visual_roi_overlay = None
         self._apply_roi_local(roi)
 
+    def cancel_pending_interaction_updates(self) -> None:
+        # Drop queued interaction/touch emits so old manual gestures cannot
+        # override a programmatic keyframe recall endpoint.
+        self._cancel_interaction_interpolation()
+        self._touch_emit_pending = False
+        self._touch_emit_pending_scale = False
+
     def set_visual_roi_overlay(self, x: float, y: float, w: float, h: float) -> None:
         self._visual_roi_overlay = (float(x), float(y), float(w), float(h))
         self.update()
@@ -1255,6 +1298,12 @@ class VideoProcessorController:
         self.ai_sr_roi_overscan_percent = 0.0
         self.ai_sr_inference_divisor = 0
         self.ai_sr_detail_preserve_percent = 0.0
+        self.ai_sr_post_denoise_method = "off"
+        self.ai_sr_post_denoise_strength = 0.0
+        self.ai_sr_post_artifact_reduction_method = "off"
+        self.ai_sr_post_artifact_reduction_strength = 0.0
+        self.ai_sr_post_exaggeration_enabled = False
+        self.ai_sr_post_exaggeration_gain = 2.0
         self.ai_sr_max_inflight = 1
         self.ai_sr_info: dict[str, object] | None = None
         self.rtx_vsr_enabled = False
@@ -1268,6 +1317,9 @@ class VideoProcessorController:
         self.rtx_thdr_middle_gray = 50
         self.rtx_thdr_max_luminance = 1000
         self.decklink_output_buffer_frames = 2
+        self.worker_process_priority = _normalize_worker_priority_name(
+            os.environ.get("VP_WORKER_PROCESS_PRIORITY", "above_normal")
+        )
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
         self.processor = None
@@ -1463,6 +1515,12 @@ class VideoProcessorController:
         roi_overscan_percent: float,
         inference_divisor: int,
         detail_preserve_percent: float,
+        post_denoise_method: str,
+        post_denoise_strength: float,
+        post_artifact_reduction_method: str,
+        post_artifact_reduction_strength: float,
+        post_exaggeration_enabled: bool,
+        post_exaggeration_gain: float,
         max_inflight: int | None = None,
         wait_for_ack: bool = False,
         timeout_seconds: float = 3.0,
@@ -1477,6 +1535,12 @@ class VideoProcessorController:
         self.ai_sr_roi_overscan_percent = max(0.0, float(roi_overscan_percent))
         self.ai_sr_inference_divisor = max(0, int(inference_divisor))
         self.ai_sr_detail_preserve_percent = max(0.0, float(detail_preserve_percent))
+        self.ai_sr_post_denoise_method = str(post_denoise_method).strip().lower()
+        self.ai_sr_post_denoise_strength = max(0.0, min(1.0, float(post_denoise_strength)))
+        self.ai_sr_post_artifact_reduction_method = str(post_artifact_reduction_method).strip().lower()
+        self.ai_sr_post_artifact_reduction_strength = max(0.0, min(1.0, float(post_artifact_reduction_strength)))
+        self.ai_sr_post_exaggeration_enabled = bool(post_exaggeration_enabled)
+        self.ai_sr_post_exaggeration_gain = max(1.0, min(4.0, float(post_exaggeration_gain)))
         if max_inflight is not None:
             self.ai_sr_max_inflight = max(1, min(4, int(max_inflight)))
         self.ai_sr_active = False
@@ -1521,6 +1585,15 @@ class VideoProcessorController:
     def decklink_processed_counter(self) -> int:
         return 0
 
+    def decklink_output_nominal_fps(self) -> float:
+        return 0.0
+
+    def decklink_output_buffer_health(self) -> dict[str, object]:
+        return {}
+
+    def decklink_pipeline_timing_health(self) -> dict[str, object]:
+        return {}
+
     def set_preview_fps(self, preview_fps: float) -> None:
         # In-process backend does not use worker tick preview throttling.
         _ = preview_fps
@@ -1528,6 +1601,10 @@ class VideoProcessorController:
     def set_decklink_output_buffer_frames(self, buffer_frames: int) -> None:
         # In-process backend does not use worker DeckLink output buffering.
         self.decklink_output_buffer_frames = max(0, min(10, int(buffer_frames)))
+
+    def set_worker_process_priority(self, priority_name: str) -> None:
+        # In-process backend does not launch a worker process.
+        self.worker_process_priority = _normalize_worker_priority_name(priority_name)
 
     def set_roi_subpixel_shift(self, shift_x: float, shift_y: float) -> None:
         _ = (shift_x, shift_y)
@@ -1543,8 +1620,17 @@ class VideoProcessorController:
         interpolation_mode: str,
         overscan_percent: float,
         start_from_current: bool = False,
+        enforce_full_frame_scale_1x: bool = False,
     ) -> None:
-        _ = (start_roi, target_roi, duration_frames, interpolation_mode, overscan_percent, start_from_current)
+        _ = (
+            start_roi,
+            target_roi,
+            duration_frames,
+            interpolation_mode,
+            overscan_percent,
+            start_from_current,
+            enforce_full_frame_scale_1x,
+        )
 
     def cancel_roi_microstep_transition(self, reset_subpixel_shift: bool = True) -> None:
         _ = reset_subpixel_shift
@@ -1583,6 +1669,20 @@ class ProcessVideoProcessorController:
         self.ai_sr_roi_overscan_percent = max(0.0, float(os.environ.get("VP_AI_SR_ROI_OVERSCAN_PCT", "0")))
         self.ai_sr_inference_divisor = max(0, int(os.environ.get("VP_AI_SR_INFERENCE_DIVISOR", "0")))
         self.ai_sr_detail_preserve_percent = max(0.0, float(os.environ.get("VP_AI_SR_DETAIL_PRESERVE_PCT", "0")))
+        self.ai_sr_post_denoise_method = str(os.environ.get("VP_AI_SR_POST_DENOISE_METHOD", "off")).strip().lower() or "off"
+        self.ai_sr_post_denoise_strength = max(0.0, min(1.0, float(os.environ.get("VP_AI_SR_POST_DENOISE_STRENGTH", "0.0"))))
+        self.ai_sr_post_artifact_reduction_method = str(
+            os.environ.get("VP_AI_SR_POST_ARTIFACT_REDUCTION_METHOD", "off")
+        ).strip().lower() or "off"
+        self.ai_sr_post_artifact_reduction_strength = max(
+            0.0,
+            min(1.0, float(os.environ.get("VP_AI_SR_POST_ARTIFACT_REDUCTION_STRENGTH", "0.0"))),
+        )
+        self.ai_sr_post_exaggeration_enabled = os.environ.get("VP_AI_SR_POST_EXAGGERATION_ENABLED", "0") == "1"
+        self.ai_sr_post_exaggeration_gain = max(
+            1.0,
+            min(4.0, float(os.environ.get("VP_AI_SR_POST_EXAGGERATION_GAIN", "2.0"))),
+        )
         self.ai_sr_hold_last_frame = os.environ.get("VP_AI_SR_HOLD_LAST_FRAME", "1") == "1"
         self.ai_sr_max_hold_ms = max(0.0, float(os.environ.get("VP_AI_SR_MAX_HOLD_MS", "0")))
         self.ai_sr_max_inflight = max(1, min(4, int(os.environ.get("VP_AI_SR_MAX_INFLIGHT", "1"))))
@@ -1600,6 +1700,10 @@ class ProcessVideoProcessorController:
         self.rtx_thdr_middle_gray = max(0, int(os.environ.get("VP_RTX_THDR_MIDDLE_GRAY", "50")))
         self.rtx_thdr_max_luminance = max(0, int(os.environ.get("VP_RTX_THDR_MAX_LUMINANCE", "1000")))
         self.decklink_output_buffer_frames = max(0, min(10, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "2"))))
+        self.worker_process_priority = _normalize_worker_priority_name(
+            os.environ.get("VP_WORKER_PROCESS_PRIORITY", "above_normal")
+        )
+        self.worker_process_priority_error: str | None = None
         self.rtx_vsr_active = False
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
@@ -1617,6 +1721,7 @@ class ProcessVideoProcessorController:
         self._decklink_no_frame_reason: str | None = None
         self._decklink_processed_counter = 0
         self._decklink_processed_fps = 0.0
+        self._decklink_output_nominal_fps = 0.0
         self._decklink_processed_counter_last = 0
         self._decklink_processed_counter_last_ts = 0.0
         self._decklink_processed_fps_smoothed = 0.0
@@ -1679,10 +1784,15 @@ class ProcessVideoProcessorController:
             "preprocess": 0,
             "upscale": 0,
         }
+        self._decklink_output_buffer_health: dict[str, object] = {}
+        self._decklink_pipeline_timing_health: dict[str, object] = {}
 
     def _reset_decklink_fps_tracking(self) -> None:
         self._decklink_processed_counter = 0
         self._decklink_processed_fps = 0.0
+        self._decklink_output_nominal_fps = 0.0
+        self._decklink_output_buffer_health = {}
+        self._decklink_pipeline_timing_health = {}
         self._decklink_processed_counter_last = 0
         self._decklink_processed_counter_last_ts = 0.0
         self._decklink_processed_fps_smoothed = 0.0
@@ -1731,6 +1841,10 @@ class ProcessVideoProcessorController:
 
         self._decklink_processed_fps_smoothed = max(0.0, float(effective_fps))
         self._decklink_processed_fps = self._decklink_processed_fps_smoothed
+        self._decklink_output_nominal_fps = max(
+            0.0,
+            float(message.get("output_nominal_fps", self._decklink_output_nominal_fps)),
+        )
 
         self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
         self._decklink_ai_reused_frames = int(message.get("ai_sr_reused_frames", self._decklink_ai_reused_frames))
@@ -1763,6 +1877,12 @@ class ProcessVideoProcessorController:
         self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
         self._decklink_stage_queue_depths = dict(message.get("stage_queue_depths", self._decklink_stage_queue_depths))
         self._decklink_stage_drop_counts = dict(message.get("stage_drop_counts", self._decklink_stage_drop_counts))
+        self._decklink_output_buffer_health = dict(
+            message.get("output_buffer_health", self._decklink_output_buffer_health)
+        )
+        self._decklink_pipeline_timing_health = dict(
+            message.get("pipeline_timing_health", self._decklink_pipeline_timing_health)
+        )
         self._decklink_no_frame_reason = None
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
@@ -1842,6 +1962,12 @@ class ProcessVideoProcessorController:
     def decklink_queue_telemetry(self) -> tuple[dict[str, int], dict[str, int]]:
         return dict(self._decklink_stage_queue_depths), dict(self._decklink_stage_drop_counts)
 
+    def decklink_output_buffer_health(self) -> dict[str, object]:
+        return dict(self._decklink_output_buffer_health)
+
+    def decklink_pipeline_timing_health(self) -> dict[str, object]:
+        return dict(self._decklink_pipeline_timing_health)
+
     def create(self, roi: Roi) -> None:
         self.close()
 
@@ -1883,6 +2009,12 @@ class ProcessVideoProcessorController:
             "ai_sr_roi_overscan_percent": self.ai_sr_roi_overscan_percent,
             "ai_sr_inference_divisor": self.ai_sr_inference_divisor,
             "ai_sr_detail_preserve_percent": self.ai_sr_detail_preserve_percent,
+            "ai_sr_post_denoise_method": self.ai_sr_post_denoise_method,
+            "ai_sr_post_denoise_strength": self.ai_sr_post_denoise_strength,
+            "ai_sr_post_artifact_reduction_method": self.ai_sr_post_artifact_reduction_method,
+            "ai_sr_post_artifact_reduction_strength": self.ai_sr_post_artifact_reduction_strength,
+            "ai_sr_post_exaggeration_enabled": self.ai_sr_post_exaggeration_enabled,
+            "ai_sr_post_exaggeration_gain": self.ai_sr_post_exaggeration_gain,
             "ai_sr_hold_last_frame": bool(self.ai_sr_hold_last_frame),
             "ai_sr_max_hold_ms": float(self.ai_sr_max_hold_ms),
             "ai_sr_max_inflight": int(self.ai_sr_max_inflight),
@@ -1896,6 +2028,7 @@ class ProcessVideoProcessorController:
             "rtx_thdr_middle_gray": self.rtx_thdr_middle_gray,
             "rtx_thdr_max_luminance": self.rtx_thdr_max_luminance,
             "decklink_output_buffer_frames": self.decklink_output_buffer_frames,
+            "worker_process_priority": self.worker_process_priority,
             "rtx_video_sdk_root": os.environ.get("RTX_VIDEO_SDK_ROOT", r"C:\Coding Projects\sdks\NVidia video SDK"),
         }
 
@@ -1945,6 +2078,12 @@ class ProcessVideoProcessorController:
                 self.rtx_vsr_info = message.get("rtx_vsr_info")
                 self.color_space = _normalize_color_space_name(str(message.get("color_space", self.color_space)))
                 self.color_range = _normalize_color_range_name(str(message.get("color_range", self.color_range)))
+                self.worker_process_priority = _normalize_worker_priority_name(
+                    str(message.get("worker_process_priority", self.worker_process_priority))
+                )
+                self.worker_process_priority_error = (
+                    str(message.get("worker_process_priority_error", "")).strip() or None
+                )
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -1979,7 +2118,6 @@ class ProcessVideoProcessorController:
         }
         best_effort_cmds = {
             "decklink_tick",
-            "set_decklink_output_buffer_frames",
             # Live ROI interaction commands should never block the GUI thread.
             "set_roi",
             "set_roi_position",
@@ -2145,6 +2283,13 @@ class ProcessVideoProcessorController:
                         0,
                         min(10, int(message.get("decklink_output_buffer_frames", self.decklink_output_buffer_frames))),
                     )
+                elif ack_cmd == "set_worker_process_priority":
+                    self.worker_process_priority = _normalize_worker_priority_name(
+                        str(message.get("worker_process_priority", self.worker_process_priority))
+                    )
+                    self.worker_process_priority_error = (
+                        str(message.get("worker_process_priority_error", "")).strip() or None
+                    )
                 continue
 
             if message_type == "warning":
@@ -2194,6 +2339,7 @@ class ProcessVideoProcessorController:
         interpolation_mode: str,
         overscan_percent: float,
         start_from_current: bool = False,
+        enforce_full_frame_scale_1x: bool = False,
     ) -> None:
         self._send_control(
             {
@@ -2210,6 +2356,7 @@ class ProcessVideoProcessorController:
                 "interpolation_mode": str(interpolation_mode),
                 "overscan_percent": float(overscan_percent),
                 "start_from_current": bool(start_from_current),
+                "enforce_full_frame_scale_1x": bool(enforce_full_frame_scale_1x),
             }
         )
 
@@ -2468,6 +2615,9 @@ class ProcessVideoProcessorController:
     def decklink_processed_fps(self) -> float:
         return float(self._decklink_processed_fps)
 
+    def decklink_output_nominal_fps(self) -> float:
+        return float(self._decklink_output_nominal_fps)
+
     def set_preview_fps(self, preview_fps: float) -> None:
         self._preview_fps = max(0.0, float(preview_fps))
         # Allow an immediate preview request after a user-adjusted FPS change.
@@ -2479,6 +2629,16 @@ class ProcessVideoProcessorController:
             {
                 "cmd": "set_decklink_output_buffer_frames",
                 "decklink_output_buffer_frames": int(self.decklink_output_buffer_frames),
+            }
+        )
+
+    def set_worker_process_priority(self, priority_name: str) -> None:
+        normalized = _normalize_worker_priority_name(priority_name)
+        self.worker_process_priority = normalized
+        self._send_control(
+            {
+                "cmd": "set_worker_process_priority",
+                "worker_process_priority": normalized,
             }
         )
 
@@ -2569,6 +2729,12 @@ class ProcessVideoProcessorController:
         roi_overscan_percent: float,
         inference_divisor: int,
         detail_preserve_percent: float,
+        post_denoise_method: str,
+        post_denoise_strength: float,
+        post_artifact_reduction_method: str,
+        post_artifact_reduction_strength: float,
+        post_exaggeration_enabled: bool,
+        post_exaggeration_gain: float,
         max_inflight: int | None = None,
         wait_for_ack: bool = False,
         timeout_seconds: float = 3.0,
@@ -2583,6 +2749,12 @@ class ProcessVideoProcessorController:
         self.ai_sr_roi_overscan_percent = max(0.0, float(roi_overscan_percent))
         self.ai_sr_inference_divisor = max(0, int(inference_divisor))
         self.ai_sr_detail_preserve_percent = max(0.0, float(detail_preserve_percent))
+        self.ai_sr_post_denoise_method = str(post_denoise_method).strip().lower()
+        self.ai_sr_post_denoise_strength = max(0.0, min(1.0, float(post_denoise_strength)))
+        self.ai_sr_post_artifact_reduction_method = str(post_artifact_reduction_method).strip().lower()
+        self.ai_sr_post_artifact_reduction_strength = max(0.0, min(1.0, float(post_artifact_reduction_strength)))
+        self.ai_sr_post_exaggeration_enabled = bool(post_exaggeration_enabled)
+        self.ai_sr_post_exaggeration_gain = max(1.0, min(4.0, float(post_exaggeration_gain)))
         if max_inflight is not None:
             self.ai_sr_max_inflight = max(1, min(4, int(max_inflight)))
         self._send_control(
@@ -2598,6 +2770,12 @@ class ProcessVideoProcessorController:
                 "roi_overscan_percent": self.ai_sr_roi_overscan_percent,
                 "inference_divisor": self.ai_sr_inference_divisor,
                 "detail_preserve_percent": self.ai_sr_detail_preserve_percent,
+                "post_denoise_method": self.ai_sr_post_denoise_method,
+                "post_denoise_strength": self.ai_sr_post_denoise_strength,
+                "post_artifact_reduction_method": self.ai_sr_post_artifact_reduction_method,
+                "post_artifact_reduction_strength": self.ai_sr_post_artifact_reduction_strength,
+                "post_exaggeration_enabled": self.ai_sr_post_exaggeration_enabled,
+                "post_exaggeration_gain": self.ai_sr_post_exaggeration_gain,
                 "max_inflight": self.ai_sr_max_inflight,
             }
         )
@@ -2790,6 +2968,38 @@ class MainWindow(QMainWindow):
         self._perf_guard_enabled = False
         self._perf_guard_low_fps_seconds = 0
         self._perf_guard_last_action = ""
+        self._health_drop_events_total = 0
+        self._health_drop_events_interpolation = 0
+        self._health_buffer_warn_events = 0
+        self._health_drop_active = False
+        self._health_drop_active_interpolation = False
+        self._health_last_output_fps = 0.0
+        self._health_last_output_nominal_fps = 0.0
+        self._health_last_buffer_starvation = 0
+        self._health_last_buffer_overflow = 0
+        self._health_last_buffer_reprime = 0
+        self._decklink_buffer_guard_enabled = os.environ.get("VP_DECKLINK_BUFFER_GUARD", "1") != "0"
+        self._decklink_buffer_guard_floor_frames = max(
+            1,
+            min(10, int(os.environ.get("VP_DECKLINK_BUFFER_GUARD_FLOOR", "2"))),
+        )
+        self._decklink_buffer_guard_engage_miss_ratio = max(
+            0.0,
+            min(1.0, float(os.environ.get("VP_DECKLINK_BUFFER_GUARD_ENGAGE_MISS_RATIO", "0.06"))),
+        )
+        self._decklink_buffer_guard_release_miss_ratio = max(
+            0.0,
+            min(1.0, float(os.environ.get("VP_DECKLINK_BUFFER_GUARD_RELEASE_MISS_RATIO", "0.01"))),
+        )
+        self._decklink_buffer_guard_release_windows_needed = max(
+            1,
+            int(os.environ.get("VP_DECKLINK_BUFFER_GUARD_RELEASE_WINDOWS", "4")),
+        )
+        self._decklink_buffer_guard_active = False
+        self._decklink_buffer_guard_stable_windows = 0
+        self._worker_process_priority = _normalize_worker_priority_name(
+            getattr(self._controller, "worker_process_priority", os.environ.get("VP_WORKER_PROCESS_PRIORITY", "above_normal"))
+        )
         self._updating_controls = False
         self._controller_roi_target: Roi | None = None
         self._controller_roi_applied = self._roi
@@ -2838,6 +3048,7 @@ class MainWindow(QMainWindow):
             0,
             min(10, int(getattr(self._controller, "decklink_output_buffer_frames", 2))),
         )
+        self._decklink_output_buffer_user_target_frames = int(self._decklink_output_buffer_frames)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2851,6 +3062,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
         self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
         self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_decklink_output_buffer_spins: dict[str, QSpinBox] = {}
         viewers = QWidget()
         viewers_layout = QVBoxLayout(viewers)
         viewers_layout.setContentsMargins(0, 0, 0, 0)
@@ -2944,7 +3156,7 @@ class MainWindow(QMainWindow):
         self._roi_controls_sync_timer.timeout.connect(self._flush_pending_roi_controls_sync)
 
         self._roi_keyframe_transition_timer = QTimer(self)
-        self._roi_keyframe_transition_timer.setInterval(8)
+        self._roi_keyframe_transition_timer.setInterval(16)
         self._roi_keyframe_transition_timer.setTimerType(Qt.PreciseTimer)
         self._roi_keyframe_transition_timer.timeout.connect(self._step_roi_keyframe_transition)
 
@@ -2952,9 +3164,11 @@ class MainWindow(QMainWindow):
         self._connect_settings_persistence_signals()
         self.roi_transition_frames_spin.valueChanged.connect(self._sync_fullscreen_transition_rate_from_main)
         self.roi_keyframe_duration_override_btn.toggled.connect(self._sync_fullscreen_override_duration_from_main)
+        self.decklink_output_buffer_spin.valueChanged.connect(self._sync_fullscreen_decklink_output_buffer_from_main)
         self._update_roi_key_buttons()
         self._sync_fullscreen_transition_rate_from_main(self.roi_transition_frames_spin.value())
         self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
+        self._sync_fullscreen_decklink_output_buffer_from_main(self.decklink_output_buffer_spin.value())
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
         self._sync_ai_sr_basic_scaling_ui(notify=False)
@@ -2996,10 +3210,13 @@ class MainWindow(QMainWindow):
             pass
 
         self._controller = self._create_processor_controller(self._module)
+        if hasattr(self._controller, "worker_process_priority"):
+            self._controller.worker_process_priority = _normalize_worker_priority_name(self._worker_process_priority)
         self._controller.create(self._roi)
         self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
         self._apply_controller_color_settings_from_ui()
+        self._apply_worker_process_priority_to_controller(notify=False)
         LOGGER.info("Worker controller recreated after unexpected worker exit")
 
     def _apply_controller_color_settings_from_ui(self) -> None:
@@ -3052,6 +3269,8 @@ class MainWindow(QMainWindow):
             self.ai_sr_provider_combo,
             self.ai_sr_trt_precision_combo,
             self.ai_sr_input_align_combo,
+            self.ai_sr_post_denoise_method_combo,
+            self.ai_sr_post_artifact_reduction_method_combo,
             self.rtx_vsr_quality_combo,
             self.rtx_vsr_scale_combo,
             self.rtx_vsr_post_scale_method_combo,
@@ -3060,6 +3279,7 @@ class MainWindow(QMainWindow):
             self.decklink_output_device_combo,
             self.decklink_input_mode_combo,
             self.decklink_output_mode_combo,
+            self.worker_priority_combo,
             self.roi_interp_mode_combo,
         ]
         for combo in combo_widgets:
@@ -3073,9 +3293,11 @@ class MainWindow(QMainWindow):
             self.perf_guard_checkbox,
             self.ai_sr_require_gpu_checkbox,
             self.ai_sr_strict_checkbox,
+            self.ai_sr_post_exaggeration_checkbox,
             self.rtx_thdr_enable_checkbox,
             self.decklink_auto_detect_devices,
             self.decklink_enable_format_detection,
+            self.decklink_fps_priority_guard_checkbox,
             self.roi_keyframe_duration_override_btn,
         ]
         for checkbox in checkbox_widgets:
@@ -3097,6 +3319,9 @@ class MainWindow(QMainWindow):
             self.ai_sr_overscan_spin,
             self.ai_sr_inference_divisor_spin,
             self.ai_sr_detail_preserve_spin,
+            self.ai_sr_post_denoise_strength_spin,
+            self.ai_sr_post_artifact_reduction_strength_spin,
+            self.ai_sr_post_exaggeration_gain_spin,
             self.denoise_strength_spin,
             self.rtx_thdr_contrast_spin,
             self.rtx_thdr_saturation_spin,
@@ -3157,6 +3382,12 @@ class MainWindow(QMainWindow):
             "ai_sr_roi_overscan_percent": float(self.ai_sr_overscan_spin.value()),
             "ai_sr_inference_divisor": int(self.ai_sr_inference_divisor_spin.value()),
             "ai_sr_detail_preserve_percent": float(self.ai_sr_detail_preserve_spin.value()),
+            "ai_sr_post_denoise_method": str(self.ai_sr_post_denoise_method_combo.currentText()),
+            "ai_sr_post_denoise_strength": float(self.ai_sr_post_denoise_strength_spin.value()),
+            "ai_sr_post_artifact_reduction_method": str(self.ai_sr_post_artifact_reduction_method_combo.currentText()),
+            "ai_sr_post_artifact_reduction_strength": float(self.ai_sr_post_artifact_reduction_strength_spin.value()),
+            "ai_sr_post_exaggeration_enabled": bool(self.ai_sr_post_exaggeration_checkbox.isChecked()),
+            "ai_sr_post_exaggeration_gain": float(self.ai_sr_post_exaggeration_gain_spin.value()),
             "rtx_vsr_enabled": bool(self.enable_rtx_vsr_checkbox.isChecked()),
             "rtx_vsr_quality": str(self.rtx_vsr_quality_combo.currentText()),
             "rtx_vsr_scale": str(self.rtx_vsr_scale_combo.currentText()),
@@ -3173,6 +3404,8 @@ class MainWindow(QMainWindow):
             "decklink_input_mode_text": str(self.decklink_input_mode_combo.currentText()),
             "decklink_output_mode_text": str(self.decklink_output_mode_combo.currentText()),
             "decklink_enable_format_detection": bool(self.decklink_enable_format_detection.isChecked()),
+            "decklink_fps_priority_guard": bool(self.decklink_fps_priority_guard_checkbox.isChecked()),
+            "worker_process_priority": str(self.worker_priority_combo.currentText()),
             "display_splitter_sizes": list(self._display_splitter.sizes()),
             "main_splitter_sizes": list(self._main_splitter.sizes()),
         }
@@ -3261,6 +3494,46 @@ class MainWindow(QMainWindow):
             self.ai_sr_overscan_spin.setValue(float(raw.get("ai_sr_roi_overscan_percent", self.ai_sr_overscan_spin.value())))
             self.ai_sr_inference_divisor_spin.setValue(max(0, int(raw.get("ai_sr_inference_divisor", self.ai_sr_inference_divisor_spin.value()))))
             self.ai_sr_detail_preserve_spin.setValue(float(raw.get("ai_sr_detail_preserve_percent", self.ai_sr_detail_preserve_spin.value())))
+            self.ai_sr_post_denoise_method_combo.setCurrentText(
+                str(raw.get("ai_sr_post_denoise_method", self.ai_sr_post_denoise_method_combo.currentText()))
+            )
+            self.ai_sr_post_denoise_strength_spin.setValue(
+                max(0.0, min(1.0, float(raw.get("ai_sr_post_denoise_strength", self.ai_sr_post_denoise_strength_spin.value()))))
+            )
+            self.ai_sr_post_artifact_reduction_method_combo.setCurrentText(
+                str(
+                    raw.get(
+                        "ai_sr_post_artifact_reduction_method",
+                        self.ai_sr_post_artifact_reduction_method_combo.currentText(),
+                    )
+                )
+            )
+            self.ai_sr_post_artifact_reduction_strength_spin.setValue(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(
+                            raw.get(
+                                "ai_sr_post_artifact_reduction_strength",
+                                self.ai_sr_post_artifact_reduction_strength_spin.value(),
+                            )
+                        ),
+                    ),
+                )
+            )
+            self.ai_sr_post_exaggeration_checkbox.setChecked(
+                bool(raw.get("ai_sr_post_exaggeration_enabled", self.ai_sr_post_exaggeration_checkbox.isChecked()))
+            )
+            self.ai_sr_post_exaggeration_gain_spin.setValue(
+                max(
+                    1.0,
+                    min(
+                        4.0,
+                        float(raw.get("ai_sr_post_exaggeration_gain", self.ai_sr_post_exaggeration_gain_spin.value())),
+                    ),
+                )
+            )
 
             self.enable_rtx_vsr_checkbox.setChecked(bool(raw.get("rtx_vsr_enabled", self.enable_rtx_vsr_checkbox.isChecked())))
             self.rtx_vsr_quality_combo.setCurrentText(str(raw.get("rtx_vsr_quality", self.rtx_vsr_quality_combo.currentText())))
@@ -3277,6 +3550,12 @@ class MainWindow(QMainWindow):
             self.decklink_enable_format_detection.setChecked(
                 bool(raw.get("decklink_enable_format_detection", self.decklink_enable_format_detection.isChecked()))
             )
+            self.decklink_fps_priority_guard_checkbox.setChecked(
+                bool(raw.get("decklink_fps_priority_guard", self.decklink_fps_priority_guard_checkbox.isChecked()))
+            )
+            self.worker_priority_combo.setCurrentText(
+                str(raw.get("worker_process_priority", self.worker_priority_combo.currentText()))
+            )
         finally:
             self._updating_controls = False
 
@@ -3285,6 +3564,13 @@ class MainWindow(QMainWindow):
         )
         self._decklink_tick_poll_fps = float(max(1, self.preview_poll_fps_spin.value()))
         self._decklink_output_buffer_frames = int(self.decklink_output_buffer_spin.value())
+        self._worker_process_priority = _normalize_worker_priority_name(
+            WORKER_PRIORITY_LABEL_TO_NAME.get(
+                str(self.worker_priority_combo.currentText()),
+                getattr(self._controller, "worker_process_priority", "above_normal"),
+            )
+        )
+        self._apply_worker_process_priority_to_controller(notify=False)
 
         persisted_in_device = raw.get("decklink_input_device")
         persisted_out_device = raw.get("decklink_output_device")
@@ -3339,6 +3625,18 @@ class MainWindow(QMainWindow):
             "roi_overscan_percent": float(self.ai_sr_overscan_spin.value()),
             "inference_divisor": int(self.ai_sr_inference_divisor_spin.value()),
             "detail_preserve_percent": float(self.ai_sr_detail_preserve_spin.value()),
+            "post_denoise_method": AI_SR_POST_DENOISE_LABEL_TO_NAME.get(
+                self.ai_sr_post_denoise_method_combo.currentText(),
+                "off",
+            ),
+            "post_denoise_strength": float(self.ai_sr_post_denoise_strength_spin.value()),
+            "post_artifact_reduction_method": AI_SR_POST_ARTIFACT_REDUCTION_LABEL_TO_NAME.get(
+                self.ai_sr_post_artifact_reduction_method_combo.currentText(),
+                "off",
+            ),
+            "post_artifact_reduction_strength": float(self.ai_sr_post_artifact_reduction_strength_spin.value()),
+            "post_exaggeration_enabled": bool(self.ai_sr_post_exaggeration_checkbox.isChecked()),
+            "post_exaggeration_gain": float(self.ai_sr_post_exaggeration_gain_spin.value()),
         }
 
     def _apply_ai_sr_profile(self, profile: dict[str, object]) -> None:
@@ -3376,6 +3674,60 @@ class MainWindow(QMainWindow):
 
         detail_preserve = max(0.0, float(profile.get("detail_preserve_percent", getattr(self._controller, "ai_sr_detail_preserve_percent", 0.0))))
         self.ai_sr_detail_preserve_spin.setValue(detail_preserve)
+
+        post_denoise_method = str(profile.get("post_denoise_method", getattr(self._controller, "ai_sr_post_denoise_method", "off"))).strip().lower()
+        self.ai_sr_post_denoise_method_combo.setCurrentText(
+            AI_SR_POST_DENOISE_NAME_TO_LABEL.get(post_denoise_method, "Off")
+        )
+
+        post_denoise_strength = max(0.0, min(1.0, float(profile.get("post_denoise_strength", getattr(self._controller, "ai_sr_post_denoise_strength", 0.0)))))
+        self.ai_sr_post_denoise_strength_spin.setValue(post_denoise_strength)
+
+        post_artifact_method = str(
+            profile.get(
+                "post_artifact_reduction_method",
+                getattr(self._controller, "ai_sr_post_artifact_reduction_method", "off"),
+            )
+        ).strip().lower()
+        self.ai_sr_post_artifact_reduction_method_combo.setCurrentText(
+            AI_SR_POST_ARTIFACT_REDUCTION_NAME_TO_LABEL.get(post_artifact_method, "Off")
+        )
+
+        post_artifact_strength = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    profile.get(
+                        "post_artifact_reduction_strength",
+                        getattr(self._controller, "ai_sr_post_artifact_reduction_strength", 0.0),
+                    )
+                ),
+            ),
+        )
+        self.ai_sr_post_artifact_reduction_strength_spin.setValue(post_artifact_strength)
+
+        post_exaggeration_enabled = bool(
+            profile.get(
+                "post_exaggeration_enabled",
+                getattr(self._controller, "ai_sr_post_exaggeration_enabled", False),
+            )
+        )
+        self.ai_sr_post_exaggeration_checkbox.setChecked(post_exaggeration_enabled)
+
+        post_exaggeration_gain = max(
+            1.0,
+            min(
+                4.0,
+                float(
+                    profile.get(
+                        "post_exaggeration_gain",
+                        getattr(self._controller, "ai_sr_post_exaggeration_gain", 2.0),
+                    )
+                ),
+            ),
+        )
+        self.ai_sr_post_exaggeration_gain_spin.setValue(post_exaggeration_gain)
 
     def _resolve_startup_ai_sr_model_path(self) -> str:
         configured = self.ai_sr_model_combo.currentText().strip()
@@ -3432,6 +3784,12 @@ class MainWindow(QMainWindow):
                 roi_overscan_percent=float(profile["roi_overscan_percent"]),
                 inference_divisor=int(profile["inference_divisor"]),
                 detail_preserve_percent=float(profile["detail_preserve_percent"]),
+                post_denoise_method=str(profile["post_denoise_method"]),
+                post_denoise_strength=float(profile["post_denoise_strength"]),
+                post_artifact_reduction_method=str(profile["post_artifact_reduction_method"]),
+                post_artifact_reduction_strength=float(profile["post_artifact_reduction_strength"]),
+                post_exaggeration_enabled=bool(profile["post_exaggeration_enabled"]),
+                post_exaggeration_gain=float(profile["post_exaggeration_gain"]),
                 wait_for_ack=True,
                 timeout_seconds=startup_timeout_s,
             )
@@ -3622,6 +3980,51 @@ class MainWindow(QMainWindow):
         self.ai_sr_detail_preserve_spin.setValue(float(getattr(self._controller, "ai_sr_detail_preserve_percent", 0.0)))
         self.ai_sr_detail_preserve_spin.setToolTip("Blend original ROI detail back into AI output to reduce softness")
 
+        self.ai_sr_post_denoise_method_combo = QComboBox()
+        self.ai_sr_post_denoise_method_combo.addItems(list(AI_SR_POST_DENOISE_LABEL_TO_NAME.keys()))
+        self.ai_sr_post_denoise_method_combo.setCurrentText(
+            AI_SR_POST_DENOISE_NAME_TO_LABEL.get(
+                str(getattr(self._controller, "ai_sr_post_denoise_method", "off")).strip().lower(),
+                "Off",
+            )
+        )
+
+        self.ai_sr_post_denoise_strength_spin = QDoubleSpinBox()
+        self.ai_sr_post_denoise_strength_spin.setRange(0.0, 1.0)
+        self.ai_sr_post_denoise_strength_spin.setDecimals(2)
+        self.ai_sr_post_denoise_strength_spin.setSingleStep(0.05)
+        self.ai_sr_post_denoise_strength_spin.setValue(float(getattr(self._controller, "ai_sr_post_denoise_strength", 0.0)))
+
+        self.ai_sr_post_artifact_reduction_method_combo = QComboBox()
+        self.ai_sr_post_artifact_reduction_method_combo.addItems(list(AI_SR_POST_ARTIFACT_REDUCTION_LABEL_TO_NAME.keys()))
+        self.ai_sr_post_artifact_reduction_method_combo.setCurrentText(
+            AI_SR_POST_ARTIFACT_REDUCTION_NAME_TO_LABEL.get(
+                str(getattr(self._controller, "ai_sr_post_artifact_reduction_method", "off")).strip().lower(),
+                "Off",
+            )
+        )
+
+        self.ai_sr_post_artifact_reduction_strength_spin = QDoubleSpinBox()
+        self.ai_sr_post_artifact_reduction_strength_spin.setRange(0.0, 1.0)
+        self.ai_sr_post_artifact_reduction_strength_spin.setDecimals(2)
+        self.ai_sr_post_artifact_reduction_strength_spin.setSingleStep(0.05)
+        self.ai_sr_post_artifact_reduction_strength_spin.setValue(
+            float(getattr(self._controller, "ai_sr_post_artifact_reduction_strength", 0.0))
+        )
+
+        self.ai_sr_post_exaggeration_checkbox = QCheckBox("Enable exaggerated postprocess")
+        self.ai_sr_post_exaggeration_checkbox.setChecked(
+            bool(getattr(self._controller, "ai_sr_post_exaggeration_enabled", False))
+        )
+
+        self.ai_sr_post_exaggeration_gain_spin = QDoubleSpinBox()
+        self.ai_sr_post_exaggeration_gain_spin.setRange(1.0, 4.0)
+        self.ai_sr_post_exaggeration_gain_spin.setDecimals(2)
+        self.ai_sr_post_exaggeration_gain_spin.setSingleStep(0.25)
+        self.ai_sr_post_exaggeration_gain_spin.setValue(
+            float(getattr(self._controller, "ai_sr_post_exaggeration_gain", 2.0))
+        )
+
         initial_profile = self._ai_sr_profiles.get(current_model_path)
         if initial_profile is not None:
             self._apply_ai_sr_profile(initial_profile)
@@ -3762,6 +4165,15 @@ class MainWindow(QMainWindow):
         upscaling_form.addRow(ai_sr_tuning_actions)
         upscaling_form.addRow(ai_sr_runtime_box)
 
+        ai_sr_postprocess_box = QGroupBox("AI SR Post Process Noise Reduction")
+        ai_sr_postprocess_form = QFormLayout(ai_sr_postprocess_box)
+        ai_sr_postprocess_form.addRow("Noise Method", self.ai_sr_post_denoise_method_combo)
+        ai_sr_postprocess_form.addRow("Noise Level", self.ai_sr_post_denoise_strength_spin)
+        ai_sr_postprocess_form.addRow("Artifact Method", self.ai_sr_post_artifact_reduction_method_combo)
+        ai_sr_postprocess_form.addRow("Artifact Level", self.ai_sr_post_artifact_reduction_strength_spin)
+        ai_sr_postprocess_form.addRow(self.ai_sr_post_exaggeration_checkbox)
+        ai_sr_postprocess_form.addRow("Exaggeration Gain", self.ai_sr_post_exaggeration_gain_spin)
+
         self.perf_guard_checkbox = QCheckBox("Auto performance guard (reduce SR when overloaded)")
         self.perf_guard_checkbox.setChecked(False)
         self.perf_guard_checkbox.toggled.connect(self._on_perf_guard_toggled)
@@ -3822,6 +4234,24 @@ class MainWindow(QMainWindow):
         self.decklink_output_buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames; larger values can smooth short stalls with added latency.")
         self.decklink_output_buffer_spin.valueChanged.connect(self._on_decklink_output_buffer_changed)
         decklink_form.addRow("DeckLink output buffer (frames)", self.decklink_output_buffer_spin)
+
+        self.decklink_fps_priority_guard_checkbox = QCheckBox(
+            "Prioritize output frame rate (temporary buffer boost when needed)"
+        )
+        self.decklink_fps_priority_guard_checkbox.setChecked(bool(self._decklink_buffer_guard_enabled))
+        self.decklink_fps_priority_guard_checkbox.toggled.connect(self._on_decklink_buffer_guard_toggled)
+        decklink_form.addRow(self.decklink_fps_priority_guard_checkbox)
+
+        self.worker_priority_combo = QComboBox()
+        self.worker_priority_combo.addItems(list(WORKER_PRIORITY_LABEL_TO_NAME.keys()))
+        self.worker_priority_combo.setCurrentText(
+            WORKER_PRIORITY_NAME_TO_LABEL.get(self._worker_process_priority, "Above Normal")
+        )
+        self.worker_priority_combo.setToolTip(
+            "Worker scheduling priority. Higher levels can reduce timing jitter when the system is busy."
+        )
+        self.worker_priority_combo.currentIndexChanged.connect(self._on_worker_priority_changed)
+        decklink_form.addRow("Worker process priority", self.worker_priority_combo)
 
         self.decklink_pixel_format_combo = QComboBox()
         self.decklink_pixel_format_combo.addItems(["8-bit YUV (UYVY)"])
@@ -3996,6 +4426,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(rtx_vsr_box)
         layout.addWidget(settings_box)
         layout.addWidget(roi_box)
+        layout.addWidget(ai_sr_postprocess_box)
         layout.addWidget(post_vsr_scaling_box)
         layout.addWidget(controls_hint)
         layout.addWidget(self.status_label)
@@ -4076,11 +4507,38 @@ class MainWindow(QMainWindow):
         override_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
         override_btn.toggled.connect(self._on_fullscreen_override_duration_toggled)
         panel_layout.addWidget(override_btn)
+
+        buffer_label = QLabel("DeckLink buffer\n(frames)")
+        buffer_label.setAlignment(Qt.AlignCenter)
+        buffer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; }")
+        panel_layout.addWidget(buffer_label)
+
+        buffer_spin = QSpinBox()
+        buffer_spin.setRange(0, 10)
+        buffer_spin.setValue(int(self._decklink_output_buffer_frames))
+        buffer_spin.setMinimumWidth(150)
+        buffer_spin.setMinimumHeight(72)
+        buffer_spin.setStyleSheet(
+            "QSpinBox { font-size: 22px; font-weight: 700; padding: 8px 12px; }"
+            "QSpinBox::up-button, QSpinBox::down-button { width: 34px; }"
+        )
+        buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames.")
+        buffer_spin.valueChanged.connect(self._on_fullscreen_decklink_output_buffer_changed)
+        panel_layout.addWidget(buffer_spin)
+
+        reset_roi_btn = QPushButton("RESET\nROI")
+        reset_roi_btn.setMinimumWidth(150)
+        reset_roi_btn.setMinimumHeight(96)
+        reset_roi_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
+        reset_roi_btn.clicked.connect(self._reset_roi)
+        panel_layout.addWidget(reset_roi_btn)
+
         panel_layout.addStretch(1)
 
         self._fullscreen_keyframe_side_panels[view_name] = panel
         self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
         self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
+        self._fullscreen_decklink_output_buffer_spins[view_name] = buffer_spin
         panel.setVisible(False)
         return panel
 
@@ -4111,6 +4569,20 @@ class MainWindow(QMainWindow):
             previous_block = button.blockSignals(True)
             button.setChecked(target)
             button.blockSignals(previous_block)
+
+    def _on_fullscreen_decklink_output_buffer_changed(self, value: int) -> None:
+        normalized = max(0, min(10, int(value)))
+        if self.decklink_output_buffer_spin.value() != normalized:
+            self.decklink_output_buffer_spin.setValue(normalized)
+        else:
+            self._sync_fullscreen_decklink_output_buffer_from_main(normalized)
+
+    def _sync_fullscreen_decklink_output_buffer_from_main(self, value: int) -> None:
+        normalized = max(0, min(10, int(value)))
+        for spin in self._fullscreen_decklink_output_buffer_spins.values():
+            previous_block = spin.blockSignals(True)
+            spin.setValue(normalized)
+            spin.blockSignals(previous_block)
 
     def _setup_shortcuts(self) -> None:
         reset_action = QAction(self)
@@ -4289,6 +4761,11 @@ class MainWindow(QMainWindow):
                     if hasattr(self._controller, "decklink_ai_timing_stats"):
                         ai_timing = dict(self._controller.decklink_ai_timing_stats())
 
+                    health_summary = self._evaluate_frame_and_buffer_health(
+                        preview_fps=float(fps),
+                        output_fps=float(worker_fps),
+                    )
+
                     ai_stage_timing_text = ""
                     avg_prep = ai_timing.get("avg_prep_ms")
                     avg_infer = ai_timing.get("avg_infer_ms")
@@ -4325,7 +4802,7 @@ class MainWindow(QMainWindow):
                             f" | effective scaling={self._controller.effective_scale()}"
                         )
                     self._update_status(
-                        f"Running | Preview FPS={fps:.1f} | Output FPS={worker_fps:.1f} | {basic_status_text} | AI SR={ai_sr_state}{ai_sr_detail} | AI refresh FPS={ai_refresh_fps:.2f} | AI age={ai_latest_age_ms:.0f}ms | AI completed={ai_completed} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI frames {ai_counts}{ai_stage_timing_text} | Stage enabled[{stage_enable_text}] | Stage last[{stage_last_text}] | Stage counts[{stage_count_text}]"
+                        f"Running | Preview FPS={fps:.1f} | Output FPS={worker_fps:.1f} | {basic_status_text} | AI SR={ai_sr_state}{ai_sr_detail} | AI refresh FPS={ai_refresh_fps:.2f} | AI age={ai_latest_age_ms:.0f}ms | AI completed={ai_completed} | RTX VSR={rtx_vsr_state}{rtx_vsr_detail} | RTX applied={'yes' if rtx_applied else 'no'} | RTX delta={rtx_delta:.2f} | AI frames {ai_counts}{ai_stage_timing_text} | Stage enabled[{stage_enable_text}] | Stage last[{stage_last_text}] | Stage counts[{stage_count_text}] | {health_summary}"
                     )
                     LOGGER.info(
                         (
@@ -4348,7 +4825,13 @@ class MainWindow(QMainWindow):
                         perf["tick"][1],
                     )
                     self.decklink_status_label.setText(
-                        f"DeckLink streaming via worker process | preview_fps={fps:.1f} | output_fps={worker_fps:.1f}"
+                        (
+                            f"DeckLink streaming via worker process | preview_fps={fps:.1f} | "
+                            f"output_fps={worker_fps:.1f} | {health_summary} | "
+                            f"drop_events={self._health_drop_events_total} "
+                            f"(interp={self._health_drop_events_interpolation}) | "
+                            f"buffer_warn_events={self._health_buffer_warn_events}"
+                        )
                     )
 
                     if self._roi_diag_canvas_events > 0 or self._manual_roi_interaction_active():
@@ -4803,16 +5286,72 @@ class MainWindow(QMainWindow):
 
     def _on_decklink_output_buffer_changed(self) -> None:
         buffer_frames = max(0, min(10, int(self.decklink_output_buffer_spin.value())))
+        self._decklink_output_buffer_user_target_frames = int(buffer_frames)
+        if buffer_frames >= self._decklink_buffer_guard_floor_frames:
+            self._decklink_buffer_guard_active = False
+            self._decklink_buffer_guard_stable_windows = 0
         self._decklink_output_buffer_frames = buffer_frames
         if hasattr(self._controller, "decklink_output_buffer_frames"):
             self._controller.decklink_output_buffer_frames = buffer_frames
         if self._updating_controls:
             return
         if self._source_mode == "Blackmagic DeckLink":
-            self._decklink_buffer_reapply_timer.start()
+            if self._decklink_buffer_reapply_timer.isActive():
+                self._decklink_buffer_reapply_timer.stop()
+            self._reapply_decklink_after_buffer_change()
         elif hasattr(self._controller, "set_decklink_output_buffer_frames"):
             self._controller.set_decklink_output_buffer_frames(buffer_frames)
         self._update_status(f"DeckLink output buffer set to {buffer_frames} frame(s); applying")
+
+    def _on_worker_priority_changed(self) -> None:
+        if self._updating_controls:
+            return
+        self._worker_process_priority = _normalize_worker_priority_name(
+            WORKER_PRIORITY_LABEL_TO_NAME.get(self.worker_priority_combo.currentText(), "above_normal")
+        )
+        self._apply_worker_process_priority_to_controller(notify=True)
+
+    def _on_decklink_buffer_guard_toggled(self, checked: bool) -> None:
+        self._decklink_buffer_guard_enabled = bool(checked)
+        if not self._decklink_buffer_guard_enabled:
+            self._decklink_buffer_guard_active = False
+            self._decklink_buffer_guard_stable_windows = 0
+            requested_frames = int(self._decklink_output_buffer_user_target_frames)
+            if self._decklink_output_buffer_frames != requested_frames:
+                self._decklink_output_buffer_frames = requested_frames
+                try:
+                    if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                        self._controller.set_decklink_output_buffer_frames(requested_frames)
+                    self._update_status(
+                        f"FPS-priority guard disabled; restoring requested DeckLink buffer={requested_frames}"
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to restore requested DeckLink buffer after disabling FPS-priority guard")
+            return
+
+        self._update_status(
+            "FPS-priority guard enabled; buffer remains user-selected and only temporarily increases during deadline stress"
+        )
+
+    def _apply_worker_process_priority_to_controller(self, notify: bool) -> None:
+        if not hasattr(self._controller, "set_worker_process_priority"):
+            return
+
+        priority_name = _normalize_worker_priority_name(self._worker_process_priority)
+        try:
+            self._controller.set_worker_process_priority(priority_name)
+            warning_text = str(getattr(self._controller, "worker_process_priority_error", "") or "")
+            if notify:
+                if warning_text:
+                    self._update_status(
+                        f"Worker process priority requested={priority_name}; warning={warning_text}"
+                    )
+                else:
+                    self._update_status(f"Worker process priority set to {priority_name}")
+        except Exception as exc:
+            LOGGER.exception("Failed to apply worker process priority")
+            if notify:
+                self._update_status(f"Worker process priority apply failed: {exc}")
 
     def _reapply_decklink_after_buffer_change(self) -> None:
         if self._source_mode != "Blackmagic DeckLink":
@@ -4827,6 +5366,84 @@ class MainWindow(QMainWindow):
         self._update_status(
             f"DeckLink output buffer applied: {int(self._decklink_output_buffer_frames)} frame(s)"
         )
+
+    def _maybe_auto_stabilize_decklink_buffer(
+        self,
+        *,
+        deadline_miss_ratio: float,
+        deadline_miss_streak: int,
+        starvation_delta: int,
+        buffered_count: int,
+    ) -> None:
+        if self._source_mode != "Blackmagic DeckLink":
+            return
+        if not self._decklink_sessions_running:
+            return
+        if not self._decklink_buffer_guard_enabled:
+            return
+        requested_frames = int(self._decklink_output_buffer_user_target_frames)
+        guard_floor = int(self._decklink_buffer_guard_floor_frames)
+        if requested_frames >= guard_floor:
+            self._decklink_buffer_guard_active = False
+            self._decklink_buffer_guard_stable_windows = 0
+            return
+
+        engage = (
+            float(deadline_miss_ratio) >= float(self._decklink_buffer_guard_engage_miss_ratio)
+            or int(deadline_miss_streak) >= 2
+            or int(starvation_delta) > 0
+            or int(buffered_count) == 0
+        )
+
+        if engage:
+            self._decklink_buffer_guard_stable_windows = 0
+            if self._decklink_output_buffer_frames < guard_floor:
+                self._decklink_buffer_guard_active = True
+                self._decklink_output_buffer_frames = guard_floor
+                try:
+                    if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                        self._controller.set_decklink_output_buffer_frames(int(guard_floor))
+                    self._update_status(
+                        (
+                            "DeckLink buffer guard engaged: requested "
+                            f"{requested_frames}, temporarily applying {guard_floor} "
+                            f"(dl_miss={deadline_miss_ratio * 100.0:.1f}%, streak={deadline_miss_streak})"
+                        )
+                    )
+                except Exception:
+                    LOGGER.exception("DeckLink buffer guard failed to apply raised buffer")
+            return
+
+        if not self._decklink_buffer_guard_active:
+            return
+
+        release_ready = (
+            float(deadline_miss_ratio) <= float(self._decklink_buffer_guard_release_miss_ratio)
+            and int(deadline_miss_streak) == 0
+            and int(starvation_delta) == 0
+        )
+        if not release_ready:
+            self._decklink_buffer_guard_stable_windows = 0
+            return
+
+        self._decklink_buffer_guard_stable_windows += 1
+        if self._decklink_buffer_guard_stable_windows < int(self._decklink_buffer_guard_release_windows_needed):
+            return
+
+        self._decklink_buffer_guard_active = False
+        self._decklink_buffer_guard_stable_windows = 0
+        self._decklink_output_buffer_frames = requested_frames
+        try:
+            if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                self._controller.set_decklink_output_buffer_frames(int(requested_frames))
+            self._update_status(
+                (
+                    "DeckLink buffer guard released: restoring requested buffer "
+                    f"{requested_frames} frame(s) after stable timing"
+                )
+            )
+        except Exception:
+            LOGGER.exception("DeckLink buffer guard failed to restore requested buffer")
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._last_manual_roi_update_ts = time.perf_counter()
@@ -5572,6 +6189,12 @@ class MainWindow(QMainWindow):
                 roi_overscan_percent=float(profile["roi_overscan_percent"]),
                 inference_divisor=int(profile["inference_divisor"]),
                 detail_preserve_percent=float(profile["detail_preserve_percent"]),
+                post_denoise_method=str(profile["post_denoise_method"]),
+                post_denoise_strength=float(profile["post_denoise_strength"]),
+                post_artifact_reduction_method=str(profile["post_artifact_reduction_method"]),
+                post_artifact_reduction_strength=float(profile["post_artifact_reduction_strength"]),
+                post_exaggeration_enabled=bool(profile["post_exaggeration_enabled"]),
+                post_exaggeration_gain=float(profile["post_exaggeration_gain"]),
             )
             self._update_status("AI SR tuning update requested | awaiting worker ack")
         except Exception as exc:
@@ -5649,6 +6272,32 @@ class MainWindow(QMainWindow):
         inference_divisor = int(info.get("inference_divisor", getattr(self._controller, "ai_sr_inference_divisor", 0)))
         hold_last_frame = bool(info.get("hold_last_frame", getattr(self._controller, "ai_sr_hold_last_frame", True)))
         max_hold_ms = float(info.get("max_hold_ms", getattr(self._controller, "ai_sr_max_hold_ms", 0.0)))
+        post_denoise_method = str(info.get("post_denoise_method", getattr(self._controller, "ai_sr_post_denoise_method", "off")))
+        post_denoise_strength = float(info.get("post_denoise_strength", getattr(self._controller, "ai_sr_post_denoise_strength", 0.0)))
+        post_artifact_method = str(
+            info.get(
+                "post_artifact_reduction_method",
+                getattr(self._controller, "ai_sr_post_artifact_reduction_method", "off"),
+            )
+        )
+        post_artifact_strength = float(
+            info.get(
+                "post_artifact_reduction_strength",
+                getattr(self._controller, "ai_sr_post_artifact_reduction_strength", 0.0),
+            )
+        )
+        post_exaggeration_enabled = bool(
+            info.get(
+                "post_exaggeration_enabled",
+                getattr(self._controller, "ai_sr_post_exaggeration_enabled", False),
+            )
+        )
+        post_exaggeration_gain = float(
+            info.get(
+                "post_exaggeration_gain",
+                getattr(self._controller, "ai_sr_post_exaggeration_gain", 2.0),
+            )
+        )
 
         ai_applied = 0
         ai_reused = 0
@@ -5677,6 +6326,10 @@ class MainWindow(QMainWindow):
         io_binding_error = timing_stats.get("io_binding_error", info.get("io_binding_error"))
         io_binding_text = "on" if bool(io_binding_enabled) else "off"
         pipeline_order = str(info.get("pipeline_order", "crop/preprocess -> onnx(cuda) -> cuda_postprocess -> uyvy"))
+        postprocess_gpu_chain = str(
+            info.get("postprocess_gpu_chain", "resize/sharpen -> post_denoise(xN) -> post_artifact_reduction(xN) -> rgb_to_uyvy")
+        )
+        post_exaggeration_passes = int(info.get("post_exaggeration_passes", 2 if post_exaggeration_enabled else 1))
         onnx_output_copy_to_cpu = bool(info.get("onnx_output_copy_to_cpu", True))
         detail_preserve_note = str(info.get("detail_preserve_note", "")).strip()
 
@@ -5699,9 +6352,13 @@ class MainWindow(QMainWindow):
                 f"overscan={info.get('roi_overscan_percent', getattr(self._controller, 'ai_sr_roi_overscan_percent', 'n/a'))}, "
                 f"divisor={inference_divisor}, "
                 f"detail={info.get('detail_preserve_percent', getattr(self._controller, 'ai_sr_detail_preserve_percent', 'n/a'))}, "
+                f"post_denoise={post_denoise_method}@{post_denoise_strength:.2f}, "
+                f"post_artifact={post_artifact_method}@{post_artifact_strength:.2f}, "
+                f"post_exaggerated={post_exaggeration_enabled}@{post_exaggeration_gain:.2f}, "
                 f"hold_last={hold_last_frame}, max_hold_ms={max_hold_ms:.0f}"
             ),
             f"Frames: fresh={ai_applied}, reused={ai_reused}, passthrough={ai_passthrough}",
+            f"Postprocess GPU chain: {postprocess_gpu_chain} (passes={post_exaggeration_passes})",
         ]
 
         if enabled and active and inference_fps <= 2:
@@ -5787,6 +6444,164 @@ class MainWindow(QMainWindow):
 
     def _target_fps(self) -> float:
         return float(max(1, self.fps_spin.value()))
+
+    def _evaluate_frame_and_buffer_health(self, preview_fps: float, output_fps: float) -> str:
+        _ = preview_fps
+        nominal_fps = 0.0
+        if hasattr(self._controller, "decklink_output_nominal_fps"):
+            try:
+                nominal_fps = float(self._controller.decklink_output_nominal_fps())
+            except Exception:
+                nominal_fps = 0.0
+        if nominal_fps <= 0.0:
+            nominal_fps = float(max(1.0, self._target_fps()))
+
+        output_ratio = float(output_fps) / max(1.0, nominal_fps)
+        interaction_active = bool(self._roi_keyframe_transition is not None or self._manual_roi_interaction_active())
+
+        pipeline_timing_health: dict[str, object] = {}
+        if hasattr(self._controller, "decklink_pipeline_timing_health"):
+            try:
+                pipeline_timing_health = dict(self._controller.decklink_pipeline_timing_health())
+            except Exception:
+                pipeline_timing_health = {}
+
+        emitted_frames = int(pipeline_timing_health.get("frames_emitted", 0))
+        deadline_miss_ratio = float(pipeline_timing_health.get("deadline_miss_ratio", 0.0))
+        deadline_miss_streak = int(pipeline_timing_health.get("deadline_miss_streak", 0))
+        deadline_miss_max_streak = int(pipeline_timing_health.get("deadline_miss_max_streak", 0))
+        deadline_late_ms_ema = float(pipeline_timing_health.get("deadline_late_ms_ema", 0.0))
+        e2e_ms_ema = float(pipeline_timing_health.get("e2e_ms_ema", 0.0))
+        process_ms_ema = float(pipeline_timing_health.get("process_ms_ema", 0.0))
+        capture_queue_ms_ema = float(pipeline_timing_health.get("capture_queue_ms_ema", 0.0))
+        output_queue_ms_ema = float(pipeline_timing_health.get("output_queue_ms_ema", 0.0))
+        output_wait_ms_ema = float(pipeline_timing_health.get("output_wait_ms_ema", 0.0))
+        emit_call_ms_ema = float(pipeline_timing_health.get("emit_call_ms_ema", 0.0))
+        timing_last_path = str(pipeline_timing_health.get("last_path", ""))
+
+        output_buffer_health: dict[str, object] = {}
+        if hasattr(self._controller, "decklink_output_buffer_health"):
+            try:
+                output_buffer_health = dict(self._controller.decklink_output_buffer_health())
+            except Exception:
+                output_buffer_health = {}
+
+        starvation_events = int(output_buffer_health.get("starvation_events", 0))
+        overflow_events = int(output_buffer_health.get("overflow_events", 0))
+        reprime_events = int(output_buffer_health.get("auto_reprime_events", 0))
+        buffered_count = int(output_buffer_health.get("last_buffered_count", -1))
+        target_buffer = int(output_buffer_health.get("target_buffer_frames", int(self._decklink_output_buffer_frames)))
+        last_reprime_reason = str(output_buffer_health.get("last_reprime_reason", ""))
+
+        starvation_delta = max(0, starvation_events - self._health_last_buffer_starvation)
+        overflow_delta = max(0, overflow_events - self._health_last_buffer_overflow)
+        reprime_delta = max(0, reprime_events - self._health_last_buffer_reprime)
+
+        self._health_last_buffer_starvation = starvation_events
+        self._health_last_buffer_overflow = overflow_events
+        self._health_last_buffer_reprime = reprime_events
+        self._health_last_output_fps = float(output_fps)
+        self._health_last_output_nominal_fps = float(nominal_fps)
+
+        self._maybe_auto_stabilize_decklink_buffer(
+            deadline_miss_ratio=deadline_miss_ratio,
+            deadline_miss_streak=deadline_miss_streak,
+            starvation_delta=starvation_delta,
+            buffered_count=buffered_count,
+        )
+
+        health_level = "ok"
+        health_reasons: list[str] = []
+
+        fps_drop = output_ratio < 0.92
+        severe_drop = output_ratio < 0.80
+        if fps_drop and (not self._health_drop_active):
+            self._health_drop_events_total += 1
+            self._health_drop_active = True
+            self._health_drop_active_interpolation = interaction_active
+            if interaction_active:
+                self._health_drop_events_interpolation += 1
+        elif (not fps_drop) and self._health_drop_active:
+            self._health_drop_active = False
+            self._health_drop_active_interpolation = False
+
+        if fps_drop:
+            health_level = "warn"
+            health_reasons.append(f"fps_drop={output_fps:.1f}/{nominal_fps:.1f}")
+
+        if severe_drop:
+            health_level = "critical"
+
+        if deadline_miss_ratio >= 0.05 or deadline_miss_streak >= 3:
+            if health_level == "ok":
+                health_level = "warn"
+            health_reasons.append(
+                f"deadline_miss={deadline_miss_ratio * 100.0:.1f}% streak={deadline_miss_streak}"
+            )
+
+        if deadline_miss_ratio >= 0.15 or deadline_miss_streak >= 8:
+            health_level = "critical"
+
+        if starvation_delta > 0 or overflow_delta > 0 or reprime_delta > 0:
+            self._health_buffer_warn_events += 1
+            health_level = "critical" if starvation_delta > 0 else "warn"
+            health_reasons.append(
+                f"buffer_events(+s={starvation_delta},+o={overflow_delta},+r={reprime_delta})"
+            )
+
+        if buffered_count >= 0 and target_buffer > 0 and buffered_count < max(1, target_buffer - 1):
+            if health_level == "ok":
+                health_level = "warn"
+            health_reasons.append(f"buffer_low={buffered_count}/{target_buffer}")
+
+        if health_reasons:
+            LOGGER.warning(
+                (
+                    "HEALTH | level=%s | output_fps=%.2f | nominal_fps=%.2f | ratio=%.3f | "
+                    "interp_active=%s | reasons=%s | "
+                    "timing[frames=%d,dl_miss_ratio=%.3f,dl_streak=%d,dl_max=%d,e2e_ema_ms=%.2f,proc_ema_ms=%.2f,cq_ema_ms=%.2f,oq_ema_ms=%.2f,ow_ema_ms=%.2f,emit_ema_ms=%.2f,late_ema_ms=%.2f,path=%s] | "
+                    "buffer[target=%d,current=%d,s=%d,o=%d,r=%d,reason=%s]"
+                ),
+                health_level,
+                float(output_fps),
+                float(nominal_fps),
+                float(output_ratio),
+                "yes" if interaction_active else "no",
+                ",".join(health_reasons),
+                emitted_frames,
+                deadline_miss_ratio,
+                deadline_miss_streak,
+                deadline_miss_max_streak,
+                e2e_ms_ema,
+                process_ms_ema,
+                capture_queue_ms_ema,
+                output_queue_ms_ema,
+                output_wait_ms_ema,
+                emit_call_ms_ema,
+                deadline_late_ms_ema,
+                timing_last_path,
+                target_buffer,
+                buffered_count,
+                starvation_events,
+                overflow_events,
+                reprime_events,
+                last_reprime_reason,
+            )
+
+        interp_tag = "interp" if interaction_active else "steady"
+        if not health_reasons:
+            return (
+                f"health=ok ({interp_tag}) | out={output_fps:.1f}/{nominal_fps:.1f} | "
+                f"buf={buffered_count}/{target_buffer}"
+            )
+
+        return (
+            f"health={health_level} ({interp_tag}) | out={output_fps:.1f}/{nominal_fps:.1f} | "
+            f"buf={buffered_count}/{target_buffer} | "
+            f"dl_miss={deadline_miss_ratio * 100.0:.1f}% (streak={deadline_miss_streak}) | "
+            f"e2e={e2e_ms_ema:.1f}ms proc={process_ms_ema:.1f}ms cq={capture_queue_ms_ema:.1f}ms oq={output_queue_ms_ema:.1f}ms | "
+            f"{' ; '.join(health_reasons)}"
+        )
 
     def _apply_performance_guard(self, measured_fps: float) -> None:
         if not self._perf_guard_enabled:
@@ -5874,6 +6689,8 @@ class MainWindow(QMainWindow):
             self.color_space_combo,
             self.color_range_combo,
             self.decklink_enable_format_detection,
+            self.decklink_fps_priority_guard_checkbox,
+            self.worker_priority_combo,
             self.decklink_apply_btn,
             self.decklink_refresh_btn,
         ]:
@@ -5926,6 +6743,14 @@ class MainWindow(QMainWindow):
         in_device = self._selected_combo_data(self.decklink_input_device_combo)
         out_device = self._selected_combo_data(self.decklink_output_device_combo)
         if in_device is None or out_device is None:
+            # One retry after a full catalog refresh to recover from stale/placeholder
+            # combo state when devices are present but selection data is null.
+            self._refresh_decklink_catalog()
+            if self.decklink_auto_detect_devices.isChecked():
+                self._apply_auto_detect_device_selection()
+            in_device = self._selected_combo_data(self.decklink_input_device_combo)
+            out_device = self._selected_combo_data(self.decklink_output_device_combo)
+        if in_device is None or out_device is None:
             raise RuntimeError("No compatible DeckLink input/output devices selected")
 
         in_mode = self._selected_combo_data(self.decklink_input_mode_combo)
@@ -5937,6 +6762,10 @@ class MainWindow(QMainWindow):
         output_fps = self._resolve_mode_fps(out_device, out_mode, input_side=False)
         if hasattr(self._controller, "decklink_output_buffer_frames"):
             self._controller.decklink_output_buffer_frames = int(self.decklink_output_buffer_spin.value())
+        if hasattr(self._controller, "worker_process_priority"):
+            self._controller.worker_process_priority = _normalize_worker_priority_name(
+                WORKER_PRIORITY_LABEL_TO_NAME.get(self.worker_priority_combo.currentText(), "above_normal")
+            )
 
         if self._controller_backend == "worker-process":
             try:
@@ -6111,10 +6940,16 @@ class MainWindow(QMainWindow):
         self._populate_mode_combos()
 
     def _apply_auto_detect_device_selection(self) -> None:
-        if self.decklink_input_device_combo.count() > 0:
-            self.decklink_input_device_combo.setCurrentIndex(0)
-        if self.decklink_output_device_combo.count() > 0:
-            self.decklink_output_device_combo.setCurrentIndex(0)
+        def _select_first_valid(combo: QComboBox) -> None:
+            for i in range(combo.count()):
+                if combo.itemData(i) is not None:
+                    combo.setCurrentIndex(i)
+                    return
+            if combo.count() > 0:
+                combo.setCurrentIndex(0)
+
+        _select_first_valid(self.decklink_input_device_combo)
+        _select_first_valid(self.decklink_output_device_combo)
 
     def _on_auto_detect_toggled(self, checked: bool) -> None:
         if checked:
@@ -6189,7 +7024,18 @@ class MainWindow(QMainWindow):
         combo.setCurrentIndex(0)
 
     def _selected_combo_data(self, combo: QComboBox):
-        return combo.currentData()
+        current = combo.currentData()
+        if current is not None:
+            return current
+
+        # Recover from stale placeholder selections by choosing the first
+        # concrete device/mode entry when available.
+        for i in range(combo.count()):
+            candidate = combo.itemData(i)
+            if candidate is not None:
+                combo.setCurrentIndex(i)
+                return candidate
+        return None
 
     def _stop_decklink_sessions(self) -> None:
         if self._decklink_buffer_reapply_timer.isActive():
@@ -6473,6 +7319,9 @@ class MainWindow(QMainWindow):
             if isinstance(current_estimate, Roi):
                 self._roi = clamp_roi(current_estimate)
 
+        if hasattr(self._input_canvas, "cancel_pending_interaction_updates"):
+            self._input_canvas.cancel_pending_interaction_updates()
+
         # Clear manual ROI streaming state so stale move/resize commands do not
         # cancel the worker-side keyframe transition right after recall starts.
         self._manual_roi_send_timer.stop()
@@ -6538,6 +7387,11 @@ class MainWindow(QMainWindow):
 
         self._roi_keyframe_last_step_ts = time.perf_counter()
 
+        # Match transition polling cadence to target interpolation FPS to reduce
+        # control-loop pressure and queue churn during animated recalls.
+        target_tick_interval_ms = int(round(1000.0 / max(1.0, self._roi_keyframe_transition_fps())))
+        self._roi_keyframe_transition_timer.setInterval(max(8, min(100, target_tick_interval_ms)))
+
         if backend_driven:
             try:
                 self._controller.start_roi_microstep_transition(
@@ -6547,6 +7401,18 @@ class MainWindow(QMainWindow):
                     interpolation_mode=mode_name,
                     overscan_percent=float(self._roi_keyframe_transition_overscan_percent),
                     start_from_current=True,
+                    enforce_full_frame_scale_1x=(
+                        int(target.x) == 0
+                        and int(target.y) == 0
+                        and int(target.w) == FRAME_W
+                        and int(target.h) == FRAME_H
+                        and not (
+                            int(self._roi.x) == 0
+                            and int(self._roi.y) == 0
+                            and int(self._roi.w) == FRAME_W
+                            and int(self._roi.h) == FRAME_H
+                        )
+                    ),
                 )
             except Exception as exc:
                 self._update_status(f"Worker ROI microstep transition start failed: {exc}")
@@ -6563,8 +7429,15 @@ class MainWindow(QMainWindow):
         return clamped_t
 
     def _roi_keyframe_transition_fps(self) -> float:
-        # Keep transition cadence deterministic; modulating by live worker FPS can
-        # introduce subtle speed wobble that appears as jitter.
+        # Clock keyframe transition ticks to Blackmagic output nominal FPS when
+        # available so interpolation cadence matches output frame timing.
+        if self._source_mode == "Blackmagic DeckLink" and hasattr(self._controller, "decklink_output_nominal_fps"):
+            try:
+                output_fps = float(self._controller.decklink_output_nominal_fps())
+            except Exception:
+                output_fps = 0.0
+            if output_fps > 1.0:
+                return output_fps
         return float(self._roi_keyframe_target_fps)
 
     def _step_roi_keyframe_transition(self) -> None:
@@ -6590,13 +7463,6 @@ class MainWindow(QMainWindow):
         frame_advance = 0.0
 
         if bool(state.get("use_worker_clock", False)):
-            # Keep worker telemetry fresh while a transition is active so
-            # processed_frame_counter deltas reflect output cadence.
-            try:
-                self._controller.decklink_tick(timeout_ms=0)
-            except Exception:
-                pass
-
             current_counter = None
             try:
                 current_counter = int(self._controller.decklink_processed_counter())
@@ -6616,6 +7482,12 @@ class MainWindow(QMainWindow):
                 frame_advance = min(1.0, pending)
                 state["pending_frame_advance"] = pending - frame_advance
 
+            # Worker-clock mode should only step when a new processed frame has
+            # landed. Skipping no-op ticks avoids repeated interpolation math and
+            # redundant control sends between frame arrivals.
+            if frame_advance <= 0.0:
+                return
+
         if frame_advance <= 0.0:
             if bool(state.get("use_worker_clock", False)):
                 frame_advance = 0.0
@@ -6625,6 +7497,7 @@ class MainWindow(QMainWindow):
         frame_progress += frame_advance
         frame_progress = min(float(total_frames), frame_progress)
         state["frame_progress"] = frame_progress
+        is_final_frame = frame_progress >= float(total_frames)
 
         t = min(1.0, frame_progress / float(max(1, total_frames)))
         curved_t = self._apply_roi_interpolation_curve(t, interpolation_mode)
@@ -6666,6 +7539,7 @@ class MainWindow(QMainWindow):
                 self._controller_roi_target = None
                 self._controller_filtered_target_roi = None
                 self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+
                 self._sync_controls_from_roi(target_roi)
                 self._roi_keyframe_last_step_ts = 0.0
             return
@@ -6785,6 +7659,14 @@ class MainWindow(QMainWindow):
             target_shift_x = 0.0
             target_shift_y = 0.0
 
+        if is_final_frame:
+            interpolated = target_roi
+            target_shift_x = 0.0
+            target_shift_y = 0.0
+            residual["x"] = 0.0
+            residual["y"] = 0.0
+            residual["w"] = 0.0
+
         roi_changed = (
             interpolated.x != self._roi.x
             or interpolated.y != self._roi.y
@@ -6792,7 +7674,7 @@ class MainWindow(QMainWindow):
             or interpolated.h != self._roi.h
         )
 
-        transition_complete = frame_progress >= float(total_frames) or (
+        transition_complete = is_final_frame or (
             interpolated.x == target_roi.x
             and interpolated.y == target_roi.y
             and interpolated.w == target_roi.w
@@ -6804,11 +7686,32 @@ class MainWindow(QMainWindow):
             self._input_canvas.set_roi(interpolated)
 
         if not backend_driven:
+            last_shift_state = state.get("last_subpixel_shift")
+            if not isinstance(last_shift_state, dict):
+                last_shift_state = {"x": 0.0, "y": 0.0}
+                state["last_subpixel_shift"] = last_shift_state
+            last_shift_x = float(last_shift_state.get("x", 0.0))
+            last_shift_y = float(last_shift_state.get("y", 0.0))
+            shift_changed = (
+                abs(target_shift_x - last_shift_x) > 0.02
+                or abs(target_shift_y - last_shift_y) > 0.02
+            )
+
             if hasattr(self._controller, "set_roi_with_subpixel"):
-                self._controller.set_roi_with_subpixel(interpolated, target_shift_x, target_shift_y)
-                self._controller_roi_applied = interpolated
+                if roi_changed or shift_changed or transition_complete:
+                    self._controller.set_roi_with_subpixel(interpolated, target_shift_x, target_shift_y)
+                    self._controller_roi_applied = interpolated
+                    state["last_subpixel_shift"] = {
+                        "x": float(target_shift_x),
+                        "y": float(target_shift_y),
+                    }
             elif hasattr(self._controller, "set_roi_subpixel_shift"):
-                self._controller.set_roi_subpixel_shift(target_shift_x, target_shift_y)
+                if shift_changed or transition_complete:
+                    self._controller.set_roi_subpixel_shift(target_shift_x, target_shift_y)
+                    state["last_subpixel_shift"] = {
+                        "x": float(target_shift_x),
+                        "y": float(target_shift_y),
+                    }
                 if roi_changed:
                     self._apply_controller_roi_immediate(interpolated, reset_subpixel_shift=False)
             elif roi_changed:
@@ -6834,6 +7737,7 @@ class MainWindow(QMainWindow):
                 self._controller_roi_applied = self._roi
             else:
                 self._apply_controller_roi_immediate(self._roi)
+
             self._sync_controls_from_roi(self._roi)
             self._roi_keyframe_last_step_ts = 0.0
 

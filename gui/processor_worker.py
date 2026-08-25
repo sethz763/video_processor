@@ -42,6 +42,46 @@ _RTX_DLL_DIR_KEYS: set[str] = set()
 _TRT_PREFLIGHT_CACHE_OK: bool | None = None
 _TRT_PREFLIGHT_CACHE_ERROR: str | None = None
 
+_WORKER_PRIORITY_CLASS_MAP: dict[str, int] = {
+    "normal": 0x00000020,
+    "above_normal": 0x00008000,
+    "high": 0x00000080,
+}
+
+
+def _normalize_worker_priority_name(priority_name: str) -> str:
+    normalized = str(priority_name).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"normal", "default"}:
+        return "normal"
+    if normalized in {"above_normal", "abovenormal", "high_normal", "highnormal"}:
+        return "above_normal"
+    if normalized in {"high", "high_priority", "highpriority"}:
+        return "high"
+    return "above_normal"
+
+
+def _apply_current_process_priority(priority_name: str) -> tuple[str, str | None]:
+    normalized = _normalize_worker_priority_name(priority_name)
+    if os.name != "nt":
+        return normalized, "process priority override is currently implemented for Windows only"
+
+    class_id = _WORKER_PRIORITY_CLASS_MAP.get(normalized, _WORKER_PRIORITY_CLASS_MAP["above_normal"])
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        set_priority_class = kernel32.SetPriorityClass
+        get_current_process.restype = ctypes.c_void_p
+        set_priority_class.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        set_priority_class.restype = ctypes.c_int
+
+        handle = get_current_process()
+        ok = bool(set_priority_class(handle, ctypes.c_uint32(class_id)))
+        if not ok:
+            return normalized, str(ctypes.WinError(ctypes.get_last_error()))
+        return normalized, None
+    except Exception as exc:
+        return normalized, str(exc)
+
 
 def _candidate_cuda_dll_dirs() -> list[Path]:
     dirs: list[Path] = []
@@ -351,6 +391,25 @@ FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
 _SUBPIXEL_SHIFT_APPLY_EPS = max(0.0, float(os.environ.get("VP_SUBPIXEL_SHIFT_APPLY_EPS", "0.03")))
 _AI_SR_TIMING_WARMUP_FRAMES = max(0, int(os.environ.get("VP_AI_SR_TIMING_WARMUP_FRAMES", "8")))
+_OUTPUT_SCHEDULE_STARVED_STREAK_THRESHOLD = max(
+    1,
+    int(os.environ.get("VP_OUTPUT_BUFFER_STARVED_STREAK", "10")),
+)
+_OUTPUT_SCHEDULE_OVERFLOW_STREAK_THRESHOLD = max(
+    1,
+    int(os.environ.get("VP_OUTPUT_BUFFER_OVERFLOW_STREAK", "12")),
+)
+_OUTPUT_SCHEDULE_AUTO_REPRIME_MIN_INTERVAL_S = max(
+    0.05,
+    float(os.environ.get("VP_OUTPUT_BUFFER_AUTO_REPRIME_MIN_INTERVAL_S", "2.0")),
+)
+_OUTPUT_SCHEDULE_ENABLE_HEALTH_POLLING = os.environ.get("VP_OUTPUT_BUFFER_HEALTH_POLLING", "0") == "1"
+_OUTPUT_SCHEDULE_ENABLE_AUTO_REPRIME = os.environ.get("VP_OUTPUT_BUFFER_AUTO_REPRIME", "0") == "1"
+_OUTPUT_SCHEDULE_HEALTH_SAMPLE_EVERY = max(
+    1,
+    int(os.environ.get("VP_OUTPUT_BUFFER_HEALTH_SAMPLE_EVERY", "30")),
+)
+_OUTPUT_SCHEDULE_AUTO_REPRIME_ON_OVERFLOW = os.environ.get("VP_OUTPUT_BUFFER_AUTO_REPRIME_ON_OVERFLOW", "0") == "1"
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 _OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES: dict[int, int] = {}
 
@@ -376,6 +435,20 @@ RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
     "lanczos": cv2.INTER_LANCZOS4 if cv2 is not None else 4,
 }
 
+AI_SR_POST_DENOISE_METHODS = {
+    "off",
+    "luma_gaussian3x3",
+    "luma_median3x3",
+    "luma_bilateral3x3",
+    "luma_bilateral5x5",
+}
+
+AI_SR_POST_ARTIFACT_REDUCTION_METHODS = {
+    "off",
+    "luma_bilateral3x3",
+    "luma_bilateral5x5",
+}
+
 
 def _normalize_color_space_name(color_space: str) -> str:
     normalized = str(color_space).strip().lower().replace(" ", "").replace("-", "_")
@@ -391,6 +464,24 @@ def _normalize_color_range_name(color_range: str) -> str:
     if normalized in {"full", "data", "pc"}:
         return "full"
     return "limited"
+
+
+def _normalize_ai_sr_post_denoise_method(method_name: str) -> str:
+    normalized = str(method_name).strip().lower().replace(" ", "").replace("-", "_")
+    if normalized in {"none", "off"}:
+        return "off"
+    if normalized in AI_SR_POST_DENOISE_METHODS:
+        return normalized
+    return "off"
+
+
+def _normalize_ai_sr_post_artifact_reduction_method(method_name: str) -> str:
+    normalized = str(method_name).strip().lower().replace(" ", "").replace("-", "_")
+    if normalized in {"none", "off"}:
+        return "off"
+    if normalized in AI_SR_POST_ARTIFACT_REDUCTION_METHODS:
+        return normalized
+    return "off"
 
 
 def _clip_u8_round(values: np.ndarray) -> np.ndarray:
@@ -573,6 +664,12 @@ class AiSrOnnxEngine:
         roi_overscan_percent: float = 0.0,
         inference_divisor: int = 0,
         detail_preserve_percent: float = 0.0,
+        post_denoise_method: str = "off",
+        post_denoise_strength: float = 0.0,
+        post_artifact_reduction_method: str = "off",
+        post_artifact_reduction_strength: float = 0.0,
+        post_exaggeration_enabled: bool = False,
+        post_exaggeration_gain: float = 2.0,
         color_space: str = "rec709",
         color_range: str = "limited",
         native_module: Any | None = None,
@@ -750,6 +847,12 @@ class AiSrOnnxEngine:
         self._inference_divisor = max(0, int(inference_divisor))
         self._detail_preserve_requested_percent = max(0.0, min(100.0, float(detail_preserve_percent)))
         self._detail_preserve_percent = 0.0
+        self._post_denoise_method = _normalize_ai_sr_post_denoise_method(post_denoise_method)
+        self._post_denoise_strength = max(0.0, min(1.0, float(post_denoise_strength)))
+        self._post_artifact_reduction_method = _normalize_ai_sr_post_artifact_reduction_method(post_artifact_reduction_method)
+        self._post_artifact_reduction_strength = max(0.0, min(1.0, float(post_artifact_reduction_strength)))
+        self._post_exaggeration_enabled = bool(post_exaggeration_enabled)
+        self._post_exaggeration_gain = max(1.0, min(4.0, float(post_exaggeration_gain)))
         self._color_space = _normalize_color_space_name(color_space)
         self._color_range = _normalize_color_range_name(color_range)
         self._native_processor = native_processor
@@ -772,6 +875,24 @@ class AiSrOnnxEngine:
             color_space=self._color_space,
             color_range=self._color_range,
         )
+        self._cuda_post.set_post_denoise_method(self._post_denoise_method)
+        self._cuda_post.set_post_denoise_strength(self._post_denoise_strength)
+        self._cuda_post.set_post_artifact_reduction_method(self._post_artifact_reduction_method)
+        self._cuda_post.set_post_artifact_reduction_strength(self._post_artifact_reduction_strength)
+        self._cuda_post.set_post_exaggeration_enabled(self._post_exaggeration_enabled)
+        self._cuda_post.set_post_exaggeration_gain(self._post_exaggeration_gain)
+        if hasattr(self._cuda_post, "get_post_denoise_method"):
+            self._post_denoise_method = str(self._cuda_post.get_post_denoise_method())
+        if hasattr(self._cuda_post, "get_post_denoise_strength"):
+            self._post_denoise_strength = float(self._cuda_post.get_post_denoise_strength())
+        if hasattr(self._cuda_post, "get_post_artifact_reduction_method"):
+            self._post_artifact_reduction_method = str(self._cuda_post.get_post_artifact_reduction_method())
+        if hasattr(self._cuda_post, "get_post_artifact_reduction_strength"):
+            self._post_artifact_reduction_strength = float(self._cuda_post.get_post_artifact_reduction_strength())
+        if hasattr(self._cuda_post, "get_post_exaggeration_enabled"):
+            self._post_exaggeration_enabled = bool(self._cuda_post.get_post_exaggeration_enabled())
+        if hasattr(self._cuda_post, "get_post_exaggeration_gain"):
+            self._post_exaggeration_gain = float(self._cuda_post.get_post_exaggeration_gain())
 
     def avg_infer_ms(self) -> float | None:
         if self._avg_infer_ms is None:
@@ -932,6 +1053,14 @@ class AiSrOnnxEngine:
             "inference_divisor": int(self._effective_inference_divisor()),
             "detail_preserve_percent": float(self._detail_preserve_percent),
             "detail_preserve_requested_percent": float(self._detail_preserve_requested_percent),
+            "post_denoise_method": str(self._post_denoise_method),
+            "post_denoise_strength": float(self._post_denoise_strength),
+            "post_artifact_reduction_method": str(self._post_artifact_reduction_method),
+            "post_artifact_reduction_strength": float(self._post_artifact_reduction_strength),
+            "post_exaggeration_enabled": bool(self._post_exaggeration_enabled),
+            "post_exaggeration_gain": float(self._post_exaggeration_gain),
+            "post_exaggeration_passes": 3 if self._post_exaggeration_enabled else 1,
+            "postprocess_gpu_chain": "resize/sharpen -> post_denoise(xN) -> post_artifact_reduction(xN) -> rgb_to_uyvy",
             "timing_warmup_frames": int(self._timing_warmup_frames),
             "timing_warmup_remaining": int(self._timing_warmup_remaining),
             "timing_samples": int(self._timing_samples),
@@ -1360,27 +1489,16 @@ def _tight_uyvy_bytes(frame: object) -> bytes:
     if row_bytes == UYVY_ROW_BYTES:
         return raw.tobytes()
 
-    out = bytearray(UYVY_ROW_BYTES * FRAME_H)
-    for y in range(FRAME_H):
-        src_start = y * row_bytes
-        src_end = src_start + UYVY_ROW_BYTES
-        dst_start = y * UYVY_ROW_BYTES
-        out[dst_start : dst_start + UYVY_ROW_BYTES] = raw[src_start:src_end]
-    return bytes(out)
+    # Vectorized row-tightening avoids Python per-row copy overhead at 1080i60.
+    raw_np = np.frombuffer(raw, dtype=np.uint8)
+    expected_total = row_bytes * FRAME_H
+    if raw_np.size < expected_total:
+        raise RuntimeError(f"Captured frame buffer is smaller than expected ({raw_np.size} < {expected_total})")
+
+    return raw_np[:expected_total].reshape(FRAME_H, row_bytes)[:, :UYVY_ROW_BYTES].tobytes()
 
 
 def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
-    if out.row_bytes == UYVY_ROW_BYTES:
-        payload = frame_bytes
-    else:
-        if out.row_bytes < UYVY_ROW_BYTES:
-            raise RuntimeError(f"Output row_bytes {out.row_bytes} is smaller than expected {UYVY_ROW_BYTES}")
-
-        padded = np.zeros((FRAME_H, int(out.row_bytes)), dtype=np.uint8)
-        src = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, UYVY_ROW_BYTES)
-        padded[:, :UYVY_ROW_BYTES] = src
-        payload = padded.tobytes()
-
     out_id = id(out)
     state = _OUTPUT_SCHEDULE_STATE.get(out_id)
     if state is None:
@@ -1404,12 +1522,42 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
             "schedule_epoch_perf_ts": 0.0,
             "target_buffer_frames": target_buffer_frames,
             "last_clock_resync_ts": 0.0,
+            "padded_out": None,
+            "last_buffered_count": -1,
+            "starved_streak": 0,
+            "overflow_streak": 0,
+            "starvation_events": 0,
+            "overflow_events": 0,
+            "auto_reprime_events": 0,
+            "last_reprime_reason": "",
+            "last_reprime_ts": 0.0,
+            "last_auto_reprime_ts": 0.0,
+            "scheduled_frames": 0,
         }
         _OUTPUT_SCHEDULE_STATE[out_id] = state
+
+    if out.row_bytes == UYVY_ROW_BYTES:
+        payload = frame_bytes
+    else:
+        if out.row_bytes < UYVY_ROW_BYTES:
+            raise RuntimeError(f"Output row_bytes {out.row_bytes} is smaller than expected {UYVY_ROW_BYTES}")
+
+        out_row_bytes = int(out.row_bytes)
+        padded = state.get("padded_out")
+        if not isinstance(padded, np.ndarray) or padded.shape != (FRAME_H, out_row_bytes):
+            padded = np.empty((FRAME_H, out_row_bytes), dtype=np.uint8)
+            state["padded_out"] = padded
+
+        src = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, UYVY_ROW_BYTES)
+        padded[:, :UYVY_ROW_BYTES] = src
+        if out_row_bytes > UYVY_ROW_BYTES:
+            padded[:, UYVY_ROW_BYTES:] = 0
+        payload = padded.tobytes()
 
     if bool(state.get("enabled", False)):
         frame_duration = int(state.get("frame_duration", 0))
         time_scale = int(state.get("time_scale", 0))
+        frame_period_s = float(state.get("frame_period_s", 0.0))
         if frame_duration > 0 and time_scale > 0:
             try:
                 display_time = int(state.get("display_time", 0))
@@ -1420,6 +1568,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                     time_scale,
                 )
                 state["display_time"] = int(state.get("display_time", 0)) + frame_duration
+                state["scheduled_frames"] = int(state.get("scheduled_frames", 0)) + 1
 
                 if not bool(state.get("started", False)):
                     target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
@@ -1442,6 +1591,58 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                         out.start_scheduled_playback(0, time_scale, 1.0)
                         state["started"] = True
                         state["queued_before_start"] = 0
+                        if frame_period_s > 0.0:
+                            state["sync_next_emit_ts"] = 0.0
+
+                if (
+                    _OUTPUT_SCHEDULE_ENABLE_HEALTH_POLLING
+                    and bool(state.get("started", False))
+                    and bool(state.get("can_query_buffered", False))
+                ):
+                    try:
+                        if (int(state.get("scheduled_frames", 0)) % _OUTPUT_SCHEDULE_HEALTH_SAMPLE_EVERY) != 0:
+                            return True
+
+                        buffered_count = int(out.buffered_video_frame_count())
+                        state["last_buffered_count"] = buffered_count
+
+                        target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
+                        overflow_threshold = max(target_start_frames + 8, 12)
+
+                        if buffered_count <= 0:
+                            state["starved_streak"] = int(state.get("starved_streak", 0)) + 1
+                        else:
+                            state["starved_streak"] = 0
+
+                        if buffered_count >= overflow_threshold:
+                            state["overflow_streak"] = int(state.get("overflow_streak", 0)) + 1
+                        else:
+                            state["overflow_streak"] = 0
+
+                        now_ts = time.perf_counter()
+                        since_last_reprime = now_ts - float(state.get("last_auto_reprime_ts", 0.0))
+                        can_auto_reprime = since_last_reprime >= _OUTPUT_SCHEDULE_AUTO_REPRIME_MIN_INTERVAL_S
+
+                        if (
+                            _OUTPUT_SCHEDULE_ENABLE_AUTO_REPRIME
+                            and int(state.get("starved_streak", 0)) >= _OUTPUT_SCHEDULE_STARVED_STREAK_THRESHOLD
+                            and can_auto_reprime
+                        ):
+                            state["starvation_events"] = int(state.get("starvation_events", 0)) + 1
+                            state["auto_reprime_events"] = int(state.get("auto_reprime_events", 0)) + 1
+                            state["last_auto_reprime_ts"] = now_ts
+                            _reprime_output_schedule(out, reason="auto_starvation")
+                        elif (
+                            _OUTPUT_SCHEDULE_AUTO_REPRIME_ON_OVERFLOW
+                            and int(state.get("overflow_streak", 0)) >= _OUTPUT_SCHEDULE_OVERFLOW_STREAK_THRESHOLD
+                            and can_auto_reprime
+                        ):
+                            state["overflow_events"] = int(state.get("overflow_events", 0)) + 1
+                            state["auto_reprime_events"] = int(state.get("auto_reprime_events", 0)) + 1
+                            state["last_auto_reprime_ts"] = now_ts
+                            _reprime_output_schedule(out, reason="auto_overflow")
+                    except Exception:
+                        state["can_query_buffered"] = False
                 return True
             except Exception:
                 # Fall back to blocking output if scheduling path errors at runtime.
@@ -1468,7 +1669,7 @@ def _set_output_schedule_buffer_frames(out: object, buffer_frames: int) -> None:
         state["target_buffer_frames"] = clamped
 
 
-def _reprime_output_schedule(out: object) -> None:
+def _reprime_output_schedule(out: object, reason: str = "manual") -> None:
     state = _OUTPUT_SCHEDULE_STATE.get(id(out))
     if state is None:
         return
@@ -1485,6 +1686,10 @@ def _reprime_output_schedule(out: object) -> None:
     state["display_time"] = 0
     state["schedule_epoch_perf_ts"] = 0.0
     state["sync_next_emit_ts"] = 0.0
+    state["starved_streak"] = 0
+    state["overflow_streak"] = 0
+    state["last_reprime_reason"] = str(reason)
+    state["last_reprime_ts"] = time.perf_counter()
 
 
 def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -1512,6 +1717,10 @@ class _StageFrame:
     frame_id: int
     captured_ts: float
     input_bytes: bytes
+    process_start_ts: float = 0.0
+    process_end_ts: float = 0.0
+    output_queue_put_ts: float = 0.0
+    output_dequeue_ts: float = 0.0
     preprocess_bytes: bytes | None = None
     output_bytes: bytes | None = None
     shift_x: float = 0.0
@@ -1524,6 +1733,10 @@ class _StageFrame:
 def run_processor_worker(request_queue, response_queue, startup_config: dict[str, Any]) -> None:
     _FRAME_MESSAGE_TYPES = {"frame", "decklink_frame", "decklink_no_frame"}
     _CONTROL_MESSAGE_TYPES = {"ready", "ack", "warning", "error"}
+    worker_process_priority = _normalize_worker_priority_name(
+        str(startup_config.get("worker_process_priority", "above_normal"))
+    )
+    worker_process_priority, worker_process_priority_error = _apply_current_process_priority(worker_process_priority)
 
     def _safe_put(message: dict[str, Any]) -> None:
         # Prioritize control-plane messages (ready/ack/error) over frame traffic so
@@ -1629,6 +1842,9 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     rtx_effect_sample_counter = 0
     processed_frame_counter = 0
     started_perf_ts = 0.0
+    output_nominal_fps = 0.0
+    output_frame_period_s = 0.0
+    output_next_emit_ts = 0.0
     stage_preprocess_applied_frames = 0
     stage_basic_applied_frames = 0
     stage_ai_applied_frames = 0
@@ -1639,6 +1855,30 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     last_stage_ai_applied = False
     last_stage_rtx_applied = False
     last_stage_stack: list[str] = []
+    basic_scaling_last_frame_ms = 0.0
+    basic_scaling_avg_frame_ms: float | None = None
+    basic_scaling_max_frame_ms = 0.0
+    basic_scaling_timing_samples = 0
+    timing_frames_emitted = 0
+    timing_deadline_miss_events = 0
+    timing_deadline_miss_streak = 0
+    timing_deadline_miss_max_streak = 0
+    timing_e2e_ms_last = 0.0
+    timing_e2e_ms_ema = 0.0
+    timing_e2e_ms_peak = 0.0
+    timing_process_ms_ema = 0.0
+    timing_process_ms_peak = 0.0
+    timing_capture_queue_ms_ema = 0.0
+    timing_capture_queue_ms_peak = 0.0
+    timing_output_queue_ms_ema = 0.0
+    timing_output_queue_ms_peak = 0.0
+    timing_output_wait_ms_ema = 0.0
+    timing_output_wait_ms_peak = 0.0
+    timing_emit_call_ms_ema = 0.0
+    timing_emit_call_ms_peak = 0.0
+    timing_deadline_late_ms_ema = 0.0
+    timing_deadline_late_ms_peak = 0.0
+    timing_last_path = ""
     ai_sr_enabled = bool(startup_config.get("ai_sr_enabled", False))
     ai_sr_model_path = str(startup_config.get("ai_sr_model_path", ""))
     ai_sr_provider = str(startup_config.get("ai_sr_provider", "cuda"))
@@ -1653,6 +1893,20 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     ai_sr_roi_overscan_percent = float(startup_config.get("ai_sr_roi_overscan_percent", 0.0))
     ai_sr_inference_divisor = max(0, int(startup_config.get("ai_sr_inference_divisor", 0)))
     ai_sr_detail_preserve_percent = float(startup_config.get("ai_sr_detail_preserve_percent", 0.0))
+    ai_sr_post_denoise_method = _normalize_ai_sr_post_denoise_method(str(startup_config.get("ai_sr_post_denoise_method", "off")))
+    ai_sr_post_denoise_strength = max(0.0, min(1.0, float(startup_config.get("ai_sr_post_denoise_strength", 0.0))))
+    ai_sr_post_artifact_reduction_method = _normalize_ai_sr_post_artifact_reduction_method(
+        str(startup_config.get("ai_sr_post_artifact_reduction_method", "off"))
+    )
+    ai_sr_post_artifact_reduction_strength = max(
+        0.0,
+        min(1.0, float(startup_config.get("ai_sr_post_artifact_reduction_strength", 0.0))),
+    )
+    ai_sr_post_exaggeration_enabled = bool(startup_config.get("ai_sr_post_exaggeration_enabled", False))
+    ai_sr_post_exaggeration_gain = max(
+        1.0,
+        min(4.0, float(startup_config.get("ai_sr_post_exaggeration_gain", 2.0))),
+    )
     ai_sr_runtime_note: str | None = None
     ai_sr_engine: AiSrOnnxEngine | None = None
     ai_sr_info: dict[str, object] | None = None
@@ -1888,6 +2142,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         duration_frames: int,
         interpolation_mode: str,
         overscan_percent: float,
+        enforce_full_frame_scale_1x: bool = False,
     ) -> None:
         nonlocal roi_microstep_transition
         nonlocal roi_shift_applied_x, roi_shift_applied_y
@@ -1916,6 +2171,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             "residual": {"x": start_source_dx, "y": start_source_dy, "w": 0.0},
             "last_roi": (s_x, s_y, s_w, s_h),
             "overscan_percent": max(0.0, float(overscan_percent)),
+            "enforce_full_frame_scale_1x": bool(enforce_full_frame_scale_1x),
         }
 
     def _cancel_roi_microstep_transition(reset_shift: bool = True) -> None:
@@ -1989,6 +2245,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
         frame_progress = min(total_frames, int(state.get("frame_progress", 0)) + 1)
         state["frame_progress"] = frame_progress
+        is_final_frame = frame_progress >= total_frames
 
         t = float(frame_progress) / float(max(1, total_frames))
         curved_t = _apply_roi_curve(t, mode_name)
@@ -2067,6 +2324,18 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             mono_h = min(mono_h, int(last_roi[3]))
 
         i_x, i_y, i_w, i_h = _normalize_worker_roi(mono_x, mono_y, mono_w, mono_h)
+
+        if is_final_frame:
+            i_x, i_y, i_w, i_h = _normalize_worker_roi(
+                int(target_roi[0]),
+                int(target_roi[1]),
+                int(target_roi[2]),
+                int(target_roi[3]),
+            )
+            residual["x"] = 0.0
+            residual["y"] = 0.0
+            residual["w"] = 0.0
+
         state["last_roi"] = (i_x, i_y, i_w, i_h)
 
         interp_cx = float(i_x) + (float(i_w) * 0.5)
@@ -2105,7 +2374,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
                         _schedule_rtx_roi_rebuild()
 
-        transition_complete = frame_progress >= total_frames or (
+        transition_complete = is_final_frame or (
             current_roi_x == int(target_roi[0])
             and current_roi_y == int(target_roi[1])
             and current_roi_w == int(target_roi[2])
@@ -2115,6 +2384,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
                 int(target_roi[0]), int(target_roi[1]), int(target_roi[2]), int(target_roi[3])
             )
+
+            enforce_full_frame_scale = bool(state.get("enforce_full_frame_scale_1x", False))
+            if enforce_full_frame_scale and current_roi_x == 0 and current_roi_y == 0 and current_roi_w == FRAME_W and current_roi_h == FRAME_H:
+                try:
+                    processor.set_sr_mode_auto()
+                except Exception:
+                    pass
+
             if (
                 current_roi_x != i_x
                 or current_roi_y != i_y
@@ -2379,19 +2656,21 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         preprocess_already_applied: bool,
         shift_x: float,
         shift_y: float,
-    ) -> tuple[bytes, bool, bool]:
+    ) -> tuple[bytes, bool, bool, float]:
         nonlocal zeroed_output_warning_emitted
         if not _basic_scaling_enabled():
-            return frame_bytes, False, False
+            return frame_bytes, False, False, 0.0
 
         native_shift_applied = False
         if _set_native_subpixel_shift(shift_x, shift_y):
             native_shift_applied = _has_effective_subpixel_shift(shift_x, shift_y)
 
+        basic_stage_start_ts = time.perf_counter()
         if preprocess_already_applied and hasattr(processor, "process_frame_no_deinterlace"):
             scaled = processor.process_frame_no_deinterlace(frame_bytes)
         else:
             scaled = processor.process_frame(frame_bytes)
+        basic_stage_ms = max(0.0, (time.perf_counter() - basic_stage_start_ts) * 1000.0)
 
         # Strict GPU-only mode: no CPU fallback.
         if (not _is_valid_uyvy_frame(scaled)) or _looks_zeroed_uyvy_frame(scaled):
@@ -2403,9 +2682,20 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     }
                 )
                 zeroed_output_warning_emitted = True
-            return frame_bytes, False, False
+            return frame_bytes, False, False, basic_stage_ms
 
-        return scaled, True, native_shift_applied
+        return scaled, True, native_shift_applied, basic_stage_ms
+
+    def _record_basic_scaling_timing(frame_ms: float) -> None:
+        nonlocal basic_scaling_last_frame_ms, basic_scaling_avg_frame_ms, basic_scaling_max_frame_ms, basic_scaling_timing_samples
+        sample_ms = max(0.0, float(frame_ms))
+        basic_scaling_last_frame_ms = sample_ms
+        basic_scaling_timing_samples += 1
+        if basic_scaling_avg_frame_ms is None:
+            basic_scaling_avg_frame_ms = sample_ms
+        else:
+            basic_scaling_avg_frame_ms = (0.92 * float(basic_scaling_avg_frame_ms)) + (0.08 * sample_ms)
+        basic_scaling_max_frame_ms = max(float(basic_scaling_max_frame_ms), sample_ms)
 
     def _apply_rtx_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
         if not (rtx_vsr_enabled and rtx_vsr_engine is not None):
@@ -2477,12 +2767,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 continue
 
             if stage_name == "basic_scaling":
-                working, basic_applied, native_shift_applied = _apply_basic_scaling_stage(
+                working, basic_applied, native_shift_applied, basic_stage_ms = _apply_basic_scaling_stage(
                     working,
                     preprocess_applied,
                     shift_x,
                     shift_y,
                 )
+                if basic_applied:
+                    _record_basic_scaling_timing(basic_stage_ms)
                 continue
 
         return working, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied
@@ -2508,11 +2800,22 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+        nonlocal output_nominal_fps, output_frame_period_s, output_next_emit_ts
         nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
         nonlocal rtx_effect_sample_counter
         nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
         nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
         nonlocal last_stage_stack
+        nonlocal basic_scaling_last_frame_ms, basic_scaling_avg_frame_ms, basic_scaling_max_frame_ms, basic_scaling_timing_samples
+        nonlocal timing_frames_emitted, timing_deadline_miss_events, timing_deadline_miss_streak, timing_deadline_miss_max_streak
+        nonlocal timing_e2e_ms_last, timing_e2e_ms_ema, timing_e2e_ms_peak
+        nonlocal timing_process_ms_ema, timing_process_ms_peak
+        nonlocal timing_capture_queue_ms_ema, timing_capture_queue_ms_peak
+        nonlocal timing_output_queue_ms_ema, timing_output_queue_ms_peak
+        nonlocal timing_output_wait_ms_ema, timing_output_wait_ms_peak
+        nonlocal timing_emit_call_ms_ema, timing_emit_call_ms_peak
+        nonlocal timing_deadline_late_ms_ema, timing_deadline_late_ms_peak
+        nonlocal timing_last_path
         if capture_session is None or output_session is None:
             raise RuntimeError("Cannot start pipeline without active DeckLink sessions")
 
@@ -2533,6 +2836,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         rtx_effect_sample_counter = 0
         processed_frame_counter = 0
         started_perf_ts = time.perf_counter()
+        frame_duration = int(getattr(output_session, "frame_duration", 0))
+        time_scale = int(getattr(output_session, "time_scale", 0))
+        if frame_duration > 0 and time_scale > 0:
+            output_frame_period_s = max(0.0, float(frame_duration) / float(time_scale))
+            output_nominal_fps = float(time_scale) / float(frame_duration)
+        else:
+            output_frame_period_s = 0.0
+            output_nominal_fps = 0.0
+        output_next_emit_ts = 0.0
         stage_preprocess_applied_frames = 0
         stage_basic_applied_frames = 0
         stage_ai_applied_frames = 0
@@ -2543,8 +2855,105 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         last_stage_ai_applied = False
         last_stage_rtx_applied = False
         last_stage_stack = []
+        basic_scaling_last_frame_ms = 0.0
+        basic_scaling_avg_frame_ms = None
+        basic_scaling_max_frame_ms = 0.0
+        basic_scaling_timing_samples = 0
+        timing_frames_emitted = 0
+        timing_deadline_miss_events = 0
+        timing_deadline_miss_streak = 0
+        timing_deadline_miss_max_streak = 0
+        timing_e2e_ms_last = 0.0
+        timing_e2e_ms_ema = 0.0
+        timing_e2e_ms_peak = 0.0
+        timing_process_ms_ema = 0.0
+        timing_process_ms_peak = 0.0
+        timing_capture_queue_ms_ema = 0.0
+        timing_capture_queue_ms_peak = 0.0
+        timing_output_queue_ms_ema = 0.0
+        timing_output_queue_ms_peak = 0.0
+        timing_output_wait_ms_ema = 0.0
+        timing_output_wait_ms_peak = 0.0
+        timing_emit_call_ms_ema = 0.0
+        timing_emit_call_ms_peak = 0.0
+        timing_deadline_late_ms_ema = 0.0
+        timing_deadline_late_ms_peak = 0.0
+        timing_last_path = ""
         preprocess_noop_warning_emitted = False
         native_subpixel_warning_emitted = False
+
+        def _record_pipeline_timing(
+            path_name: str,
+            captured_ts: float,
+            process_start_ts: float,
+            process_end_ts: float,
+            output_dequeue_ts: float,
+            emit_start_ts: float,
+            emit_end_ts: float,
+            output_wait_s: float,
+            emitted: bool,
+        ) -> None:
+            nonlocal timing_frames_emitted, timing_deadline_miss_events, timing_deadline_miss_streak, timing_deadline_miss_max_streak
+            nonlocal timing_e2e_ms_last, timing_e2e_ms_ema, timing_e2e_ms_peak
+            nonlocal timing_process_ms_ema, timing_process_ms_peak
+            nonlocal timing_capture_queue_ms_ema, timing_capture_queue_ms_peak
+            nonlocal timing_output_queue_ms_ema, timing_output_queue_ms_peak
+            nonlocal timing_output_wait_ms_ema, timing_output_wait_ms_peak
+            nonlocal timing_emit_call_ms_ema, timing_emit_call_ms_peak
+            nonlocal timing_deadline_late_ms_ema, timing_deadline_late_ms_peak
+            nonlocal timing_last_path
+
+            if not emitted:
+                return
+
+            with state_lock:
+                alpha = 0.16
+                e2e_ms = max(0.0, (emit_end_ts - captured_ts) * 1000.0)
+                process_ms = max(0.0, (process_end_ts - process_start_ts) * 1000.0)
+                capture_queue_ms = max(0.0, (process_start_ts - captured_ts) * 1000.0)
+                output_queue_ms = max(0.0, (output_dequeue_ts - process_end_ts) * 1000.0)
+                output_wait_ms = max(0.0, float(output_wait_s) * 1000.0)
+                emit_call_ms = max(0.0, (emit_end_ts - emit_start_ts) * 1000.0)
+
+                budget_ms = (1000.0 / output_nominal_fps) if output_nominal_fps > 0.0 else 0.0
+                deadline_late_ms = max(0.0, e2e_ms - budget_ms) if budget_ms > 0.0 else 0.0
+                missed_deadline = deadline_late_ms > 0.0
+
+                timing_frames_emitted += 1
+                timing_last_path = str(path_name)
+                timing_e2e_ms_last = e2e_ms
+
+                if timing_frames_emitted == 1:
+                    timing_e2e_ms_ema = e2e_ms
+                    timing_process_ms_ema = process_ms
+                    timing_capture_queue_ms_ema = capture_queue_ms
+                    timing_output_queue_ms_ema = output_queue_ms
+                    timing_output_wait_ms_ema = output_wait_ms
+                    timing_emit_call_ms_ema = emit_call_ms
+                    timing_deadline_late_ms_ema = deadline_late_ms
+                else:
+                    timing_e2e_ms_ema = ((1.0 - alpha) * timing_e2e_ms_ema) + (alpha * e2e_ms)
+                    timing_process_ms_ema = ((1.0 - alpha) * timing_process_ms_ema) + (alpha * process_ms)
+                    timing_capture_queue_ms_ema = ((1.0 - alpha) * timing_capture_queue_ms_ema) + (alpha * capture_queue_ms)
+                    timing_output_queue_ms_ema = ((1.0 - alpha) * timing_output_queue_ms_ema) + (alpha * output_queue_ms)
+                    timing_output_wait_ms_ema = ((1.0 - alpha) * timing_output_wait_ms_ema) + (alpha * output_wait_ms)
+                    timing_emit_call_ms_ema = ((1.0 - alpha) * timing_emit_call_ms_ema) + (alpha * emit_call_ms)
+                    timing_deadline_late_ms_ema = ((1.0 - alpha) * timing_deadline_late_ms_ema) + (alpha * deadline_late_ms)
+
+                timing_e2e_ms_peak = max(timing_e2e_ms_peak, e2e_ms)
+                timing_process_ms_peak = max(timing_process_ms_peak, process_ms)
+                timing_capture_queue_ms_peak = max(timing_capture_queue_ms_peak, capture_queue_ms)
+                timing_output_queue_ms_peak = max(timing_output_queue_ms_peak, output_queue_ms)
+                timing_output_wait_ms_peak = max(timing_output_wait_ms_peak, output_wait_ms)
+                timing_emit_call_ms_peak = max(timing_emit_call_ms_peak, emit_call_ms)
+                timing_deadline_late_ms_peak = max(timing_deadline_late_ms_peak, deadline_late_ms)
+
+                if missed_deadline:
+                    timing_deadline_miss_events += 1
+                    timing_deadline_miss_streak += 1
+                    timing_deadline_miss_max_streak = max(timing_deadline_miss_max_streak, timing_deadline_miss_streak)
+                else:
+                    timing_deadline_miss_streak = 0
 
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
@@ -2566,6 +2975,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Capture frame conversion failed: {exc}"})
                     continue
+                frame_captured_ts = time.perf_counter()
 
                 # Keep input preview live even when processing is backlogged.
                 with state_lock:
@@ -2573,6 +2983,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                 if _is_live_passthrough_mode():
                     # In zero-processing mode, avoid staged queueing and preserve output cadence.
+                    process_start_ts = time.perf_counter()
                     output_bytes = input_bytes
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     native_shift_applied = False
@@ -2582,6 +2993,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         output_bytes = processor.process_frame_no_deinterlace(output_bytes)
                     elif _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                         output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
+                    process_end_ts = time.perf_counter()
+                    emit_start_ts = time.perf_counter()
                     try:
                         if output_session is not None:
                             emitted = _write_frame_to_output(output_session, output_bytes)
@@ -2590,6 +3003,18 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
                         continue
+                    emit_end_ts = time.perf_counter()
+                    _record_pipeline_timing(
+                        path_name="passthrough_fast",
+                        captured_ts=frame_captured_ts,
+                        process_start_ts=process_start_ts,
+                        process_end_ts=process_end_ts,
+                        output_dequeue_ts=process_end_ts,
+                        emit_start_ts=emit_start_ts,
+                        emit_end_ts=emit_end_ts,
+                        output_wait_s=0.0,
+                        emitted=bool(emitted),
+                    )
 
                     with state_lock:
                         latest_input_frame = input_bytes
@@ -2606,9 +3031,10 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 if _is_live_basic_scaling_fast_mode():
                     # Keep basic-scaling-only path off the staged queue graph to
                     # reduce Python scheduling overhead at 1080p60.
+                    process_start_ts = time.perf_counter()
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     try:
-                        output_bytes, basic_applied, native_shift_applied = _apply_basic_scaling_stage(
+                        output_bytes, basic_applied, native_shift_applied, basic_stage_ms = _apply_basic_scaling_stage(
                             input_bytes,
                             False,
                             shift_x,
@@ -2618,8 +3044,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         _safe_put({"type": "warning", "warning": f"Basic scaling fast path failed: {exc}"})
                         continue
 
+                    if basic_applied:
+                        _record_basic_scaling_timing(basic_stage_ms)
+
                     if (not native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                         output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
+
+                    process_end_ts = time.perf_counter()
+                    emit_start_ts = time.perf_counter()
 
                     try:
                         if output_session is not None:
@@ -2629,6 +3061,18 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
                         continue
+                    emit_end_ts = time.perf_counter()
+                    _record_pipeline_timing(
+                        path_name="basic_scaling_fast",
+                        captured_ts=frame_captured_ts,
+                        process_start_ts=process_start_ts,
+                        process_end_ts=process_end_ts,
+                        output_dequeue_ts=process_end_ts,
+                        emit_start_ts=emit_start_ts,
+                        emit_end_ts=emit_end_ts,
+                        output_wait_s=0.0,
+                        emitted=bool(emitted),
+                    )
 
                     if basic_applied:
                         stage_basic_applied_frames += 1
@@ -2654,7 +3098,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     continue
 
                 frame_id_counter += 1
-                item = _StageFrame(frame_id=frame_id_counter, captured_ts=time.perf_counter(), input_bytes=input_bytes)
+                item = _StageFrame(frame_id=frame_id_counter, captured_ts=frame_captured_ts, input_bytes=input_bytes)
                 if _put_latest_stage_frame(q_capture_to_preprocess, item):
                     capture_drop_count += 1
 
@@ -2680,12 +3124,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
+                    item.process_start_ts = time.perf_counter()
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
                         preprocessed,
                         shift_x,
                         shift_y,
                     )
+                    item.process_end_ts = time.perf_counter()
                     stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Upscale stage failed: {exc}"})
@@ -2717,6 +3163,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 item.ai_applied = bool(ai_applied)
                 item.rtx_applied = bool(rtx_applied)
                 item.native_shift_applied = bool(native_shift_applied)
+                item.output_queue_put_ts = time.perf_counter()
                 if _put_latest_stage_frame(q_upscale_to_output, item):
                     upscale_drop_count += 1
 
@@ -2724,12 +3171,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
             nonlocal rtx_effect_sample_counter
+            nonlocal output_next_emit_ts
             assert q_upscale_to_output is not None
             while not pipeline_stop_event.is_set():
                 try:
                     item = q_upscale_to_output.get(timeout=0.01)
                 except queue.Empty:
                     continue
+
+                item.output_dequeue_ts = time.perf_counter()
 
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
                 shift_x = float(item.shift_x)
@@ -2756,6 +3206,17 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         except Exception:
                             sampled_delta = 0.0
 
+                output_wait_s = 0.0
+                if output_frame_period_s > 0.0:
+                    now_ts = time.perf_counter()
+                    if output_next_emit_ts <= 0.0:
+                        output_next_emit_ts = now_ts
+                    wait_s = output_next_emit_ts - now_ts
+                    if wait_s > 0.0:
+                        output_wait_s = wait_s
+                        time.sleep(wait_s)
+
+                emit_start_ts = time.perf_counter()
                 try:
                     if output_session is not None:
                         emitted = _write_frame_to_output(output_session, output_bytes)
@@ -2764,6 +3225,29 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
                     continue
+                emit_end_ts = time.perf_counter()
+
+                process_start_ts = item.process_start_ts if item.process_start_ts > 0.0 else item.captured_ts
+                process_end_ts = item.process_end_ts if item.process_end_ts > 0.0 else process_start_ts
+                output_dequeue_ts = item.output_dequeue_ts if item.output_dequeue_ts > 0.0 else emit_start_ts
+                _record_pipeline_timing(
+                    path_name="staged_pipeline",
+                    captured_ts=item.captured_ts,
+                    process_start_ts=process_start_ts,
+                    process_end_ts=process_end_ts,
+                    output_dequeue_ts=output_dequeue_ts,
+                    emit_start_ts=emit_start_ts,
+                    emit_end_ts=emit_end_ts,
+                    output_wait_s=output_wait_s,
+                    emitted=bool(emitted),
+                )
+
+                if emitted and output_frame_period_s > 0.0:
+                    now_ts = time.perf_counter()
+                    next_ts = output_next_emit_ts + output_frame_period_s
+                    if next_ts < (now_ts - output_frame_period_s):
+                        next_ts = now_ts + output_frame_period_s
+                    output_next_emit_ts = next_ts
 
                 with state_lock:
                     latest_input_frame = item.input_bytes
@@ -2818,6 +3302,12 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 roi_overscan_percent=ai_sr_roi_overscan_percent,
                 inference_divisor=ai_sr_inference_divisor,
                 detail_preserve_percent=ai_sr_detail_preserve_percent,
+                post_denoise_method=ai_sr_post_denoise_method,
+                post_denoise_strength=ai_sr_post_denoise_strength,
+                post_artifact_reduction_method=ai_sr_post_artifact_reduction_method,
+                post_artifact_reduction_strength=ai_sr_post_artifact_reduction_strength,
+                post_exaggeration_enabled=ai_sr_post_exaggeration_enabled,
+                post_exaggeration_gain=ai_sr_post_exaggeration_gain,
                 color_space=current_color_space,
                 color_range=current_color_range,
                 native_module=module,
@@ -2837,6 +3327,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             ai_sr_info["hold_last_frame"] = bool(ai_sr_hold_last_frame)
             ai_sr_info["max_inflight"] = int(ai_sr_max_inflight)
             ai_sr_info["submit_spacing_ms"] = float(ai_sr_submit_spacing_ms)
+            ai_sr_info["post_denoise_method"] = str(ai_sr_post_denoise_method)
+            ai_sr_info["post_denoise_strength"] = float(ai_sr_post_denoise_strength)
+            ai_sr_info["post_artifact_reduction_method"] = str(ai_sr_post_artifact_reduction_method)
+            ai_sr_info["post_artifact_reduction_strength"] = float(ai_sr_post_artifact_reduction_strength)
+            ai_sr_info["post_exaggeration_enabled"] = bool(ai_sr_post_exaggeration_enabled)
+            ai_sr_info["post_exaggeration_gain"] = float(ai_sr_post_exaggeration_gain)
+            ai_sr_info["post_exaggeration_passes"] = 3 if ai_sr_post_exaggeration_enabled else 1
+            ai_sr_info["postprocess_gpu_chain"] = "resize/sharpen -> post_denoise(xN) -> post_artifact_reduction(xN) -> rgb_to_uyvy"
             ai_sr_info["basic_cuda_post_scale_enabled"] = False
             ai_sr_info["basic_cuda_post_scale_active"] = False
             ai_sr_info["pipeline_order"] = "crop/preprocess -> onnx(cuda) -> cuda_postprocess -> uyvy"
@@ -3147,6 +3645,8 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 "rtx_vsr_info": rtx_vsr_info,
                 "color_space": current_color_space,
                 "color_range": current_color_range,
+                "worker_process_priority": worker_process_priority,
+                "worker_process_priority_error": worker_process_priority_error,
             }
         )
 
@@ -3271,12 +3771,25 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 )
                 if output_session is not None:
                     _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
-                    _reprime_output_schedule(output_session)
+                    _reprime_output_schedule(output_session, reason="manual_buffer_frames_change")
                 _safe_put(
                     {
                         "type": "ack",
                         "cmd": "set_decklink_output_buffer_frames",
                         "decklink_output_buffer_frames": int(current_output_buffer_frames),
+                    }
+                )
+                continue
+
+            if command == "set_worker_process_priority":
+                requested_priority = str(message.get("worker_process_priority", worker_process_priority))
+                worker_process_priority, worker_process_priority_error = _apply_current_process_priority(requested_priority)
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_worker_process_priority",
+                        "worker_process_priority": worker_process_priority,
+                        "worker_process_priority_error": worker_process_priority_error,
                     }
                 )
                 continue
@@ -3300,6 +3813,26 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     current_counter = int(processed_frame_counter)
                     current_rtx_applied = bool(latest_rtx_vsr_applied)
                     current_rtx_delta = float(latest_rtx_effect_mean_abs_luma)
+                    timing_frames_emitted_snapshot = int(timing_frames_emitted)
+                    timing_deadline_miss_events_snapshot = int(timing_deadline_miss_events)
+                    timing_deadline_miss_streak_snapshot = int(timing_deadline_miss_streak)
+                    timing_deadline_miss_max_streak_snapshot = int(timing_deadline_miss_max_streak)
+                    timing_deadline_late_ms_ema_snapshot = float(timing_deadline_late_ms_ema)
+                    timing_deadline_late_ms_peak_snapshot = float(timing_deadline_late_ms_peak)
+                    timing_e2e_ms_last_snapshot = float(timing_e2e_ms_last)
+                    timing_e2e_ms_ema_snapshot = float(timing_e2e_ms_ema)
+                    timing_e2e_ms_peak_snapshot = float(timing_e2e_ms_peak)
+                    timing_process_ms_ema_snapshot = float(timing_process_ms_ema)
+                    timing_process_ms_peak_snapshot = float(timing_process_ms_peak)
+                    timing_capture_queue_ms_ema_snapshot = float(timing_capture_queue_ms_ema)
+                    timing_capture_queue_ms_peak_snapshot = float(timing_capture_queue_ms_peak)
+                    timing_output_queue_ms_ema_snapshot = float(timing_output_queue_ms_ema)
+                    timing_output_queue_ms_peak_snapshot = float(timing_output_queue_ms_peak)
+                    timing_output_wait_ms_ema_snapshot = float(timing_output_wait_ms_ema)
+                    timing_output_wait_ms_peak_snapshot = float(timing_output_wait_ms_peak)
+                    timing_emit_call_ms_ema_snapshot = float(timing_emit_call_ms_ema)
+                    timing_emit_call_ms_peak_snapshot = float(timing_emit_call_ms_peak)
+                    timing_last_path_snapshot = str(timing_last_path)
 
                 if current_input is None or current_output is None:
                     _safe_put({"type": "decklink_no_frame", "reason": "no_input_signal"})
@@ -3307,17 +3840,68 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
 
                 elapsed = max(0.0001, time.perf_counter() - started_perf_ts)
                 processed_fps = float(current_counter) / elapsed
+                if output_nominal_fps > 0.0:
+                    processed_fps = min(processed_fps, output_nominal_fps)
                 stage_depths = {
                     "capture_to_preprocess": 0 if q_capture_to_preprocess is None else q_capture_to_preprocess.qsize(),
                     "preprocess_to_upscale": 0 if q_preprocess_to_upscale is None else q_preprocess_to_upscale.qsize(),
                     "upscale_to_output": 0 if q_upscale_to_output is None else q_upscale_to_output.qsize(),
                 }
                 ai_sr_timing_ms = ai_sr_engine.timing_info() if ai_sr_engine is not None else {}
+                output_schedule_stats: dict[str, object] = {}
+                if output_session is not None:
+                    out_state = _OUTPUT_SCHEDULE_STATE.get(id(output_session))
+                    if out_state is not None:
+                        output_schedule_stats = {
+                            "started": bool(out_state.get("started", False)),
+                            "target_buffer_frames": int(out_state.get("target_buffer_frames", 0)),
+                            "last_buffered_count": int(out_state.get("last_buffered_count", -1)),
+                            "starvation_events": int(out_state.get("starvation_events", 0)),
+                            "overflow_events": int(out_state.get("overflow_events", 0)),
+                            "auto_reprime_events": int(out_state.get("auto_reprime_events", 0)),
+                            "last_reprime_reason": str(out_state.get("last_reprime_reason", "")),
+                            "last_reprime_age_ms": (
+                                max(0.0, (time.perf_counter() - float(out_state.get("last_reprime_ts", 0.0))) * 1000.0)
+                                if float(out_state.get("last_reprime_ts", 0.0)) > 0.0
+                                else -1.0
+                            ),
+                        }
+                deadline_miss_ratio = (
+                    float(timing_deadline_miss_events_snapshot) / float(timing_frames_emitted_snapshot)
+                    if timing_frames_emitted_snapshot > 0
+                    else 0.0
+                )
+                output_budget_ms = (1000.0 / output_nominal_fps) if output_nominal_fps > 0.0 else 0.0
+                pipeline_timing_health: dict[str, object] = {
+                    "frames_emitted": int(timing_frames_emitted_snapshot),
+                    "output_budget_ms": float(output_budget_ms),
+                    "deadline_miss_events": int(timing_deadline_miss_events_snapshot),
+                    "deadline_miss_ratio": float(deadline_miss_ratio),
+                    "deadline_miss_streak": int(timing_deadline_miss_streak_snapshot),
+                    "deadline_miss_max_streak": int(timing_deadline_miss_max_streak_snapshot),
+                    "deadline_late_ms_ema": float(timing_deadline_late_ms_ema_snapshot),
+                    "deadline_late_ms_peak": float(timing_deadline_late_ms_peak_snapshot),
+                    "e2e_ms_last": float(timing_e2e_ms_last_snapshot),
+                    "e2e_ms_ema": float(timing_e2e_ms_ema_snapshot),
+                    "e2e_ms_peak": float(timing_e2e_ms_peak_snapshot),
+                    "process_ms_ema": float(timing_process_ms_ema_snapshot),
+                    "process_ms_peak": float(timing_process_ms_peak_snapshot),
+                    "capture_queue_ms_ema": float(timing_capture_queue_ms_ema_snapshot),
+                    "capture_queue_ms_peak": float(timing_capture_queue_ms_peak_snapshot),
+                    "output_queue_ms_ema": float(timing_output_queue_ms_ema_snapshot),
+                    "output_queue_ms_peak": float(timing_output_queue_ms_peak_snapshot),
+                    "output_wait_ms_ema": float(timing_output_wait_ms_ema_snapshot),
+                    "output_wait_ms_peak": float(timing_output_wait_ms_peak_snapshot),
+                    "emit_call_ms_ema": float(timing_emit_call_ms_ema_snapshot),
+                    "emit_call_ms_peak": float(timing_emit_call_ms_peak_snapshot),
+                    "last_path": str(timing_last_path_snapshot),
+                }
                 payload: dict[str, object] = {
                     "type": "decklink_frame",
                     "effective_sr_scale": current_scale,
                     "processed_frame_counter": current_counter,
                     "processed_fps": processed_fps,
+                    "output_nominal_fps": float(output_nominal_fps),
                     "ai_sr_applied_frames": int(ai_sr_applied_frames),
                     "ai_sr_reused_frames": int(ai_sr_reused_frames),
                     "ai_sr_passthrough_frames": int(ai_sr_passthrough_frames),
@@ -3355,6 +3939,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         "preprocess": int(preprocess_drop_count),
                         "upscale": int(upscale_drop_count),
                     },
+                    "basic_scaling_timing_ms": {
+                        "last": float(basic_scaling_last_frame_ms),
+                        "avg": None if basic_scaling_avg_frame_ms is None else float(basic_scaling_avg_frame_ms),
+                        "max": float(basic_scaling_max_frame_ms),
+                        "samples": int(basic_scaling_timing_samples),
+                    },
+                    "output_buffer_health": output_schedule_stats,
+                    "pipeline_timing_health": pipeline_timing_health,
                 }
                 if include_frames:
                     payload["input_frame_bytes"] = current_input
@@ -3435,6 +4027,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     duration_frames=int(message.get("duration_frames", 1)),
                     interpolation_mode=str(message.get("interpolation_mode", "linear")),
                     overscan_percent=float(message.get("overscan_percent", 0.0)),
+                    enforce_full_frame_scale_1x=bool(message.get("enforce_full_frame_scale_1x", False)),
                 )
                 continue
 
@@ -3659,6 +4252,27 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 ai_sr_roi_overscan_percent = float(message.get("roi_overscan_percent", ai_sr_roi_overscan_percent))
                 ai_sr_inference_divisor = max(0, int(message.get("inference_divisor", ai_sr_inference_divisor)))
                 ai_sr_detail_preserve_percent = float(message.get("detail_preserve_percent", ai_sr_detail_preserve_percent))
+                ai_sr_post_denoise_method = _normalize_ai_sr_post_denoise_method(
+                    str(message.get("post_denoise_method", ai_sr_post_denoise_method))
+                )
+                ai_sr_post_denoise_strength = max(
+                    0.0,
+                    min(1.0, float(message.get("post_denoise_strength", ai_sr_post_denoise_strength))),
+                )
+                ai_sr_post_artifact_reduction_method = _normalize_ai_sr_post_artifact_reduction_method(
+                    str(message.get("post_artifact_reduction_method", ai_sr_post_artifact_reduction_method))
+                )
+                ai_sr_post_artifact_reduction_strength = max(
+                    0.0,
+                    min(1.0, float(message.get("post_artifact_reduction_strength", ai_sr_post_artifact_reduction_strength))),
+                )
+                ai_sr_post_exaggeration_enabled = bool(
+                    message.get("post_exaggeration_enabled", ai_sr_post_exaggeration_enabled)
+                )
+                ai_sr_post_exaggeration_gain = max(
+                    1.0,
+                    min(4.0, float(message.get("post_exaggeration_gain", ai_sr_post_exaggeration_gain))),
+                )
                 ai_sr_max_inflight = max(1, min(4, int(message.get("max_inflight", ai_sr_max_inflight))))
                 ai_sr_error = _refresh_ai_sr_engine()
                 _safe_put(

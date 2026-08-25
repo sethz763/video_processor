@@ -50,8 +50,14 @@ inline int SelectAutoSrScale(int width, int height, int roi_w, int roi_h, int ma
 
     const int capped_max = ClampToSupportedSrScale(max_auto_sr_scale);
 
-    // Keep auto mode visibly active whenever basic scaling is enabled.
-    // Large ROIs still use a conservative 2x scale to balance quality/perf.
+    // Full-frame (or effectively full-frame) ROI should remain 1x so
+    // reset/startup framing does not appear zoomed.
+    if (ratio >= 0.98f) {
+        return 1;
+    }
+
+    // For non-full ROIs, keep auto mode visibly active with a conservative 2x
+    // baseline on large crops.
     if (ratio > 0.66f) {
         return 2;
     }
@@ -1008,8 +1014,10 @@ std::string VideoProcessor::ProcessFramePreprocessRoiRgbBuffer(
     const int preprocess_w = roi_w;
     const int preprocess_h = roi_h;
     const int preprocess_field_phase = roi_y & 1;
+    const bool temporal_denoise_active =
+        denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f;
 
-    if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+    if (temporal_denoise_active) {
         cuda_kernels::LaunchCropCopyRgb(
             d_rgb_prev_full_,
             width_,
@@ -1126,17 +1134,21 @@ std::string VideoProcessor::ProcessFramePreprocessRoiRgbBuffer(
         "cudaMemcpyAsync D2H preprocess roi rgb"
     );
 
-    CheckCuda(
-        cudaMemcpyAsync(
-            d_rgb_prev_full_,
-            d_rgb_full_,
-            rgb_pixels_ * kRgbBytesPerPixel,
-            cudaMemcpyDeviceToDevice,
-            stream_
-        ),
-        "cudaMemcpyAsync D2D update prev rgb preprocess roi"
-    );
-    has_prev_rgb_full_ = true;
+    if (temporal_denoise_active) {
+        CheckCuda(
+            cudaMemcpyAsync(
+                d_rgb_prev_full_,
+                d_rgb_full_,
+                rgb_pixels_ * kRgbBytesPerPixel,
+                cudaMemcpyDeviceToDevice,
+                stream_
+            ),
+            "cudaMemcpyAsync D2D update prev rgb preprocess roi"
+        );
+        has_prev_rgb_full_ = true;
+    } else {
+        has_prev_rgb_full_ = false;
+    }
 
     CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize preprocess roi rgb");
     return std::string(reinterpret_cast<const char*>(host_rgb_ptr), out_bytes);
@@ -1237,8 +1249,10 @@ CudaTensorBuffer VideoProcessor::ProcessFramePreprocessRoiTensorCudaBuffer(
     const int preprocess_w = roi_w;
     const int preprocess_h = roi_h;
     const int preprocess_field_phase = roi_y & 1;
+    const bool temporal_denoise_active =
+        denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f;
 
-    if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+    if (temporal_denoise_active) {
         cuda_kernels::LaunchCropCopyRgb(
             d_rgb_prev_full_,
             width_,
@@ -1363,17 +1377,21 @@ CudaTensorBuffer VideoProcessor::ProcessFramePreprocessRoiTensorCudaBuffer(
             stream_
         );
 
-        CheckCuda(
-            cudaMemcpyAsync(
-                d_rgb_prev_full_,
-                d_rgb_full_,
-                rgb_pixels_ * kRgbBytesPerPixel,
-                cudaMemcpyDeviceToDevice,
-                stream_
-            ),
-            "cudaMemcpyAsync D2D update prev rgb preprocess roi tensor"
-        );
-        has_prev_rgb_full_ = true;
+        if (temporal_denoise_active) {
+            CheckCuda(
+                cudaMemcpyAsync(
+                    d_rgb_prev_full_,
+                    d_rgb_full_,
+                    rgb_pixels_ * kRgbBytesPerPixel,
+                    cudaMemcpyDeviceToDevice,
+                    stream_
+                ),
+                "cudaMemcpyAsync D2D update prev rgb preprocess roi tensor"
+            );
+            has_prev_rgb_full_ = true;
+        } else {
+            has_prev_rgb_full_ = false;
+        }
 
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize preprocess roi tensor");
     } catch (...) {
@@ -1489,6 +1507,8 @@ std::string VideoProcessor::ProcessFrameInternal(
     );
 
     const bool denoise_active = denoise_method != DenoiseMethod::Off && denoise_strength > 0.001f;
+    const bool temporal_denoise_active =
+        denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f;
     const bool sr_inactive = (!enable_placeholder_sr_) || (sr_scale <= 1);
     const bool full_frame_roi = (roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_);
     if (!deinterlace_only && !deinterlace_enabled && denoise_active &&
@@ -1644,7 +1664,7 @@ std::string VideoProcessor::ProcessFrameInternal(
     int preprocess_h = use_roi_preprocess_for_scaling ? roi_h : height_;
     const int preprocess_field_phase = use_roi_preprocess_for_scaling ? (roi_y & 1) : 0;
 
-    if (denoise_method == DenoiseMethod::FieldTemporalLuma && denoise_strength > 0.001f) {
+    if (temporal_denoise_active) {
         const uchar3* temporal_prev = d_rgb_prev_full_;
         if (use_roi_preprocess_for_scaling) {
             cuda_kernels::LaunchCropCopyRgb(
@@ -1774,24 +1794,53 @@ std::string VideoProcessor::ProcessFrameInternal(
             "cudaMemcpyAsync D2H"
         );
 
-        CheckCuda(
-            cudaMemcpyAsync(
-                d_rgb_prev_full_,
-                d_rgb_full_,
-                rgb_pixels_ * kRgbBytesPerPixel,
-                cudaMemcpyDeviceToDevice,
-                stream_
-            ),
-            "cudaMemcpyAsync D2D update prev rgb"
-        );
-        has_prev_rgb_full_ = true;
+        if (temporal_denoise_active) {
+            CheckCuda(
+                cudaMemcpyAsync(
+                    d_rgb_prev_full_,
+                    d_rgb_full_,
+                    rgb_pixels_ * kRgbBytesPerPixel,
+                    cudaMemcpyDeviceToDevice,
+                    stream_
+                ),
+                "cudaMemcpyAsync D2D update prev rgb"
+            );
+            has_prev_rgb_full_ = true;
+        } else {
+            has_prev_rgb_full_ = false;
+        }
 
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
 
         return std::string(reinterpret_cast<const char*>(host_output_ptr), uyvy_bytes_);
     }
 
-    if (enable_placeholder_sr_ && sr_scale > 1) {
+    const bool use_single_pass_full_frame_zoom =
+        enable_placeholder_sr_ &&
+        sr_scale > 1 &&
+        !deinterlace_only &&
+        !preprocess_active &&
+        roi_x == 0 &&
+        roi_y == 0 &&
+        roi_w == width_ &&
+        roi_h == height_;
+
+    if (use_single_pass_full_frame_zoom) {
+        int zoom_roi_w = std::max(2, width_ / sr_scale);
+        int zoom_roi_h = std::max(2, height_ / sr_scale);
+        zoom_roi_w &= ~1;
+        if (zoom_roi_w < 2) {
+            zoom_roi_w = 2;
+        }
+
+        crop_roi_x = std::max(0, (width_ - zoom_roi_w) / 2);
+        crop_roi_y = std::max(0, (height_ - zoom_roi_h) / 2);
+        crop_roi_x &= ~1;
+        crop_roi_w = zoom_roi_w;
+        crop_roi_h = zoom_roi_h;
+    }
+
+    if (enable_placeholder_sr_ && sr_scale > 1 && !use_single_pass_full_frame_zoom) {
         int sr_roi_w = std::max(2, roi_w * sr_scale);
         int sr_roi_h = std::max(2, roi_h * sr_scale);
         const bool sr_pass_is_redundant = (sr_roi_w <= roi_w) && (sr_roi_h <= roi_h);
@@ -1983,17 +2032,21 @@ std::string VideoProcessor::ProcessFrameInternal(
         "cudaMemcpyAsync D2H"
     );
 
-    CheckCuda(
-        cudaMemcpyAsync(
-            d_rgb_prev_full_,
-            d_rgb_full_,
-            rgb_pixels_ * kRgbBytesPerPixel,
-            cudaMemcpyDeviceToDevice,
-            stream_
-        ),
-        "cudaMemcpyAsync D2D update prev rgb"
-    );
-    has_prev_rgb_full_ = true;
+    if (temporal_denoise_active) {
+        CheckCuda(
+            cudaMemcpyAsync(
+                d_rgb_prev_full_,
+                d_rgb_full_,
+                rgb_pixels_ * kRgbBytesPerPixel,
+                cudaMemcpyDeviceToDevice,
+                stream_
+            ),
+            "cudaMemcpyAsync D2D update prev rgb"
+        );
+        has_prev_rgb_full_ = true;
+    } else {
+        has_prev_rgb_full_ = false;
+    }
 
     CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
 

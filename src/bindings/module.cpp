@@ -498,6 +498,72 @@ PYBIND11_MODULE(video_processor, m) {
         .def("set_color_range", &vp::AiSrCudaPostProcessor::SetColorRangeByName, py::arg("color_range"))
         .def("get_color_space", &vp::AiSrCudaPostProcessor::GetColorSpaceName)
         .def("get_color_range", &vp::AiSrCudaPostProcessor::GetColorRangeName)
+        .def(
+            "set_post_denoise_method",
+            &vp::AiSrCudaPostProcessor::SetPostDenoiseMethodByName,
+            py::arg("method"),
+            "Set AI SR postprocess denoise method to one of [off, luma_gaussian3x3, luma_median3x3, luma_bilateral3x3, luma_bilateral5x5]."
+        )
+        .def(
+            "get_post_denoise_method",
+            &vp::AiSrCudaPostProcessor::GetPostDenoiseMethodName,
+            "Get AI SR postprocess denoise method name."
+        )
+        .def(
+            "set_post_denoise_strength",
+            &vp::AiSrCudaPostProcessor::SetPostDenoiseStrength,
+            py::arg("strength"),
+            "Set AI SR postprocess denoise strength in [0.0, 1.0]."
+        )
+        .def(
+            "get_post_denoise_strength",
+            &vp::AiSrCudaPostProcessor::GetPostDenoiseStrength,
+            "Get AI SR postprocess denoise strength in [0.0, 1.0]."
+        )
+        .def(
+            "set_post_artifact_reduction_method",
+            &vp::AiSrCudaPostProcessor::SetPostArtifactReductionMethodByName,
+            py::arg("method"),
+            "Set AI SR postprocess artifact reduction method to one of [off, luma_bilateral3x3, luma_bilateral5x5]."
+        )
+        .def(
+            "get_post_artifact_reduction_method",
+            &vp::AiSrCudaPostProcessor::GetPostArtifactReductionMethodName,
+            "Get AI SR postprocess artifact reduction method name."
+        )
+        .def(
+            "set_post_artifact_reduction_strength",
+            &vp::AiSrCudaPostProcessor::SetPostArtifactReductionStrength,
+            py::arg("strength"),
+            "Set AI SR postprocess artifact reduction strength in [0.0, 1.0]."
+        )
+        .def(
+            "get_post_artifact_reduction_strength",
+            &vp::AiSrCudaPostProcessor::GetPostArtifactReductionStrength,
+            "Get AI SR postprocess artifact reduction strength in [0.0, 1.0]."
+        )
+        .def(
+            "set_post_exaggeration_enabled",
+            &vp::AiSrCudaPostProcessor::SetPostExaggerationEnabled,
+            py::arg("enabled"),
+            "Enable or disable exaggerated AI SR postprocess debug mode."
+        )
+        .def(
+            "get_post_exaggeration_enabled",
+            &vp::AiSrCudaPostProcessor::GetPostExaggerationEnabled,
+            "Return whether exaggerated AI SR postprocess debug mode is enabled."
+        )
+        .def(
+            "set_post_exaggeration_gain",
+            &vp::AiSrCudaPostProcessor::SetPostExaggerationGain,
+            py::arg("gain"),
+            "Set exaggerated AI SR postprocess gain in [1.0, 4.0]."
+        )
+        .def(
+            "get_post_exaggeration_gain",
+            &vp::AiSrCudaPostProcessor::GetPostExaggerationGain,
+            "Get exaggerated AI SR postprocess gain in [1.0, 4.0]."
+        )
         .def_property_readonly("output_width", &vp::AiSrCudaPostProcessor::output_width)
         .def_property_readonly("output_height", &vp::AiSrCudaPostProcessor::output_height);
 }
