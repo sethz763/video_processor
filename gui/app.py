@@ -804,6 +804,33 @@ class RoiCanvas(QWidget):
     def set_latency_smoothing_percent(self, value: int) -> None:
         self._latency_smoothing_percent = max(0, min(100, int(value)))
 
+    def _resize_handle_rect(self, roi_rect: QRectF) -> QRectF:
+        roi_min_edge = max(1.0, min(roi_rect.width(), roi_rect.height()))
+        # Keep handle usable while preserving a move area on small ROIs.
+        handle_size = max(8.0, min(48.0, roi_min_edge * 0.45))
+        if roi_min_edge > 18.0:
+            handle_size = min(handle_size, roi_min_edge - 10.0)
+        else:
+            handle_size = min(handle_size, roi_min_edge * 0.5)
+        handle_size = max(6.0, min(handle_size, roi_min_edge))
+        return QRectF(
+            roi_rect.right() - handle_size,
+            roi_rect.bottom() - handle_size,
+            handle_size,
+            handle_size,
+        )
+
+    def _is_roi_near_frame_edge(self, roi: Roi, margin: int = 0) -> bool:
+        m = max(0, int(margin))
+        max_x = max(0, FRAME_W - roi.w)
+        max_y = max(0, FRAME_H - roi.h)
+        return (
+            roi.x <= m
+            or roi.y <= m
+            or roi.x >= (max_x - m)
+            or roi.y >= (max_y - m)
+        )
+
     def paintEvent(self, event) -> None:
         del event
         p = QPainter(self)
@@ -828,17 +855,8 @@ class RoiCanvas(QWidget):
         p.drawText(12, 24, f"ROI: x={self._roi.x} y={self._roi.y} w={self._roi.w} h={self._roi.h}")
         p.drawText(12, 44, f"Scale: {scale:.2f}x")
 
-        # Keep the resize handle fully inside the ROI and make it easier to grab.
-        handle_size = 48
-        p.fillRect(
-            QRectF(
-                roi_rect_w.right() - handle_size,
-                roi_rect_w.bottom() - handle_size,
-                handle_size,
-                handle_size,
-            ),
-            Qt.yellow,
-        )
+        # Keep the handle in the bottom-right corner without consuming tiny ROIs.
+        p.fillRect(self._resize_handle_rect(roi_rect_w), Qt.yellow)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         step = 8
@@ -889,13 +907,7 @@ class RoiCanvas(QWidget):
         self._drag_start_roi = self._roi
 
         roi_rect = self._frame_to_widget_rect(self._roi)
-        handle_size = 48
-        handle_rect = QRectF(
-            roi_rect.right() - handle_size,
-            roi_rect.bottom() - handle_size,
-            handle_size,
-            handle_size,
-        )
+        handle_rect = self._resize_handle_rect(roi_rect)
 
         if handle_rect.contains(event.position()):
             self._drag_mode = "resize"
@@ -942,6 +954,14 @@ class RoiCanvas(QWidget):
             )
 
         target_roi = clamp_roi(new_roi)
+        if self._drag_mode == "move" and self._is_roi_near_frame_edge(target_roi, margin=64):
+            # Near frame limits, remove damping so drag remains faithful while
+            # clamp_roi still prevents crossing beyond the frame bounds.
+            self._cancel_interaction_interpolation()
+            self._set_roi_and_emit_touch_throttled(target_roi, emit_scale=False)
+            self._schedule_interaction_emit_flush()
+            return
+
         emit_scale = self._drag_mode != "move"
         self._queue_interpolated_roi(target_roi, emit_scale=emit_scale, anchor_to_current=True)
 

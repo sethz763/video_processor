@@ -1,10 +1,10 @@
 {
   "ai_sr_detail_preserve_percent": 0.0,
   "ai_sr_enabled": false,
-  "ai_sr_inference_divisor": 2,
-  "ai_sr_inference_fps": 15,
-  "ai_sr_input_align": "2",
-  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\2x-spanx2-ch48_int8.onnx",
+  "ai_sr_inference_divisor": 1,
+  "ai_sr_inference_fps": 24,
+  "ai_sr_input_align": "1",
+  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\rt4ksr_x4_from_x2_fp16.onnx",
   "ai_sr_post_artifact_reduction_method": "Off",
   "ai_sr_post_artifact_reduction_strength": 1.0,
   "ai_sr_post_denoise_method": "Off",
@@ -15,7 +15,7 @@
   "ai_sr_require_gpu": true,
   "ai_sr_roi_overscan_percent": 0.0,
   "ai_sr_strict": false,
-  "ai_sr_trt_precision": "int8",
+  "ai_sr_trt_precision": "fp16",
   "basic_scaling_auto_max": "2",
   "basic_scaling_enabled": true,
   "basic_scaling_manual": "2",
@@ -28,12 +28,12 @@
   "decklink_fps_priority_guard": true,
   "decklink_input_device": 1,
   "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
-  "decklink_output_buffer_frames": 5,
+  "decklink_output_buffer_frames": 3,
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "deinterlace_enabled": false,
   "deinterlace_method": "Blend (Stable)",
-  "denoise_method": "Field Temporal Luma (Advanced)",
+  "denoise_method": "Off",
   "denoise_strength": 1.0,
   "display_splitter_sizes": [
     421,
@@ -49,40 +49,40 @@
   "preview_poll_fps": 30,
   "preview_request_fps": 30,
   "roi_interpolation_mode": "Ease In/Out",
-  "roi_keyframe_duration_override": true,
+  "roi_keyframe_duration_override": false,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 30,
+      "duration_frames": 26,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        724,
-        359,
-        598,
-        336
+        1722,
+        615,
+        198,
+        111
       ]
     },
     "2": {
-      "duration_frames": 30,
+      "duration_frames": 26,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1104,
-        366,
-        598,
-        336
+        1752,
+        618,
+        164,
+        92
       ]
     },
     "3": {
-      "duration_frames": 30,
+      "duration_frames": 26,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        586,
-        101,
-        730,
-        411
+        610,
+        348,
+        668,
+        376
       ]
     },
     "4": {
-      "duration_frames": 90,
+      "duration_frames": 26,
       "interpolation_mode": "ease_in_out",
       "roi": [
         0,
@@ -92,9 +92,9 @@
       ]
     }
   },
-  "roi_latency_smoothing_percent": 17,
+  "roi_latency_smoothing_percent": 83,
   "roi_smoothing_percent": 100,
-  "roi_transition_duration_frames": 20,
+  "roi_transition_duration_frames": 26,
   "rtx_thdr_contrast": 58,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
