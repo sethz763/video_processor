@@ -28,7 +28,7 @@
   "decklink_fps_priority_guard": true,
   "decklink_input_device": 1,
   "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
-  "decklink_output_buffer_frames": 0,
+  "decklink_output_buffer_frames": 5,
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "deinterlace_enabled": false,
@@ -49,40 +49,40 @@
   "preview_poll_fps": 30,
   "preview_request_fps": 30,
   "roi_interpolation_mode": "Ease In/Out",
-  "roi_keyframe_duration_override": false,
+  "roi_keyframe_duration_override": true,
   "roi_keyframes": {
     "1": {
       "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        604,
-        340,
-        710,
-        399
+        724,
+        359,
+        598,
+        336
       ]
     },
     "2": {
       "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        586,
-        575,
-        710,
-        399
+        1104,
+        366,
+        598,
+        336
       ]
     },
     "3": {
-      "duration_frames": 20,
+      "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        0,
-        0,
-        1920,
-        1080
+        586,
+        101,
+        730,
+        411
       ]
     },
     "4": {
-      "duration_frames": 30,
+      "duration_frames": 90,
       "interpolation_mode": "ease_in_out",
       "roi": [
         0,
@@ -92,9 +92,9 @@
       ]
     }
   },
-  "roi_latency_smoothing_percent": 26,
+  "roi_latency_smoothing_percent": 17,
   "roi_smoothing_percent": 100,
-  "roi_transition_duration_frames": 30,
+  "roi_transition_duration_frames": 20,
   "rtx_thdr_contrast": 58,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,

@@ -1730,9 +1730,91 @@ class _StageFrame:
     native_shift_applied: bool = False
 
 
-def run_processor_worker(request_queue, response_queue, startup_config: dict[str, Any]) -> None:
+def run_processor_worker(
+    request_queue,
+    response_queue,
+    startup_config: dict[str, Any],
+    roi_telemetry_shared=None,
+    roi_telemetry_seq=None,
+) -> None:
     _FRAME_MESSAGE_TYPES = {"frame", "decklink_frame", "decklink_no_frame"}
     _CONTROL_MESSAGE_TYPES = {"ready", "ack", "warning", "error"}
+    _ROI_SLOT_COUNT = 16
+    _TM_ACTIVE = 0
+    _TM_FRAME_PROGRESS = 1
+    _TM_TOTAL_FRAMES = 2
+    _TM_INTERP_MODE_CODE = 3
+    _TM_APPLIED_X = 4
+    _TM_APPLIED_Y = 5
+    _TM_APPLIED_W = 6
+    _TM_APPLIED_H = 7
+    _TM_START_X = 8
+    _TM_START_Y = 9
+    _TM_START_W = 10
+    _TM_START_H = 11
+    _TM_TARGET_X = 12
+    _TM_TARGET_Y = 13
+    _TM_TARGET_W = 14
+    _TM_TARGET_H = 15
+
+    def _interp_mode_to_code(interp_mode: str) -> int:
+        mode = str(interp_mode).strip().lower()
+        if mode == "ease_in_out":
+            return 1
+        if mode == "ease_out":
+            return 2
+        return 0
+
+    def _publish_roi_telemetry(
+        current_x: int,
+        current_y: int,
+        current_w: int,
+        current_h: int,
+        transition_state: dict[str, Any] | None,
+    ) -> None:
+        if roi_telemetry_shared is None or roi_telemetry_seq is None:
+            return
+
+        start_roi = (current_x, current_y, current_w, current_h)
+        target_roi = (current_x, current_y, current_w, current_h)
+        active = False
+        frame_progress = 0
+        total_frames = 0
+        interp_mode_code = 0
+
+        if isinstance(transition_state, dict):
+            active = True
+            start_roi = tuple(transition_state.get("start", start_roi))
+            target_roi = tuple(transition_state.get("target", target_roi))
+            frame_progress = int(transition_state.get("frame_progress", 0))
+            total_frames = int(transition_state.get("total_frames", 0))
+            interp_mode_code = _interp_mode_to_code(str(transition_state.get("interpolation_mode", "linear")))
+
+        try:
+            with roi_telemetry_shared.get_lock():
+                if len(roi_telemetry_shared) < _ROI_SLOT_COUNT:
+                    return
+                roi_telemetry_shared[_TM_ACTIVE] = 1.0 if active else 0.0
+                roi_telemetry_shared[_TM_FRAME_PROGRESS] = float(frame_progress)
+                roi_telemetry_shared[_TM_TOTAL_FRAMES] = float(total_frames)
+                roi_telemetry_shared[_TM_INTERP_MODE_CODE] = float(interp_mode_code)
+                roi_telemetry_shared[_TM_APPLIED_X] = float(current_x)
+                roi_telemetry_shared[_TM_APPLIED_Y] = float(current_y)
+                roi_telemetry_shared[_TM_APPLIED_W] = float(current_w)
+                roi_telemetry_shared[_TM_APPLIED_H] = float(current_h)
+                roi_telemetry_shared[_TM_START_X] = float(int(start_roi[0]))
+                roi_telemetry_shared[_TM_START_Y] = float(int(start_roi[1]))
+                roi_telemetry_shared[_TM_START_W] = float(int(start_roi[2]))
+                roi_telemetry_shared[_TM_START_H] = float(int(start_roi[3]))
+                roi_telemetry_shared[_TM_TARGET_X] = float(int(target_roi[0]))
+                roi_telemetry_shared[_TM_TARGET_Y] = float(int(target_roi[1]))
+                roi_telemetry_shared[_TM_TARGET_W] = float(int(target_roi[2]))
+                roi_telemetry_shared[_TM_TARGET_H] = float(int(target_roi[3]))
+            with roi_telemetry_seq.get_lock():
+                roi_telemetry_seq.value = int(roi_telemetry_seq.value) + 1
+        except Exception:
+            # Never allow telemetry publishing failures to disrupt frame processing.
+            return
     worker_process_priority = _normalize_worker_priority_name(
         str(startup_config.get("worker_process_priority", "above_normal"))
     )
@@ -1844,7 +1926,6 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
     started_perf_ts = 0.0
     output_nominal_fps = 0.0
     output_frame_period_s = 0.0
-    output_next_emit_ts = 0.0
     stage_preprocess_applied_frames = 0
     stage_basic_applied_frames = 0
     stage_ai_applied_frames = 0
@@ -2800,7 +2881,7 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
-        nonlocal output_nominal_fps, output_frame_period_s, output_next_emit_ts
+        nonlocal output_nominal_fps, output_frame_period_s
         nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
         nonlocal rtx_effect_sample_counter
         nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
@@ -2844,7 +2925,6 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
         else:
             output_frame_period_s = 0.0
             output_nominal_fps = 0.0
-        output_next_emit_ts = 0.0
         stage_preprocess_applied_frames = 0
         stage_basic_applied_frames = 0
         stage_ai_applied_frames = 0
@@ -3025,6 +3105,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         if emitted:
                             processed_frame_counter += 1
                     if emitted:
+                        with state_lock:
+                            roi_transition_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
+                            roi_x_snapshot = int(current_roi_x)
+                            roi_y_snapshot = int(current_roi_y)
+                            roi_w_snapshot = int(current_roi_w)
+                            roi_h_snapshot = int(current_roi_h)
+                        _publish_roi_telemetry(
+                            roi_x_snapshot,
+                            roi_y_snapshot,
+                            roi_w_snapshot,
+                            roi_h_snapshot,
+                            roi_transition_snapshot,
+                        )
                         _advance_roi_microstep_transition_one_frame()
                     continue
 
@@ -3094,6 +3187,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         if emitted:
                             processed_frame_counter += 1
                     if emitted:
+                        with state_lock:
+                            roi_transition_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
+                            roi_x_snapshot = int(current_roi_x)
+                            roi_y_snapshot = int(current_roi_y)
+                            roi_w_snapshot = int(current_roi_w)
+                            roi_h_snapshot = int(current_roi_h)
+                        _publish_roi_telemetry(
+                            roi_x_snapshot,
+                            roi_y_snapshot,
+                            roi_w_snapshot,
+                            roi_h_snapshot,
+                            roi_transition_snapshot,
+                        )
                         _advance_roi_microstep_transition_one_frame()
                     continue
 
@@ -3171,7 +3277,6 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
             nonlocal rtx_effect_sample_counter
-            nonlocal output_next_emit_ts
             assert q_upscale_to_output is not None
             while not pipeline_stop_event.is_set():
                 try:
@@ -3207,14 +3312,6 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                             sampled_delta = 0.0
 
                 output_wait_s = 0.0
-                if output_frame_period_s > 0.0:
-                    now_ts = time.perf_counter()
-                    if output_next_emit_ts <= 0.0:
-                        output_next_emit_ts = now_ts
-                    wait_s = output_next_emit_ts - now_ts
-                    if wait_s > 0.0:
-                        output_wait_s = wait_s
-                        time.sleep(wait_s)
 
                 emit_start_ts = time.perf_counter()
                 try:
@@ -3242,13 +3339,6 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     emitted=bool(emitted),
                 )
 
-                if emitted and output_frame_period_s > 0.0:
-                    now_ts = time.perf_counter()
-                    next_ts = output_next_emit_ts + output_frame_period_s
-                    if next_ts < (now_ts - output_frame_period_s):
-                        next_ts = now_ts + output_frame_period_s
-                    output_next_emit_ts = next_ts
-
                 with state_lock:
                     latest_input_frame = item.input_bytes
                     latest_output_frame = output_bytes
@@ -3258,6 +3348,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     if emitted:
                         processed_frame_counter += 1
                 if emitted:
+                    with state_lock:
+                        roi_transition_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
+                        roi_x_snapshot = int(current_roi_x)
+                        roi_y_snapshot = int(current_roi_y)
+                        roi_w_snapshot = int(current_roi_w)
+                        roi_h_snapshot = int(current_roi_h)
+                    _publish_roi_telemetry(
+                        roi_x_snapshot,
+                        roi_y_snapshot,
+                        roi_w_snapshot,
+                        roi_h_snapshot,
+                        roi_transition_snapshot,
+                    )
                     _advance_roi_microstep_transition_one_frame()
 
         capture_thread = threading.Thread(target=_capture_worker, name="vp-capture", daemon=True)
@@ -3833,6 +3936,15 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     timing_emit_call_ms_ema_snapshot = float(timing_emit_call_ms_ema)
                     timing_emit_call_ms_peak_snapshot = float(timing_emit_call_ms_peak)
                     timing_last_path_snapshot = str(timing_last_path)
+                    current_roi_x_snapshot = int(current_roi_x)
+                    current_roi_y_snapshot = int(current_roi_y)
+                    current_roi_w_snapshot = int(current_roi_w)
+                    current_roi_h_snapshot = int(current_roi_h)
+                    roi_shift_applied_x_snapshot = float(roi_shift_applied_x)
+                    roi_shift_applied_y_snapshot = float(roi_shift_applied_y)
+                    roi_shift_target_x_snapshot = float(roi_shift_target_x)
+                    roi_shift_target_y_snapshot = float(roi_shift_target_y)
+                    roi_transition_state_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
 
                 if current_input is None or current_output is None:
                     _safe_put({"type": "decklink_no_frame", "reason": "no_input_signal"})
@@ -3896,6 +4008,44 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                     "emit_call_ms_peak": float(timing_emit_call_ms_peak_snapshot),
                     "last_path": str(timing_last_path_snapshot),
                 }
+                roi_transition_payload: dict[str, object]
+                if isinstance(roi_transition_state_snapshot, dict):
+                    start_roi = roi_transition_state_snapshot.get("start", (current_roi_x_snapshot, current_roi_y_snapshot, current_roi_w_snapshot, current_roi_h_snapshot))
+                    target_roi = roi_transition_state_snapshot.get("target", (current_roi_x_snapshot, current_roi_y_snapshot, current_roi_w_snapshot, current_roi_h_snapshot))
+                    roi_transition_payload = {
+                        "active": True,
+                        "frame_progress": int(roi_transition_state_snapshot.get("frame_progress", 0)),
+                        "total_frames": int(roi_transition_state_snapshot.get("total_frames", 1)),
+                        "interpolation_mode": str(roi_transition_state_snapshot.get("interpolation_mode", "linear")),
+                        "start_roi": {
+                            "x": int(start_roi[0]),
+                            "y": int(start_roi[1]),
+                            "w": int(start_roi[2]),
+                            "h": int(start_roi[3]),
+                        },
+                        "target_roi": {
+                            "x": int(target_roi[0]),
+                            "y": int(target_roi[1]),
+                            "w": int(target_roi[2]),
+                            "h": int(target_roi[3]),
+                        },
+                    }
+                else:
+                    roi_transition_payload = {
+                        "active": False,
+                        "frame_progress": 0,
+                        "total_frames": 0,
+                        "interpolation_mode": "",
+                    }
+
+                _publish_roi_telemetry(
+                    current_roi_x_snapshot,
+                    current_roi_y_snapshot,
+                    current_roi_w_snapshot,
+                    current_roi_h_snapshot,
+                    roi_transition_state_snapshot,
+                )
+
                 payload: dict[str, object] = {
                     "type": "decklink_frame",
                     "effective_sr_scale": current_scale,
@@ -3945,6 +4095,19 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                         "max": float(basic_scaling_max_frame_ms),
                         "samples": int(basic_scaling_timing_samples),
                     },
+                    "roi_applied": {
+                        "x": current_roi_x_snapshot,
+                        "y": current_roi_y_snapshot,
+                        "w": current_roi_w_snapshot,
+                        "h": current_roi_h_snapshot,
+                    },
+                    "roi_subpixel_shift": {
+                        "target_x": roi_shift_target_x_snapshot,
+                        "target_y": roi_shift_target_y_snapshot,
+                        "applied_x": roi_shift_applied_x_snapshot,
+                        "applied_y": roi_shift_applied_y_snapshot,
+                    },
+                    "roi_transition": roi_transition_payload,
                     "output_buffer_health": output_schedule_stats,
                     "pipeline_timing_health": pipeline_timing_health,
                 }
@@ -3975,6 +4138,14 @@ def run_processor_worker(request_queue, response_queue, startup_config: dict[str
                 last_stage_ai_applied = bool(ai_applied)
                 last_stage_rtx_applied = bool(rtx_applied)
                 last_stage_stack = _build_stage_stack()
+                with state_lock:
+                    _publish_roi_telemetry(
+                        int(current_roi_x),
+                        int(current_roi_y),
+                        int(current_roi_w),
+                        int(current_roi_h),
+                        dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None,
+                    )
                 _safe_put(
                     {
                         "type": "frame",

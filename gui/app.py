@@ -344,6 +344,24 @@ LOGGER = setup_logger()
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 _RPC_E_CHANGED_MODE_HEX = "0x80010106"
 
+_ROI_TELEMETRY_SLOT_COUNT = 16
+_ROI_TM_ACTIVE = 0
+_ROI_TM_FRAME_PROGRESS = 1
+_ROI_TM_TOTAL_FRAMES = 2
+_ROI_TM_INTERP_MODE_CODE = 3
+_ROI_TM_APPLIED_X = 4
+_ROI_TM_APPLIED_Y = 5
+_ROI_TM_APPLIED_W = 6
+_ROI_TM_APPLIED_H = 7
+_ROI_TM_START_X = 8
+_ROI_TM_START_Y = 9
+_ROI_TM_START_W = 10
+_ROI_TM_START_H = 11
+_ROI_TM_TARGET_X = 12
+_ROI_TM_TARGET_Y = 13
+_ROI_TM_TARGET_W = 14
+_ROI_TM_TARGET_H = 15
+
 
 def initialize_com_for_decklink() -> None:
     if sys.platform != "win32":
@@ -1594,6 +1612,12 @@ class VideoProcessorController:
     def decklink_pipeline_timing_health(self) -> dict[str, object]:
         return {}
 
+    def decklink_applied_roi(self) -> Roi | None:
+        return None
+
+    def decklink_roi_transition_state(self) -> dict[str, object]:
+        return {}
+
     def set_preview_fps(self, preview_fps: float) -> None:
         # In-process backend does not use worker tick preview throttling.
         _ = preview_fps
@@ -1712,6 +1736,9 @@ class ProcessVideoProcessorController:
         self._request_queue = None
         self._response_queue = None
         self._process = None
+        self._roi_telemetry_shared = None
+        self._roi_telemetry_seq = None
+        self._roi_telemetry_last_seq = -1
 
         self._next_frame_id = 1
         self._latest_output_frame: bytes | None = None
@@ -1786,6 +1813,8 @@ class ProcessVideoProcessorController:
         }
         self._decklink_output_buffer_health: dict[str, object] = {}
         self._decklink_pipeline_timing_health: dict[str, object] = {}
+        self._decklink_applied_roi: Roi | None = None
+        self._decklink_roi_transition_state: dict[str, object] = {}
 
     def _reset_decklink_fps_tracking(self) -> None:
         self._decklink_processed_counter = 0
@@ -1805,6 +1834,69 @@ class ProcessVideoProcessorController:
         self._decklink_ai_refresh_fps = 0.0
         self._decklink_ai_latest_age_ms = -1.0
         self._decklink_ai_timing_ms = {}
+        self._decklink_applied_roi = None
+        self._decklink_roi_transition_state = {}
+
+    def _decode_interp_mode_code(self, mode_code: int) -> str:
+        code = int(mode_code)
+        if code == 1:
+            return "ease_in_out"
+        if code == 2:
+            return "ease_out"
+        return "linear"
+
+    def _read_shared_roi_telemetry(self, force: bool = False) -> None:
+        shared = self._roi_telemetry_shared
+        seq = self._roi_telemetry_seq
+        if shared is None or seq is None:
+            return
+        try:
+            current_seq = int(seq.value)
+        except Exception:
+            return
+        if (not force) and current_seq == self._roi_telemetry_last_seq:
+            return
+
+        try:
+            with shared.get_lock():
+                snapshot = [float(shared[i]) for i in range(_ROI_TELEMETRY_SLOT_COUNT)]
+        except Exception:
+            return
+
+        self._roi_telemetry_last_seq = current_seq
+        try:
+            self._decklink_applied_roi = clamp_roi(
+                Roi(
+                    int(round(snapshot[_ROI_TM_APPLIED_X])),
+                    int(round(snapshot[_ROI_TM_APPLIED_Y])),
+                    int(round(snapshot[_ROI_TM_APPLIED_W])),
+                    int(round(snapshot[_ROI_TM_APPLIED_H])),
+                )
+            )
+        except Exception:
+            pass
+
+        active = bool(snapshot[_ROI_TM_ACTIVE] >= 0.5)
+        total_frames = max(0, int(round(snapshot[_ROI_TM_TOTAL_FRAMES])))
+        frame_progress = max(0, int(round(snapshot[_ROI_TM_FRAME_PROGRESS])))
+        self._decklink_roi_transition_state = {
+            "active": active,
+            "frame_progress": frame_progress,
+            "total_frames": total_frames,
+            "interpolation_mode": self._decode_interp_mode_code(int(round(snapshot[_ROI_TM_INTERP_MODE_CODE]))),
+            "start_roi": {
+                "x": int(round(snapshot[_ROI_TM_START_X])),
+                "y": int(round(snapshot[_ROI_TM_START_Y])),
+                "w": int(round(snapshot[_ROI_TM_START_W])),
+                "h": int(round(snapshot[_ROI_TM_START_H])),
+            },
+            "target_roi": {
+                "x": int(round(snapshot[_ROI_TM_TARGET_X])),
+                "y": int(round(snapshot[_ROI_TM_TARGET_Y])),
+                "w": int(round(snapshot[_ROI_TM_TARGET_W])),
+                "h": int(round(snapshot[_ROI_TM_TARGET_H])),
+            },
+        }
 
     def _apply_decklink_frame_message(self, message: dict[str, object]) -> None:
         self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
@@ -1883,9 +1975,36 @@ class ProcessVideoProcessorController:
         self._decklink_pipeline_timing_health = dict(
             message.get("pipeline_timing_health", self._decklink_pipeline_timing_health)
         )
+
+        roi_payload = message.get("roi_applied")
+        if isinstance(roi_payload, dict):
+            try:
+                self._decklink_applied_roi = clamp_roi(
+                    Roi(
+                        int(roi_payload.get("x", 0)),
+                        int(roi_payload.get("y", 0)),
+                        int(roi_payload.get("w", FRAME_W)),
+                        int(roi_payload.get("h", FRAME_H)),
+                    )
+                )
+            except Exception:
+                self._decklink_applied_roi = None
+
+        transition_payload = message.get("roi_transition")
+        if isinstance(transition_payload, dict):
+            self._decklink_roi_transition_state = dict(transition_payload)
+
         self._decklink_no_frame_reason = None
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
+
+    def decklink_applied_roi(self) -> Roi | None:
+        self._read_shared_roi_telemetry()
+        return self._decklink_applied_roi
+
+    def decklink_roi_transition_state(self) -> dict[str, object]:
+        self._read_shared_roi_telemetry()
+        return dict(self._decklink_roi_transition_state)
 
     def _record_control_send_result(
         self,
@@ -2036,9 +2155,18 @@ class ProcessVideoProcessorController:
         # (ROI drag, tick polling) do not trip queue.Full in the GUI thread.
         self._request_queue = self._ctx.Queue(maxsize=32)
         self._response_queue = self._ctx.Queue(maxsize=64)
+        self._roi_telemetry_shared = self._ctx.Array("d", _ROI_TELEMETRY_SLOT_COUNT)
+        self._roi_telemetry_seq = self._ctx.Value("i", 0)
+        self._roi_telemetry_last_seq = -1
         self._process = self._ctx.Process(
             target=run_processor_worker,
-            args=(self._request_queue, self._response_queue, startup_config),
+            args=(
+                self._request_queue,
+                self._response_queue,
+                startup_config,
+                self._roi_telemetry_shared,
+                self._roi_telemetry_seq,
+            ),
             daemon=True,
             name="video-processor-worker",
         )
@@ -2701,6 +2829,9 @@ class ProcessVideoProcessorController:
         self._process = None
         self._request_queue = None
         self._response_queue = None
+        self._roi_telemetry_shared = None
+        self._roi_telemetry_seq = None
+        self._roi_telemetry_last_seq = -1
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
 
@@ -4650,6 +4781,7 @@ class MainWindow(QMainWindow):
 
                 input_frame, output_frame = decklink_frame
                 self._no_frame_counter = 0
+                self._sync_backend_roi_from_worker()
                 preview_updated = True
                 if hasattr(self._controller, "consume_decklink_frame_updated"):
                     preview_updated = bool(self._controller.consume_decklink_frame_updated())
@@ -5636,6 +5768,91 @@ class MainWindow(QMainWindow):
         if self._manual_roi_send_timer.isActive():
             return True
         return self._pending_manual_controller_roi is not None
+
+    def _sync_backend_roi_from_worker(self) -> dict[str, object]:
+        if self._source_mode != "Blackmagic DeckLink" or self._controller_backend != "worker-process":
+            return {}
+
+        state = self._roi_keyframe_transition
+        if not (isinstance(state, dict) and bool(state.get("backend_driven", False))):
+            return {}
+
+        if not hasattr(self._controller, "decklink_applied_roi"):
+            return {}
+
+        try:
+            worker_roi = self._controller.decklink_applied_roi()
+        except Exception:
+            worker_roi = None
+
+        worker_transition_state: dict[str, object] = {}
+        if hasattr(self._controller, "decklink_roi_transition_state"):
+            try:
+                worker_transition_state = dict(self._controller.decklink_roi_transition_state())
+            except Exception:
+                worker_transition_state = {}
+        transition_active = bool(worker_transition_state.get("active", False))
+        if transition_active:
+            state["worker_transition_seen"] = True
+
+        if not isinstance(worker_roi, Roi):
+            return worker_transition_state
+
+        worker_roi = clamp_roi(worker_roi)
+        state["current_roi_estimate"] = worker_roi
+        # Never snap canvas ROI directly during a backend-driven transition.
+        # We render a smoothed visual overlay and commit once complete.
+        self._roi = worker_roi
+
+        self._controller_roi_applied = worker_roi
+        self._schedule_roi_controls_sync(worker_roi)
+
+        # Render GUI interpolation from worker transition phase so the on-screen
+        # ROI appears smooth between quantized applied-ROI steps.
+        if transition_active:
+            try:
+                start_raw = worker_transition_state.get("start_roi", {})
+                target_raw = worker_transition_state.get("target_roi", {})
+                start_roi = clamp_roi(
+                    Roi(
+                        int(start_raw.get("x", worker_roi.x)),
+                        int(start_raw.get("y", worker_roi.y)),
+                        int(start_raw.get("w", worker_roi.w)),
+                        int(start_raw.get("h", worker_roi.h)),
+                    )
+                )
+                target_roi = clamp_roi(
+                    Roi(
+                        int(target_raw.get("x", worker_roi.x)),
+                        int(target_raw.get("y", worker_roi.y)),
+                        int(target_raw.get("w", worker_roi.w)),
+                        int(target_raw.get("h", worker_roi.h)),
+                    )
+                )
+                total_frames = max(1, int(worker_transition_state.get("total_frames", 1)))
+                frame_progress = max(0.0, min(float(total_frames), float(worker_transition_state.get("frame_progress", 0.0))))
+                t = frame_progress / float(total_frames)
+                curve_mode = str(worker_transition_state.get("interpolation_mode", "linear"))
+                curved_t = self._apply_roi_interpolation_curve(t, curve_mode)
+
+                start_cx = float(start_roi.x) + (float(start_roi.w) * 0.5)
+                start_cy = float(start_roi.y) + (float(start_roi.h) * 0.5)
+                target_cx = float(target_roi.x) + (float(target_roi.w) * 0.5)
+                target_cy = float(target_roi.y) + (float(target_roi.h) * 0.5)
+
+                overlay_cx = start_cx + ((target_cx - start_cx) * curved_t)
+                overlay_cy = start_cy + ((target_cy - start_cy) * curved_t)
+                overlay_w = float(start_roi.w) + ((float(target_roi.w) - float(start_roi.w)) * curved_t)
+                overlay_h = max(2.0, float(overlay_w * 9.0 / 16.0))
+                overlay_x = overlay_cx - (overlay_w * 0.5)
+                overlay_y = overlay_cy - (overlay_h * 0.5)
+                self._input_canvas.set_visual_roi_overlay(overlay_x, overlay_y, overlay_w, overlay_h)
+            except Exception:
+                self._input_canvas.clear_visual_roi_overlay()
+        else:
+            self._input_canvas.clear_visual_roi_overlay()
+
+        return worker_transition_state
 
     def _scaled_preview_target(self, target: tuple[int, int] | None, scale: float) -> tuple[int, int] | None:
         if target is None:
@@ -7311,6 +7528,7 @@ class MainWindow(QMainWindow):
                 pass
         if reset_subpixel_shift and hasattr(self._controller, "set_roi_subpixel_shift"):
             self._controller.set_roi_subpixel_shift(0.0, 0.0)
+        self._update_timer_interval()
 
     def _start_roi_keyframe_transition(self, target_roi: Roi, duration_frames: int, interpolation_mode: str) -> None:
         previous_state = self._roi_keyframe_transition
@@ -7353,6 +7571,7 @@ class MainWindow(QMainWindow):
             "last_roi": clamp_roi(self._roi),
             "last_subpixel_shift": {"x": 0.0, "y": 0.0},
             "pending_frame_advance": 0.0,
+            "worker_transition_seen": False,
         }
 
         backend_driven = bool(
@@ -7418,6 +7637,7 @@ class MainWindow(QMainWindow):
                 self._update_status(f"Worker ROI microstep transition start failed: {exc}")
                 self._roi_keyframe_transition["backend_driven"] = False
         self._roi_keyframe_transition_timer.start()
+        self._update_timer_interval()
 
     def _apply_roi_interpolation_curve(self, t: float, interpolation_mode: str) -> float:
         clamped_t = max(0.0, min(1.0, float(t)))
@@ -7485,14 +7705,13 @@ class MainWindow(QMainWindow):
             # Worker-clock mode should only step when a new processed frame has
             # landed. Skipping no-op ticks avoids repeated interpolation math and
             # redundant control sends between frame arrivals.
-            if frame_advance <= 0.0:
+            if frame_advance <= 0.0 and (not backend_driven):
                 return
 
         if frame_advance <= 0.0:
-            if bool(state.get("use_worker_clock", False)):
-                frame_advance = 0.0
-            else:
-                frame_advance = dt * self._roi_keyframe_transition_fps()
+            # Keep GUI interpolation alive on every timer tick. In backend-driven
+            # mode, worker snapshots reconcile phase but should not freeze motion.
+            frame_advance = dt * self._roi_keyframe_transition_fps()
 
         frame_progress += frame_advance
         frame_progress = min(float(total_frames), frame_progress)
@@ -7514,34 +7733,63 @@ class MainWindow(QMainWindow):
         ideal_w = float(start_roi.w) + ((float(target_roi.w) - float(start_roi.w)) * curved_t)
 
         if backend_driven:
-            display_w = max(2.0, float(ideal_w))
-            display_h = max(2.0, float(display_w * 9.0 / 16.0))
-            display_x = float(ideal_cx - (display_w * 0.5))
-            display_y = float(ideal_cy - (display_h * 0.5))
-            self._input_canvas.set_visual_roi_overlay(display_x, display_y, display_w, display_h)
+            worker_transition_state = self._sync_backend_roi_from_worker()
 
-            estimated_scale = FRAME_W / max(1.0, display_w)
-            estimated_roi = clamp_roi(roi_from_scale(estimated_scale, ideal_cx, ideal_cy))
-            state["current_roi_estimate"] = estimated_roi
-            self._roi = estimated_roi
-            self._controller_roi_applied = estimated_roi
-            self._controller_roi_target = None
-            self._controller_filtered_target_roi = None
+            worker_transition_active = False
+            worker_transition_seen = bool(state.get("worker_transition_seen", False))
+            if worker_transition_state:
+                worker_transition_active = bool(worker_transition_state.get("active", False))
+                worker_progress = float(worker_transition_state.get("frame_progress", frame_progress))
+                worker_total_frames = max(
+                    1,
+                    int(worker_transition_state.get("total_frames", total_frames)),
+                )
+                # Reconcile local GUI phase toward worker phase gradually to avoid
+                # abrupt jumps when worker telemetry arrives in coarse intervals.
+                if worker_progress > frame_progress:
+                    max_catch_up = max(1.0, dt * self._roi_keyframe_transition_fps() * 1.5)
+                    frame_progress = min(float(worker_total_frames), frame_progress + min(worker_progress - frame_progress, max_catch_up))
+                else:
+                    frame_progress = min(float(worker_total_frames), frame_progress)
+                state["frame_progress"] = frame_progress
+                is_final_frame = frame_progress >= float(worker_total_frames)
+            else:
+                # Fallback for older worker payloads: preserve smooth local
+                # interpolation at GUI preview cadence instead of snapping.
+                worker_transition_active = bool(not is_final_frame)
 
-            transition_complete = frame_progress >= float(total_frames)
+            if not worker_transition_seen:
+                display_w = max(2.0, float(ideal_w))
+                display_h = max(2.0, float(display_w * 9.0 / 16.0))
+                display_x = float(ideal_cx - (display_w * 0.5))
+                display_y = float(ideal_cy - (display_h * 0.5))
+                self._input_canvas.set_visual_roi_overlay(display_x, display_y, display_w, display_h)
+
+            transition_complete = (not worker_transition_active) or is_final_frame
             if transition_complete:
                 self._roi_keyframe_transition = None
                 self._roi_keyframe_transition_timer.stop()
                 self._input_canvas.clear_visual_roi_overlay()
-                self._roi = target_roi
-                self._input_canvas.set_roi(target_roi)
-                self._controller_roi_applied = target_roi
+                final_roi = state.get("current_roi_estimate", self._roi)
+                if isinstance(final_roi, Roi):
+                    final_roi = clamp_roi(final_roi)
+                if not isinstance(final_roi, Roi):
+                    final_roi = target_roi
+                if not self._is_controller_roi_close(final_roi, target_roi):
+                    # Worker transition state may be unavailable (for example,
+                    # stale worker build); fall back to requested target.
+                    final_roi = target_roi
+
+                self._roi = clamp_roi(final_roi)
+                self._input_canvas.set_roi(self._roi)
+                self._controller_roi_applied = self._roi
                 self._controller_roi_target = None
                 self._controller_filtered_target_roi = None
                 self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
 
-                self._sync_controls_from_roi(target_roi)
+                self._sync_controls_from_roi(self._roi)
                 self._roi_keyframe_last_step_ts = 0.0
+                self._update_timer_interval()
             return
 
         residual = state.get("quant_residual")
