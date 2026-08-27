@@ -971,10 +971,6 @@ class RoiCanvas(QWidget):
         self._flush_interaction_emit()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self.fullscreenRequested.emit(self._view_name)
-            event.accept()
-            return
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -1301,10 +1297,6 @@ class ImageCanvas(QWidget):
         return QRectF(0.0, 0.0, float(self.width()), float(self.height()))
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self.fullscreenRequested.emit(self._view_name)
-            event.accept()
-            return
         super().mouseDoubleClickEvent(event)
 
 
@@ -3176,6 +3168,8 @@ class MainWindow(QMainWindow):
         self._pending_persisted_output_device = None
         self._pending_persisted_input_mode_text = ""
         self._pending_persisted_output_mode_text = ""
+        self._windowed_geometry_before_fullscreen: QRect | None = None
+        self._windowed_was_maximized_before_fullscreen = False
         self._settings_path = Path(__file__).resolve().parent / "app_settings.json"
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -3214,6 +3208,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
         self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
         self._fullscreen_decklink_output_buffer_spins: dict[str, QSpinBox] = {}
+        self._fullscreen_enter_buttons: dict[str, QPushButton] = {}
         viewers = QWidget()
         viewers_layout = QVBoxLayout(viewers)
         viewers_layout.setContentsMargins(0, 0, 0, 0)
@@ -3223,8 +3218,18 @@ class MainWindow(QMainWindow):
         input_layout = QVBoxLayout(self._input_panel)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(2)
+        self._input_header = QWidget()
+        input_header_layout = QHBoxLayout(self._input_header)
+        input_header_layout.setContentsMargins(0, 0, 0, 0)
+        input_header_layout.setSpacing(8)
         self._input_title_label = QLabel("Input View (ROI controls are locked to this view)")
-        input_layout.addWidget(self._input_title_label)
+        input_header_layout.addWidget(self._input_title_label)
+        input_fullscreen_btn = QPushButton("Full screen")
+        input_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view("input"))
+        input_header_layout.addWidget(input_fullscreen_btn)
+        input_header_layout.addStretch(1)
+        self._fullscreen_enter_buttons["input"] = input_fullscreen_btn
+        input_layout.addWidget(self._input_header)
 
         self._input_viewer_row = QWidget()
         input_viewer_row_layout = QHBoxLayout(self._input_viewer_row)
@@ -3242,8 +3247,18 @@ class MainWindow(QMainWindow):
         output_layout = QVBoxLayout(self._output_panel)
         output_layout.setContentsMargins(0, 0, 0, 0)
         output_layout.setSpacing(2)
+        self._output_header = QWidget()
+        output_header_layout = QHBoxLayout(self._output_header)
+        output_header_layout.setContentsMargins(0, 0, 0, 0)
+        output_header_layout.setSpacing(8)
         self._output_title_label = QLabel("Output View (processed result only)")
-        output_layout.addWidget(self._output_title_label)
+        output_header_layout.addWidget(self._output_title_label)
+        output_fullscreen_btn = QPushButton("Full screen")
+        output_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view("output"))
+        output_header_layout.addWidget(output_fullscreen_btn)
+        output_header_layout.addStretch(1)
+        self._fullscreen_enter_buttons["output"] = output_fullscreen_btn
+        output_layout.addWidget(self._output_header)
 
         self._output_viewer_row = QWidget()
         output_viewer_row_layout = QHBoxLayout(self._output_viewer_row)
@@ -3320,6 +3335,7 @@ class MainWindow(QMainWindow):
         self._sync_fullscreen_transition_rate_from_main(self.roi_transition_frames_spin.value())
         self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
         self._sync_fullscreen_decklink_output_buffer_from_main(self.decklink_output_buffer_spin.value())
+        self._sync_fullscreen_button_states()
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
         self._sync_ai_sr_basic_scaling_ui(notify=False)
@@ -4633,6 +4649,13 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("QLabel { font-size: 18px; font-weight: 700; }")
         panel_layout.addWidget(title)
 
+        exit_fullscreen_btn = QPushButton("EXIT\nFULL SCREEN")
+        exit_fullscreen_btn.setMinimumWidth(150)
+        exit_fullscreen_btn.setMinimumHeight(96)
+        exit_fullscreen_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
+        exit_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view(None))
+        panel_layout.addWidget(exit_fullscreen_btn)
+
         transition_label = QLabel("Transition\n(frames)")
         transition_label.setAlignment(Qt.AlignCenter)
         transition_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; }")
@@ -4740,6 +4763,45 @@ class MainWindow(QMainWindow):
         reset_action.setShortcut("R")
         reset_action.triggered.connect(self._reset_roi)
         self.addAction(reset_action)
+
+        fullscreen_action = QAction(self)
+        fullscreen_action.setShortcut("F11")
+        fullscreen_action.triggered.connect(self._toggle_fullscreen_view)
+        self.addAction(fullscreen_action)
+
+    def _toggle_fullscreen_view(self) -> None:
+        if self._fullscreen_view_name is not None:
+            self._set_fullscreen_view(None)
+            return
+
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is not None and (
+            focus_widget is self._output_canvas or self._output_canvas.isAncestorOf(focus_widget)
+        ):
+            self._set_fullscreen_view("output")
+            return
+
+        self._set_fullscreen_view("input")
+
+    def _sync_fullscreen_button_states(self) -> None:
+        active_view = self._fullscreen_view_name
+        for view_name, button in self._fullscreen_enter_buttons.items():
+            button.setEnabled(active_view is None)
+            button.setVisible(active_view is None)
+
+    def _capture_windowed_geometry_before_fullscreen(self) -> None:
+        self._windowed_was_maximized_before_fullscreen = self.isMaximized()
+        self._windowed_geometry_before_fullscreen = self.geometry()
+
+    def _restore_windowed_geometry_after_fullscreen(self) -> None:
+        geometry = self._windowed_geometry_before_fullscreen
+        was_maximized = self._windowed_was_maximized_before_fullscreen
+
+        self.showNormal()
+        if geometry is not None and geometry.isValid():
+            self.setGeometry(geometry)
+        if was_maximized:
+            self.showMaximized()
 
     def _perf_add(self, stage_name: str, elapsed_ms: float) -> None:
         if stage_name not in self._perf_stage_sums_ms:
@@ -5221,14 +5283,14 @@ class MainWindow(QMainWindow):
     def _fit_viewers_to_video_aspect(self) -> None:
         self._fit_canvas_in_panel(
             panel=self._input_panel,
-            title_label=self._input_title_label,
+            header_widget=self._input_header,
             canvas=self._input_canvas,
             footer_widget=self._input_fullscreen_keyframe_toolbar,
             side_widget=self._input_fullscreen_keyframe_side_panel,
         )
         self._fit_canvas_in_panel(
             panel=self._output_panel,
-            title_label=self._output_title_label,
+            header_widget=self._output_header,
             canvas=self._output_canvas,
             footer_widget=self._output_fullscreen_keyframe_toolbar,
             side_widget=self._output_fullscreen_keyframe_side_panel,
@@ -5237,7 +5299,7 @@ class MainWindow(QMainWindow):
     def _fit_canvas_in_panel(
         self,
         panel: QWidget,
-        title_label: QLabel,
+        header_widget: QWidget,
         canvas: QWidget,
         footer_widget: QWidget | None = None,
         side_widget: QWidget | None = None,
@@ -5252,8 +5314,8 @@ class MainWindow(QMainWindow):
         margins = layout.contentsMargins()
         spacing = max(0, layout.spacing())
         used_h = 0
-        if title_label.isVisible():
-            used_h += title_label.sizeHint().height() + spacing
+        if header_widget.isVisible():
+            used_h += header_widget.sizeHint().height() + spacing
         if footer_widget is not None and footer_widget.isVisible():
             used_h += footer_widget.sizeHint().height() + spacing
 
@@ -5285,6 +5347,10 @@ class MainWindow(QMainWindow):
         canvas.setFixedSize(target_w, target_h)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key_F11:
+            self._toggle_fullscreen_view()
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._fullscreen_view_name is not None:
             self._set_fullscreen_view(None)
             event.accept()
@@ -5298,7 +5364,12 @@ class MainWindow(QMainWindow):
         self._set_fullscreen_view(view_name)
 
     def _set_fullscreen_view(self, view_name: str | None) -> None:
+        previous_view = self._fullscreen_view_name
+        if view_name is not None and previous_view is None:
+            self._capture_windowed_geometry_before_fullscreen()
+
         self._fullscreen_view_name = view_name
+        self._sync_fullscreen_button_states()
         if view_name is None:
             self._controls_scroll.setVisible(True)
             self._input_panel.setVisible(True)
@@ -5309,7 +5380,10 @@ class MainWindow(QMainWindow):
                 side_panel.setVisible(False)
             self._input_canvas.setEnabled(True)
             self._output_canvas.setEnabled(True)
-            self.showNormal()
+            if previous_view is not None:
+                self._restore_windowed_geometry_after_fullscreen()
+            else:
+                self.showNormal()
             self._splitter_initialized = False
             QTimer.singleShot(0, self._apply_initial_viewer_layout)
             return
