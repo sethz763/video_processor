@@ -745,18 +745,23 @@ class RoiCanvas(QWidget):
         self._image: QImage | None = None
         self._image_backing: np.ndarray | None = None
         self._roi = Roi(0, 0, FRAME_W, FRAME_H)
-        self._visual_roi_overlay: tuple[float, float, float, float] | None = None
+        self._visual_roi_overlay_transition: tuple[float, float, float, float] | None = None
+        self._visual_roi_overlay_drag: tuple[float, float, float, float] | None = None
 
         self._drag_mode = "none"
         self._drag_start_pos = QPointF()
         self._drag_start_roi = self._roi
 
         self._last_touch_emit_ts = 0.0
-        self._touch_emit_interval_s = 1.0 / 45.0
+        self._default_touch_emit_interval_s = 1.0 / 60.0
+        drag_emit_hz = max(60.0, min(90.0, float(os.environ.get("VP_MANUAL_DRAG_EMIT_HZ", "75"))))
+        self._drag_move_touch_emit_interval_s = 1.0 / drag_emit_hz
+        self._touch_emit_interval_s = self._default_touch_emit_interval_s
         self._touch_emit_pending = False
         self._touch_emit_pending_scale = False
         self._smoothing_percent = 60
         self._latency_smoothing_percent = 0
+        self._drag_x_hysteresis_px = max(0.10, min(1.20, float(os.environ.get("VP_ROI_DRAG_X_HYSTERESIS_PX", "0.45"))))
         self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         self._interaction_filtered_target_roi: Roi | None = None
         self._interaction_target_roi: Roi | None = None
@@ -775,7 +780,8 @@ class RoiCanvas(QWidget):
 
     def set_roi(self, roi: Roi) -> None:
         self._cancel_interaction_interpolation()
-        self._visual_roi_overlay = None
+        self._visual_roi_overlay_transition = None
+        self._visual_roi_overlay_drag = None
         self._apply_roi_local(roi)
 
     def cancel_pending_interaction_updates(self) -> None:
@@ -786,14 +792,33 @@ class RoiCanvas(QWidget):
         self._touch_emit_pending_scale = False
 
     def set_visual_roi_overlay(self, x: float, y: float, w: float, h: float) -> None:
-        self._visual_roi_overlay = (float(x), float(y), float(w), float(h))
+        self._visual_roi_overlay_transition = (float(x), float(y), float(w), float(h))
         self.update()
 
     def clear_visual_roi_overlay(self) -> None:
-        if self._visual_roi_overlay is None:
+        if self._visual_roi_overlay_transition is None:
             return
-        self._visual_roi_overlay = None
+        self._visual_roi_overlay_transition = None
         self.update()
+
+    def _set_drag_visual_roi_overlay(self, x: float, y: float, w: float, h: float) -> None:
+        # Keep a float-domain overlay while dragging so the ROI box tracks the
+        # pointer smoothly even when controller ROI is quantized to even pixels.
+        ow = max(2.0, min(float(FRAME_W), float(w)))
+        oh = max(2.0, min(float(FRAME_H), float(h)))
+        ox = max(0.0, min(float(FRAME_W) - ow, float(x)))
+        oy = max(0.0, min(float(FRAME_H) - oh, float(y)))
+        self._visual_roi_overlay_drag = (ox, oy, ow, oh)
+        self.update()
+
+    def _clear_drag_visual_roi_overlay(self) -> None:
+        if self._visual_roi_overlay_drag is None:
+            return
+        self._visual_roi_overlay_drag = None
+        self.update()
+
+    def drag_visual_roi_overlay(self) -> tuple[float, float, float, float] | None:
+        return self._visual_roi_overlay_drag
 
     def roi(self) -> Roi:
         return self._roi
@@ -803,6 +828,9 @@ class RoiCanvas(QWidget):
 
     def set_latency_smoothing_percent(self, value: int) -> None:
         self._latency_smoothing_percent = max(0, min(100, int(value)))
+
+    def set_drag_x_hysteresis_px(self, value: float) -> None:
+        self._drag_x_hysteresis_px = max(0.10, min(1.20, float(value)))
 
     def _resize_handle_rect(self, roi_rect: QRectF) -> QRectF:
         roi_min_edge = max(1.0, min(roi_rect.width(), roi_rect.height()))
@@ -831,6 +859,30 @@ class RoiCanvas(QWidget):
             or roi.y >= (max_y - m)
         )
 
+    def _quantize_drag_axis_with_hysteresis(
+        self,
+        target_value: float,
+        current_value: int,
+        quantum: int,
+        hysteresis_px: float,
+    ) -> int:
+        q = max(1, int(quantum))
+        current = int(current_value)
+        snapped = int(round(float(target_value) / float(q))) * q
+        if snapped == current:
+            return current
+
+        if snapped > current:
+            # Require crossing most of the next quantized step before advancing.
+            threshold = float(current + q) - float(hysteresis_px)
+            if float(target_value) < threshold:
+                return current
+        else:
+            threshold = float(current - q) + float(hysteresis_px)
+            if float(target_value) > threshold:
+                return current
+        return snapped
+
     def paintEvent(self, event) -> None:
         del event
         p = QPainter(self)
@@ -840,8 +892,12 @@ class RoiCanvas(QWidget):
         if self._image is not None:
             p.drawImage(image_rect, self._image)
 
-        if self._visual_roi_overlay is not None:
-            overlay_x, overlay_y, overlay_w, overlay_h = self._visual_roi_overlay
+        overlay = self._visual_roi_overlay_drag
+        if overlay is None:
+            overlay = self._visual_roi_overlay_transition
+
+        if overlay is not None:
+            overlay_x, overlay_y, overlay_w, overlay_h = overlay
             roi_rect_w = self._frame_to_widget_rect_float(overlay_x, overlay_y, overlay_w, overlay_h)
         else:
             roi_rect_w = self._frame_to_widget_rect(self._roi)
@@ -916,6 +972,18 @@ class RoiCanvas(QWidget):
         else:
             self._drag_mode = "none"
 
+        if self._drag_mode != "none":
+            self._set_drag_visual_roi_overlay(
+                float(self._roi.x),
+                float(self._roi.y),
+                float(self._roi.w),
+                float(self._roi.h),
+            )
+            if self._drag_mode == "move":
+                self._touch_emit_interval_s = self._drag_move_touch_emit_interval_s
+            else:
+                self._touch_emit_interval_s = self._default_touch_emit_interval_s
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_mode == "none":
             return
@@ -931,43 +999,68 @@ class RoiCanvas(QWidget):
         sy = FRAME_H / image_rect.height()
 
         if self._drag_mode == "move":
+            target_x = float(self._drag_start_roi.x) + (dx * sx)
+            target_y = float(self._drag_start_roi.y) + (dy * sy)
+            self._set_drag_visual_roi_overlay(
+                target_x,
+                target_y,
+                float(self._drag_start_roi.w),
+                float(self._drag_start_roi.h),
+            )
+
+            # ROI x must remain even for UYVY 4:2:2; use hysteresis-aware
+            # quantization to avoid rapid back/forth near quantization edges.
+            quant_x = self._quantize_drag_axis_with_hysteresis(
+                target_x,
+                self._roi.x,
+                quantum=2,
+                hysteresis_px=self._drag_x_hysteresis_px,
+            )
+            quant_y = self._quantize_drag_axis_with_hysteresis(
+                target_y,
+                self._roi.y,
+                quantum=1,
+                hysteresis_px=0.45,
+            )
             new_roi = Roi(
-                self._drag_start_roi.x + int(round(dx * sx)),
-                self._drag_start_roi.y + int(round(dy * sy)),
+                int(quant_x),
+                int(quant_y),
                 self._drag_start_roi.w,
                 self._drag_start_roi.h,
             )
         else:
-            dw_x = int(round(dx * sx))
-            dw_y = int(round(dy * sy * (16.0 / 9.0)))
+            dw_x = dx * sx
+            dw_y = dy * sy * (16.0 / 9.0)
             dw = dw_x if abs(dw_x) >= abs(dw_y) else dw_y
             # Resize around center so the whole ROI scales symmetrically.
-            new_w = self._drag_start_roi.w + (2 * dw)
-            new_h = int(round(new_w * 9.0 / 16.0))
-            center_x = self._drag_start_roi.x + (self._drag_start_roi.w / 2.0)
-            center_y = self._drag_start_roi.y + (self._drag_start_roi.h / 2.0)
+            new_w = float(self._drag_start_roi.w) + (2.0 * dw)
+            new_h = max(2.0, new_w * 9.0 / 16.0)
+            center_x = float(self._drag_start_roi.x) + (float(self._drag_start_roi.w) / 2.0)
+            center_y = float(self._drag_start_roi.y) + (float(self._drag_start_roi.h) / 2.0)
+            new_x = center_x - (new_w / 2.0)
+            new_y = center_y - (new_h / 2.0)
+            self._set_drag_visual_roi_overlay(new_x, new_y, new_w, new_h)
             new_roi = Roi(
-                int(round(center_x - (new_w / 2.0))),
-                int(round(center_y - (new_h / 2.0))),
-                new_w,
-                new_h,
+                int(round(new_x)),
+                int(round(new_y)),
+                int(round(new_w)),
+                int(round(new_h)),
             )
 
         target_roi = clamp_roi(new_roi)
-        if self._drag_mode == "move" and self._is_roi_near_frame_edge(target_roi, margin=64):
-            # Near frame limits, remove damping so drag remains faithful while
-            # clamp_roi still prevents crossing beyond the frame bounds.
-            self._cancel_interaction_interpolation()
-            self._set_roi_and_emit_touch_throttled(target_roi, emit_scale=False)
-            self._schedule_interaction_emit_flush()
-            return
-
         emit_scale = self._drag_mode != "move"
-        self._queue_interpolated_roi(target_roi, emit_scale=emit_scale, anchor_to_current=True)
+        self._queue_interpolated_roi(
+            target_roi,
+            emit_scale=emit_scale,
+            anchor_to_current=(self._drag_mode == "resize"),
+            apply_latency_filter=(self._drag_mode != "move"),
+        )
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         del event
         self._drag_mode = "none"
+        self._touch_emit_interval_s = self._default_touch_emit_interval_s
+        self._clear_drag_visual_roi_overlay()
         self._flush_interaction_emit()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -1018,9 +1111,17 @@ class RoiCanvas(QWidget):
             return
         self._set_roi_and_emit(new_roi, emit_scale=emit_scale)
 
-    def _queue_interpolated_roi(self, target_roi: Roi, emit_scale: bool = True, anchor_to_current: bool = False) -> None:
+    def _queue_interpolated_roi(
+        self,
+        target_roi: Roi,
+        emit_scale: bool = True,
+        anchor_to_current: bool = False,
+        apply_latency_filter: bool = True,
+    ) -> None:
         raw_target = clamp_roi(target_roi)
-        latency = max(0.0, min(1.0, self._latency_smoothing_percent / 100.0))
+        latency = 0.0
+        if apply_latency_filter:
+            latency = max(0.0, min(1.0, self._latency_smoothing_percent / 100.0))
         if anchor_to_current:
             # Treat each manual drag update as a fresh interpolation segment
             # from the currently displayed ROI to the latest pointer target.
@@ -1643,10 +1744,32 @@ class VideoProcessorController:
         self.worker_process_priority = _normalize_worker_priority_name(priority_name)
 
     def set_roi_subpixel_shift(self, shift_x: float, shift_y: float) -> None:
-        _ = (shift_x, shift_y)
+        if self.processor is not None and hasattr(self.processor, "set_subpixel_shift"):
+            self.processor.set_subpixel_shift(float(shift_x), float(shift_y))
 
-    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float) -> None:
-        _ = (roi, shift_x, shift_y)
+    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float, manual_drag: bool = False) -> bool:
+        _ = manual_drag
+        clamped = clamp_roi(roi)
+        if self.processor is not None:
+            moving_only = hasattr(self.processor, "set_roi_position")
+            if moving_only:
+                try:
+                    prev_roi = self.processor.get_roi() if hasattr(self.processor, "get_roi") else None
+                except Exception:
+                    prev_roi = None
+                if isinstance(prev_roi, tuple) and len(prev_roi) == 4:
+                    moving_only = (int(prev_roi[2]) == int(clamped.w) and int(prev_roi[3]) == int(clamped.h))
+            if moving_only and hasattr(self.processor, "set_roi_position"):
+                self.processor.set_roi_position(int(clamped.x), int(clamped.y))
+            else:
+                self.processor.set_roi(int(clamped.x), int(clamped.y), int(clamped.w), int(clamped.h))
+            if hasattr(self.processor, "set_subpixel_shift"):
+                self.processor.set_subpixel_shift(float(shift_x), float(shift_y))
+        return True
+
+    def set_roi_manual_drag_hold_seconds(self, hold_seconds: float) -> None:
+        _ = hold_seconds
+        return
 
     def start_roi_microstep_transition(
         self,
@@ -2458,8 +2581,8 @@ class ProcessVideoProcessorController:
             }
         )
 
-    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float) -> None:
-        self._send_control(
+    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float, manual_drag: bool = False) -> bool:
+        return self._send_control(
             {
                 "cmd": "set_roi_with_subpixel",
                 "x": int(roi.x),
@@ -2468,6 +2591,15 @@ class ProcessVideoProcessorController:
                 "h": int(roi.h),
                 "shift_x": float(shift_x),
                 "shift_y": float(shift_y),
+                "manual_drag": bool(manual_drag),
+            }
+        )
+
+    def set_roi_manual_drag_hold_seconds(self, hold_seconds: float) -> None:
+        self._send_control(
+            {
+                "cmd": "set_roi_manual_drag_hold_seconds",
+                "hold_seconds": float(hold_seconds),
             }
         )
 
@@ -3066,6 +3198,11 @@ class MainWindow(QMainWindow):
         self._no_frame_counter = 0
         self._roi_smoothing_percent = 60
         self._roi_latency_smoothing_percent = 0
+        self._roi_drag_x_hysteresis_px = max(0.10, min(1.20, float(os.environ.get("VP_ROI_DRAG_X_HYSTERESIS_PX", "0.45"))))
+        self._roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
+        self._roi_min_drag_nudge = max(0.0, min(0.50, float(os.environ.get("VP_ROI_MIN_DRAG_NUDGE", "0.035"))))
+        self._manual_drag_worker_send_hz = max(60.0, min(90.0, float(os.environ.get("VP_MANUAL_DRAG_WORKER_SEND_HZ", "75"))))
+        self._manual_drag_worker_send_interval_ms = int(round(1000.0 / self._manual_drag_worker_send_hz))
         self._roi_keyframes: dict[int, RoiKeyframe] = {}
         self._roi_keyframe_slots = (1, 2, 3, 4)
         self._roi_key_save_armed = False
@@ -3081,6 +3218,7 @@ class MainWindow(QMainWindow):
         self._status_repeat_log_interval_s = 5.0
         self._input_canvas.set_smoothing_percent(self._roi_smoothing_percent)
         self._input_canvas.set_latency_smoothing_percent(self._roi_latency_smoothing_percent)
+        self._input_canvas.set_drag_x_hysteresis_px(self._roi_drag_x_hysteresis_px)
 
         self._last_stat_time = time.perf_counter()
         self._frame_count = 0
@@ -3148,6 +3286,11 @@ class MainWindow(QMainWindow):
         self._controller_roi_applied = self._roi
         self._manual_live_target_roi: Roi | None = None
         self._pending_manual_controller_roi: Roi | None = None
+        self._manual_drag_interp_start_overlay: tuple[float, float, float, float] | None = None
+        self._manual_drag_interp_end_overlay: tuple[float, float, float, float] | None = None
+        self._manual_drag_interp_started_ts = 0.0
+        self._manual_drag_interp_duration_s = 1.0 / 90.0
+        self._manual_drag_last_event_ts = 0.0
         self._pending_roi_controls_sync: Roi | None = None
         self._last_manual_roi_update_ts = 0.0
         self._manual_roi_preview_reduce_scale = max(
@@ -3338,6 +3481,7 @@ class MainWindow(QMainWindow):
         self._sync_fullscreen_button_states()
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
+        self._apply_manual_drag_tuning_to_controller()
         self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
         self._source_mode = self.source_mode_combo.currentText()
@@ -3384,6 +3528,7 @@ class MainWindow(QMainWindow):
         self._apply_startup_ai_sr_settings()
         self._apply_controller_color_settings_from_ui()
         self._apply_worker_process_priority_to_controller(notify=False)
+        self._apply_manual_drag_tuning_to_controller()
         LOGGER.info("Worker controller recreated after unexpected worker exit")
 
     def _apply_controller_color_settings_from_ui(self) -> None:
@@ -3482,6 +3627,9 @@ class MainWindow(QMainWindow):
             self.scale_spin,
             self.roi_smoothing_slider,
             self.roi_latency_smoothing_slider,
+            self.roi_drag_x_hysteresis_spin,
+            self.roi_manual_drag_hold_spin,
+            self.roi_min_drag_nudge_spin,
             self.ai_sr_frame_interval_spin,
             self.ai_sr_overscan_spin,
             self.ai_sr_inference_divisor_spin,
@@ -3524,6 +3672,9 @@ class MainWindow(QMainWindow):
             "color_range": str(self.color_range_combo.currentText()),
             "roi_smoothing_percent": int(self.roi_smoothing_slider.value()),
             "roi_latency_smoothing_percent": int(self.roi_latency_smoothing_slider.value()),
+            "roi_drag_x_hysteresis_px": float(self.roi_drag_x_hysteresis_spin.value()),
+            "roi_manual_drag_hold_s": float(self.roi_manual_drag_hold_spin.value()),
+            "roi_min_drag_nudge": float(self.roi_min_drag_nudge_spin.value()),
             "roi_transition_duration_frames": int(self.roi_transition_frames_spin.value()),
             "roi_interpolation_mode": str(self.roi_interp_mode_combo.currentText()),
             "roi_keyframe_duration_override": bool(self.roi_keyframe_duration_override_btn.isChecked()),
@@ -3606,6 +3757,15 @@ class MainWindow(QMainWindow):
             )
             self.roi_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value())))))
             self.roi_latency_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_latency_smoothing_percent", self.roi_latency_smoothing_slider.value())))))
+            self.roi_drag_x_hysteresis_spin.setValue(
+                max(0.10, min(1.20, float(raw.get("roi_drag_x_hysteresis_px", self.roi_drag_x_hysteresis_spin.value()))))
+            )
+            self.roi_manual_drag_hold_spin.setValue(
+                max(0.05, min(0.50, float(raw.get("roi_manual_drag_hold_s", self.roi_manual_drag_hold_spin.value()))))
+            )
+            self.roi_min_drag_nudge_spin.setValue(
+                max(0.0, min(0.50, float(raw.get("roi_min_drag_nudge", self.roi_min_drag_nudge_spin.value()))))
+            )
             self.roi_transition_frames_spin.setValue(
                 max(1, min(600, int(raw.get("roi_transition_duration_frames", self.roi_transition_frames_spin.value()))))
             )
@@ -4503,6 +4663,33 @@ class MainWindow(QMainWindow):
         roi_latency_smoothing_layout.addWidget(self.roi_latency_smoothing_slider, 1)
         roi_latency_smoothing_layout.addWidget(self.roi_latency_smoothing_value_label)
         roi_form.addRow("Smoothing+Latency", roi_latency_smoothing_row)
+
+        self.roi_drag_x_hysteresis_spin = QDoubleSpinBox()
+        self.roi_drag_x_hysteresis_spin.setRange(0.10, 1.20)
+        self.roi_drag_x_hysteresis_spin.setDecimals(2)
+        self.roi_drag_x_hysteresis_spin.setSingleStep(0.01)
+        self.roi_drag_x_hysteresis_spin.setValue(float(self._roi_drag_x_hysteresis_px))
+        self.roi_drag_x_hysteresis_spin.valueChanged.connect(self._on_roi_drag_x_hysteresis_changed)
+        self.roi_drag_x_hysteresis_spin.setToolTip("Lower values track faster but can jitter; higher values resist micro-wobble.")
+        roi_form.addRow("Drag X hysteresis (px)", self.roi_drag_x_hysteresis_spin)
+
+        self.roi_manual_drag_hold_spin = QDoubleSpinBox()
+        self.roi_manual_drag_hold_spin.setRange(0.05, 0.50)
+        self.roi_manual_drag_hold_spin.setDecimals(2)
+        self.roi_manual_drag_hold_spin.setSingleStep(0.01)
+        self.roi_manual_drag_hold_spin.setValue(float(self._roi_manual_drag_hold_s))
+        self.roi_manual_drag_hold_spin.valueChanged.connect(self._on_roi_manual_drag_hold_changed)
+        self.roi_manual_drag_hold_spin.setToolTip("How long worker keeps softer follow mode after each manual drag update.")
+        roi_form.addRow("Manual drag hold (s)", self.roi_manual_drag_hold_spin)
+
+        self.roi_min_drag_nudge_spin = QDoubleSpinBox()
+        self.roi_min_drag_nudge_spin.setRange(0.00, 0.50)
+        self.roi_min_drag_nudge_spin.setDecimals(3)
+        self.roi_min_drag_nudge_spin.setSingleStep(0.005)
+        self.roi_min_drag_nudge_spin.setValue(float(self._roi_min_drag_nudge))
+        self.roi_min_drag_nudge_spin.valueChanged.connect(self._on_roi_min_drag_nudge_changed)
+        self.roi_min_drag_nudge_spin.setToolTip("Minimum subpixel motion while drag is active and carrier ROI is unchanged.")
+        roi_form.addRow("Min subpixel nudge", self.roi_min_drag_nudge_spin)
 
         self.roi_transition_frames_spin = QSpinBox()
         self.roi_transition_frames_spin.setRange(1, 600)
@@ -5697,6 +5884,28 @@ class MainWindow(QMainWindow):
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         self._manual_live_target_roi = self._roi
 
+        drag_overlay = self._input_canvas.drag_visual_roi_overlay()
+        if drag_overlay is not None:
+            now = time.perf_counter()
+            overlay = tuple(float(v) for v in drag_overlay)
+            prev_end = self._manual_drag_interp_end_overlay
+            if prev_end is None:
+                self._manual_drag_interp_start_overlay = overlay
+                self._manual_drag_interp_end_overlay = overlay
+                self._manual_drag_interp_started_ts = now
+                self._manual_drag_interp_duration_s = 1.0 / 90.0
+            else:
+                dt = now - self._manual_drag_last_event_ts if self._manual_drag_last_event_ts > 0.0 else (1.0 / 90.0)
+                self._manual_drag_interp_start_overlay = tuple(float(v) for v in prev_end)
+                self._manual_drag_interp_end_overlay = overlay
+                self._manual_drag_interp_started_ts = now
+                self._manual_drag_interp_duration_s = max(1.0 / 180.0, min(1.0 / 45.0, dt * 1.10))
+            self._manual_drag_last_event_ts = now
+        else:
+            self._manual_drag_interp_start_overlay = None
+            self._manual_drag_interp_end_overlay = None
+            self._manual_drag_last_event_ts = 0.0
+
         self._pending_manual_controller_roi = self._roi
         if not self._manual_roi_send_timer.isActive():
             self._manual_roi_send_timer.start()
@@ -5715,8 +5924,7 @@ class MainWindow(QMainWindow):
 
         current = self._controller_roi_applied
         use_subpixel_microstep = bool(
-            self._controller_backend == "worker-process"
-            and hasattr(self._controller, "set_roi_with_subpixel")
+            hasattr(self._controller, "set_roi_with_subpixel")
         )
         target_scale = roi_scale_from_roi(target)
         if use_subpixel_microstep:
@@ -5726,7 +5934,22 @@ class MainWindow(QMainWindow):
             step_shift_x = 0.0
             step_shift_y = 0.0
 
-        if self._is_controller_roi_close(step_roi, target):
+        moving_only = (
+            step_roi.w == self._controller_roi_applied.w
+            and step_roi.h == self._controller_roi_applied.h
+        )
+
+        drag_overlay = self._sample_manual_drag_overlay_target(self._input_canvas.drag_visual_roi_overlay())
+        if use_subpixel_microstep and moving_only and drag_overlay is not None:
+            step_roi, step_shift_x, step_shift_y = self._manual_roi_step_with_subpixel_float_target(
+                current,
+                drag_overlay,
+            )
+
+        should_close_snap = self._is_controller_roi_close(step_roi, target) and not (
+            use_subpixel_microstep and moving_only and drag_overlay is not None
+        )
+        if should_close_snap:
             step_roi = target
             step_shift_x = 0.0
             step_shift_y = 0.0
@@ -5735,15 +5958,16 @@ class MainWindow(QMainWindow):
             started = time.perf_counter()
             self._roi_diag_controller_send_attempts += 1
             if use_subpixel_microstep:
-                self._controller.set_roi_with_subpixel(step_roi, step_shift_x, step_shift_y)
-                sent = True
-            else:
-                moving_only = (
-                    step_roi.w == self._controller_roi_applied.w
-                    and step_roi.h == self._controller_roi_applied.h
-                    and hasattr(self._controller, "set_roi_position")
+                sent = bool(
+                    self._controller.set_roi_with_subpixel(
+                        step_roi,
+                        step_shift_x,
+                        step_shift_y,
+                        manual_drag=moving_only,
+                    )
                 )
-                if moving_only:
+            else:
+                if moving_only and hasattr(self._controller, "set_roi_position"):
                     sent = bool(self._controller.set_roi_position(step_roi.x, step_roi.y))
                 else:
                     sent = bool(self._controller.set_roi(step_roi))
@@ -5764,25 +5988,155 @@ class MainWindow(QMainWindow):
 
         # Continue stepping while target is not reached, or while new user
         # updates keep arriving.
-        if self._is_controller_roi_close(self._controller_roi_applied, target):
+        manual_drag_active = self._input_canvas.drag_visual_roi_overlay() is not None
+        if self._is_controller_roi_close(self._controller_roi_applied, target) and not manual_drag_active:
             if use_subpixel_microstep:
                 try:
-                    self._controller.set_roi_with_subpixel(target, 0.0, 0.0)
+                    self._controller.set_roi_with_subpixel(target, 0.0, 0.0, manual_drag=False)
                 except Exception:
                     pass
             self._manual_live_target_roi = None
+            self._manual_drag_interp_start_overlay = None
+            self._manual_drag_interp_end_overlay = None
+            self._manual_drag_last_event_ts = 0.0
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         if self._pending_manual_controller_roi is not None or self._manual_live_target_roi is not None:
-            self._manual_roi_send_timer.setInterval(self._manual_roi_send_interval_ms(target_scale))
+            interval_ms = self._manual_roi_send_interval_ms(target_scale, moving_only=moving_only)
+            if not sent and self._controller_backend == "worker-process":
+                # Back off on queue pressure; latest-wins ROI compaction keeps motion responsive.
+                interval_ms = min(24, interval_ms + 4)
+            self._manual_roi_send_timer.setInterval(interval_ms)
             self._manual_roi_send_timer.start()
 
-    def _manual_roi_send_interval_ms(self, zoom_scale: float) -> int:
+    def _manual_roi_send_interval_ms(self, zoom_scale: float, moving_only: bool = False) -> int:
         z = max(1.0, float(zoom_scale))
         if z >= 6.0:
-            return 8
-        if z >= 4.0:
-            return 10
-        return 16
+            base = 8
+        elif z >= 4.0:
+            base = 10
+        else:
+            base = 16
+
+        if moving_only and self._controller_backend == "worker-process":
+            return max(base, int(self._manual_drag_worker_send_interval_ms))
+        return base
+
+    def _sample_manual_drag_overlay_target(
+        self,
+        live_overlay: tuple[float, float, float, float] | None,
+    ) -> tuple[float, float, float, float] | None:
+        if live_overlay is None:
+            self._manual_drag_interp_start_overlay = None
+            self._manual_drag_interp_end_overlay = None
+            self._manual_drag_last_event_ts = 0.0
+            return None
+
+        start = self._manual_drag_interp_start_overlay
+        end = self._manual_drag_interp_end_overlay
+        if start is None or end is None:
+            overlay = tuple(float(v) for v in live_overlay)
+            self._manual_drag_interp_start_overlay = overlay
+            self._manual_drag_interp_end_overlay = overlay
+            self._manual_drag_interp_started_ts = time.perf_counter()
+            self._manual_drag_interp_duration_s = 1.0 / 90.0
+            return overlay
+
+        now = time.perf_counter()
+        duration = max(1e-4, float(self._manual_drag_interp_duration_s))
+        t = max(0.0, min(1.0, (now - float(self._manual_drag_interp_started_ts)) / duration))
+        curved_t = self._apply_roi_interpolation_curve(t, "ease_in_out")
+        sampled = (
+            float(start[0]) + ((float(end[0]) - float(start[0])) * curved_t),
+            float(start[1]) + ((float(end[1]) - float(start[1])) * curved_t),
+            float(start[2]) + ((float(end[2]) - float(start[2])) * curved_t),
+            float(start[3]) + ((float(end[3]) - float(start[3])) * curved_t),
+        )
+        if t >= 1.0:
+            self._manual_drag_interp_start_overlay = end
+            self._manual_drag_interp_started_ts = now
+        return sampled
+
+    def _manual_roi_step_with_subpixel_float_target(
+        self,
+        current: Roi,
+        target_overlay: tuple[float, float, float, float],
+    ) -> tuple[Roi, float, float]:
+        target_x, target_y, target_w, target_h = [float(v) for v in target_overlay]
+
+        moving_only = (
+            abs(target_w - float(current.w)) <= 1e-3
+            and abs(target_h - float(current.h)) <= 1e-3
+        )
+        zoom_scale = max(1.0, FRAME_W / max(1.0, float(current.w)))
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+
+        if moving_only:
+            if zoom_scale >= 6.0:
+                alpha_pos = 0.09
+            elif zoom_scale >= 4.0:
+                alpha_pos = 0.12
+            else:
+                alpha_pos = 0.16
+        else:
+            alpha_pos = 0.22
+        alpha_size = 0.20
+
+        alpha_scale = 1.15 - (0.55 * smoothing)
+        alpha_pos = max(0.05, min(0.32, alpha_pos * alpha_scale))
+        alpha_size = max(0.07, min(0.36, alpha_size * alpha_scale))
+
+        current_cx = float(current.x) + (float(current.w) * 0.5)
+        current_cy = float(current.y) + (float(current.h) * 0.5)
+        target_cx = target_x + (target_w * 0.5)
+        target_cy = target_y + (target_h * 0.5)
+
+        desired_cx = current_cx + ((target_cx - current_cx) * alpha_pos)
+        desired_cy = current_cy + ((target_cy - current_cy) * alpha_pos)
+        desired_w = float(current.w) + ((target_w - float(current.w)) * alpha_size)
+
+        quant_w = max(2, int(round(desired_w)) & ~1)
+        quant_h = max(2, int(round(quant_w * 9.0 / 16.0)))
+        desired_x = desired_cx - (float(quant_w) * 0.5)
+        desired_y = desired_cy - (float(quant_h) * 0.5)
+
+        carrier_roi = clamp_roi(
+            Roi(
+                int(round(desired_x)),
+                int(round(desired_y)),
+                quant_w,
+                quant_h,
+            )
+        )
+
+        carrier_cx = float(carrier_roi.x) + (float(carrier_roi.w) * 0.5)
+        carrier_cy = float(carrier_roi.y) + (float(carrier_roi.h) * 0.5)
+        source_dx = target_cx - carrier_cx
+        source_dy = target_cy - carrier_cy
+
+        sx = FRAME_W / max(1.0, float(carrier_roi.w))
+        sy = FRAME_H / max(1.0, float(carrier_roi.h))
+        max_shift_x = max(2.0, min(48.0, sx * 1.5))
+        max_shift_y = max(2.0, min(48.0, sy * 1.5))
+        shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
+        shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
+
+        # If even-pixel carrier ROI is unchanged during drag, ensure tiny
+        # non-zero subpixel motion so output does not appear to pause.
+        carrier_static = (
+            carrier_roi.x == current.x
+            and carrier_roi.y == current.y
+            and carrier_roi.w == current.w
+            and carrier_roi.h == current.h
+        )
+        if carrier_static and moving_only:
+            min_drag_nudge_x = float(self._roi_min_drag_nudge)
+            min_drag_nudge_y = float(self._roi_min_drag_nudge * 0.8)
+            if abs(source_dx) > 0.010 and abs(shift_x) < min_drag_nudge_x:
+                shift_x = max(-max_shift_x, min(max_shift_x, (-1.0 if source_dx > 0.0 else 1.0) * min_drag_nudge_x))
+            if abs(source_dy) > 0.010 and abs(shift_y) < min_drag_nudge_y:
+                shift_y = max(-max_shift_y, min(max_shift_y, (-1.0 if source_dy > 0.0 else 1.0) * min_drag_nudge_y))
+
+        return carrier_roi, float(shift_x), float(shift_y)
 
     def _manual_roi_step_with_subpixel(self, current: Roi, target: Roi) -> tuple[Roi, float, float]:
         moving_only = current.w == target.w and current.h == target.h
@@ -6164,6 +6518,28 @@ class MainWindow(QMainWindow):
         self._roi_latency_smoothing_percent = clamped
         self.roi_latency_smoothing_value_label.setText(f"{clamped}%")
         self._input_canvas.set_latency_smoothing_percent(clamped)
+
+    def _on_roi_drag_x_hysteresis_changed(self, value: float) -> None:
+        clamped = max(0.10, min(1.20, float(value)))
+        self._roi_drag_x_hysteresis_px = clamped
+        self._input_canvas.set_drag_x_hysteresis_px(clamped)
+
+    def _on_roi_manual_drag_hold_changed(self, value: float) -> None:
+        clamped = max(0.05, min(0.50, float(value)))
+        self._roi_manual_drag_hold_s = clamped
+        self._apply_manual_drag_tuning_to_controller()
+
+    def _on_roi_min_drag_nudge_changed(self, value: float) -> None:
+        clamped = max(0.0, min(0.50, float(value)))
+        self._roi_min_drag_nudge = clamped
+
+    def _apply_manual_drag_tuning_to_controller(self) -> None:
+        if not hasattr(self._controller, "set_roi_manual_drag_hold_seconds"):
+            return
+        try:
+            self._controller.set_roi_manual_drag_hold_seconds(float(self._roi_manual_drag_hold_s))
+        except Exception:
+            LOGGER.exception("Failed to apply manual drag hold tuning")
 
     def _is_controller_roi_close(self, roi_a: Roi, roi_b: Roi) -> bool:
         return (

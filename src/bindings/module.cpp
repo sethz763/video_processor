@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cctype>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -38,6 +39,58 @@ std::pair<const std::uint8_t*, std::size_t> GetContiguousByteBuffer(const py::bu
         reinterpret_cast<const std::uint8_t*>(info.ptr),
         total_bytes,
     };
+}
+
+std::pair<std::uint8_t*, std::size_t> GetWritableContiguousByteBuffer(
+    const py::buffer& buffer,
+    const char* buffer_name
+) {
+    const py::buffer_info info = buffer.request();
+    if (info.readonly) {
+        throw py::value_error(std::string(buffer_name) + " must be writable");
+    }
+    if (info.itemsize != 1) {
+        throw py::value_error(std::string(buffer_name) + " must have byte-sized elements");
+    }
+    if (info.ndim < 1) {
+        throw py::value_error(std::string(buffer_name) + " must have at least one dimension");
+    }
+
+    std::size_t total_bytes = static_cast<std::size_t>(info.itemsize);
+    for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+        const py::ssize_t shape = info.shape[dim];
+        const py::ssize_t stride = info.strides[dim];
+        if (shape < 0) {
+            throw py::value_error(std::string(buffer_name) + " has invalid shape");
+        }
+        if (shape > 1 && stride != static_cast<py::ssize_t>(total_bytes)) {
+            throw py::value_error(std::string(buffer_name) + " must be C-contiguous");
+        }
+        total_bytes *= static_cast<std::size_t>(shape);
+    }
+
+    return {
+        reinterpret_cast<std::uint8_t*>(info.ptr),
+        total_bytes,
+    };
+}
+
+py::ssize_t CopyOutputToWritableBuffer(
+    const std::string& output,
+    std::uint8_t* out_ptr,
+    std::size_t out_size,
+    const char* output_arg_name
+) {
+    if (output.size() != out_size) {
+        throw py::value_error(
+            std::string(output_arg_name) +
+            " has incorrect size; expected " +
+            std::to_string(output.size()) +
+            " bytes"
+        );
+    }
+    std::memcpy(out_ptr, output.data(), output.size());
+    return static_cast<py::ssize_t>(output.size());
 }
 
 }  // namespace
@@ -82,6 +135,23 @@ PYBIND11_MODULE(video_processor, m) {
             "Process one 1920x1080 interlaced UYVY frame and return UYVY bytes."
         )
         .def(
+            "process_frame_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Process one frame and write UYVY bytes into a caller-provided writable output buffer."
+        )
+        .def(
             "process_frame_no_deinterlace",
             [](vp::VideoProcessor& self, const py::buffer& frame) {
                 const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
@@ -94,6 +164,23 @@ PYBIND11_MODULE(video_processor, m) {
             },
             py::arg("frame"),
             "Process one UYVY frame while skipping Bob deinterlacing in this pass."
+        )
+        .def(
+            "process_frame_no_deinterlace_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameNoDeinterlaceBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Process one frame with deinterlace disabled and write UYVY bytes into a writable output buffer."
         )
         .def(
             "process_frame_deinterlace_only",
@@ -110,6 +197,23 @@ PYBIND11_MODULE(video_processor, m) {
             "Apply Bob deinterlacing and return deinterlaced UYVY bytes without ROI scaling."
         )
         .def(
+            "process_frame_deinterlace_only_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameDeinterlaceOnlyBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Apply Bob deinterlacing and write UYVY bytes into a writable output buffer."
+        )
+        .def(
             "process_frame_preprocess_only",
             [](vp::VideoProcessor& self, const py::buffer& frame) {
                 const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
@@ -122,6 +226,23 @@ PYBIND11_MODULE(video_processor, m) {
             },
             py::arg("frame"),
             "Apply enabled preprocess stages (deinterlace/denoise) and return UYVY bytes without ROI scaling."
+        )
+        .def(
+            "process_frame_preprocess_only_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFramePreprocessOnlyBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Apply enabled preprocess stages and write UYVY bytes into a writable output buffer."
         )
         .def(
             "process_frame_preprocess_roi_rgb",

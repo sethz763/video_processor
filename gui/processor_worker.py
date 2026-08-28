@@ -424,6 +424,12 @@ def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
     return sample.size > 0 and int(np.count_nonzero(sample)) == 0
 
 
+def _freeze_frame_bytes(frame_bytes: bytes | bytearray | memoryview) -> bytes:
+    if isinstance(frame_bytes, bytes):
+        return frame_bytes
+    return bytes(frame_bytes)
+
+
 def _has_effective_subpixel_shift(shift_x: float, shift_y: float) -> bool:
     eps = float(_SUBPIXEL_SHIFT_APPLY_EPS)
     return abs(float(shift_x)) >= eps or abs(float(shift_y)) >= eps
@@ -1725,6 +1731,11 @@ class _StageFrame:
     output_bytes: bytes | None = None
     shift_x: float = 0.0
     shift_y: float = 0.0
+    roi_x: int = 0
+    roi_y: int = 0
+    roi_w: int = FRAME_W
+    roi_h: int = FRAME_H
+    effective_sr_scale: int = 1
     ai_applied: bool = False
     rtx_applied: bool = False
     native_shift_applied: bool = False
@@ -1756,6 +1767,25 @@ def run_processor_worker(
     _TM_TARGET_Y = 13
     _TM_TARGET_W = 14
     _TM_TARGET_H = 15
+
+    reusable_native_into_supported = False
+    reusable_process_frame_out: bytearray | None = None
+    reusable_process_frame_no_deinterlace_out: bytearray | None = None
+    reusable_process_frame_deinterlace_only_out: bytearray | None = None
+    reusable_process_frame_preprocess_only_out: bytearray | None = None
+
+    def _run_native_uyvy_process(
+        frame_bytes: bytes,
+        process_method_name: str,
+        process_into_method_name: str,
+        reusable_output: bytearray | None,
+    ) -> bytes | bytearray:
+        method = getattr(processor, process_method_name)
+        if reusable_output is not None and hasattr(processor, process_into_method_name):
+            into_method = getattr(processor, process_into_method_name)
+            into_method(frame_bytes, reusable_output)
+            return reusable_output
+        return method(frame_bytes)
 
     def _interp_mode_to_code(interp_mode: str) -> int:
         mode = str(interp_mode).strip().lower()
@@ -1908,7 +1938,11 @@ def run_processor_worker(
     capture_thread: threading.Thread | None = None
     preprocess_thread: threading.Thread | None = None
     upscale_thread: threading.Thread | None = None
+    upscale_extra_threads: list[threading.Thread] = []
     output_thread: threading.Thread | None = None
+    parallel_basic_processors: list[Any] = []
+    parallel_basic_worker_count = 1
+    parallel_basic_max_inflight = max(1, min(4, int(os.environ.get("VP_BASIC_SCALING_MAX_INFLIGHT", "1"))))
     q_capture_to_preprocess: queue.Queue[_StageFrame] | None = None
     q_preprocess_to_upscale: queue.Queue[_StageFrame] | None = None
     q_upscale_to_output: queue.Queue[_StageFrame] | None = None
@@ -2056,6 +2090,8 @@ def run_processor_worker(
     roi_shift_velocity_y = 0.0
     roi_shift_accel_x = 0.0
     roi_shift_accel_y = 0.0
+    roi_manual_drag_until_ts = 0.0
+    roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
     roi_microstep_transition: dict[str, object] | None = None
     current_deinterlace_enabled = bool(startup_config.get("deinterlace_enabled", True))
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
@@ -2063,6 +2099,9 @@ def run_processor_worker(
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
     current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 2))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
+    current_basic_scaling_auto_mode = bool(startup_config.get("basic_scaling_auto_mode", True))
+    current_basic_scaling_manual_scale = int(startup_config.get("basic_scaling_manual", startup_config.get("sr_scale", 4)))
+    current_max_auto_basic_scaling = int(startup_config.get("max_auto_basic_scaling", startup_config.get("max_auto_sr_scale", 4)))
     state_lock = threading.Lock()
 
     def _is_live_passthrough_mode() -> bool:
@@ -2095,6 +2134,7 @@ def run_processor_worker(
         nonlocal roi_shift_velocity_x, roi_shift_velocity_y
         nonlocal roi_shift_target_lpf_x, roi_shift_target_lpf_y
         nonlocal roi_shift_accel_x, roi_shift_accel_y
+        nonlocal roi_manual_drag_until_ts
         nonlocal roi_microstep_transition
 
         # During active keyframe transitions, apply the exact per-frame shift
@@ -2112,15 +2152,28 @@ def run_processor_worker(
 
         # Deterministic microstep follower: predictable per-frame motion with
         # very small minimum steps to avoid perceptible stair-stepping.
-        target_alpha = 0.34
-        follow_alpha_x = 0.22
-        follow_alpha_y = 0.20
-        min_step_x = 0.0040
-        min_step_y = 0.0035
-        max_step_x = 0.30
-        max_step_y = 0.26
-        settle_eps_x = 0.0012
-        settle_eps_y = 0.0010
+        manual_drag_active = time.perf_counter() <= float(roi_manual_drag_until_ts)
+        if manual_drag_active:
+            # Softer follower during manual drag to hide even-x carrier steps.
+            target_alpha = 0.26
+            follow_alpha_x = 0.16
+            follow_alpha_y = 0.14
+            min_step_x = 0.0030
+            min_step_y = 0.0026
+            max_step_x = 0.22
+            max_step_y = 0.19
+            settle_eps_x = 0.0010
+            settle_eps_y = 0.0009
+        else:
+            target_alpha = 0.34
+            follow_alpha_x = 0.22
+            follow_alpha_y = 0.20
+            min_step_x = 0.0040
+            min_step_y = 0.0035
+            max_step_x = 0.30
+            max_step_y = 0.26
+            settle_eps_x = 0.0012
+            settle_eps_y = 0.0010
 
         roi_shift_target_lpf_x += (float(roi_shift_target_x) - roi_shift_target_lpf_x) * target_alpha
         roi_shift_target_lpf_y += (float(roi_shift_target_y) - roi_shift_target_lpf_y) * target_alpha
@@ -2653,10 +2706,32 @@ def run_processor_worker(
             except queue.Full:
                 return True
 
+    def _put_stage_frame_fifo_drop_newest(stage_queue: queue.Queue[_StageFrame], item: _StageFrame) -> bool:
+        # Preserve FIFO order under saturation by dropping the incoming frame.
+        try:
+            stage_queue.put_nowait(item)
+            return False
+        except queue.Full:
+            return True
+
+    def _put_stage_frame_blocking(stage_queue: queue.Queue[_StageFrame], item: _StageFrame, timeout_s: float = 0.03) -> bool:
+        # Backpressure producers instead of evicting older frames.
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        while not pipeline_stop_event.is_set():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                return False
+            try:
+                stage_queue.put(item, timeout=min(0.005, remaining))
+                return True
+            except queue.Full:
+                continue
+        return False
+
     def _denoise_enabled() -> bool:
         return current_denoise_method not in {"off", "none"} and current_denoise_strength > 0.001
 
-    def _is_valid_uyvy_frame(frame_bytes: bytes) -> bool:
+    def _is_valid_uyvy_frame(frame_bytes: bytes | bytearray | memoryview) -> bool:
         return isinstance(frame_bytes, (bytes, bytearray)) and len(frame_bytes) == (UYVY_ROW_BYTES * FRAME_H)
 
     def _set_native_subpixel_shift(shift_x: float, shift_y: float) -> bool:
@@ -2712,9 +2787,19 @@ def run_processor_worker(
 
         native_out = frame_bytes
         if hasattr(processor, "process_frame_preprocess_only"):
-            native_out = processor.process_frame_preprocess_only(frame_bytes)
+            native_out = _run_native_uyvy_process(
+                frame_bytes,
+                "process_frame_preprocess_only",
+                "process_frame_preprocess_only_into",
+                reusable_process_frame_preprocess_only_out,
+            )
         elif current_deinterlace_enabled and hasattr(processor, "process_frame_deinterlace_only"):
-            native_out = processor.process_frame_deinterlace_only(frame_bytes)
+            native_out = _run_native_uyvy_process(
+                frame_bytes,
+                "process_frame_deinterlace_only",
+                "process_frame_deinterlace_only_into",
+                reusable_process_frame_deinterlace_only_out,
+            )
         else:
             return frame_bytes, False
 
@@ -2748,9 +2833,19 @@ def run_processor_worker(
 
         basic_stage_start_ts = time.perf_counter()
         if preprocess_already_applied and hasattr(processor, "process_frame_no_deinterlace"):
-            scaled = processor.process_frame_no_deinterlace(frame_bytes)
+            scaled = _run_native_uyvy_process(
+                frame_bytes,
+                "process_frame_no_deinterlace",
+                "process_frame_no_deinterlace_into",
+                reusable_process_frame_no_deinterlace_out,
+            )
         else:
-            scaled = processor.process_frame(frame_bytes)
+            scaled = _run_native_uyvy_process(
+                frame_bytes,
+                "process_frame",
+                "process_frame_into",
+                reusable_process_frame_out,
+            )
         basic_stage_ms = max(0.0, (time.perf_counter() - basic_stage_start_ts) * 1000.0)
 
         # Strict GPU-only mode: no CPU fallback.
@@ -2862,16 +2957,21 @@ def run_processor_worker(
 
     def _stop_live_pipeline() -> None:
         nonlocal pipeline_running, capture_thread, preprocess_thread, upscale_thread, output_thread
+        nonlocal upscale_extra_threads, parallel_basic_processors, parallel_basic_worker_count
         if not pipeline_running:
             return
         pipeline_stop_event.set()
-        for thread in (capture_thread, upscale_thread, output_thread):
+        threads_to_join = [capture_thread, upscale_thread, output_thread, *upscale_extra_threads]
+        for thread in threads_to_join:
             if thread is not None:
                 thread.join(timeout=1.0)
         capture_thread = None
         preprocess_thread = None
         upscale_thread = None
+        upscale_extra_threads = []
         output_thread = None
+        parallel_basic_processors = []
+        parallel_basic_worker_count = 1
         pipeline_running = False
 
     def _start_live_pipeline() -> None:
@@ -2879,6 +2979,7 @@ def run_processor_worker(
         nonlocal q_capture_to_preprocess, q_preprocess_to_upscale, q_upscale_to_output
         nonlocal frame_id_counter, capture_drop_count, preprocess_drop_count, upscale_drop_count
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
+        nonlocal upscale_extra_threads, parallel_basic_processors, parallel_basic_worker_count
         nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
         nonlocal output_nominal_fps, output_frame_period_s
@@ -2902,9 +3003,29 @@ def run_processor_worker(
 
         _stop_live_pipeline()
         pipeline_stop_event.clear()
-        q_capture_to_preprocess = queue.Queue(maxsize=2)
+        parallel_basic_processors = []
+        parallel_basic_worker_count = 1
+        if parallel_basic_max_inflight > 1 and _is_live_basic_scaling_fast_mode():
+            for _ in range(parallel_basic_max_inflight):
+                try:
+                    parallel_proc, _ = _create_processor(module, startup_config)
+                except Exception:
+                    parallel_basic_processors = []
+                    parallel_basic_worker_count = 1
+                    _safe_put(
+                        {
+                            "type": "warning",
+                            "warning": "Parallel basic scaling init failed; falling back to single-worker scaling",
+                        }
+                    )
+                    break
+                parallel_basic_processors.append(parallel_proc)
+            if parallel_basic_processors:
+                parallel_basic_worker_count = len(parallel_basic_processors)
+
+        q_capture_to_preprocess = queue.Queue(maxsize=max(2, parallel_basic_worker_count * 2))
         q_preprocess_to_upscale = None
-        q_upscale_to_output = queue.Queue(maxsize=1)
+        q_upscale_to_output = queue.Queue(maxsize=max(1, parallel_basic_worker_count))
         frame_id_counter = 0
         capture_drop_count = 0
         preprocess_drop_count = 0
@@ -2961,6 +3082,7 @@ def run_processor_worker(
         timing_last_path = ""
         preprocess_noop_warning_emitted = False
         native_subpixel_warning_emitted = False
+        upscale_extra_threads = []
 
         def _record_pipeline_timing(
             path_name: str,
@@ -3070,7 +3192,12 @@ def run_processor_worker(
                     if _set_native_subpixel_shift(shift_x, shift_y):
                         native_shift_applied = _has_effective_subpixel_shift(shift_x, shift_y)
                     if native_shift_applied and hasattr(processor, "process_frame_no_deinterlace"):
-                        output_bytes = processor.process_frame_no_deinterlace(output_bytes)
+                        output_bytes = _run_native_uyvy_process(
+                            output_bytes,
+                            "process_frame_no_deinterlace",
+                            "process_frame_no_deinterlace_into",
+                            reusable_process_frame_no_deinterlace_out,
+                        )
                     elif _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
                         output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                     process_end_ts = time.perf_counter()
@@ -3122,6 +3249,27 @@ def run_processor_worker(
                     continue
 
                 if _is_live_basic_scaling_fast_mode():
+                    if parallel_basic_worker_count > 1:
+                        # Parallel basic scaling is handled in dedicated upscale workers.
+                        shift_x, shift_y = _step_smoothed_roi_shift()
+                        next_frame_id = frame_id_counter + 1
+                        item = _StageFrame(
+                            frame_id=next_frame_id,
+                            captured_ts=frame_captured_ts,
+                            input_bytes=input_bytes,
+                            shift_x=float(shift_x),
+                            shift_y=float(shift_y),
+                            roi_x=int(current_roi_x),
+                            roi_y=int(current_roi_y),
+                            roi_w=int(current_roi_w),
+                            roi_h=int(current_roi_h),
+                        )
+                        if _put_stage_frame_fifo_drop_newest(q_capture_to_preprocess, item):
+                            capture_drop_count += 1
+                        else:
+                            frame_id_counter = next_frame_id
+                        continue
+
                     # Keep basic-scaling-only path off the staged queue graph to
                     # reduce Python scheduling overhead at 1080p60.
                     process_start_ts = time.perf_counter()
@@ -3204,22 +3352,154 @@ def run_processor_worker(
                     continue
 
                 frame_id_counter += 1
-                item = _StageFrame(frame_id=frame_id_counter, captured_ts=frame_captured_ts, input_bytes=input_bytes)
+                shift_x, shift_y = _step_smoothed_roi_shift()
+                item = _StageFrame(
+                    frame_id=frame_id_counter,
+                    captured_ts=frame_captured_ts,
+                    input_bytes=input_bytes,
+                    shift_x=float(shift_x),
+                    shift_y=float(shift_y),
+                    roi_x=int(current_roi_x),
+                    roi_y=int(current_roi_y),
+                    roi_w=int(current_roi_w),
+                    roi_h=int(current_roi_h),
+                )
                 if _put_latest_stage_frame(q_capture_to_preprocess, item):
                     capture_drop_count += 1
 
-        def _upscale_worker() -> None:
+        def _upscale_worker(worker_index: int = 0) -> None:
             nonlocal upscale_drop_count, ai_sr_dropped_frames, preprocess_drop_count
             nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
             nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
             nonlocal last_stage_stack
             assert q_capture_to_preprocess is not None
             assert q_upscale_to_output is not None
+
+            thread_parallel_proc = None
+            if worker_index < len(parallel_basic_processors):
+                thread_parallel_proc = parallel_basic_processors[worker_index]
+
+            last_synced_mode_auto: bool | None = None
+            last_synced_manual_scale: int | None = None
+            last_synced_max_auto_scale: int | None = None
+            last_synced_method = ""
+            last_synced_deinterlace_enabled: bool | None = None
+            last_synced_deinterlace_method = ""
+            last_synced_denoise_method = ""
+            last_synced_denoise_strength: float | None = None
+            last_synced_color_space = ""
+            last_synced_color_range = ""
+
             while not pipeline_stop_event.is_set():
                 try:
                     item = q_capture_to_preprocess.get(timeout=0.01)
                 except queue.Empty:
                     continue
+
+                parallel_basic_active = (
+                    thread_parallel_proc is not None
+                    and parallel_basic_worker_count > 1
+                    and _is_live_basic_scaling_fast_mode()
+                )
+
+                if parallel_basic_active:
+                    try:
+                        if hasattr(thread_parallel_proc, "set_roi"):
+                            thread_parallel_proc.set_roi(int(item.roi_x), int(item.roi_y), int(item.roi_w), int(item.roi_h))
+
+                        if hasattr(thread_parallel_proc, "set_sr_flavor") and current_basic_scaling_method != last_synced_method:
+                            thread_parallel_proc.set_sr_flavor(current_basic_scaling_method)
+                            last_synced_method = str(current_basic_scaling_method)
+
+                        if hasattr(thread_parallel_proc, "set_max_auto_sr_scale") and current_max_auto_basic_scaling != last_synced_max_auto_scale:
+                            thread_parallel_proc.set_max_auto_sr_scale(int(current_max_auto_basic_scaling))
+                            last_synced_max_auto_scale = int(current_max_auto_basic_scaling)
+
+                        if current_basic_scaling_auto_mode != last_synced_mode_auto:
+                            if current_basic_scaling_auto_mode:
+                                thread_parallel_proc.set_sr_mode_auto()
+                            else:
+                                thread_parallel_proc.set_sr_scale_manual(int(current_basic_scaling_manual_scale))
+                            last_synced_mode_auto = bool(current_basic_scaling_auto_mode)
+
+                        if (
+                            (not current_basic_scaling_auto_mode)
+                            and current_basic_scaling_manual_scale != last_synced_manual_scale
+                        ):
+                            thread_parallel_proc.set_sr_scale_manual(int(current_basic_scaling_manual_scale))
+                            last_synced_manual_scale = int(current_basic_scaling_manual_scale)
+
+                        if current_deinterlace_enabled != last_synced_deinterlace_enabled:
+                            thread_parallel_proc.set_deinterlace_enabled(bool(current_deinterlace_enabled))
+                            last_synced_deinterlace_enabled = bool(current_deinterlace_enabled)
+
+                        if hasattr(thread_parallel_proc, "set_deinterlace_method") and current_deinterlace_method != last_synced_deinterlace_method:
+                            thread_parallel_proc.set_deinterlace_method(current_deinterlace_method)
+                            last_synced_deinterlace_method = str(current_deinterlace_method)
+
+                        if hasattr(thread_parallel_proc, "set_denoise_method") and current_denoise_method != last_synced_denoise_method:
+                            thread_parallel_proc.set_denoise_method(current_denoise_method)
+                            last_synced_denoise_method = str(current_denoise_method)
+
+                        if (
+                            hasattr(thread_parallel_proc, "set_denoise_strength")
+                            and (last_synced_denoise_strength is None or abs(current_denoise_strength - last_synced_denoise_strength) > 1e-6)
+                        ):
+                            thread_parallel_proc.set_denoise_strength(float(current_denoise_strength))
+                            last_synced_denoise_strength = float(current_denoise_strength)
+
+                        if hasattr(thread_parallel_proc, "set_color_space") and current_color_space != last_synced_color_space:
+                            thread_parallel_proc.set_color_space(current_color_space)
+                            last_synced_color_space = str(current_color_space)
+
+                        if hasattr(thread_parallel_proc, "set_color_range") and current_color_range != last_synced_color_range:
+                            thread_parallel_proc.set_color_range(current_color_range)
+                            last_synced_color_range = str(current_color_range)
+
+                        native_shift_applied = False
+                        if hasattr(thread_parallel_proc, "set_subpixel_shift"):
+                            thread_parallel_proc.set_subpixel_shift(float(item.shift_x), float(item.shift_y))
+                            native_shift_applied = _has_effective_subpixel_shift(float(item.shift_x), float(item.shift_y))
+
+                        item.process_start_ts = time.perf_counter()
+                        output_bytes = thread_parallel_proc.process_frame(item.input_bytes)
+                        item.process_end_ts = time.perf_counter()
+                        basic_stage_ms = max(0.0, (item.process_end_ts - item.process_start_ts) * 1000.0)
+                        _record_basic_scaling_timing(basic_stage_ms)
+
+                        if (not _is_valid_uyvy_frame(output_bytes)) or _looks_zeroed_uyvy_frame(output_bytes):
+                            output_bytes = item.input_bytes
+                            basic_applied = False
+                            native_shift_applied = False
+                        else:
+                            basic_applied = True
+
+                        last_stage_preprocess_applied = False
+                        last_stage_basic_applied = bool(basic_applied)
+                        last_stage_ai_applied = False
+                        last_stage_rtx_applied = False
+                        last_stage_stack = ["basic_scaling"] if basic_applied else []
+
+                        if basic_applied:
+                            stage_basic_applied_frames += 1
+                        else:
+                            stage_passthrough_frames += 1
+
+                        item.output_bytes = output_bytes
+                        if hasattr(thread_parallel_proc, "get_effective_sr_scale"):
+                            item.effective_sr_scale = int(thread_parallel_proc.get_effective_sr_scale())
+                        else:
+                            item.effective_sr_scale = 1
+                        item.native_shift_applied = bool(native_shift_applied)
+                        item.ai_applied = False
+                        item.rtx_applied = False
+                        item.output_queue_put_ts = time.perf_counter()
+                        if not _put_stage_frame_blocking(q_upscale_to_output, item):
+                            upscale_drop_count += 1
+                        continue
+                    except Exception as exc:
+                        _safe_put({"type": "warning", "warning": f"Parallel basic scaling worker failed: {exc}"})
+                        continue
 
                 try:
                     item.preprocess_bytes = item.input_bytes
@@ -3231,11 +3511,10 @@ def run_processor_worker(
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
                     item.process_start_ts = time.perf_counter()
-                    shift_x, shift_y = _step_smoothed_roi_shift()
                     output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
                         preprocessed,
-                        shift_x,
-                        shift_y,
+                        float(item.shift_x),
+                        float(item.shift_y),
                     )
                     item.process_end_ts = time.perf_counter()
                     stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
@@ -3264,8 +3543,7 @@ def run_processor_worker(
                 last_stage_stack = _build_stage_stack()
 
                 item.output_bytes = output_bytes
-                item.shift_x = float(shift_x)
-                item.shift_y = float(shift_y)
+                item.effective_sr_scale = int(processor.get_effective_sr_scale()) if hasattr(processor, "get_effective_sr_scale") else 1
                 item.ai_applied = bool(ai_applied)
                 item.rtx_applied = bool(rtx_applied)
                 item.native_shift_applied = bool(native_shift_applied)
@@ -3278,13 +3556,17 @@ def run_processor_worker(
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
             nonlocal rtx_effect_sample_counter
             assert q_upscale_to_output is not None
-            while not pipeline_stop_event.is_set():
-                try:
-                    item = q_upscale_to_output.get(timeout=0.01)
-                except queue.Empty:
-                    continue
 
-                item.output_dequeue_ts = time.perf_counter()
+            # Preserve capture order when parallel upscale workers complete out-of-order.
+            reorder_pending: dict[int, _StageFrame] = {}
+            next_frame_id = 1
+            max_reorder_buffer = max(2, parallel_basic_worker_count * 2)
+            max_reorder_wait_s = 0.012
+
+            def _emit_output_item(item: _StageFrame) -> None:
+                nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
+                nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+                nonlocal rtx_effect_sample_counter
 
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
                 shift_x = float(item.shift_x)
@@ -3311,9 +3593,8 @@ def run_processor_worker(
                         except Exception:
                             sampled_delta = 0.0
 
-                output_wait_s = 0.0
-
                 emit_start_ts = time.perf_counter()
+                output_wait_s = max(0.0, emit_start_ts - item.output_dequeue_ts) if item.output_dequeue_ts > 0.0 else 0.0
                 try:
                     if output_session is not None:
                         emitted = _write_frame_to_output(output_session, output_bytes)
@@ -3321,7 +3602,7 @@ def run_processor_worker(
                         emitted = False
                 except Exception as exc:
                     _safe_put({"type": "warning", "warning": f"Output stage failed: {exc}"})
-                    continue
+                    return
                 emit_end_ts = time.perf_counter()
 
                 process_start_ts = item.process_start_ts if item.process_start_ts > 0.0 else item.captured_ts
@@ -3342,7 +3623,7 @@ def run_processor_worker(
                 with state_lock:
                     latest_input_frame = item.input_bytes
                     latest_output_frame = output_bytes
-                    latest_effective_sr_scale = int(processor.get_effective_sr_scale())
+                    latest_effective_sr_scale = int(item.effective_sr_scale)
                     latest_rtx_vsr_applied = bool(item.rtx_applied)
                     latest_rtx_effect_mean_abs_luma = sampled_delta
                     if emitted:
@@ -3363,13 +3644,48 @@ def run_processor_worker(
                     )
                     _advance_roi_microstep_transition_one_frame()
 
+            while not pipeline_stop_event.is_set():
+                try:
+                    item = q_upscale_to_output.get(timeout=0.01)
+                except queue.Empty:
+                    item = None
+
+                now_ts = time.perf_counter()
+                if item is not None:
+                    item.output_dequeue_ts = now_ts
+                    reorder_pending[int(item.frame_id)] = item
+
+                while reorder_pending:
+                    if next_frame_id in reorder_pending:
+                        ready_item = reorder_pending.pop(next_frame_id)
+                        next_frame_id += 1
+                        _emit_output_item(ready_item)
+                        continue
+
+                    min_pending_id = min(reorder_pending.keys())
+                    oldest_pending = min(reorder_pending.values(), key=lambda f: f.output_dequeue_ts)
+                    oldest_wait_s = max(0.0, now_ts - oldest_pending.output_dequeue_ts)
+                    if len(reorder_pending) >= max_reorder_buffer or oldest_wait_s >= max_reorder_wait_s:
+                        next_frame_id = min_pending_id
+                        continue
+                    break
+
         capture_thread = threading.Thread(target=_capture_worker, name="vp-capture", daemon=True)
         preprocess_thread = None
-        upscale_thread = threading.Thread(target=_upscale_worker, name="vp-upscale", daemon=True)
+        upscale_thread = threading.Thread(target=lambda: _upscale_worker(0), name="vp-upscale-0", daemon=True)
+        for worker_index in range(1, parallel_basic_worker_count):
+            extra_thread = threading.Thread(
+                target=lambda i=worker_index: _upscale_worker(i),
+                name=f"vp-upscale-{worker_index}",
+                daemon=True,
+            )
+            upscale_extra_threads.append(extra_thread)
         output_thread = threading.Thread(target=_output_worker, name="vp-output", daemon=True)
 
         capture_thread.start()
         upscale_thread.start()
+        for thread in upscale_extra_threads:
+            thread.start()
         output_thread.start()
         pipeline_running = True
 
@@ -3731,6 +4047,18 @@ def run_processor_worker(
         project_root = Path(startup_config["project_root"])
         module = _load_video_processor_module(project_root)
         processor, basic_scaling_method_supported = _create_processor(module, startup_config)
+        reusable_native_into_supported = (
+            hasattr(processor, "process_frame_into")
+            and hasattr(processor, "process_frame_no_deinterlace_into")
+            and hasattr(processor, "process_frame_deinterlace_only_into")
+            and hasattr(processor, "process_frame_preprocess_only_into")
+        )
+        if reusable_native_into_supported:
+            frame_bytes = UYVY_ROW_BYTES * FRAME_H
+            reusable_process_frame_out = bytearray(frame_bytes)
+            reusable_process_frame_no_deinterlace_out = bytearray(frame_bytes)
+            reusable_process_frame_deinterlace_only_out = bytearray(frame_bytes)
+            reusable_process_frame_preprocess_only_out = bytearray(frame_bytes)
         ai_sr_error = _refresh_ai_sr_engine()
         rtx_vsr_error = _refresh_rtx_vsr_engine()
         _safe_put(
@@ -4112,8 +4440,8 @@ def run_processor_worker(
                     "pipeline_timing_health": pipeline_timing_health,
                 }
                 if include_frames:
-                    payload["input_frame_bytes"] = current_input
-                    payload["output_frame_bytes"] = current_output
+                    payload["input_frame_bytes"] = _freeze_frame_bytes(current_input)
+                    payload["output_frame_bytes"] = _freeze_frame_bytes(current_output)
                 _safe_put(payload)
                 continue
 
@@ -4208,6 +4536,8 @@ def run_processor_worker(
 
             if command == "set_roi_with_subpixel":
                 _cancel_roi_microstep_transition(reset_shift=False)
+                if bool(message.get("manual_drag", False)):
+                    roi_manual_drag_until_ts = time.perf_counter() + float(roi_manual_drag_hold_s)
                 next_roi_x, next_roi_y, next_roi_w, next_roi_h = _normalize_worker_roi(
                     int(message["x"]),
                     int(message["y"]),
@@ -4244,13 +4574,20 @@ def run_processor_worker(
                 )
                 continue
 
+            if command == "set_roi_manual_drag_hold_seconds":
+                roi_manual_drag_hold_s = max(0.05, min(0.50, float(message.get("hold_seconds", roi_manual_drag_hold_s))))
+                continue
+
             if command in {"set_basic_scaling_mode_auto", "set_sr_mode_auto"}:
+                current_basic_scaling_auto_mode = True
                 processor.set_sr_mode_auto()
                 _safe_put({"type": "ack", "cmd": "set_basic_scaling_mode_auto"})
                 continue
 
             if command in {"set_basic_scaling_manual", "set_sr_scale_manual"}:
-                processor.set_sr_scale_manual(int(message["scale"]))
+                current_basic_scaling_auto_mode = False
+                current_basic_scaling_manual_scale = int(message["scale"])
+                processor.set_sr_scale_manual(int(current_basic_scaling_manual_scale))
                 _safe_put({"type": "ack", "cmd": "set_basic_scaling_manual"})
                 continue
 
@@ -4368,7 +4705,8 @@ def run_processor_worker(
                 continue
 
             if command in {"set_max_auto_basic_scaling", "set_max_auto_sr_scale"}:
-                processor.set_max_auto_sr_scale(int(message["scale"]))
+                current_max_auto_basic_scaling = int(message["scale"])
+                processor.set_max_auto_sr_scale(int(current_max_auto_basic_scaling))
                 continue
 
             if command == "set_ai_sr_enabled":

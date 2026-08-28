@@ -2,9 +2,9 @@
   "ai_sr_detail_preserve_percent": 0.0,
   "ai_sr_enabled": false,
   "ai_sr_inference_divisor": 1,
-  "ai_sr_inference_fps": 24,
-  "ai_sr_input_align": "1",
-  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\rt4ksr_x4_from_x2_fp16.onnx",
+  "ai_sr_inference_fps": 10,
+  "ai_sr_input_align": "4",
+  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\rt4ksr_x2_fp16.onnx",
   "ai_sr_post_artifact_reduction_method": "Off",
   "ai_sr_post_artifact_reduction_strength": 1.0,
   "ai_sr_post_denoise_method": "Off",
@@ -25,7 +25,7 @@
   "color_space": "Rec.2020 HLG (HDR)",
   "decklink_auto_detect": true,
   "decklink_enable_format_detection": true,
-  "decklink_fps_priority_guard": true,
+  "decklink_fps_priority_guard": false,
   "decklink_input_device": 1,
   "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_output_buffer_frames": 3,
@@ -48,6 +48,7 @@
   "preview_downsample": "Full (1:1)",
   "preview_poll_fps": 30,
   "preview_request_fps": 30,
+  "roi_drag_x_hysteresis_px": 0.15,
   "roi_interpolation_mode": "Ease In/Out",
   "roi_keyframe_duration_override": false,
   "roi_keyframes": {
@@ -55,30 +56,30 @@
       "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        596,
-        492,
-        730,
-        411
+        124,
+        456,
+        712,
+        400
       ]
     },
     "2": {
-      "duration_frames": 26,
+      "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1752,
-        618,
-        164,
-        92
+        848,
+        364,
+        376,
+        212
       ]
     },
     "3": {
-      "duration_frames": 26,
+      "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        610,
-        348,
-        668,
-        376
+        0,
+        0,
+        1920,
+        1080
       ]
     },
     "4": {
@@ -92,8 +93,10 @@
       ]
     }
   },
-  "roi_latency_smoothing_percent": 9,
-  "roi_smoothing_percent": 100,
+  "roi_latency_smoothing_percent": 0,
+  "roi_manual_drag_hold_s": 0.1,
+  "roi_min_drag_nudge": 0.015,
+  "roi_smoothing_percent": 84,
   "roi_transition_duration_frames": 30,
   "rtx_thdr_contrast": 58,
   "rtx_thdr_enabled": false,
@@ -106,5 +109,5 @@
   "rtx_vsr_scale": "2",
   "source_mode": "Blackmagic DeckLink",
   "version": 1,
-  "worker_process_priority": "Above Normal"
+  "worker_process_priority": "High"
 }
