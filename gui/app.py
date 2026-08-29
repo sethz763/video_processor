@@ -68,8 +68,12 @@ DEINTERLACE_METHOD_LABEL_TO_NAME = {
     "Bob (Fast)": "bob",
     "Blend (Stable)": "blend",
     "Edge Adaptive (Field Aware)": "edge_adaptive",
+    "Motion Adaptive (Broadcast: Deinterlace->Scale->Interlace)": "edge_adaptive",
 }
 DEINTERLACE_METHOD_NAME_TO_LABEL = {value: key for key, value in DEINTERLACE_METHOD_LABEL_TO_NAME.items()}
+
+INTERLACED_DEFAULT_DEINTERLACE_METHOD = "edge_adaptive"
+PROGRESSIVE_DEFAULT_DEINTERLACE_METHOD = "bob"
 
 DENOISE_METHOD_LABEL_TO_NAME = {
     "Off": "off",
@@ -132,6 +136,19 @@ INTERLACED_FIELD2_PHASE_MAX = 2.0
 
 def _clamp_interlaced_field2_phase_fraction(value: float) -> float:
     return max(INTERLACED_FIELD2_PHASE_MIN, min(INTERLACED_FIELD2_PHASE_MAX, float(value)))
+
+
+def _mode_name_is_interlaced(mode_label: str) -> bool:
+    mode_text = str(mode_label).strip().lower()
+    if not mode_text:
+        return False
+
+    mode_name = mode_text.split("(", 1)[0].strip()
+    if "progressive" in mode_name or "psf" in mode_name:
+        return False
+    if "interlace" in mode_name:
+        return True
+    return ("i" in mode_name) and any(ch.isdigit() for ch in mode_name)
 
 try:
     import decklink_wrapper as d
@@ -763,12 +780,12 @@ class RoiCanvas(QWidget):
 
         self._last_touch_emit_ts = 0.0
         self._default_touch_emit_interval_s = 1.0 / 60.0
-        drag_emit_hz = max(60.0, min(90.0, float(os.environ.get("VP_MANUAL_DRAG_EMIT_HZ", "75"))))
+        drag_emit_hz = max(60.0, min(120.0, float(os.environ.get("VP_MANUAL_DRAG_EMIT_HZ", "90"))))
         self._drag_move_touch_emit_interval_s = 1.0 / drag_emit_hz
         self._touch_emit_interval_s = self._default_touch_emit_interval_s
         self._touch_emit_pending = False
         self._touch_emit_pending_scale = False
-        self._smoothing_percent = 60
+        self._smoothing_percent = 4
         self._latency_smoothing_percent = 0
         self._drag_x_hysteresis_px = max(0.10, min(1.20, float(os.environ.get("VP_ROI_DRAG_X_HYSTERESIS_PX", "0.45"))))
         self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
@@ -834,7 +851,7 @@ class RoiCanvas(QWidget):
         return self._roi
 
     def set_smoothing_percent(self, value: int) -> None:
-        self._smoothing_percent = max(0, min(100, int(value)))
+        self._smoothing_percent = max(0, min(10, int(value)))
 
     def set_latency_smoothing_percent(self, value: int) -> None:
         self._latency_smoothing_percent = max(0, min(100, int(value)))
@@ -1161,7 +1178,7 @@ class RoiCanvas(QWidget):
         if not self._interaction_interp_timer.isActive():
             self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         target_scale = roi_scale_from_roi(self._interaction_target_roi)
-        smoothing = max(0.0, min(1.0, self._smoothing_percent / 100.0))
+        smoothing = max(0.0, min(1.0, self._smoothing_percent / 10.0))
         if target_scale >= 6.0:
             base_interval_ms = 8
         elif target_scale >= 4.0:
@@ -1195,7 +1212,7 @@ class RoiCanvas(QWidget):
     def _interpolate_roi_step(self, current: Roi, target: Roi) -> Roi:
         moving_only = current.w == target.w and current.h == target.h
         zoom_scale = roi_scale_from_roi(target)
-        smoothing = max(0.0, min(1.0, self._smoothing_percent / 100.0))
+        smoothing = max(0.0, min(1.0, self._smoothing_percent / 10.0))
         # Use gentler easing for translation-only motion so ROI travel feels smoother.
         if moving_only:
             if zoom_scale >= 6.0:
@@ -1416,6 +1433,7 @@ class VideoProcessorController:
         self._module = module
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
+        self.reinterlace_enabled = False
         self.basic_scaling_method = "bilinear_sharp"
         self.deinterlace_method = "bob"
         self.denoise_method = "off"
@@ -1532,6 +1550,9 @@ class VideoProcessorController:
         self.deinterlace_enabled = enabled
         if self.processor is not None:
             self.processor.set_deinterlace_enabled(enabled)
+
+    def set_reinterlace_enabled(self, enabled: bool) -> None:
+        self.reinterlace_enabled = bool(enabled)
 
     def set_deinterlace_method(self, method: str) -> None:
         self.deinterlace_method = str(method)
@@ -1820,6 +1841,7 @@ class ProcessVideoProcessorController:
     def __init__(self) -> None:
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
+        self.reinterlace_enabled = os.environ.get("VP_REINTERLACE_ENABLE", "0") == "1"
         self.basic_scaling_method = "bilinear_sharp"
         self.deinterlace_method = "bob"
         self.denoise_method = "off"
@@ -1947,7 +1969,7 @@ class ProcessVideoProcessorController:
         self._decklink_preview_interval = max(1, int(os.environ.get("VP_DECKLINK_PREVIEW_INTERVAL", "3")))
         self._decklink_tick_counter = 0
         self._gpu_live_mode = os.environ.get("VP_GPU_LIVE_MODE", "1") == "1"
-        self._preview_fps = max(0.0, float(os.environ.get("VP_PREVIEW_FPS", "30")))
+        self._preview_fps = max(0.0, float(os.environ.get("VP_PREVIEW_FPS", "90")))
         self._last_preview_request_ts = 0.0
         self._control_send_stats = {
             "attempted": 0,
@@ -2292,6 +2314,7 @@ class ProcessVideoProcessorController:
             "color_range": self.color_range,
             "max_auto_basic_scaling": self.max_auto_basic_scaling,
             "deinterlace_enabled": self.deinterlace_enabled,
+            "reinterlace_enabled": bool(self.reinterlace_enabled),
             "deinterlace_method": self.deinterlace_method,
             "denoise_method": self.denoise_method,
             "denoise_strength": self.denoise_strength,
@@ -2567,6 +2590,8 @@ class ProcessVideoProcessorController:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
                 elif ack_cmd == "set_deinterlace_enabled":
                     self.deinterlace_enabled = bool(message.get("deinterlace_enabled", self.deinterlace_enabled))
+                elif ack_cmd == "set_reinterlace_enabled":
+                    self.reinterlace_enabled = bool(message.get("reinterlace_enabled", self.reinterlace_enabled))
                 elif ack_cmd == "set_deinterlace_method":
                     self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
                 elif ack_cmd == "set_denoise_settings":
@@ -2721,6 +2746,11 @@ class ProcessVideoProcessorController:
         self._send_control({"cmd": "set_deinterlace_enabled", "enabled": bool(enabled)})
         self._wait_for_ack("set_deinterlace_enabled", timeout_seconds=1.0)
 
+    def set_reinterlace_enabled(self, enabled: bool) -> None:
+        self.reinterlace_enabled = bool(enabled)
+        self._send_control({"cmd": "set_reinterlace_enabled", "enabled": bool(enabled)})
+        self._wait_for_ack("set_reinterlace_enabled", timeout_seconds=1.0)
+
     def set_deinterlace_method(self, method: str) -> None:
         self.deinterlace_method = str(method)
         self._send_control({"cmd": "set_deinterlace_method", "method": self.deinterlace_method})
@@ -2812,6 +2842,8 @@ class ProcessVideoProcessorController:
                     self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
                 if expected_cmd == "set_deinterlace_enabled":
                     self.deinterlace_enabled = bool(message.get("deinterlace_enabled", self.deinterlace_enabled))
+                if expected_cmd == "set_reinterlace_enabled":
+                    self.reinterlace_enabled = bool(message.get("reinterlace_enabled", self.reinterlace_enabled))
                 if expected_cmd == "set_denoise_settings":
                     self.denoise_method = str(message.get("denoise_method", self.denoise_method))
                     self.denoise_strength = float(message.get("denoise_strength", self.denoise_strength))
@@ -3273,7 +3305,7 @@ class MainWindow(QMainWindow):
         self._decklink_sessions_running = False
         self._last_frame_error: str | None = None
         self._no_frame_counter = 0
-        self._roi_smoothing_percent = 60
+        self._roi_smoothing_percent = 4
         self._roi_latency_smoothing_percent = 0
         self._roi_drag_x_hysteresis_px = max(0.10, min(1.20, float(os.environ.get("VP_ROI_DRAG_X_HYSTERESIS_PX", "0.45"))))
         self._roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
@@ -3281,8 +3313,11 @@ class MainWindow(QMainWindow):
         self._interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
             float(os.environ.get("VP_INTERLACED_FIELD2_PHASE_FRACTION", "0.50"))
         )
-        self._manual_drag_worker_send_hz = max(60.0, min(90.0, float(os.environ.get("VP_MANUAL_DRAG_WORKER_SEND_HZ", "75"))))
+        self._manual_drag_worker_send_hz = max(60.0, min(120.0, float(os.environ.get("VP_MANUAL_DRAG_WORKER_SEND_HZ", "90"))))
         self._manual_drag_worker_send_interval_ms = int(round(1000.0 / self._manual_drag_worker_send_hz))
+        self._manual_roi_frame_lock_to_output = os.environ.get("VP_MANUAL_ROI_FRAME_LOCK", "1") != "0"
+        self._manual_roi_last_send_ts = 0.0
+        self._manual_roi_target_history: list[tuple[float, float, float]] = []
         self._roi_keyframes: dict[int, RoiKeyframe] = {}
         self._roi_keyframe_slots = (1, 2, 3, 4)
         self._roi_key_save_armed = False
@@ -3392,6 +3427,8 @@ class MainWindow(QMainWindow):
         self._pending_persisted_output_device = None
         self._pending_persisted_input_mode_text = ""
         self._pending_persisted_output_mode_text = ""
+        self._has_persisted_deinterlace_method = False
+        self._deinterlace_method_user_selected = False
         self._windowed_geometry_before_fullscreen: QRect | None = None
         self._windowed_was_maximized_before_fullscreen = False
         self._settings_path = Path(__file__).resolve().parent / "app_settings.json"
@@ -3412,7 +3449,7 @@ class MainWindow(QMainWindow):
         self._preview_downsample_factor = self._normalize_preview_downsample_factor(
             float(os.environ.get("VP_PREVIEW_DOWNSAMPLE", "0.25"))
         )
-        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "30")))
+        self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "90")))
         self._decklink_output_buffer_frames = max(
             0,
             min(10, int(getattr(self._controller, "decklink_output_buffer_frames", 2))),
@@ -3685,6 +3722,7 @@ class MainWindow(QMainWindow):
             self.enable_ai_sr_checkbox,
             self.enable_rtx_vsr_checkbox,
             self.deinterlace_checkbox,
+            self.reinterlace_checkbox,
             self.perf_guard_checkbox,
             self.ai_sr_require_gpu_checkbox,
             self.ai_sr_strict_checkbox,
@@ -3770,6 +3808,7 @@ class MainWindow(QMainWindow):
             "basic_scaling_auto_max": str(self.auto_sr_max_combo.currentText()),
             "basic_scaling_enabled": bool(self.enable_sr_checkbox.isChecked()) and not bool(self.enable_ai_sr_checkbox.isChecked()),
             "deinterlace_enabled": bool(self.deinterlace_checkbox.isChecked()),
+            "reinterlace_enabled": bool(self.reinterlace_checkbox.isChecked()),
             "deinterlace_method": str(self.deinterlace_method_combo.currentText()),
             "denoise_method": str(self.denoise_method_combo.currentText()),
             "denoise_strength": float(self.denoise_strength_spin.value()),
@@ -3832,6 +3871,8 @@ class MainWindow(QMainWindow):
         if not isinstance(raw, dict):
             return
 
+        self._has_persisted_deinterlace_method = bool(str(raw.get("deinterlace_method", "")).strip())
+
         self._updating_controls = True
         try:
             self.fps_spin.setValue(max(1, min(60, int(raw.get("fps", self.fps_spin.value())))))
@@ -3840,7 +3881,10 @@ class MainWindow(QMainWindow):
             self.decklink_output_buffer_spin.setValue(
                 max(0, min(10, int(raw.get("decklink_output_buffer_frames", self.decklink_output_buffer_spin.value()))))
             )
-            self.roi_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value())))))
+            raw_smoothing = int(raw.get("roi_smoothing_percent", self.roi_smoothing_slider.value()))
+            if raw_smoothing > 10:
+                raw_smoothing = int(round(raw_smoothing / 10.0))
+            self.roi_smoothing_slider.setValue(max(0, min(10, raw_smoothing)))
             self.roi_latency_smoothing_slider.setValue(max(0, min(100, int(raw.get("roi_latency_smoothing_percent", self.roi_latency_smoothing_slider.value())))))
             self.roi_drag_x_hysteresis_spin.setValue(
                 max(0.10, min(1.20, float(raw.get("roi_drag_x_hysteresis_px", self.roi_drag_x_hysteresis_spin.value()))))
@@ -3874,6 +3918,7 @@ class MainWindow(QMainWindow):
 
             self.enable_sr_checkbox.setChecked(bool(raw.get("basic_scaling_enabled", self.enable_sr_checkbox.isChecked())))
             self.deinterlace_checkbox.setChecked(bool(raw.get("deinterlace_enabled", self.deinterlace_checkbox.isChecked())))
+            self.reinterlace_checkbox.setChecked(bool(raw.get("reinterlace_enabled", self.reinterlace_checkbox.isChecked())))
             self.deinterlace_method_combo.setCurrentText(str(raw.get("deinterlace_method", self.deinterlace_method_combo.currentText())))
             self.denoise_method_combo.setCurrentText(str(raw.get("denoise_method", self.denoise_method_combo.currentText())))
             self.denoise_strength_spin.setValue(float(raw.get("denoise_strength", self.denoise_strength_spin.value())))
@@ -4528,6 +4573,10 @@ class MainWindow(QMainWindow):
         self.deinterlace_checkbox.setChecked(True)
         self.deinterlace_checkbox.toggled.connect(self._on_deinterlace_toggled)
 
+        self.reinterlace_checkbox = QCheckBox("Reinterlace output (interlaced modes)")
+        self.reinterlace_checkbox.setChecked(bool(getattr(self._controller, "reinterlace_enabled", False)))
+        self.reinterlace_checkbox.toggled.connect(self._on_reinterlace_toggled)
+
         self.deinterlace_method_combo = QComboBox()
         self.deinterlace_method_combo.addItems(list(DEINTERLACE_METHOD_LABEL_TO_NAME.keys()))
         self.deinterlace_method_combo.setCurrentText(
@@ -4552,6 +4601,7 @@ class MainWindow(QMainWindow):
         deinterlace_box = QGroupBox("De-interlacing")
         deinterlace_form = QFormLayout(deinterlace_box)
         deinterlace_form.addRow(self.deinterlace_checkbox)
+        deinterlace_form.addRow(self.reinterlace_checkbox)
         deinterlace_form.addRow("Method", self.deinterlace_method_combo)
 
         denoise_box = QGroupBox("Noise Reduction")
@@ -4723,13 +4773,13 @@ class MainWindow(QMainWindow):
         roi_form.addRow("Scale", self.scale_spin)
 
         self.roi_smoothing_slider = QSlider(Qt.Horizontal)
-        self.roi_smoothing_slider.setRange(0, 100)
+        self.roi_smoothing_slider.setRange(0, 10)
         self.roi_smoothing_slider.setSingleStep(1)
-        self.roi_smoothing_slider.setPageStep(5)
+        self.roi_smoothing_slider.setPageStep(1)
         self.roi_smoothing_slider.setValue(int(self._roi_smoothing_percent))
         self.roi_smoothing_slider.valueChanged.connect(self._on_roi_smoothing_changed)
 
-        self.roi_smoothing_value_label = QLabel(f"{self._roi_smoothing_percent}%")
+        self.roi_smoothing_value_label = QLabel(f"{int(self._roi_smoothing_percent)}/10")
         roi_smoothing_row = QWidget()
         roi_smoothing_layout = QHBoxLayout(roi_smoothing_row)
         roi_smoothing_layout.setContentsMargins(0, 0, 0, 0)
@@ -6086,13 +6136,21 @@ class MainWindow(QMainWindow):
         self._controller_filtered_target_roi = None
         self._controller_roi_interp_timer.stop()
 
+        drag_overlay = self._input_canvas.drag_visual_roi_overlay()
+
         # Treat manual updates as a continuous live keyframe stream: keep only
         # the latest target and interpolate from applied ROI on each send tick.
         if self._manual_live_target_roi is None:
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
-        self._manual_live_target_roi = self._roi
+            self._manual_roi_target_history = []
+        raw_curve_target: Roi | tuple[float, float, float, float]
+        if drag_overlay is not None:
+            raw_curve_target = tuple(float(v) for v in drag_overlay)
+        else:
+            raw_curve_target = self._roi
+        smoothed_target = self._smooth_manual_roi_target(raw_curve_target)
+        self._manual_live_target_roi = smoothed_target
 
-        drag_overlay = self._input_canvas.drag_visual_roi_overlay()
         if drag_overlay is not None:
             now = time.perf_counter()
             overlay = tuple(float(v) for v in drag_overlay)
@@ -6114,7 +6172,7 @@ class MainWindow(QMainWindow):
             self._manual_drag_interp_end_overlay = None
             self._manual_drag_last_event_ts = 0.0
 
-        self._pending_manual_controller_roi = self._roi
+        self._pending_manual_controller_roi = smoothed_target
         if not self._manual_roi_send_timer.isActive():
             self._manual_roi_send_timer.start()
 
@@ -6162,6 +6220,17 @@ class MainWindow(QMainWindow):
             step_shift_x = 0.0
             step_shift_y = 0.0
 
+        sent = False
+        scale_intent_active = (target.w != current.w) or (target.h != current.h)
+        frame_gate_interval_ms = self._manual_roi_render_gate_interval_ms()
+        if frame_gate_interval_ms is not None:
+            elapsed_ms = (time.perf_counter() - float(self._manual_roi_last_send_ts)) * 1000.0
+            if elapsed_ms < float(frame_gate_interval_ms) and not should_close_snap and not scale_intent_active:
+                wait_ms = max(1, int(round(float(frame_gate_interval_ms) - elapsed_ms)))
+                self._manual_roi_send_timer.setInterval(wait_ms)
+                self._manual_roi_send_timer.start()
+                return
+
         try:
             started = time.perf_counter()
             self._roi_diag_controller_send_attempts += 1
@@ -6198,6 +6267,7 @@ class MainWindow(QMainWindow):
 
             if sent:
                 self._roi_diag_controller_send_success += 1
+                self._manual_roi_last_send_ts = time.perf_counter()
             else:
                 self._roi_diag_controller_send_drops += 1
             self._controller_roi_applied = step_roi
@@ -6215,6 +6285,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self._manual_live_target_roi = None
+            self._manual_roi_target_history = []
             self._manual_drag_interp_start_overlay = None
             self._manual_drag_interp_end_overlay = None
             self._manual_drag_last_event_ts = 0.0
@@ -6245,6 +6316,107 @@ class MainWindow(QMainWindow):
             # Slower-than-field pacing makes drag appear steppy at 1080i rates.
             return min(base, int(field_interval_ms))
         return base
+
+    def _smooth_manual_roi_target(self, raw_target: Roi | tuple[float, float, float, float]) -> Roi:
+        sample_count = max(0, min(10, int(self._roi_smoothing_percent)))
+
+        if isinstance(raw_target, tuple):
+            raw_x, raw_y, raw_w, _raw_h = [float(v) for v in raw_target]
+            clamped_w_f = max(2.0, min(float(FRAME_W), raw_w))
+            clamped_h_f = max(2.0, min(float(FRAME_H), clamped_w_f * 9.0 / 16.0))
+            if clamped_h_f >= float(FRAME_H):
+                clamped_h_f = float(FRAME_H)
+                clamped_w_f = max(2.0, min(float(FRAME_W), clamped_h_f * 16.0 / 9.0))
+            clamped_x_f = max(0.0, min(float(FRAME_W) - clamped_w_f, raw_x))
+            clamped_y_f = max(0.0, min(float(FRAME_H) - clamped_h_f, raw_y))
+            sample_cx = clamped_x_f + (clamped_w_f * 0.5)
+            sample_cy = clamped_y_f + (clamped_h_f * 0.5)
+            clamped_target = clamp_roi(
+                Roi(
+                    int(round(clamped_x_f)),
+                    int(round(clamped_y_f)),
+                    max(2, int(round(clamped_w_f)) & ~1),
+                    max(2, int(round((max(2, int(round(clamped_w_f)) & ~1) * 9.0) / 16.0))),
+                )
+            )
+            sample_w = clamped_w_f
+        else:
+            clamped_target = clamp_roi(raw_target)
+            sample_cx = float(clamped_target.x) + (float(clamped_target.w) * 0.5)
+            sample_cy = float(clamped_target.y) + (float(clamped_target.h) * 0.5)
+            sample_w = float(clamped_target.w)
+
+        if sample_count <= 0:
+            self._manual_roi_target_history = []
+            return clamped_target
+
+        self._manual_roi_target_history.append((sample_cx, sample_cy, sample_w))
+        if len(self._manual_roi_target_history) > sample_count:
+            self._manual_roi_target_history = self._manual_roi_target_history[-sample_count:]
+
+        history = self._manual_roi_target_history
+        if len(history) == 1:
+            h_cx, h_cy, h_w = history[0]
+            h_w_i = max(2, int(round(h_w)) & ~1)
+            h_h_i = max(2, int(round(h_w_i * 9.0 / 16.0)))
+            h_x_i = int(round(h_cx - (h_w_i * 0.5)))
+            h_y_i = int(round(h_cy - (h_h_i * 0.5)))
+            return clamp_roi(Roi(h_x_i, h_y_i, h_w_i, h_h_i))
+
+        # Baseline latest-weighted smoothing (stable when sample_count is small).
+        weights = np.arange(1.0, float(len(history)) + 1.0, dtype=np.float64)
+        total_weight = float(np.sum(weights))
+        if total_weight <= 1e-6:
+            return clamped_target
+        cxs = np.array([float(sample[0]) for sample in history], dtype=np.float64)
+        cys = np.array([float(sample[1]) for sample in history], dtype=np.float64)
+        ws = np.array([float(sample[2]) for sample in history], dtype=np.float64)
+        base_cx = float(np.dot(cxs, weights) / total_weight)
+        base_cy = float(np.dot(cys, weights) / total_weight)
+        base_w = float(np.dot(ws, weights) / total_weight)
+
+        # Curve-fit smoothing: fit a quadratic over recent polls and evaluate a
+        # short fractional lag behind "now". This yields a smoother trajectory
+        # than simple averaging while keeping drag response predictable.
+        t = np.arange(float(len(history)), dtype=np.float64)
+        degree = 2 if len(history) >= 3 else 1
+        lag = min(0.95, 0.09 * float(sample_count))
+        t_eval = max(0.0, float(len(history) - 1) - lag)
+
+        def _curve_eval(values: np.ndarray, base_value: float) -> float:
+            try:
+                coeff = np.polyfit(t, values, deg=degree)
+                predicted = float(np.polyval(coeff, t_eval))
+            except Exception:
+                predicted = base_value
+
+            lo = float(np.min(values))
+            hi = float(np.max(values))
+            span = max(1.0, hi - lo)
+            bounded = max(lo - (0.20 * span), min(hi + (0.20 * span), predicted))
+            curve_weight = min(0.92, 0.39 + (0.056 * float(sample_count)))
+            if len(history) < 4:
+                curve_weight *= 0.80
+            return (base_value * (1.0 - curve_weight)) + (bounded * curve_weight)
+
+        smoothed_cx_f = _curve_eval(cxs, base_cx)
+        smoothed_cy_f = _curve_eval(cys, base_cy)
+        smoothed_w_f = _curve_eval(ws, base_w)
+
+        smoothed_w = max(2, int(round(smoothed_w_f)) & ~1)
+        smoothed_h = max(2, int(round(smoothed_w * 9.0 / 16.0)))
+        smoothed_x = int(round(smoothed_cx_f - (smoothed_w * 0.5)))
+        smoothed_y = int(round(smoothed_cy_f - (smoothed_h * 0.5)))
+        return clamp_roi(Roi(smoothed_x, smoothed_y, smoothed_w, smoothed_h))
+
+    def _manual_roi_render_gate_interval_ms(self) -> int | None:
+        if not bool(self._manual_roi_frame_lock_to_output):
+            return None
+        if self._source_mode != "Blackmagic DeckLink":
+            return None
+        if self._controller_backend != "worker-process":
+            return None
+        return self._decklink_output_field_interval_ms()
 
     def _sample_manual_drag_overlay_target(
         self,
@@ -6293,7 +6465,7 @@ class MainWindow(QMainWindow):
             and abs(target_h - float(current.h)) <= 1e-3
         )
         zoom_scale = max(1.0, FRAME_W / max(1.0, float(current.w)))
-        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 10.0))
 
         if moving_only:
             if zoom_scale >= 6.0:
@@ -6366,7 +6538,7 @@ class MainWindow(QMainWindow):
     def _manual_roi_step_with_subpixel(self, current: Roi, target: Roi) -> tuple[Roi, float, float]:
         moving_only = current.w == target.w and current.h == target.h
         zoom_scale = roi_scale_from_roi(target)
-        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 10.0))
 
         if moving_only:
             if zoom_scale >= 6.0:
@@ -6567,7 +6739,7 @@ class MainWindow(QMainWindow):
         if not self._controller_roi_interp_timer.isActive():
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         target_scale = roi_scale_from_roi(self._controller_roi_target)
-        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 10.0))
         if target_scale >= 6.0:
             base_interval_ms = 8
         elif target_scale >= 4.0:
@@ -6661,7 +6833,7 @@ class MainWindow(QMainWindow):
     def _interpolate_controller_roi_step(self, current: Roi, target: Roi) -> Roi:
         moving_only = current.w == target.w and current.h == target.h
         zoom_scale = roi_scale_from_roi(target)
-        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 100.0))
+        smoothing = max(0.0, min(1.0, self._roi_smoothing_percent / 10.0))
         # Keep output translation slightly more eased than resize/scale updates.
         if moving_only:
             if zoom_scale >= 6.0:
@@ -6737,9 +6909,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_roi_smoothing_changed(self, value: int) -> None:
-        clamped = max(0, min(100, int(value)))
+        clamped = max(0, min(10, int(value)))
         self._roi_smoothing_percent = clamped
-        self.roi_smoothing_value_label.setText(f"{clamped}%")
+        self.roi_smoothing_value_label.setText(f"{clamped}/10")
+        self._manual_roi_target_history = []
         self._input_canvas.set_smoothing_percent(clamped)
 
     def _on_roi_latency_smoothing_changed(self, value: int) -> None:
@@ -6968,7 +7141,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._update_status(f"Deinterlace toggle failed: {exc}")
 
+    def _on_reinterlace_toggled(self, checked: bool) -> None:
+        try:
+            if hasattr(self._controller, "set_reinterlace_enabled"):
+                self._controller.set_reinterlace_enabled(checked)
+            mode_text = "enabled" if checked else "disabled"
+            self._update_status(f"Reinterlace {mode_text}")
+        except Exception as exc:
+            self._update_status(f"Reinterlace toggle failed: {exc}")
+
     def _on_deinterlace_method_changed(self) -> None:
+        if not self._updating_controls:
+            self._deinterlace_method_user_selected = True
         method_label = self.deinterlace_method_combo.currentText()
         method_name = DEINTERLACE_METHOD_LABEL_TO_NAME.get(method_label, "bob")
         try:
@@ -7604,6 +7788,7 @@ class MainWindow(QMainWindow):
     def _on_blackmagic_combo_changed(self) -> None:
         if self._updating_controls:
             return
+        self._apply_mode_aware_deinterlace_default_if_needed()
         self._sync_blackmagic_controls_enabled_state()
         self._update_fps_control_lock()
         self._update_status("DeckLink settings changed. Click Apply DeckLink Settings to apply.")
@@ -7936,6 +8121,37 @@ class MainWindow(QMainWindow):
                     self.decklink_output_mode_combo.setCurrentIndex(i)
                     break
 
+        self._apply_mode_aware_deinterlace_default_if_needed()
+
+        self._apply_mode_aware_deinterlace_default_if_needed()
+
+    def _default_deinterlace_method_name_for_source_mode(self) -> str:
+        if self.source_mode_combo.currentText() == "Blackmagic DeckLink":
+            if _mode_name_is_interlaced(self.decklink_input_mode_combo.currentText()):
+                return INTERLACED_DEFAULT_DEINTERLACE_METHOD
+        return PROGRESSIVE_DEFAULT_DEINTERLACE_METHOD
+
+    def _apply_mode_aware_deinterlace_default_if_needed(self) -> None:
+        if self._has_persisted_deinterlace_method or self._deinterlace_method_user_selected:
+            return
+
+        method_name = self._default_deinterlace_method_name_for_source_mode()
+        method_label = DEINTERLACE_METHOD_NAME_TO_LABEL.get(method_name)
+        if not method_label:
+            return
+
+        if self.deinterlace_method_combo.currentText() != method_label:
+            self._updating_controls = True
+            try:
+                self.deinterlace_method_combo.setCurrentText(method_label)
+            finally:
+                self._updating_controls = False
+
+        try:
+            self._controller.set_deinterlace_method(method_name)
+        except Exception:
+            LOGGER.exception("Failed to apply mode-aware deinterlace default")
+
     def _fps_from_mode(self, mode: object) -> float:
         frame_duration = float(getattr(mode, "frame_duration", 0))
         time_scale = float(getattr(mode, "time_scale", 0))
@@ -7949,19 +8165,7 @@ class MainWindow(QMainWindow):
                 return bool(self._controller.decklink_output_is_interlaced())
             except Exception:
                 pass
-
-        mode_label = str(self.decklink_output_mode_combo.currentText()).strip().lower()
-        if not mode_label:
-            return False
-
-        mode_name = mode_label.split("(", 1)[0].strip()
-        if "progressive" in mode_name or "psf" in mode_name:
-            return False
-        if "interlace" in mode_name:
-            return True
-
-        # Common DeckLink naming uses forms like "1080i59.94".
-        return ("i" in mode_name) and any(ch.isdigit() for ch in mode_name)
+        return _mode_name_is_interlaced(self.decklink_output_mode_combo.currentText())
 
     def _decklink_output_field_interval_ms(self) -> int | None:
         field_rate_hz = self._decklink_output_effective_field_rate_fps()

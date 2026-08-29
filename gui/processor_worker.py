@@ -2195,6 +2195,7 @@ def run_processor_worker(
     )
     roi_microstep_transition: dict[str, object] | None = None
     current_deinterlace_enabled = bool(startup_config.get("deinterlace_enabled", True))
+    current_reinterlace_enabled = bool(startup_config.get("reinterlace_enabled", False))
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
     current_denoise_method = str(startup_config.get("denoise_method", "off"))
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
@@ -2674,6 +2675,57 @@ def run_processor_worker(
 
         _apply_processor_roi_for_phase(roi1)
         out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(input_bytes, field1_x, field1_y)
+        out1_frozen = bytes(out1)
+
+        return (
+            _weave_interlaced_fields(out0_frozen, out1_frozen),
+            bool(p0 or p1),
+            bool(b0 or b1),
+            bool(a0 or a1),
+            bool(r0 or r1),
+            bool(n0 and n1),
+        )
+
+    def _build_static_interlaced_phase_for_reinterlace(shift_x: float, shift_y: float) -> dict[str, object]:
+        roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
+        return {
+            "roi0": roi_state,
+            "roi1": roi_state,
+            "field0_x": float(shift_x),
+            "field0_y": float(shift_y),
+            "field1_x": float(shift_x),
+            "field1_y": float(shift_y),
+        }
+
+    def _split_interlaced_source_fields(input_bytes: bytes) -> tuple[bytes, bytes]:
+        is_lower_field_first = int(output_field_dominance_code) == 1 if output_field_dominance_code is not None else False
+        if is_lower_field_first:
+            field0_input = _collapse_interlaced_to_single_field_uyvy(input_bytes, True)
+            field1_input = _collapse_interlaced_to_single_field_uyvy(input_bytes, False)
+        else:
+            field0_input = _collapse_interlaced_to_single_field_uyvy(input_bytes, False)
+            field1_input = _collapse_interlaced_to_single_field_uyvy(input_bytes, True)
+        return field0_input, field1_input
+
+    def _render_dual_phase_full_pipeline_reinterlace(
+        input_bytes: bytes,
+        phase: dict[str, object],
+    ) -> tuple[bytes, bool, bool, bool, bool, bool]:
+        field0_input, field1_input = _split_interlaced_source_fields(input_bytes)
+
+        roi0 = tuple(phase.get("roi0", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        roi1 = tuple(phase.get("roi1", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        field0_x = float(phase.get("field0_x", 0.0))
+        field0_y = float(phase.get("field0_y", 0.0))
+        field1_x = float(phase.get("field1_x", 0.0))
+        field1_y = float(phase.get("field1_y", 0.0))
+
+        _apply_processor_roi_for_phase(roi0)
+        out0, p0, b0, a0, r0, n0 = _process_pipeline_frame(field0_input, field0_x, field0_y)
+        out0_frozen = bytes(out0)
+
+        _apply_processor_roi_for_phase(roi1)
+        out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(field1_input, field1_x, field1_y)
         out1_frozen = bytes(out1)
 
         return (
@@ -3445,6 +3497,28 @@ def run_processor_worker(
         phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
         return abs(phase_fraction) > 1e-4
 
+    prev_reinterlace_frame_bytes: bytes | None = None
+
+    def _reinterlace_enabled_for_output() -> bool:
+        return bool(output_mode_is_interlaced and current_reinterlace_enabled)
+
+    def _apply_reinterlace_from_previous_frame_if_needed(frame_bytes: bytes) -> bytes:
+        nonlocal prev_reinterlace_frame_bytes
+
+        if not _reinterlace_enabled_for_output():
+            prev_reinterlace_frame_bytes = None
+            return frame_bytes
+
+        if len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
+            return frame_bytes
+
+        prev_frame = prev_reinterlace_frame_bytes
+        prev_reinterlace_frame_bytes = frame_bytes
+        if prev_frame is None or len(prev_frame) != (UYVY_ROW_BYTES * FRAME_H):
+            return frame_bytes
+
+        return _weave_interlaced_fields(prev_frame, frame_bytes)
+
     def _basic_scaling_enabled() -> bool:
         if not bool(basic_scaling_enabled):
             return False
@@ -3988,7 +4062,18 @@ def run_processor_worker(
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     interlaced_phase = interlaced_phase_snapshot
                     try:
-                        if interlaced_phase is not None:
+                        if _reinterlace_enabled_for_output():
+                            reinterlace_phase = interlaced_phase
+                            if reinterlace_phase is None:
+                                reinterlace_phase = _build_static_interlaced_phase_for_reinterlace(shift_x, shift_y)
+                            interlaced_phase = reinterlace_phase
+                            output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
+                                input_bytes,
+                                reinterlace_phase,
+                            )
+                            _ = preprocess_applied, ai_applied, rtx_applied
+                            basic_stage_ms = 0.0
+                        elif interlaced_phase is not None:
                             output_bytes, basic_applied, native_shift_applied, basic_stage_ms = _render_dual_phase_basic_scaling(
                                 input_bytes,
                                 interlaced_phase,
@@ -4131,6 +4216,7 @@ def run_processor_worker(
                     thread_parallel_proc is not None
                     and parallel_basic_worker_count > 1
                     and _is_live_basic_scaling_fast_mode()
+                    and not (output_mode_is_interlaced and _reinterlace_enabled_for_output())
                     and not (
                         output_mode_is_interlaced
                         and isinstance(item.interlaced_field_phase, dict)
@@ -4247,7 +4333,15 @@ def run_processor_worker(
                 try:
                     item.process_start_ts = time.perf_counter()
                     interlaced_phase = item.interlaced_field_phase if isinstance(item.interlaced_field_phase, dict) else None
-                    if output_mode_is_interlaced and _interlaced_phase_controls_active() and interlaced_phase is not None:
+                    if output_mode_is_interlaced and _reinterlace_enabled_for_output():
+                        if interlaced_phase is None:
+                            interlaced_phase = _build_static_interlaced_phase_for_reinterlace(float(item.shift_x), float(item.shift_y))
+                        output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
+                            preprocessed,
+                            interlaced_phase,
+                        )
+                        item.interlaced_phase_rendered = True
+                    elif output_mode_is_interlaced and _interlaced_phase_controls_active() and interlaced_phase is not None:
                         output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline(
                             preprocessed,
                             interlaced_phase,
@@ -4329,7 +4423,9 @@ def run_processor_worker(
                         shift_y,
                         native_shift_applied=bool(item.native_shift_applied),
                     )
-                if output_mode_is_interlaced and not _interlaced_phase_controls_active():
+                if (not bool(item.interlaced_phase_rendered)) and _reinterlace_enabled_for_output():
+                    output_bytes = _apply_reinterlace_from_previous_frame_if_needed(output_bytes)
+                if output_mode_is_interlaced and (not _interlaced_phase_controls_active()) and (not _reinterlace_enabled_for_output()):
                     is_lower_field_first = int(output_field_dominance_code) == 1 if output_field_dominance_code is not None else False
                     output_bytes = _collapse_interlaced_to_single_field_uyvy(output_bytes, is_lower_field_first)
                 sampled_delta = 0.0
@@ -5308,7 +5404,14 @@ def run_processor_worker(
                 _advance_roi_microstep_transition_for_output_frame()
                 shift_x, shift_y = _step_smoothed_roi_shift()
                 interlaced_phase = _active_interlaced_field_phase_state(consume_manual_snapshot=True)
-                if interlaced_phase is not None:
+                if output_mode_is_interlaced and _reinterlace_enabled_for_output():
+                    if interlaced_phase is None:
+                        interlaced_phase = _build_static_interlaced_phase_for_reinterlace(shift_x, shift_y)
+                    output_bytes, _, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
+                        frame_bytes,
+                        interlaced_phase,
+                    )
+                elif interlaced_phase is not None:
                     output_bytes, _, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline(
                         frame_bytes,
                         interlaced_phase,
@@ -5333,6 +5436,8 @@ def run_processor_worker(
                         shift_y,
                         native_shift_applied=native_shift_applied,
                     )
+                if interlaced_phase is None and _reinterlace_enabled_for_output():
+                    output_bytes = _apply_reinterlace_from_previous_frame_if_needed(output_bytes)
 
                 if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
                     ai_sr_dropped_frames += 1
@@ -5526,6 +5631,19 @@ def run_processor_worker(
                         "type": "ack",
                         "cmd": "set_deinterlace_enabled",
                         "deinterlace_enabled": bool(current_deinterlace_enabled),
+                    }
+                )
+                continue
+
+            if command == "set_reinterlace_enabled":
+                current_reinterlace_enabled = bool(message.get("enabled", current_reinterlace_enabled))
+                if not current_reinterlace_enabled:
+                    prev_reinterlace_frame_bytes = None
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_reinterlace_enabled",
+                        "reinterlace_enabled": bool(current_reinterlace_enabled),
                     }
                 )
                 continue
