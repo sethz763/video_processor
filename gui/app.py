@@ -124,6 +124,13 @@ WORKER_PRIORITY_LABEL_TO_NAME = {
 }
 WORKER_PRIORITY_NAME_TO_LABEL = {value: key for key, value in WORKER_PRIORITY_LABEL_TO_NAME.items()}
 
+INTERLACED_FIELD2_PHASE_MIN = -1.0
+INTERLACED_FIELD2_PHASE_MAX = 2.0
+
+
+def _clamp_interlaced_field2_phase_fraction(value: float) -> float:
+    return max(INTERLACED_FIELD2_PHASE_MIN, min(INTERLACED_FIELD2_PHASE_MAX, float(value)))
+
 try:
     import decklink_wrapper as d
 except Exception:
@@ -783,6 +790,7 @@ class RoiCanvas(QWidget):
         self._visual_roi_overlay_transition = None
         self._visual_roi_overlay_drag = None
         self._apply_roi_local(roi)
+        self._interaction_target_roi = roi
 
     def cancel_pending_interaction_updates(self) -> None:
         # Drop queued interaction/touch emits so old manual gestures cannot
@@ -1719,6 +1727,12 @@ class VideoProcessorController:
     def decklink_output_nominal_fps(self) -> float:
         return 0.0
 
+    def decklink_output_is_interlaced(self) -> bool:
+        return False
+
+    def decklink_transition_units_per_output_frame(self) -> float:
+        return 1.0
+
     def decklink_output_buffer_health(self) -> dict[str, object]:
         return {}
 
@@ -1769,6 +1783,10 @@ class VideoProcessorController:
 
     def set_roi_manual_drag_hold_seconds(self, hold_seconds: float) -> None:
         _ = hold_seconds
+        return
+
+    def set_interlaced_field2_phase_fraction(self, fraction: float) -> None:
+        _ = fraction
         return
 
     def start_roi_microstep_transition(
@@ -1859,6 +1877,9 @@ class ProcessVideoProcessorController:
         self.rtx_thdr_middle_gray = max(0, int(os.environ.get("VP_RTX_THDR_MIDDLE_GRAY", "50")))
         self.rtx_thdr_max_luminance = max(0, int(os.environ.get("VP_RTX_THDR_MAX_LUMINANCE", "1000")))
         self.decklink_output_buffer_frames = max(0, min(10, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "2"))))
+        self.interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
+            float(os.environ.get("VP_INTERLACED_FIELD2_PHASE_FRACTION", "0.50"))
+        )
         self.worker_process_priority = _normalize_worker_priority_name(
             os.environ.get("VP_WORKER_PROCESS_PRIORITY", "above_normal")
         )
@@ -1884,6 +1905,8 @@ class ProcessVideoProcessorController:
         self._decklink_processed_counter = 0
         self._decklink_processed_fps = 0.0
         self._decklink_output_nominal_fps = 0.0
+        self._decklink_output_is_interlaced = False
+        self._decklink_transition_units_per_output_frame = 1.0
         self._decklink_processed_counter_last = 0
         self._decklink_processed_counter_last_ts = 0.0
         self._decklink_processed_fps_smoothed = 0.0
@@ -1950,11 +1973,14 @@ class ProcessVideoProcessorController:
         self._decklink_pipeline_timing_health: dict[str, object] = {}
         self._decklink_applied_roi: Roi | None = None
         self._decklink_roi_transition_state: dict[str, object] = {}
+        self._last_interlaced_phase_log_signature: str = ""
 
     def _reset_decklink_fps_tracking(self) -> None:
         self._decklink_processed_counter = 0
         self._decklink_processed_fps = 0.0
         self._decklink_output_nominal_fps = 0.0
+        self._decklink_output_is_interlaced = False
+        self._decklink_transition_units_per_output_frame = 1.0
         self._decklink_output_buffer_health = {}
         self._decklink_pipeline_timing_health = {}
         self._decklink_processed_counter_last = 0
@@ -2013,7 +2039,9 @@ class ProcessVideoProcessorController:
 
         active = bool(snapshot[_ROI_TM_ACTIVE] >= 0.5)
         total_frames = max(0, int(round(snapshot[_ROI_TM_TOTAL_FRAMES])))
-        frame_progress = max(0, int(round(snapshot[_ROI_TM_FRAME_PROGRESS])))
+        frame_progress = max(0.0, float(snapshot[_ROI_TM_FRAME_PROGRESS]))
+        prev_transition_state = self._decklink_roi_transition_state if isinstance(self._decklink_roi_transition_state, dict) else {}
+        prev_interlaced_phase = prev_transition_state.get("interlaced_field_phase") if isinstance(prev_transition_state, dict) else None
         self._decklink_roi_transition_state = {
             "active": active,
             "frame_progress": frame_progress,
@@ -2032,6 +2060,8 @@ class ProcessVideoProcessorController:
                 "h": int(round(snapshot[_ROI_TM_TARGET_H])),
             },
         }
+        if active and isinstance(prev_interlaced_phase, dict):
+            self._decklink_roi_transition_state["interlaced_field_phase"] = dict(prev_interlaced_phase)
 
     def _apply_decklink_frame_message(self, message: dict[str, object]) -> None:
         self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
@@ -2071,6 +2101,18 @@ class ProcessVideoProcessorController:
         self._decklink_output_nominal_fps = max(
             0.0,
             float(message.get("output_nominal_fps", self._decklink_output_nominal_fps)),
+        )
+        self._decklink_output_is_interlaced = bool(
+            message.get("output_mode_is_interlaced", self._decklink_output_is_interlaced)
+        )
+        self._decklink_transition_units_per_output_frame = max(
+            0.1,
+            float(
+                message.get(
+                    "output_transition_units_per_frame",
+                    self._decklink_transition_units_per_output_frame,
+                )
+            ),
         )
 
         self._decklink_ai_applied_frames = int(message.get("ai_sr_applied_frames", self._decklink_ai_applied_frames))
@@ -2282,6 +2324,7 @@ class ProcessVideoProcessorController:
             "rtx_thdr_middle_gray": self.rtx_thdr_middle_gray,
             "rtx_thdr_max_luminance": self.rtx_thdr_max_luminance,
             "decklink_output_buffer_frames": self.decklink_output_buffer_frames,
+            "interlaced_field2_phase_fraction": float(self.interlaced_field2_phase_fraction),
             "worker_process_priority": self.worker_process_priority,
             "rtx_video_sdk_root": os.environ.get("RTX_VIDEO_SDK_ROOT", r"C:\Coding Projects\sdks\NVidia video SDK"),
         }
@@ -2553,6 +2596,10 @@ class ProcessVideoProcessorController:
                     self.worker_process_priority_error = (
                         str(message.get("worker_process_priority_error", "")).strip() or None
                     )
+                elif ack_cmd == "set_interlaced_field2_phase_fraction":
+                    self.interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
+                        float(message.get("interlaced_field2_phase_fraction", self.interlaced_field2_phase_fraction))
+                    )
                 continue
 
             if message_type == "warning":
@@ -2602,6 +2649,17 @@ class ProcessVideoProcessorController:
                 "hold_seconds": float(hold_seconds),
             }
         )
+
+    def set_interlaced_field2_phase_fraction(self, fraction: float) -> None:
+        clamped = _clamp_interlaced_field2_phase_fraction(float(fraction))
+        self.interlaced_field2_phase_fraction = clamped
+        self._send_control(
+            {
+                "cmd": "set_interlaced_field2_phase_fraction",
+                "fraction": clamped,
+            }
+        )
+        self._wait_for_ack("set_interlaced_field2_phase_fraction", timeout_seconds=1.0)
 
     def start_roi_microstep_transition(
         self,
@@ -2733,6 +2791,17 @@ class ProcessVideoProcessorController:
                         if decklink_error:
                             raise RuntimeError(decklink_error)
                         raise RuntimeError("DeckLink start failed")
+                    LOGGER.info(
+                        (
+                            "DeckLink output mode resolved | name=%s | mode=%s | interlaced=%s | "
+                            "field_dominance_code=%s | field_dominance_name=%s"
+                        ),
+                        str(message.get("output_mode_name", "")),
+                        str(message.get("output_mode_value", "")),
+                        bool(message.get("output_mode_is_interlaced", False)),
+                        str(message.get("output_field_dominance_code", "")),
+                        str(message.get("output_field_dominance_name", "")),
+                    )
                 if expected_cmd == "set_basic_scaling_method":
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
                 if expected_cmd == "set_sr_flavor":
@@ -2889,6 +2958,12 @@ class ProcessVideoProcessorController:
 
     def decklink_output_nominal_fps(self) -> float:
         return float(self._decklink_output_nominal_fps)
+
+    def decklink_output_is_interlaced(self) -> bool:
+        return bool(self._decklink_output_is_interlaced)
+
+    def decklink_transition_units_per_output_frame(self) -> float:
+        return float(self._decklink_transition_units_per_output_frame)
 
     def set_preview_fps(self, preview_fps: float) -> None:
         self._preview_fps = max(0.0, float(preview_fps))
@@ -3201,6 +3276,9 @@ class MainWindow(QMainWindow):
         self._roi_drag_x_hysteresis_px = max(0.10, min(1.20, float(os.environ.get("VP_ROI_DRAG_X_HYSTERESIS_PX", "0.45"))))
         self._roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
         self._roi_min_drag_nudge = max(0.0, min(0.50, float(os.environ.get("VP_ROI_MIN_DRAG_NUDGE", "0.035"))))
+        self._interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
+            float(os.environ.get("VP_INTERLACED_FIELD2_PHASE_FRACTION", "0.50"))
+        )
         self._manual_drag_worker_send_hz = max(60.0, min(90.0, float(os.environ.get("VP_MANUAL_DRAG_WORKER_SEND_HZ", "75"))))
         self._manual_drag_worker_send_interval_ms = int(round(1000.0 / self._manual_drag_worker_send_hz))
         self._roi_keyframes: dict[int, RoiKeyframe] = {}
@@ -3303,6 +3381,7 @@ class MainWindow(QMainWindow):
         self._roi_diag_controller_send_drops = 0
         self._roi_diag_controller_send_ms_sum = 0.0
         self._roi_diag_controller_send_ms_max = 0.0
+        self._last_interlaced_phase_log_signature = ""
         self._fullscreen_view_name: str | None = None
         self._splitter_initialized = False
         self._main_splitter_initialized = False
@@ -3482,6 +3561,7 @@ class MainWindow(QMainWindow):
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
         self._apply_manual_drag_tuning_to_controller()
+        self._apply_interlaced_phase_tuning_to_controller()
         self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
         self._source_mode = self.source_mode_combo.currentText()
@@ -3529,6 +3609,7 @@ class MainWindow(QMainWindow):
         self._apply_controller_color_settings_from_ui()
         self._apply_worker_process_priority_to_controller(notify=False)
         self._apply_manual_drag_tuning_to_controller()
+        self._apply_interlaced_phase_tuning_to_controller()
         LOGGER.info("Worker controller recreated after unexpected worker exit")
 
     def _apply_controller_color_settings_from_ui(self) -> None:
@@ -3630,6 +3711,7 @@ class MainWindow(QMainWindow):
             self.roi_drag_x_hysteresis_spin,
             self.roi_manual_drag_hold_spin,
             self.roi_min_drag_nudge_spin,
+            self.roi_interlaced_field2_phase_spin,
             self.ai_sr_frame_interval_spin,
             self.ai_sr_overscan_spin,
             self.ai_sr_inference_divisor_spin,
@@ -3675,6 +3757,7 @@ class MainWindow(QMainWindow):
             "roi_drag_x_hysteresis_px": float(self.roi_drag_x_hysteresis_spin.value()),
             "roi_manual_drag_hold_s": float(self.roi_manual_drag_hold_spin.value()),
             "roi_min_drag_nudge": float(self.roi_min_drag_nudge_spin.value()),
+            "interlaced_field2_phase_fraction": float(self.roi_interlaced_field2_phase_spin.value()),
             "roi_transition_duration_frames": int(self.roi_transition_frames_spin.value()),
             "roi_interpolation_mode": str(self.roi_interp_mode_combo.currentText()),
             "roi_keyframe_duration_override": bool(self.roi_keyframe_duration_override_btn.isChecked()),
@@ -3765,6 +3848,11 @@ class MainWindow(QMainWindow):
             )
             self.roi_min_drag_nudge_spin.setValue(
                 max(0.0, min(0.50, float(raw.get("roi_min_drag_nudge", self.roi_min_drag_nudge_spin.value()))))
+            )
+            self.roi_interlaced_field2_phase_spin.setValue(
+                _clamp_interlaced_field2_phase_fraction(
+                    float(raw.get("interlaced_field2_phase_fraction", self.roi_interlaced_field2_phase_spin.value()))
+                )
             )
             self.roi_transition_frames_spin.setValue(
                 max(1, min(600, int(raw.get("roi_transition_duration_frames", self.roi_transition_frames_spin.value()))))
@@ -4691,6 +4779,17 @@ class MainWindow(QMainWindow):
         self.roi_min_drag_nudge_spin.setToolTip("Minimum subpixel motion while drag is active and carrier ROI is unchanged.")
         roi_form.addRow("Min subpixel nudge", self.roi_min_drag_nudge_spin)
 
+        self.roi_interlaced_field2_phase_spin = QDoubleSpinBox()
+        self.roi_interlaced_field2_phase_spin.setRange(INTERLACED_FIELD2_PHASE_MIN, INTERLACED_FIELD2_PHASE_MAX)
+        self.roi_interlaced_field2_phase_spin.setDecimals(2)
+        self.roi_interlaced_field2_phase_spin.setSingleStep(0.05)
+        self.roi_interlaced_field2_phase_spin.setValue(float(self._interlaced_field2_phase_fraction))
+        self.roi_interlaced_field2_phase_spin.valueChanged.connect(self._on_interlaced_field2_phase_fraction_changed)
+        self.roi_interlaced_field2_phase_spin.setToolTip(
+            "2nd field timing within one output frame (-1.00 to 2.00). 0=field1 at current frame, 0.5=half-step, 1.0=next frame."
+        )
+        roi_form.addRow("Interlaced field2 phase", self.roi_interlaced_field2_phase_spin)
+
         self.roi_transition_frames_spin = QSpinBox()
         self.roi_transition_frames_spin.setRange(1, 600)
         self.roi_transition_frames_spin.setValue(int(self._roi_keyframe_transition_default_frames))
@@ -5285,6 +5384,97 @@ class MainWindow(QMainWindow):
                             queue_drops.get("preprocess", 0),
                             queue_drops.get("upscale", 0),
                         )
+
+                    transition_state_for_log: dict[str, object] = {}
+                    if hasattr(self._controller, "decklink_roi_transition_state"):
+                        try:
+                            transition_state_for_log = dict(self._controller.decklink_roi_transition_state())
+                        except Exception:
+                            transition_state_for_log = {}
+                    transition_active_for_log = bool(transition_state_for_log.get("active", False))
+                    output_interlaced_raw = getattr(self._controller, "decklink_output_is_interlaced", False)
+                    if callable(output_interlaced_raw):
+                        try:
+                            output_interlaced_raw = output_interlaced_raw()
+                        except Exception:
+                            output_interlaced_raw = False
+                    output_interlaced_for_log = bool(output_interlaced_raw)
+                    transition_units_raw = getattr(
+                        self._controller,
+                        "decklink_transition_units_per_output_frame",
+                        0.0,
+                    )
+                    if callable(transition_units_raw):
+                        try:
+                            transition_units_raw = transition_units_raw()
+                        except Exception:
+                            transition_units_raw = 0.0
+                    try:
+                        transition_units_for_log = float(transition_units_raw)
+                    except Exception:
+                        transition_units_for_log = 0.0
+                    phase_for_log = transition_state_for_log.get("interlaced_field_phase")
+                    phase_present_for_log = isinstance(phase_for_log, dict)
+                    controller_field2_phase_for_log = _clamp_interlaced_field2_phase_fraction(
+                        float(getattr(self._controller, "interlaced_field2_phase_fraction", self._interlaced_field2_phase_fraction))
+                    )
+                    phase_disabled_for_log = abs(controller_field2_phase_for_log) <= 1e-4
+                    LOGGER.info(
+                        (
+                            "ROI_FIELD_GATE | active=%s | interlaced=%s | phase_present=%s | phase_disabled=%s | "
+                            "units=%.2f | phase2=%.2f | progress=%.3f/%d | mode=%s"
+                        ),
+                        transition_active_for_log,
+                        output_interlaced_for_log,
+                        phase_present_for_log,
+                        phase_disabled_for_log,
+                        transition_units_for_log,
+                        controller_field2_phase_for_log,
+                        float(transition_state_for_log.get("frame_progress", 0.0)),
+                        max(0, int(transition_state_for_log.get("total_frames", 0))),
+                        str(transition_state_for_log.get("interpolation_mode", "")),
+                    )
+
+                    if transition_active_for_log and output_interlaced_for_log:
+                        phase = phase_for_log
+                        if isinstance(phase, dict):
+                            roi0 = phase.get("roi0")
+                            roi1 = phase.get("roi1")
+                            if isinstance(roi0, (list, tuple)) and len(roi0) >= 4 and isinstance(roi1, (list, tuple)) and len(roi1) >= 4:
+                                progress = float(transition_state_for_log.get("frame_progress", 0.0))
+                                total = max(1, int(transition_state_for_log.get("total_frames", 1)))
+                                signature = (
+                                    f"{progress:.3f}|{int(roi0[0])},{int(roi0[1])},{int(roi0[2])},{int(roi0[3])}|"
+                                    f"{int(roi1[0])},{int(roi1[1])},{int(roi1[2])},{int(roi1[3])}|"
+                                    f"{float(phase.get('field0_x', 0.0)):.4f},{float(phase.get('field0_y', 0.0)):.4f}|"
+                                    f"{float(phase.get('field1_x', 0.0)):.4f},{float(phase.get('field1_y', 0.0)):.4f}"
+                                )
+                                if signature != self._last_interlaced_phase_log_signature:
+                                    LOGGER.info(
+                                        (
+                                            "ROI_FIELD_PHASE | progress=%.3f/%d | "
+                                            "field0_roi=(%d,%d,%d,%d) | field1_roi=(%d,%d,%d,%d) | "
+                                            "field0_shift=(%.4f,%.4f) | field1_shift=(%.4f,%.4f) | phase2=%.2f"
+                                        ),
+                                        progress,
+                                        total,
+                                        int(roi0[0]),
+                                        int(roi0[1]),
+                                        int(roi0[2]),
+                                        int(roi0[3]),
+                                        int(roi1[0]),
+                                        int(roi1[1]),
+                                        int(roi1[2]),
+                                        int(roi1[3]),
+                                        float(phase.get("field0_x", 0.0)),
+                                        float(phase.get("field0_y", 0.0)),
+                                        float(phase.get("field1_x", 0.0)),
+                                        float(phase.get("field1_y", 0.0)),
+                                        controller_field2_phase_for_log,
+                                    )
+                                    self._last_interlaced_phase_log_signature = signature
+                    elif self._last_interlaced_phase_log_signature:
+                        self._last_interlaced_phase_log_signature = ""
 
                     self._roi_diag_canvas_events = 0
                     self._roi_diag_controller_send_attempts = 0
@@ -5958,12 +6148,23 @@ class MainWindow(QMainWindow):
             started = time.perf_counter()
             self._roi_diag_controller_send_attempts += 1
             if use_subpixel_microstep:
+                output_is_interlaced = False
+                output_is_interlaced_fn = getattr(self._controller, "decklink_output_is_interlaced", None)
+                if callable(output_is_interlaced_fn):
+                    try:
+                        output_is_interlaced = bool(output_is_interlaced_fn())
+                    except Exception:
+                        output_is_interlaced = False
+                manual_interaction = bool(drag_overlay is not None) or (
+                    output_is_interlaced
+                    and ((step_roi.w != current.w) or (step_roi.h != current.h))
+                )
                 sent = bool(
                     self._controller.set_roi_with_subpixel(
                         step_roi,
                         step_shift_x,
                         step_shift_y,
-                        manual_drag=moving_only,
+                        manual_drag=manual_interaction,
                     )
                 )
             else:
@@ -6018,7 +6219,13 @@ class MainWindow(QMainWindow):
             base = 16
 
         if moving_only and self._controller_backend == "worker-process":
-            return max(base, int(self._manual_drag_worker_send_interval_ms))
+            base = max(base, int(self._manual_drag_worker_send_interval_ms))
+
+        field_interval_ms = self._decklink_output_field_interval_ms()
+        if field_interval_ms is not None:
+            # Keep manual control updates at least as responsive as field cadence.
+            # Slower-than-field pacing makes drag appear steppy at 1080i rates.
+            return min(base, int(field_interval_ms))
         return base
 
     def _sample_manual_drag_overlay_target(
@@ -6351,7 +6558,11 @@ class MainWindow(QMainWindow):
             base_interval_ms = 16
         interval_scale = 1.20 - (0.60 * smoothing)
         interval_ms = int(round(base_interval_ms * interval_scale))
-        self._controller_roi_interp_timer.setInterval(max(6, min(24, interval_ms)))
+        interval_ms = max(6, min(24, interval_ms))
+        field_interval_ms = self._decklink_output_field_interval_ms()
+        if field_interval_ms is not None:
+            interval_ms = min(interval_ms, int(field_interval_ms))
+        self._controller_roi_interp_timer.setInterval(interval_ms)
         if not self._controller_roi_interp_timer.isActive():
             self._controller_roi_interp_timer.start()
 
@@ -6533,6 +6744,12 @@ class MainWindow(QMainWindow):
         clamped = max(0.0, min(0.50, float(value)))
         self._roi_min_drag_nudge = clamped
 
+    def _on_interlaced_field2_phase_fraction_changed(self, value: float) -> None:
+        clamped = _clamp_interlaced_field2_phase_fraction(float(value))
+        self._interlaced_field2_phase_fraction = clamped
+        LOGGER.info("Interlaced field2 phase tuning changed in GUI: fraction=%.2f", clamped)
+        self._apply_interlaced_phase_tuning_to_controller()
+
     def _apply_manual_drag_tuning_to_controller(self) -> None:
         if not hasattr(self._controller, "set_roi_manual_drag_hold_seconds"):
             return
@@ -6540,6 +6757,14 @@ class MainWindow(QMainWindow):
             self._controller.set_roi_manual_drag_hold_seconds(float(self._roi_manual_drag_hold_s))
         except Exception:
             LOGGER.exception("Failed to apply manual drag hold tuning")
+
+    def _apply_interlaced_phase_tuning_to_controller(self) -> None:
+        if not hasattr(self._controller, "set_interlaced_field2_phase_fraction"):
+            return
+        try:
+            self._controller.set_interlaced_field2_phase_fraction(float(self._interlaced_field2_phase_fraction))
+        except Exception:
+            LOGGER.exception("Failed to apply interlaced field2 phase tuning")
 
     def _is_controller_roi_close(self, roi_a: Roi, roi_b: Roi) -> bool:
         return (
@@ -7700,6 +7925,66 @@ class MainWindow(QMainWindow):
             return 0.0
         return time_scale / frame_duration
 
+    def _decklink_output_mode_is_interlaced(self) -> bool:
+        if self._source_mode == "Blackmagic DeckLink" and hasattr(self._controller, "decklink_output_is_interlaced"):
+            try:
+                return bool(self._controller.decklink_output_is_interlaced())
+            except Exception:
+                pass
+
+        mode_label = str(self.decklink_output_mode_combo.currentText()).strip().lower()
+        if not mode_label:
+            return False
+
+        mode_name = mode_label.split("(", 1)[0].strip()
+        if "progressive" in mode_name or "psf" in mode_name:
+            return False
+        if "interlace" in mode_name:
+            return True
+
+        # Common DeckLink naming uses forms like "1080i59.94".
+        return ("i" in mode_name) and any(ch.isdigit() for ch in mode_name)
+
+    def _decklink_output_field_interval_ms(self) -> int | None:
+        field_rate_hz = self._decklink_output_effective_field_rate_fps()
+        if field_rate_hz <= 1.0:
+            return None
+        return max(1, int(round(1000.0 / field_rate_hz)))
+
+    def _decklink_output_effective_field_rate_fps(self) -> float:
+        if self._source_mode != "Blackmagic DeckLink":
+            return 0.0
+
+        nominal_fps = 0.0
+        if hasattr(self._controller, "decklink_output_nominal_fps"):
+            try:
+                nominal_fps = float(self._controller.decklink_output_nominal_fps())
+            except Exception:
+                nominal_fps = 0.0
+
+        if nominal_fps <= 1.0:
+            out_device = self._selected_combo_data(self.decklink_output_device_combo)
+            out_mode = self._selected_combo_data(self.decklink_output_mode_combo)
+            if out_device is not None and out_mode is not None:
+                resolved_fps = self._resolve_mode_fps(int(out_device), out_mode, input_side=False)
+                if resolved_fps is not None:
+                    nominal_fps = float(resolved_fps)
+
+        if nominal_fps <= 1.0:
+            return 0.0
+
+        if hasattr(self._controller, "decklink_transition_units_per_output_frame"):
+            try:
+                units_per_frame = float(self._controller.decklink_transition_units_per_output_frame())
+            except Exception:
+                units_per_frame = 1.0
+            if units_per_frame > 0.1:
+                return nominal_fps * units_per_frame
+
+        if self._decklink_output_mode_is_interlaced() and nominal_fps < 45.0:
+            return nominal_fps * 2.0
+        return nominal_fps
+
     def _select_default_mode(self, combo: QComboBox, preferred_name: str) -> None:
         if combo.count() == 0:
             return
@@ -7906,43 +8191,23 @@ class MainWindow(QMainWindow):
             requested_duration_frames = max(1, min(600, int(keyframe.duration_frames)))
 
         duration_frames = self._effective_roi_keyframe_duration_frames(keyframe.roi, requested_duration_frames)
-        adaptive_suffix = ""
-        if duration_frames != requested_duration_frames:
-            adaptive_suffix = f", adaptive from {requested_duration_frames}"
 
         self._start_roi_keyframe_transition(keyframe.roi, duration_frames, keyframe.interpolation_mode)
         if override_duration:
             self._update_status(
-                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}, override{adaptive_suffix})"
+                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}, override)"
             )
         else:
             self._update_status(
-                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}{adaptive_suffix})"
+                f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)})"
             )
 
     def _effective_roi_keyframe_duration_frames(self, target_roi: Roi, requested_frames: int) -> int:
+        _ = target_roi
         requested = max(1, min(600, int(requested_frames)))
-        current_roi = clamp_roi(self._roi)
-        target = clamp_roi(target_roi)
-
-        start_scale = max(1.0, roi_scale_from_roi(current_roi))
-        target_scale = max(1.0, roi_scale_from_roi(target))
-        scale_ratio = max(start_scale, target_scale) / max(1e-6, min(start_scale, target_scale))
-        scale_jump = max(0.0, math.log2(max(1.0, scale_ratio)))
-
-        current_cx = float(current_roi.x) + (float(current_roi.w) * 0.5)
-        current_cy = float(current_roi.y) + (float(current_roi.h) * 0.5)
-        target_cx = float(target.x) + (float(target.w) * 0.5)
-        target_cy = float(target.y) + (float(target.h) * 0.5)
-        center_distance = math.hypot(target_cx - current_cx, target_cy - current_cy)
-
-        adaptive_floor = int(math.ceil((scale_jump * 14.0) + (center_distance / 180.0)))
-        if scale_ratio >= 1.75:
-            adaptive_floor = max(adaptive_floor, int(math.ceil(requested * 1.35)))
-        elif scale_ratio >= 1.4:
-            adaptive_floor = max(adaptive_floor, int(math.ceil(requested * 1.15)))
-
-        return max(requested, min(600, adaptive_floor))
+        # Keep explicit requested units; worker-side stepping handles
+        # field-vs-frame progression.
+        return requested
 
     def _update_roi_key_buttons(self) -> None:
         for save_button in self._all_roi_save_key_buttons():
@@ -8119,15 +8384,11 @@ class MainWindow(QMainWindow):
         return clamped_t
 
     def _roi_keyframe_transition_fps(self) -> float:
-        # Clock keyframe transition ticks to Blackmagic output nominal FPS when
-        # available so interpolation cadence matches output frame timing.
-        if self._source_mode == "Blackmagic DeckLink" and hasattr(self._controller, "decklink_output_nominal_fps"):
-            try:
-                output_fps = float(self._controller.decklink_output_nominal_fps())
-            except Exception:
-                output_fps = 0.0
-            if output_fps > 1.0:
-                return output_fps
+        # Clock transition ticks to effective DeckLink cadence. Interlaced
+        # modes resolve to field rate when nominal reporting is frame-based.
+        decklink_rate = self._decklink_output_effective_field_rate_fps()
+        if decklink_rate > 1.0:
+            return decklink_rate
         return float(self._roi_keyframe_target_fps)
 
     def _step_roi_keyframe_transition(self) -> None:
@@ -8378,12 +8639,11 @@ class MainWindow(QMainWindow):
             target_shift_y = 0.0
 
         if is_final_frame:
-            interpolated = target_roi
-            target_shift_x = 0.0
-            target_shift_y = 0.0
-            residual["x"] = 0.0
-            residual["y"] = 0.0
-            residual["w"] = 0.0
+            # Avoid a terminal-frame hard snap. Keep interpolated carrier/shift
+            # and let completion criteria finalize with a bounded tolerance.
+            residual["x"] = desired_cx - interp_cx
+            residual["y"] = desired_cy - interp_cy
+            residual["w"] = desired_w_backend - float(interpolated.w)
 
         roi_changed = (
             interpolated.x != self._roi.x
@@ -8392,11 +8652,17 @@ class MainWindow(QMainWindow):
             or interpolated.h != self._roi.h
         )
 
-        transition_complete = is_final_frame or (
+        transition_complete = (
             interpolated.x == target_roi.x
             and interpolated.y == target_roi.y
             and interpolated.w == target_roi.w
             and interpolated.h == target_roi.h
+        ) or (
+            is_final_frame
+            and abs(interpolated.x - target_roi.x) <= 2
+            and abs(interpolated.y - target_roi.y) <= 1
+            and abs(interpolated.w - target_roi.w) <= 2
+            and abs(interpolated.h - target_roi.h) <= 2
         )
 
         if roi_changed:
@@ -8439,7 +8705,7 @@ class MainWindow(QMainWindow):
             self._roi_keyframe_transition = None
             self._roi_keyframe_transition_timer.stop()
             self._input_canvas.clear_visual_roi_overlay()
-            if hasattr(self._controller, "set_roi_subpixel_shift"):
+            if (not backend_driven) and hasattr(self._controller, "set_roi_subpixel_shift"):
                 self._controller.set_roi_subpixel_shift(0.0, 0.0)
             if (
                 interpolated.x != target_roi.x
@@ -8447,13 +8713,11 @@ class MainWindow(QMainWindow):
                 or interpolated.w != target_roi.w
                 or interpolated.h != target_roi.h
             ):
-                self._roi = target_roi
-                self._input_canvas.set_roi(target_roi)
+                if not backend_driven:
+                    self._roi = target_roi
+                    self._input_canvas.set_roi(target_roi)
             # Always finalize backend ROI and control values at transition end.
-            if backend_driven and hasattr(self._controller, "set_roi_with_subpixel"):
-                self._controller.set_roi_with_subpixel(self._roi, 0.0, 0.0)
-                self._controller_roi_applied = self._roi
-            else:
+            if not backend_driven:
                 self._apply_controller_roi_immediate(self._roi)
 
             self._sync_controls_from_roi(self._roi)

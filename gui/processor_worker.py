@@ -83,6 +83,10 @@ def _apply_current_process_priority(priority_name: str) -> tuple[str, str | None
         return normalized, str(exc)
 
 
+def _clamp_interlaced_field2_phase_fraction(value: float) -> float:
+    return max(_INTERLACED_FIELD2_PHASE_MIN, min(_INTERLACED_FIELD2_PHASE_MAX, float(value)))
+
+
 def _candidate_cuda_dll_dirs() -> list[Path]:
     dirs: list[Path] = []
     seen: set[str] = set()
@@ -390,6 +394,12 @@ FRAME_W = 1920
 FRAME_H = 1080
 UYVY_ROW_BYTES = FRAME_W * 2
 _SUBPIXEL_SHIFT_APPLY_EPS = max(0.0, float(os.environ.get("VP_SUBPIXEL_SHIFT_APPLY_EPS", "0.03")))
+_INTERLACED_FIELD2_PHASE_MIN = -1.0
+_INTERLACED_FIELD2_PHASE_MAX = 2.0
+_INTERLACED_FIELD2_PHASE_FRACTION = max(
+    _INTERLACED_FIELD2_PHASE_MIN,
+    min(_INTERLACED_FIELD2_PHASE_MAX, float(os.environ.get("VP_INTERLACED_FIELD2_PHASE_FRACTION", "0.50"))),
+)
 _AI_SR_TIMING_WARMUP_FRAMES = max(0, int(os.environ.get("VP_AI_SR_TIMING_WARMUP_FRAMES", "8")))
 _OUTPUT_SCHEDULE_STARVED_STREAK_THRESHOLD = max(
     1,
@@ -655,6 +665,81 @@ def _apply_subpixel_shift_uyvy(frame_bytes: bytes, shift_x: float, shift_y: floa
     out[:, :, 1] = y_shifted[:, 0::2]
     out[:, :, 2] = uv_shifted[:, :, 1]
     out[:, :, 3] = y_shifted[:, 1::2]
+    return out.tobytes()
+
+
+def _apply_interlaced_field_phase_shift_uyvy(
+    frame_bytes: bytes,
+    field0_shift_x: float,
+    field0_shift_y: float,
+    field1_shift_x: float,
+    field1_shift_y: float,
+) -> bytes:
+    if cv2 is None:
+        return frame_bytes
+    if len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
+        return frame_bytes
+
+    yuv422 = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, FRAME_W, 2)
+    packed = yuv422.reshape(FRAME_H, FRAME_W // 2, 4)
+
+    y_plane = np.empty((FRAME_H, FRAME_W), dtype=np.uint8)
+    y_plane[:, 0::2] = packed[:, :, 1]
+    y_plane[:, 1::2] = packed[:, :, 3]
+    uv_plane = np.empty((FRAME_H, FRAME_W // 2, 2), dtype=np.uint8)
+    uv_plane[:, :, 0] = packed[:, :, 0]
+    uv_plane[:, :, 1] = packed[:, :, 2]
+
+    def _warp_planes(shift_x: float, shift_y: float) -> tuple[np.ndarray, np.ndarray]:
+        mat_y = np.array([[1.0, 0.0, float(shift_x)], [0.0, 1.0, float(shift_y)]], dtype=np.float32)
+        mat_uv = np.array([[1.0, 0.0, float(shift_x) * 0.5], [0.0, 1.0, float(shift_y)]], dtype=np.float32)
+        y_shifted_local = cv2.warpAffine(
+            y_plane,
+            mat_y,
+            (FRAME_W, FRAME_H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        uv_shifted_local = cv2.warpAffine(
+            uv_plane,
+            mat_uv,
+            (FRAME_W // 2, FRAME_H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        return y_shifted_local, uv_shifted_local
+
+    y_f0, uv_f0 = _warp_planes(float(field0_shift_x), float(field0_shift_y))
+    y_f1, uv_f1 = _warp_planes(float(field1_shift_x), float(field1_shift_y))
+
+    y_out = np.empty_like(y_plane)
+    uv_out = np.empty_like(uv_plane)
+    y_out[0::2, :] = y_f0[0::2, :]
+    y_out[1::2, :] = y_f1[1::2, :]
+    uv_out[0::2, :, :] = uv_f0[0::2, :, :]
+    uv_out[1::2, :, :] = uv_f1[1::2, :, :]
+
+    out = np.empty((FRAME_H, FRAME_W // 2, 4), dtype=np.uint8)
+    out[:, :, 0] = uv_out[:, :, 0]
+    out[:, :, 1] = y_out[:, 0::2]
+    out[:, :, 2] = uv_out[:, :, 1]
+    out[:, :, 3] = y_out[:, 1::2]
+    return out.tobytes()
+
+
+def _collapse_interlaced_to_single_field_uyvy(frame_bytes: bytes, lower_field_first: bool) -> bytes:
+    if len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
+        return frame_bytes
+    plane = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(FRAME_H, UYVY_ROW_BYTES)
+    out = np.empty_like(plane)
+    # Neutral interlaced ROI mode: duplicate one temporal field into both line
+    # parities so ROI motion does not exhibit field-offset rendering.
+    if lower_field_first:
+        out[0::2, :] = plane[1::2, :]
+        out[1::2, :] = plane[1::2, :]
+    else:
+        out[0::2, :] = plane[0::2, :]
+        out[1::2, :] = plane[0::2, :]
     return out.tobytes()
 
 
@@ -1739,6 +1824,8 @@ class _StageFrame:
     ai_applied: bool = False
     rtx_applied: bool = False
     native_shift_applied: bool = False
+    interlaced_field_phase: dict[str, object] | None = None
+    interlaced_phase_rendered: bool = False
 
 
 def run_processor_worker(
@@ -1808,7 +1895,7 @@ def run_processor_worker(
         start_roi = (current_x, current_y, current_w, current_h)
         target_roi = (current_x, current_y, current_w, current_h)
         active = False
-        frame_progress = 0
+        frame_progress = 0.0
         total_frames = 0
         interp_mode_code = 0
 
@@ -1816,7 +1903,7 @@ def run_processor_worker(
             active = True
             start_roi = tuple(transition_state.get("start", start_roi))
             target_roi = tuple(transition_state.get("target", target_roi))
-            frame_progress = int(transition_state.get("frame_progress", 0))
+            frame_progress = float(transition_state.get("frame_progress", 0.0))
             total_frames = int(transition_state.get("total_frames", 0))
             interp_mode_code = _interp_mode_to_code(str(transition_state.get("interpolation_mode", "linear")))
 
@@ -1960,6 +2047,12 @@ def run_processor_worker(
     started_perf_ts = 0.0
     output_nominal_fps = 0.0
     output_frame_period_s = 0.0
+    output_mode_is_interlaced = False
+    output_field_dominance_code: int | None = None
+    output_mode_name = ""
+    output_mode_value = ""
+    output_field_dominance_name = ""
+    output_transition_units_per_frame = 1.0
     stage_preprocess_applied_frames = 0
     stage_basic_applied_frames = 0
     stage_ai_applied_frames = 0
@@ -2090,8 +2183,16 @@ def run_processor_worker(
     roi_shift_velocity_y = 0.0
     roi_shift_accel_x = 0.0
     roi_shift_accel_y = 0.0
+    interlaced_prev_motion_shift_x: float | None = None
+    interlaced_prev_motion_shift_y: float | None = None
+    manual_interlaced_phase_state: dict[str, object] | None = None
+    manual_interlaced_phase_until_ts = 0.0
+    manual_interlaced_phase_pending = False
     roi_manual_drag_until_ts = 0.0
     roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
+    interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
+        float(startup_config.get("interlaced_field2_phase_fraction", _INTERLACED_FIELD2_PHASE_FRACTION))
+    )
     roi_microstep_transition: dict[str, object] | None = None
     current_deinterlace_enabled = bool(startup_config.get("deinterlace_enabled", True))
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
@@ -2136,14 +2237,22 @@ def run_processor_worker(
         nonlocal roi_shift_accel_x, roi_shift_accel_y
         nonlocal roi_manual_drag_until_ts
         nonlocal roi_microstep_transition
+        nonlocal output_transition_units_per_frame
 
-        # During active keyframe transitions, apply the exact per-frame shift
-        # target to remove follower lag and achieve dolly-like smoothness.
+        # During active keyframe transitions, follow the shift target tightly.
+        # For interlaced field-unit progression, keep a small LPF to reduce
+        # visible per-frame stepping when transition units advance by 2.
         if roi_microstep_transition is not None:
-            roi_shift_target_lpf_x = float(roi_shift_target_x)
-            roi_shift_target_lpf_y = float(roi_shift_target_y)
-            roi_shift_applied_x = float(roi_shift_target_x)
-            roi_shift_applied_y = float(roi_shift_target_y)
+            if float(output_transition_units_per_frame) > 1.0:
+                roi_shift_target_lpf_x += (float(roi_shift_target_x) - roi_shift_target_lpf_x) * 0.74
+                roi_shift_target_lpf_y += (float(roi_shift_target_y) - roi_shift_target_lpf_y) * 0.72
+                roi_shift_applied_x += (roi_shift_target_lpf_x - roi_shift_applied_x) * 0.86
+                roi_shift_applied_y += (roi_shift_target_lpf_y - roi_shift_applied_y) * 0.84
+            else:
+                roi_shift_target_lpf_x = float(roi_shift_target_x)
+                roi_shift_target_lpf_y = float(roi_shift_target_y)
+                roi_shift_applied_x = float(roi_shift_target_x)
+                roi_shift_applied_y = float(roi_shift_target_y)
             roi_shift_velocity_x = 0.0
             roi_shift_velocity_y = 0.0
             roi_shift_accel_x = 0.0
@@ -2155,13 +2264,13 @@ def run_processor_worker(
         manual_drag_active = time.perf_counter() <= float(roi_manual_drag_until_ts)
         if manual_drag_active:
             # Softer follower during manual drag to hide even-x carrier steps.
-            target_alpha = 0.26
-            follow_alpha_x = 0.16
-            follow_alpha_y = 0.14
-            min_step_x = 0.0030
-            min_step_y = 0.0026
-            max_step_x = 0.22
-            max_step_y = 0.19
+            target_alpha = 0.32
+            follow_alpha_x = 0.21
+            follow_alpha_y = 0.19
+            min_step_x = 0.0022
+            min_step_y = 0.0019
+            max_step_x = 0.28
+            max_step_y = 0.24
             settle_eps_x = 0.0010
             settle_eps_y = 0.0009
         else:
@@ -2259,6 +2368,323 @@ def run_processor_worker(
         roi_shift_accel_x = 0.0
         roi_shift_accel_y = 0.0
 
+    def _apply_interlaced_field_phase_if_needed(
+        frame_bytes: bytes,
+        base_shift_x: float,
+        base_shift_y: float,
+        native_shift_applied: bool,
+    ) -> bytes:
+        nonlocal interlaced_prev_motion_shift_x, interlaced_prev_motion_shift_y
+        nonlocal output_mode_is_interlaced, output_transition_units_per_frame
+        nonlocal roi_microstep_transition, roi_manual_drag_until_ts
+        nonlocal roi_shift_target_x, roi_shift_target_y, roi_shift_applied_x, roi_shift_applied_y
+        nonlocal interlaced_field2_phase_fraction
+
+        if not output_mode_is_interlaced:
+            interlaced_prev_motion_shift_x = None
+            interlaced_prev_motion_shift_y = None
+            return frame_bytes
+
+        if cv2 is None or len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
+            return frame_bytes
+
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
+
+        transition_state = roi_microstep_transition if isinstance(roi_microstep_transition, dict) else None
+        now_ts = time.perf_counter()
+        motion_active = bool(
+            (roi_microstep_transition is not None)
+            or (now_ts <= float(roi_manual_drag_until_ts))
+            or (abs(float(roi_shift_target_x) - float(roi_shift_applied_x)) >= 0.01)
+            or (abs(float(roi_shift_target_y) - float(roi_shift_applied_y)) >= 0.01)
+        )
+        if not _interlaced_phase_controls_active():
+            # Neutral controls must fully disable field-phase synthesis.
+            interlaced_prev_motion_shift_x = float(base_shift_x)
+            interlaced_prev_motion_shift_y = float(base_shift_y)
+            if motion_active:
+                is_lower_field_first = int(output_field_dominance_code) == 1 if output_field_dominance_code is not None else False
+                return _collapse_interlaced_to_single_field_uyvy(frame_bytes, is_lower_field_first)
+            return frame_bytes
+
+        transition_field_shift = transition_state.get("interlaced_field_shift") if transition_state is not None else None
+        if isinstance(transition_field_shift, dict):
+            field0_x = float(transition_field_shift.get("field0_x", 0.0))
+            field0_y = float(transition_field_shift.get("field0_y", 0.0))
+            field1_x = float(transition_field_shift.get("field1_x", field0_x))
+            field1_y = float(transition_field_shift.get("field1_y", field0_y))
+            if native_shift_applied:
+                # Native path already applied field1/base shift to the whole
+                # frame. Overlay differential shifts per field.
+                base_x = float(base_shift_x)
+                base_y = float(base_shift_y)
+                out = _apply_interlaced_field_phase_shift_uyvy(
+                    frame_bytes,
+                    field0_x - base_x,
+                    field0_y - base_y,
+                    field1_x - base_x,
+                    field1_y - base_y,
+                )
+            else:
+                out = _apply_interlaced_field_phase_shift_uyvy(
+                    frame_bytes,
+                    field0_x,
+                    field0_y,
+                    field1_x,
+                    field1_y,
+                )
+            interlaced_prev_motion_shift_x = field1_x
+            interlaced_prev_motion_shift_y = field1_y
+            return out
+
+        if not motion_active:
+            interlaced_prev_motion_shift_x = None
+            interlaced_prev_motion_shift_y = None
+            return frame_bytes
+
+        prev_x = interlaced_prev_motion_shift_x
+        prev_y = interlaced_prev_motion_shift_y
+        if prev_x is None or prev_y is None:
+            prev_x = float(base_shift_x)
+            prev_y = float(base_shift_y)
+
+        delta_x = float(base_shift_x) - float(prev_x)
+        delta_y = float(base_shift_y) - float(prev_y)
+        per_field_dx = delta_x * phase_fraction
+        per_field_dy = delta_y * phase_fraction
+
+        # If follower lag hides motion in consecutive frames, derive a small
+        # forward microstep from residual target error to avoid repeated fields.
+        if abs(per_field_dx) < 0.0008:
+            residual_x = float(roi_shift_target_x) - float(base_shift_x)
+            per_field_dx = max(-0.75, min(0.75, residual_x * phase_fraction))
+        if abs(per_field_dy) < 0.0008:
+            residual_y = float(roi_shift_target_y) - float(base_shift_y)
+            per_field_dy = max(-0.75, min(0.75, residual_y * phase_fraction))
+
+        if native_shift_applied:
+            field0_x = 0.0
+            field0_y = 0.0
+            field1_x = float(per_field_dx)
+            field1_y = float(per_field_dy)
+        else:
+            field0_x = float(base_shift_x)
+            field0_y = float(base_shift_y)
+            field1_x = float(base_shift_x) + float(per_field_dx)
+            field1_y = float(base_shift_y) + float(per_field_dy)
+
+        out = _apply_interlaced_field_phase_shift_uyvy(
+            frame_bytes,
+            field0_x,
+            field0_y,
+            field1_x,
+            field1_y,
+        )
+
+        interlaced_prev_motion_shift_x = float(base_shift_x) + float(per_field_dx)
+        interlaced_prev_motion_shift_y = float(base_shift_y) + float(per_field_dy)
+        return out
+
+    def _weave_interlaced_fields(frame0_bytes: bytes, frame1_bytes: bytes) -> bytes:
+        if len(frame0_bytes) != (UYVY_ROW_BYTES * FRAME_H) or len(frame1_bytes) != (UYVY_ROW_BYTES * FRAME_H):
+            return frame1_bytes
+        frame0 = np.frombuffer(frame0_bytes, dtype=np.uint8).reshape(FRAME_H, UYVY_ROW_BYTES)
+        frame1 = np.frombuffer(frame1_bytes, dtype=np.uint8).reshape(FRAME_H, UYVY_ROW_BYTES)
+        out = np.empty_like(frame1)
+        # DeckLink lower-field-first outputs emit odd lines first; upper-field-first
+        # emits even lines first. phase0 is always the first temporal field step.
+        is_lower_field_first = int(output_field_dominance_code) == 1 if output_field_dominance_code is not None else False
+        if is_lower_field_first:
+            out[0::2, :] = frame1[0::2, :]
+            out[1::2, :] = frame0[1::2, :]
+        else:
+            out[0::2, :] = frame0[0::2, :]
+            out[1::2, :] = frame1[1::2, :]
+        return out.tobytes()
+
+    def _apply_processor_roi_for_phase(roi_phase: tuple[int, int, int, int]) -> None:
+        phase_x, phase_y, phase_w, phase_h = _normalize_worker_roi(
+            int(roi_phase[0]),
+            int(roi_phase[1]),
+            int(roi_phase[2]),
+            int(roi_phase[3]),
+        )
+        if phase_w == int(current_roi_w) and phase_h == int(current_roi_h):
+            processor.set_roi_position(phase_x, phase_y)
+        else:
+            processor.set_roi(phase_x, phase_y, phase_w, phase_h)
+
+    def _active_interlaced_field_phase_state(consume_manual_snapshot: bool = False) -> dict[str, object] | None:
+        nonlocal manual_interlaced_phase_state, manual_interlaced_phase_until_ts, manual_interlaced_phase_pending
+        if not output_mode_is_interlaced:
+            manual_interlaced_phase_state = None
+            manual_interlaced_phase_until_ts = 0.0
+            manual_interlaced_phase_pending = False
+            return None
+        if not _interlaced_phase_controls_active():
+            manual_interlaced_phase_state = None
+            manual_interlaced_phase_until_ts = 0.0
+            manual_interlaced_phase_pending = False
+            return None
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
+        state = roi_microstep_transition
+        if not isinstance(state, dict):
+            now_ts = time.perf_counter()
+            if now_ts > float(manual_interlaced_phase_until_ts):
+                manual_interlaced_phase_pending = False
+            if (
+                isinstance(manual_interlaced_phase_state, dict)
+                and now_ts <= float(manual_interlaced_phase_until_ts)
+                and bool(manual_interlaced_phase_pending)
+            ):
+                roi0 = manual_interlaced_phase_state.get("roi0")
+                roi1 = manual_interlaced_phase_state.get("roi1")
+                if (
+                    isinstance(roi0, tuple)
+                    and len(roi0) == 4
+                    and isinstance(roi1, tuple)
+                    and len(roi1) == 4
+                ):
+                    if consume_manual_snapshot:
+                        manual_interlaced_phase_pending = False
+                    return manual_interlaced_phase_state
+        if not isinstance(state, dict):
+            # Manual drag and residual shift path (no keyframe transition):
+            # synthesize interlaced field0/field1 shifts from current smoothed
+            # shift state so field-phase rendering remains active while dragging.
+            now_ts = time.perf_counter()
+            motion_active = bool(
+                (now_ts <= float(roi_manual_drag_until_ts))
+                or (abs(float(roi_shift_target_x) - float(roi_shift_applied_x)) >= 0.01)
+                or (abs(float(roi_shift_target_y) - float(roi_shift_applied_y)) >= 0.01)
+            )
+            if not motion_active:
+                return None
+
+            field0_x = float(roi_shift_applied_x)
+            field0_y = float(roi_shift_applied_y)
+            delta_x = float(roi_shift_target_x) - field0_x
+            delta_y = float(roi_shift_target_y) - field0_y
+            field1_x = field0_x + (delta_x * phase_fraction)
+            field1_y = field0_y + (delta_y * phase_fraction)
+
+            return {
+                "roi0": (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h)),
+                "roi1": (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h)),
+                "field0_x": float(field0_x),
+                "field0_y": float(field0_y),
+                "field1_x": float(field1_x),
+                "field1_y": float(field1_y),
+            }
+        phase = state.get("interlaced_field_phase")
+        if not isinstance(phase, dict):
+            return None
+        if "roi0" not in phase or "roi1" not in phase:
+            return None
+        return phase
+
+    def _render_dual_phase_no_deinterlace(
+        input_bytes: bytes,
+        phase: dict[str, object],
+    ) -> tuple[bytes, bool]:
+        roi0 = tuple(phase.get("roi0", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        roi1 = tuple(phase.get("roi1", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        field0_x = float(phase.get("field0_x", 0.0))
+        field0_y = float(phase.get("field0_y", 0.0))
+        field1_x = float(phase.get("field1_x", 0.0))
+        field1_y = float(phase.get("field1_y", 0.0))
+
+        _apply_processor_roi_for_phase(roi0)
+        native0 = _set_native_subpixel_shift(field0_x, field0_y)
+        if hasattr(processor, "process_frame_no_deinterlace"):
+            out0 = _run_native_uyvy_process(
+                input_bytes,
+                "process_frame_no_deinterlace",
+                "process_frame_no_deinterlace_into",
+                reusable_process_frame_no_deinterlace_out,
+            )
+        else:
+            out0 = _apply_subpixel_shift_uyvy(input_bytes, field0_x, field0_y)
+
+        # Native *_into paths reuse a shared bytearray. Snapshot field0 now so
+        # the second render cannot overwrite field0 before weave.
+        out0_frozen = bytes(out0)
+
+        _apply_processor_roi_for_phase(roi1)
+        native1 = _set_native_subpixel_shift(field1_x, field1_y)
+        if hasattr(processor, "process_frame_no_deinterlace"):
+            out1 = _run_native_uyvy_process(
+                input_bytes,
+                "process_frame_no_deinterlace",
+                "process_frame_no_deinterlace_into",
+                reusable_process_frame_no_deinterlace_out,
+            )
+        else:
+            out1 = _apply_subpixel_shift_uyvy(input_bytes, field1_x, field1_y)
+
+        out1_frozen = bytes(out1)
+
+        return _weave_interlaced_fields(out0_frozen, out1_frozen), bool(native0 and native1)
+
+    def _render_dual_phase_basic_scaling(
+        input_bytes: bytes,
+        phase: dict[str, object],
+    ) -> tuple[bytes, bool, bool, float]:
+        roi0 = tuple(phase.get("roi0", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        roi1 = tuple(phase.get("roi1", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        field0_x = float(phase.get("field0_x", 0.0))
+        field0_y = float(phase.get("field0_y", 0.0))
+        field1_x = float(phase.get("field1_x", 0.0))
+        field1_y = float(phase.get("field1_y", 0.0))
+
+        _apply_processor_roi_for_phase(roi0)
+        out0, basic0, native0, ms0 = _apply_basic_scaling_stage(
+            input_bytes,
+            False,
+            field0_x,
+            field0_y,
+        )
+        out0_frozen = bytes(out0)
+
+        _apply_processor_roi_for_phase(roi1)
+        out1, basic1, native1, ms1 = _apply_basic_scaling_stage(
+            input_bytes,
+            False,
+            field1_x,
+            field1_y,
+        )
+        out1_frozen = bytes(out1)
+
+        return _weave_interlaced_fields(out0_frozen, out1_frozen), bool(basic0 or basic1), bool(native0 and native1), float(ms0 + ms1)
+
+    def _render_dual_phase_full_pipeline(
+        input_bytes: bytes,
+        phase: dict[str, object],
+    ) -> tuple[bytes, bool, bool, bool, bool, bool]:
+        roi0 = tuple(phase.get("roi0", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        roi1 = tuple(phase.get("roi1", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        field0_x = float(phase.get("field0_x", 0.0))
+        field0_y = float(phase.get("field0_y", 0.0))
+        field1_x = float(phase.get("field1_x", 0.0))
+        field1_y = float(phase.get("field1_y", 0.0))
+
+        _apply_processor_roi_for_phase(roi0)
+        out0, p0, b0, a0, r0, n0 = _process_pipeline_frame(input_bytes, field0_x, field0_y)
+        out0_frozen = bytes(out0)
+
+        _apply_processor_roi_for_phase(roi1)
+        out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(input_bytes, field1_x, field1_y)
+        out1_frozen = bytes(out1)
+
+        return (
+            _weave_interlaced_fields(out0_frozen, out1_frozen),
+            bool(p0 or p1),
+            bool(b0 or b1),
+            bool(a0 or a1),
+            bool(r0 or r1),
+            bool(n0 and n1),
+        )
+
     def _apply_roi_curve(t: float, mode: str) -> float:
         clamped_t = max(0.0, min(1.0, float(t)))
         mode_name = str(mode).strip().lower()
@@ -2297,7 +2723,7 @@ def run_processor_worker(
             "start": (s_x, s_y, s_w, s_h),
             "target": (t_x, t_y, t_w, t_h),
             "total_frames": total_frames,
-            "frame_progress": 0,
+            "frame_progress": 0.0,
             "interpolation_mode": mode_name,
             # Preserve the currently rendered subpixel-compensated center as
             # the transition start state so the first transition frame is
@@ -2312,7 +2738,73 @@ def run_processor_worker(
         nonlocal roi_microstep_transition
         roi_microstep_transition = None
         if reset_shift:
-            _set_roi_shift_immediate(0.0, 0.0)
+            _set_roi_shift_target(0.0, 0.0)
+
+    def _build_manual_interlaced_phase_snapshot(
+        prev_roi_state: tuple[int, int, int, int],
+        next_roi_state: tuple[int, int, int, int],
+        prev_shift_state: tuple[float, float],
+        next_shift_state: tuple[float, float],
+    ) -> dict[str, object]:
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
+        # For manual updates, keep interpolation bounded to avoid field-order
+        # overstep and visible x/y wobble on resize-only gestures.
+        t_field1 = max(0.0, min(1.0, float(phase_fraction)))
+
+        p_x, p_y, p_w, p_h = [int(v) for v in prev_roi_state]
+        n_x, n_y, n_w, n_h = [int(v) for v in next_roi_state]
+
+        p_cx = float(p_x) + (float(p_w) * 0.5)
+        p_cy = float(p_y) + (float(p_h) * 0.5)
+        n_cx = float(n_x) + (float(n_w) * 0.5)
+        n_cy = float(n_y) + (float(n_h) * 0.5)
+
+        size_changed = (p_w != n_w) or (p_h != n_h)
+        center_dx = n_cx - p_cx
+        center_dy = n_cy - p_cy
+        scale_only_like = size_changed and abs(center_dx) <= 0.75 and abs(center_dy) <= 0.75
+
+        if scale_only_like:
+            center_x = n_cx
+            center_y = n_cy
+            interp_w = int(round(float(p_w) + ((float(n_w - p_w)) * t_field1)))
+            interp_w = max(2, interp_w & ~1)
+            interp_h = max(2, int(round(float(interp_w) * 9.0 / 16.0)))
+
+            roi0 = _normalize_worker_roi(
+                int(round(center_x - (float(p_w) * 0.5))),
+                int(round(center_y - (float(p_h) * 0.5))),
+                int(p_w),
+                int(p_h),
+            )
+            roi1 = _normalize_worker_roi(
+                int(round(center_x - (float(interp_w) * 0.5))),
+                int(round(center_y - (float(interp_h) * 0.5))),
+                int(interp_w),
+                int(interp_h),
+            )
+        else:
+            roi0 = _normalize_worker_roi(p_x, p_y, p_w, p_h)
+            roi1 = _normalize_worker_roi(
+                int(round(float(p_x) + ((float(n_x - p_x)) * t_field1))),
+                int(round(float(p_y) + ((float(n_y - p_y)) * t_field1))),
+                max(2, int(round(float(p_w) + ((float(n_w - p_w)) * t_field1)))) & ~1,
+                max(2, int(round(float(p_h) + ((float(n_h - p_h)) * t_field1)))),
+            )
+
+        prev_shift_x, prev_shift_y = [float(v) for v in prev_shift_state]
+        next_shift_x, next_shift_y = [float(v) for v in next_shift_state]
+        field1_x = prev_shift_x + ((next_shift_x - prev_shift_x) * t_field1)
+        field1_y = prev_shift_y + ((next_shift_y - prev_shift_y) * t_field1)
+
+        return {
+            "roi0": (int(roi0[0]), int(roi0[1]), int(roi0[2]), int(roi0[3])),
+            "roi1": (int(roi1[0]), int(roi1[1]), int(roi1[2]), int(roi1[3])),
+            "field0_x": float(prev_shift_x),
+            "field0_y": float(prev_shift_y),
+            "field1_x": float(field1_x),
+            "field1_y": float(field1_y),
+        }
 
     def _apply_manual_roi_with_subpixel_compensation(
         req_x: int,
@@ -2321,6 +2813,10 @@ def run_processor_worker(
         req_h: int,
     ) -> None:
         nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, rtx_vsr_error
+        nonlocal manual_interlaced_phase_state, manual_interlaced_phase_until_ts, manual_interlaced_phase_pending
+
+        prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
+        prev_shift_state = (float(roi_shift_applied_x), float(roi_shift_applied_y))
 
         prev_roi_w = current_roi_w
         prev_roi_h = current_roi_h
@@ -2359,10 +2855,25 @@ def run_processor_worker(
         max_shift_y = max(2.0, min(48.0, sy * 1.5))
         shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
         shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
-        _set_roi_shift_immediate(shift_x, shift_y)
+        _set_roi_shift_target(shift_x, shift_y)
 
-    def _advance_roi_microstep_transition_one_frame() -> None:
-        nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition
+        if output_mode_is_interlaced and _interlaced_phase_controls_active():
+            manual_interlaced_phase_state = _build_manual_interlaced_phase_snapshot(
+                prev_roi_state,
+                (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h)),
+                prev_shift_state,
+                (float(roi_shift_target_x), float(roi_shift_target_y)),
+            )
+            manual_interlaced_phase_until_ts = time.perf_counter() + 0.12
+            manual_interlaced_phase_pending = True
+        else:
+            manual_interlaced_phase_state = None
+            manual_interlaced_phase_until_ts = 0.0
+            manual_interlaced_phase_pending = False
+
+    def _advance_roi_microstep_transition_one_frame(progress_units: float | None = None) -> None:
+        nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition, output_transition_units_per_frame
+        nonlocal interlaced_field2_phase_fraction
 
         state = roi_microstep_transition
         if state is None:
@@ -2377,12 +2888,26 @@ def run_processor_worker(
             residual = {"x": 0.0, "y": 0.0, "w": 0.0}
             state["residual"] = residual
 
-        frame_progress = min(total_frames, int(state.get("frame_progress", 0)) + 1)
+        step_units = float(output_transition_units_per_frame) if progress_units is None else max(0.01, float(progress_units))
+        if output_mode_is_interlaced:
+            # Interlaced ROI field synthesis is defined as one ROI frame-step per
+            # emitted output frame; field2 phase stays fractional within that step.
+            step_units = 1.0
+        frame_progress = min(float(total_frames), float(state.get("frame_progress", 0.0)) + step_units)
         state["frame_progress"] = frame_progress
-        is_final_frame = frame_progress >= total_frames
+        is_final_frame = frame_progress >= float(total_frames)
 
         t = float(frame_progress) / float(max(1, total_frames))
         curved_t = _apply_roi_curve(t, mode_name)
+
+        prev_progress = max(0.0, frame_progress - step_units)
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
+        field0_progress = prev_progress
+        field1_progress = max(0.0, min(float(total_frames), prev_progress + (step_units * phase_fraction)))
+        t_field0 = min(1.0, field0_progress / float(max(1, total_frames)))
+        t_field1 = min(1.0, field1_progress / float(max(1, total_frames)))
+        curved_t_field0 = _apply_roi_curve(t_field0, mode_name)
+        curved_t_field1 = _apply_roi_curve(t_field1, mode_name)
 
         s_x, s_y, s_w, s_h = [float(v) for v in start_roi]
         t_x, t_y, t_w, t_h = [float(v) for v in target_roi]
@@ -2395,18 +2920,31 @@ def run_processor_worker(
         ideal_cx = start_cx + ((target_cx - start_cx) * curved_t)
         ideal_cy = start_cy + ((target_cy - start_cy) * curved_t)
         ideal_w = s_w + ((t_w - s_w) * curved_t)
+        ideal_w_field0 = s_w + ((t_w - s_w) * curved_t_field0)
+        ideal_w_field1 = s_w + ((t_w - s_w) * curved_t_field1)
+        ideal_cx_field0 = start_cx + ((target_cx - start_cx) * curved_t_field0)
+        ideal_cy_field0 = start_cy + ((target_cy - start_cy) * curved_t_field0)
+        ideal_cx_field1 = start_cx + ((target_cx - start_cx) * curved_t_field1)
+        ideal_cy_field1 = start_cy + ((target_cy - start_cy) * curved_t_field1)
 
+        residual_w = float(residual.get("w", 0.0))
         desired_cx = ideal_cx + float(residual.get("x", 0.0))
         desired_cy = ideal_cy + float(residual.get("y", 0.0))
-        desired_w = ideal_w + float(residual.get("w", 0.0))
+        desired_w = ideal_w + residual_w
 
         target_scale = FRAME_W / max(1.0, t_w)
         overscan_pct = float(state.get("overscan_percent", 0.0))
         if target_scale >= 4.0 and overscan_pct > 0.0:
             overscan_weight = max(0.0, 4.0 * curved_t * (1.0 - curved_t))
             desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
+            overscan_weight_field0 = max(0.0, 4.0 * curved_t_field0 * (1.0 - curved_t_field0))
+            overscan_weight_field1 = max(0.0, 4.0 * curved_t_field1 * (1.0 - curved_t_field1))
+            desired_w_backend_field0 = (ideal_w_field0 + residual_w) * (1.0 + ((overscan_pct / 100.0) * overscan_weight_field0))
+            desired_w_backend_field1 = (ideal_w_field1 + residual_w) * (1.0 + ((overscan_pct / 100.0) * overscan_weight_field1))
         else:
             desired_w_backend = desired_w
+            desired_w_backend_field0 = ideal_w_field0 + residual_w
+            desired_w_backend_field1 = ideal_w_field1 + residual_w
 
         d_x = int(target_roi[0]) - int(start_roi[0])
         d_y = int(target_roi[1]) - int(start_roi[1])
@@ -2458,18 +2996,6 @@ def run_processor_worker(
             mono_h = min(mono_h, int(last_roi[3]))
 
         i_x, i_y, i_w, i_h = _normalize_worker_roi(mono_x, mono_y, mono_w, mono_h)
-
-        if is_final_frame:
-            i_x, i_y, i_w, i_h = _normalize_worker_roi(
-                int(target_roi[0]),
-                int(target_roi[1]),
-                int(target_roi[2]),
-                int(target_roi[3]),
-            )
-            residual["x"] = 0.0
-            residual["y"] = 0.0
-            residual["w"] = 0.0
-
         state["last_roi"] = (i_x, i_y, i_w, i_h)
 
         interp_cx = float(i_x) + (float(i_w) * 0.5)
@@ -2486,6 +3012,114 @@ def run_processor_worker(
         max_shift_y = max(2.0, min(48.0, sy * 1.5))
         shift_x = max(-max_shift_x, min(max_shift_x, -(source_dx * sx)))
         shift_y = max(-max_shift_y, min(max_shift_y, -(source_dy * sy)))
+
+        quant_w_field0 = _quantize_directional(desired_w_backend_field0, d_w, 2)
+        quant_w_field0 = max(2, quant_w_field0 & ~1)
+        quant_h_field0 = max(2, int(round(quant_w_field0 * 9.0 / 16.0)))
+        quant_w_field1 = _quantize_directional(desired_w_backend_field1, d_w, 2)
+        quant_w_field1 = max(2, quant_w_field1 & ~1)
+        quant_h_field1 = max(2, int(round(quant_w_field1 * 9.0 / 16.0)))
+
+        desired_x_field0 = ideal_cx_field0 - (quant_w_field0 * 0.5)
+        desired_y_field0 = ideal_cy_field0 - (quant_h_field0 * 0.5)
+        desired_x_field1 = ideal_cx_field1 - (quant_w_field1 * 0.5)
+        desired_y_field1 = ideal_cy_field1 - (quant_h_field1 * 0.5)
+
+        roi0_x = _quantize_directional(desired_x_field0, d_x, 2)
+        roi0_y = _quantize_directional(desired_y_field0, d_y, 1)
+        roi1_x = _quantize_directional(desired_x_field1, d_x, 2)
+        roi1_y = _quantize_directional(desired_y_field1, d_y, 1)
+        roi0_x, roi0_y, roi0_w, roi0_h = _normalize_worker_roi(roi0_x, roi0_y, quant_w_field0, quant_h_field0)
+        roi1_x, roi1_y, roi1_w, roi1_h = _normalize_worker_roi(roi1_x, roi1_y, quant_w_field1, quant_h_field1)
+
+        interp_cx_field0 = float(roi0_x) + (float(roi0_w) * 0.5)
+        interp_cy_field0 = float(roi0_y) + (float(roi0_h) * 0.5)
+        interp_cx_field1 = float(roi1_x) + (float(roi1_w) * 0.5)
+        interp_cy_field1 = float(roi1_y) + (float(roi1_h) * 0.5)
+        source_dx_field0 = ideal_cx_field0 - interp_cx_field0
+        source_dy_field0 = ideal_cy_field0 - interp_cy_field0
+        source_dx_field1 = ideal_cx_field1 - interp_cx_field1
+        source_dy_field1 = ideal_cy_field1 - interp_cy_field1
+        sx0 = FRAME_W / max(1.0, float(roi0_w))
+        sy0 = FRAME_H / max(1.0, float(roi0_h))
+        sx1 = FRAME_W / max(1.0, float(roi1_w))
+        sy1 = FRAME_H / max(1.0, float(roi1_h))
+        max_shift_x0 = max(2.0, min(48.0, sx0 * 1.5))
+        max_shift_y0 = max(2.0, min(48.0, sy0 * 1.5))
+        max_shift_x1 = max(2.0, min(48.0, sx1 * 1.5))
+        max_shift_y1 = max(2.0, min(48.0, sy1 * 1.5))
+        field0_shift_x = max(-max_shift_x0, min(max_shift_x0, -(source_dx_field0 * sx0)))
+        field0_shift_y = max(-max_shift_y0, min(max_shift_y0, -(source_dy_field0 * sy0)))
+        field1_shift_x = max(-max_shift_x1, min(max_shift_x1, -(source_dx_field1 * sx1)))
+        field1_shift_y = max(-max_shift_y1, min(max_shift_y1, -(source_dy_field1 * sy1)))
+
+        phase_fraction_active = abs(_clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))) > 1e-4
+        if not phase_fraction_active:
+            state.pop("interlaced_field_shift", None)
+            state.pop("interlaced_field_phase", None)
+            _set_roi_shift_target(shift_x, shift_y)
+
+            roi_changed = (
+                i_x != current_roi_x
+                or i_y != current_roi_y
+                or i_w != current_roi_w
+                or i_h != current_roi_h
+            )
+            if roi_changed:
+                prev_roi_w = current_roi_w
+                prev_roi_h = current_roi_h
+                current_roi_x, current_roi_y, current_roi_w, current_roi_h = i_x, i_y, i_w, i_h
+                if current_roi_w == prev_roi_w and current_roi_h == prev_roi_h:
+                    processor.set_roi_position(current_roi_x, current_roi_y)
+                else:
+                    processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                    if rtx_vsr_enabled:
+                        if rtx_vsr_engine is None:
+                            _ = _refresh_rtx_vsr_engine()
+                        elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
+                            _schedule_rtx_roi_rebuild()
+
+            transition_complete = (
+                current_roi_x == int(target_roi[0])
+                and current_roi_y == int(target_roi[1])
+                and current_roi_w == int(target_roi[2])
+                and current_roi_h == int(target_roi[3])
+            ) or (
+                is_final_frame
+                and abs(current_roi_x - int(target_roi[0])) <= 2
+                and abs(current_roi_y - int(target_roi[1])) <= 1
+                and abs(current_roi_w - int(target_roi[2])) <= 2
+                and abs(current_roi_h - int(target_roi[3])) <= 2
+            )
+            if transition_complete:
+                enforce_full_frame_scale = bool(state.get("enforce_full_frame_scale_1x", False))
+                if enforce_full_frame_scale and current_roi_x == 0 and current_roi_y == 0 and current_roi_w == FRAME_W and current_roi_h == FRAME_H:
+                    try:
+                        processor.set_sr_mode_auto()
+                    except Exception:
+                        pass
+                _set_roi_shift_target(0.0, 0.0)
+                roi_microstep_transition = None
+            return
+
+        state["interlaced_field_shift"] = {
+            "field0_x": float(field0_shift_x),
+            "field0_y": float(field0_shift_y),
+            "field1_x": float(field1_shift_x),
+            "field1_y": float(field1_shift_y),
+        }
+
+        # Keep per-field phase data available on every transition step so
+        # interlaced render paths can always produce distinct field-time samples,
+        # including zoom/scale progression per field.
+        state["interlaced_field_phase"] = {
+            "roi0": (int(roi0_x), int(roi0_y), int(roi0_w), int(roi0_h)),
+            "roi1": (int(roi1_x), int(roi1_y), int(roi1_w), int(roi1_h)),
+            "field0_x": float(field0_shift_x),
+            "field0_y": float(field0_shift_y),
+            "field1_x": float(field1_shift_x),
+            "field1_y": float(field1_shift_y),
+        }
         _set_roi_shift_target(shift_x, shift_y)
 
         roi_changed = (
@@ -2508,33 +3142,42 @@ def run_processor_worker(
                     elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
                         _schedule_rtx_roi_rebuild()
 
-        transition_complete = is_final_frame or (
+        transition_complete = (
             current_roi_x == int(target_roi[0])
             and current_roi_y == int(target_roi[1])
             and current_roi_w == int(target_roi[2])
             and current_roi_h == int(target_roi[3])
+        ) or (
+            is_final_frame
+            and abs(current_roi_x - int(target_roi[0])) <= 2
+            and abs(current_roi_y - int(target_roi[1])) <= 1
+            and abs(current_roi_w - int(target_roi[2])) <= 2
+            and abs(current_roi_h - int(target_roi[3])) <= 2
         )
         if transition_complete:
-            current_roi_x, current_roi_y, current_roi_w, current_roi_h = _normalize_worker_roi(
-                int(target_roi[0]), int(target_roi[1]), int(target_roi[2]), int(target_roi[3])
-            )
-
             enforce_full_frame_scale = bool(state.get("enforce_full_frame_scale_1x", False))
             if enforce_full_frame_scale and current_roi_x == 0 and current_roi_y == 0 and current_roi_w == FRAME_W and current_roi_h == FRAME_H:
                 try:
                     processor.set_sr_mode_auto()
                 except Exception:
                     pass
-
-            if (
-                current_roi_x != i_x
-                or current_roi_y != i_y
-                or current_roi_w != i_w
-                or current_roi_h != i_h
-            ):
-                processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
-            _set_roi_shift_immediate(0.0, 0.0)
+            _set_roi_shift_target(0.0, 0.0)
             roi_microstep_transition = None
+
+    def _advance_roi_microstep_transition_for_output_frame() -> None:
+        nonlocal roi_microstep_transition, output_mode_is_interlaced
+        if roi_microstep_transition is None:
+            return
+
+        if not output_mode_is_interlaced:
+            _advance_roi_microstep_transition_one_frame()
+            return
+
+        # Interlaced path advances one transition step per output frame.
+        # Field0/field1 in-between timing is synthesized inside
+        # _advance_roi_microstep_transition_one_frame using
+        # interlaced_field2_phase_fraction (0.5 = true half-step).
+        _advance_roi_microstep_transition_one_frame(progress_units=1.0)
 
     def _cleanup_ai_async() -> None:
         nonlocal ai_sr_executor, ai_sr_futures
@@ -2760,6 +3403,10 @@ def run_processor_worker(
         # subpixel compensation shifts in Python/OpenCV.
         return not _is_any_sr_selected()
 
+    def _interlaced_phase_controls_active() -> bool:
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
+        return abs(phase_fraction) > 1e-4
+
     def _basic_scaling_enabled() -> bool:
         if not bool(basic_scaling_enabled):
             return False
@@ -2982,7 +3629,7 @@ def run_processor_worker(
         nonlocal upscale_extra_threads, parallel_basic_processors, parallel_basic_worker_count
         nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
-        nonlocal output_nominal_fps, output_frame_period_s
+        nonlocal output_nominal_fps, output_frame_period_s, output_mode_is_interlaced, output_transition_units_per_frame
         nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
         nonlocal rtx_effect_sample_counter
         nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
@@ -3046,6 +3693,10 @@ def run_processor_worker(
         else:
             output_frame_period_s = 0.0
             output_nominal_fps = 0.0
+        # Canonical transition cadence is one ROI frame-step per emitted output
+        # frame for both progressive and interlaced output. Interlaced field0/
+        # field1 in-between timing is synthesized via phase fraction.
+        output_transition_units_per_frame = 1.0
         stage_preprocess_applied_frames = 0
         stage_basic_applied_frames = 0
         stage_ai_applied_frames = 0
@@ -3179,6 +3830,15 @@ def run_processor_worker(
                     continue
                 frame_captured_ts = time.perf_counter()
 
+                # Advance transition phase before processing this frame so each
+                # emitted frame maps to the next field/frame step, avoiding
+                # duplicated field phase from post-emit advancement.
+                _advance_roi_microstep_transition_for_output_frame()
+                interlaced_phase_snapshot = None
+                interlaced_phase_active = _active_interlaced_field_phase_state(consume_manual_snapshot=True)
+                if isinstance(interlaced_phase_active, dict):
+                    interlaced_phase_snapshot = dict(interlaced_phase_active)
+
                 # Keep input preview live even when processing is backlogged.
                 with state_lock:
                     latest_input_frame = input_bytes
@@ -3189,17 +3849,31 @@ def run_processor_worker(
                     output_bytes = input_bytes
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     native_shift_applied = False
-                    if _set_native_subpixel_shift(shift_x, shift_y):
-                        native_shift_applied = _has_effective_subpixel_shift(shift_x, shift_y)
-                    if native_shift_applied and hasattr(processor, "process_frame_no_deinterlace"):
-                        output_bytes = _run_native_uyvy_process(
+                    interlaced_phase = interlaced_phase_snapshot
+                    if interlaced_phase is not None:
+                        output_bytes, native_shift_applied = _render_dual_phase_no_deinterlace(input_bytes, interlaced_phase)
+                    else:
+                        if _set_native_subpixel_shift(shift_x, shift_y):
+                            native_shift_applied = _has_effective_subpixel_shift(shift_x, shift_y)
+                        if native_shift_applied and hasattr(processor, "process_frame_no_deinterlace"):
+                            output_bytes = _run_native_uyvy_process(
+                                output_bytes,
+                                "process_frame_no_deinterlace",
+                                "process_frame_no_deinterlace_into",
+                                reusable_process_frame_no_deinterlace_out,
+                            )
+                        elif (
+                            (not output_mode_is_interlaced)
+                            and _should_apply_cpu_subpixel_fallback()
+                            and _has_effective_subpixel_shift(shift_x, shift_y)
+                        ):
+                            output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
+                        output_bytes = _apply_interlaced_field_phase_if_needed(
                             output_bytes,
-                            "process_frame_no_deinterlace",
-                            "process_frame_no_deinterlace_into",
-                            reusable_process_frame_no_deinterlace_out,
+                            shift_x,
+                            shift_y,
+                            native_shift_applied=native_shift_applied,
                         )
-                    elif _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
-                        output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
                     process_end_ts = time.perf_counter()
                     emit_start_ts = time.perf_counter()
                     try:
@@ -3245,7 +3919,6 @@ def run_processor_worker(
                             roi_h_snapshot,
                             roi_transition_snapshot,
                         )
-                        _advance_roi_microstep_transition_one_frame()
                     continue
 
                 if _is_live_basic_scaling_fast_mode():
@@ -3263,6 +3936,7 @@ def run_processor_worker(
                             roi_y=int(current_roi_y),
                             roi_w=int(current_roi_w),
                             roi_h=int(current_roi_h),
+                            interlaced_field_phase=interlaced_phase_snapshot,
                         )
                         if _put_stage_frame_fifo_drop_newest(q_capture_to_preprocess, item):
                             capture_drop_count += 1
@@ -3274,13 +3948,20 @@ def run_processor_worker(
                     # reduce Python scheduling overhead at 1080p60.
                     process_start_ts = time.perf_counter()
                     shift_x, shift_y = _step_smoothed_roi_shift()
+                    interlaced_phase = interlaced_phase_snapshot
                     try:
-                        output_bytes, basic_applied, native_shift_applied, basic_stage_ms = _apply_basic_scaling_stage(
-                            input_bytes,
-                            False,
-                            shift_x,
-                            shift_y,
-                        )
+                        if interlaced_phase is not None:
+                            output_bytes, basic_applied, native_shift_applied, basic_stage_ms = _render_dual_phase_basic_scaling(
+                                input_bytes,
+                                interlaced_phase,
+                            )
+                        else:
+                            output_bytes, basic_applied, native_shift_applied, basic_stage_ms = _apply_basic_scaling_stage(
+                                input_bytes,
+                                False,
+                                shift_x,
+                                shift_y,
+                            )
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Basic scaling fast path failed: {exc}"})
                         continue
@@ -3288,8 +3969,20 @@ def run_processor_worker(
                     if basic_applied:
                         _record_basic_scaling_timing(basic_stage_ms)
 
-                    if (not native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
+                    if (
+                        (not native_shift_applied)
+                        and (not output_mode_is_interlaced)
+                        and _should_apply_cpu_subpixel_fallback()
+                        and _has_effective_subpixel_shift(shift_x, shift_y)
+                    ):
                         output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
+                    if interlaced_phase is None:
+                        output_bytes = _apply_interlaced_field_phase_if_needed(
+                            output_bytes,
+                            shift_x,
+                            shift_y,
+                            native_shift_applied=native_shift_applied,
+                        )
 
                     process_end_ts = time.perf_counter()
                     emit_start_ts = time.perf_counter()
@@ -3348,7 +4041,6 @@ def run_processor_worker(
                             roi_h_snapshot,
                             roi_transition_snapshot,
                         )
-                        _advance_roi_microstep_transition_one_frame()
                     continue
 
                 frame_id_counter += 1
@@ -3363,6 +4055,7 @@ def run_processor_worker(
                     roi_y=int(current_roi_y),
                     roi_w=int(current_roi_w),
                     roi_h=int(current_roi_h),
+                    interlaced_field_phase=interlaced_phase_snapshot,
                 )
                 if _put_latest_stage_frame(q_capture_to_preprocess, item):
                     capture_drop_count += 1
@@ -3400,6 +4093,10 @@ def run_processor_worker(
                     thread_parallel_proc is not None
                     and parallel_basic_worker_count > 1
                     and _is_live_basic_scaling_fast_mode()
+                    and not (
+                        output_mode_is_interlaced
+                        and isinstance(item.interlaced_field_phase, dict)
+                    )
                 )
 
                 if parallel_basic_active:
@@ -3511,11 +4208,20 @@ def run_processor_worker(
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
                     item.process_start_ts = time.perf_counter()
-                    output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
-                        preprocessed,
-                        float(item.shift_x),
-                        float(item.shift_y),
-                    )
+                    interlaced_phase = item.interlaced_field_phase if isinstance(item.interlaced_field_phase, dict) else None
+                    if output_mode_is_interlaced and _interlaced_phase_controls_active() and interlaced_phase is not None:
+                        output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline(
+                            preprocessed,
+                            interlaced_phase,
+                        )
+                        item.interlaced_phase_rendered = True
+                    else:
+                        output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
+                            preprocessed,
+                            float(item.shift_x),
+                            float(item.shift_y),
+                        )
+                        item.interlaced_phase_rendered = False
                     item.process_end_ts = time.perf_counter()
                     stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
                 except Exception as exc:
@@ -3571,8 +4277,23 @@ def run_processor_worker(
                 output_bytes = item.output_bytes if item.output_bytes is not None else item.input_bytes
                 shift_x = float(item.shift_x)
                 shift_y = float(item.shift_y)
-                if (not item.native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
+                if (
+                    (not item.native_shift_applied)
+                    and (not output_mode_is_interlaced)
+                    and _should_apply_cpu_subpixel_fallback()
+                    and _has_effective_subpixel_shift(shift_x, shift_y)
+                ):
                     output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
+                if not bool(item.interlaced_phase_rendered):
+                    output_bytes = _apply_interlaced_field_phase_if_needed(
+                        output_bytes,
+                        shift_x,
+                        shift_y,
+                        native_shift_applied=bool(item.native_shift_applied),
+                    )
+                if output_mode_is_interlaced and not _interlaced_phase_controls_active():
+                    is_lower_field_first = int(output_field_dominance_code) == 1 if output_field_dominance_code is not None else False
+                    output_bytes = _collapse_interlaced_to_single_field_uyvy(output_bytes, is_lower_field_first)
                 sampled_delta = 0.0
                 if item.rtx_applied:
                     rtx_effect_sample_counter += 1
@@ -3642,7 +4363,6 @@ def run_processor_worker(
                         roi_h_snapshot,
                         roi_transition_snapshot,
                     )
-                    _advance_roi_microstep_transition_one_frame()
 
             while not pipeline_stop_event.is_set():
                 try:
@@ -3938,7 +4658,9 @@ def run_processor_worker(
             capture_session = None
 
     def _start_sessions(message: dict[str, Any]) -> None:
-        nonlocal capture_session, output_session, current_output_buffer_frames
+        nonlocal capture_session, output_session, current_output_buffer_frames, output_mode_is_interlaced
+        nonlocal output_field_dominance_code
+        nonlocal output_mode_name, output_mode_value, output_field_dominance_name
         if d is None:
             raise RuntimeError("decklink_wrapper is not available in worker process")
 
@@ -3959,7 +4681,33 @@ def run_processor_worker(
                 pass
             return str(value).strip().lower()
 
-        def _resolve_display_mode(device_index: int, requested_mode: object, input_side: bool) -> object:
+        def _mode_name_is_interlaced(name: str) -> bool:
+            mode_name = str(name).strip().lower()
+            if not mode_name:
+                return False
+            if "progressive" in mode_name or "psf" in mode_name:
+                return False
+            if "interlace" in mode_name:
+                return True
+            for idx, ch in enumerate(mode_name):
+                if ch == "i" and idx > 0 and (idx + 1) < len(mode_name):
+                    if mode_name[idx - 1].isdigit() and mode_name[idx + 1].isdigit():
+                        return True
+            return False
+
+        def _mode_name_is_progressive(name: str) -> bool:
+            mode_name = str(name).strip().lower()
+            if not mode_name:
+                return False
+            if "progressive" in mode_name or "psf" in mode_name:
+                return True
+            for idx, ch in enumerate(mode_name):
+                if ch == "p" and idx > 0 and (idx + 1) < len(mode_name):
+                    if mode_name[idx - 1].isdigit() and mode_name[idx + 1].isdigit():
+                        return True
+            return False
+
+        def _resolve_display_mode_entry(device_index: int, requested_mode: object, input_side: bool) -> object:
             list_modes = d.list_input_display_modes if input_side else d.list_output_display_modes
             mode_entries = list(list_modes(int(device_index)))
             if not mode_entries:
@@ -3972,11 +4720,11 @@ def run_processor_worker(
             for entry in mode_entries:
                 entry_mode = getattr(entry, "mode", None)
                 if entry_mode == requested_mode:
-                    return entry_mode
+                    return entry
                 if requested_key and _normalize_mode_key(entry_mode) == requested_key:
-                    return entry_mode
+                    return entry
                 if requested_text and str(getattr(entry, "name", "")).strip().lower() == requested_text:
-                    return entry_mode
+                    return entry
 
             side = "input" if input_side else "output"
             available = [
@@ -3993,8 +4741,62 @@ def run_processor_worker(
                 f"requested={requested_mode!r} | available={available}"
             )
 
-        resolved_in_mode = _resolve_display_mode(int(message["in_device"]), requested_in_mode, input_side=True)
-        resolved_out_mode = _resolve_display_mode(int(message["out_device"]), requested_out_mode, input_side=False)
+        resolved_in_entry = _resolve_display_mode_entry(int(message["in_device"]), requested_in_mode, input_side=True)
+        resolved_out_entry = _resolve_display_mode_entry(int(message["out_device"]), requested_out_mode, input_side=False)
+        resolved_in_mode = getattr(resolved_in_entry, "mode", None)
+        resolved_out_mode = getattr(resolved_out_entry, "mode", None)
+        if resolved_in_mode is None or resolved_out_mode is None:
+            raise RuntimeError("DeckLink display mode resolution failed: missing mode value")
+        output_mode_name = str(getattr(resolved_out_entry, "name", ""))
+        output_mode_value = str(getattr(resolved_out_entry, "mode", ""))
+        output_field_dominance_name = str(getattr(resolved_out_entry, "field_dominance_name", ""))
+        output_mode_is_interlaced = _mode_name_is_interlaced(str(getattr(resolved_out_entry, "name", "")))
+        output_field_dominance_code = None
+        try:
+            output_modes = list(d.list_output_display_modes(int(message["out_device"])))
+            progressive_field_dominance_codes = {
+                int(getattr(mode_entry, "field_dominance"))
+                for mode_entry in output_modes
+                if _mode_name_is_progressive(str(getattr(mode_entry, "name", "")))
+                and getattr(mode_entry, "field_dominance", None) is not None
+            }
+            interlaced_field_dominance_codes = {
+                int(getattr(mode_entry, "field_dominance"))
+                for mode_entry in output_modes
+                if _mode_name_is_interlaced(str(getattr(mode_entry, "name", "")))
+                and getattr(mode_entry, "field_dominance", None) is not None
+            }
+            resolved_field_dominance = getattr(resolved_out_entry, "field_dominance", None)
+            if resolved_field_dominance is not None:
+                output_field_dominance_code = int(resolved_field_dominance)
+
+            resolved_field_dominance_name = str(
+                getattr(resolved_out_entry, "field_dominance_name", "")
+            ).strip().lower()
+            output_field_dominance_name = str(getattr(resolved_out_entry, "field_dominance_name", ""))
+            if resolved_field_dominance_name:
+                if "progressive" in resolved_field_dominance_name:
+                    output_mode_is_interlaced = False
+                elif (
+                    ("lower" in resolved_field_dominance_name)
+                    or ("upper" in resolved_field_dominance_name)
+                    or ("interlace" in resolved_field_dominance_name)
+                ):
+                    output_mode_is_interlaced = True
+            elif resolved_field_dominance is not None:
+                resolved_field_code = int(resolved_field_dominance)
+                if (
+                    resolved_field_code in interlaced_field_dominance_codes
+                    and resolved_field_code not in progressive_field_dominance_codes
+                ):
+                    output_mode_is_interlaced = True
+                elif (
+                    resolved_field_code in progressive_field_dominance_codes
+                    and resolved_field_code not in interlaced_field_dominance_codes
+                ):
+                    output_mode_is_interlaced = False
+        except Exception:
+            pass
 
         def _open_sessions(enable_format_detection: bool) -> None:
             nonlocal capture_session, output_session
@@ -4181,6 +4983,11 @@ def run_processor_worker(
                             "cmd": "start_decklink",
                             "decklink_started": True,
                             "decklink_error": None,
+                            "output_mode_name": str(output_mode_name),
+                            "output_mode_value": str(output_mode_value),
+                            "output_mode_is_interlaced": bool(output_mode_is_interlaced),
+                            "output_field_dominance_code": output_field_dominance_code,
+                            "output_field_dominance_name": str(output_field_dominance_name),
                         }
                     )
                 except Exception as decklink_exc:
@@ -4340,9 +5147,10 @@ def run_processor_worker(
                 if isinstance(roi_transition_state_snapshot, dict):
                     start_roi = roi_transition_state_snapshot.get("start", (current_roi_x_snapshot, current_roi_y_snapshot, current_roi_w_snapshot, current_roi_h_snapshot))
                     target_roi = roi_transition_state_snapshot.get("target", (current_roi_x_snapshot, current_roi_y_snapshot, current_roi_w_snapshot, current_roi_h_snapshot))
+                    interlaced_field_phase = _active_interlaced_field_phase_state(consume_manual_snapshot=False)
                     roi_transition_payload = {
                         "active": True,
-                        "frame_progress": int(roi_transition_state_snapshot.get("frame_progress", 0)),
+                        "frame_progress": float(roi_transition_state_snapshot.get("frame_progress", 0.0)),
                         "total_frames": int(roi_transition_state_snapshot.get("total_frames", 1)),
                         "interpolation_mode": str(roi_transition_state_snapshot.get("interpolation_mode", "linear")),
                         "start_roi": {
@@ -4358,10 +5166,19 @@ def run_processor_worker(
                             "h": int(target_roi[3]),
                         },
                     }
+                    if isinstance(interlaced_field_phase, dict):
+                        roi_transition_payload["interlaced_field_phase"] = {
+                            "roi0": tuple(interlaced_field_phase.get("roi0", (current_roi_x_snapshot, current_roi_y_snapshot, current_roi_w_snapshot, current_roi_h_snapshot))),
+                            "roi1": tuple(interlaced_field_phase.get("roi1", (current_roi_x_snapshot, current_roi_y_snapshot, current_roi_w_snapshot, current_roi_h_snapshot))),
+                            "field0_x": float(interlaced_field_phase.get("field0_x", 0.0)),
+                            "field0_y": float(interlaced_field_phase.get("field0_y", 0.0)),
+                            "field1_x": float(interlaced_field_phase.get("field1_x", 0.0)),
+                            "field1_y": float(interlaced_field_phase.get("field1_y", 0.0)),
+                        }
                 else:
                     roi_transition_payload = {
                         "active": False,
-                        "frame_progress": 0,
+                        "frame_progress": 0.0,
                         "total_frames": 0,
                         "interpolation_mode": "",
                     }
@@ -4380,6 +5197,8 @@ def run_processor_worker(
                     "processed_frame_counter": current_counter,
                     "processed_fps": processed_fps,
                     "output_nominal_fps": float(output_nominal_fps),
+                    "output_mode_is_interlaced": bool(output_mode_is_interlaced),
+                    "output_transition_units_per_frame": float(output_transition_units_per_frame),
                     "ai_sr_applied_frames": int(ai_sr_applied_frames),
                     "ai_sr_reused_frames": int(ai_sr_reused_frames),
                     "ai_sr_passthrough_frames": int(ai_sr_passthrough_frames),
@@ -4448,15 +5267,34 @@ def run_processor_worker(
             if command == "process_frame":
                 frame_id = int(message["frame_id"])
                 frame_bytes = message["frame_bytes"]
-                _advance_roi_microstep_transition_one_frame()
+                _advance_roi_microstep_transition_for_output_frame()
                 shift_x, shift_y = _step_smoothed_roi_shift()
-                output_bytes, _, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
-                    frame_bytes,
-                    shift_x,
-                    shift_y,
-                )
-                if (not native_shift_applied) and _should_apply_cpu_subpixel_fallback() and _has_effective_subpixel_shift(shift_x, shift_y):
+                interlaced_phase = _active_interlaced_field_phase_state(consume_manual_snapshot=True)
+                if interlaced_phase is not None:
+                    output_bytes, _, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline(
+                        frame_bytes,
+                        interlaced_phase,
+                    )
+                else:
+                    output_bytes, _, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
+                        frame_bytes,
+                        shift_x,
+                        shift_y,
+                    )
+                if (
+                    (not native_shift_applied)
+                    and (not output_mode_is_interlaced)
+                    and _should_apply_cpu_subpixel_fallback()
+                    and _has_effective_subpixel_shift(shift_x, shift_y)
+                ):
                     output_bytes = _apply_subpixel_shift_uyvy(output_bytes, shift_x, shift_y)
+                if interlaced_phase is None:
+                    output_bytes = _apply_interlaced_field_phase_if_needed(
+                        output_bytes,
+                        shift_x,
+                        shift_y,
+                        native_shift_applied=native_shift_applied,
+                    )
 
                 if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
                     ai_sr_dropped_frames += 1
@@ -4536,6 +5374,8 @@ def run_processor_worker(
 
             if command == "set_roi_with_subpixel":
                 _cancel_roi_microstep_transition(reset_shift=False)
+                prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
+                prev_shift_state = (float(roi_shift_applied_x), float(roi_shift_applied_y))
                 if bool(message.get("manual_drag", False)):
                     roi_manual_drag_until_ts = time.perf_counter() + float(roi_manual_drag_hold_s)
                 next_roi_x, next_roi_y, next_roi_w, next_roi_h = _normalize_worker_roi(
@@ -4565,6 +5405,19 @@ def run_processor_worker(
                     float(message.get("shift_x", 0.0)),
                     float(message.get("shift_y", 0.0)),
                 )
+                if output_mode_is_interlaced and _interlaced_phase_controls_active():
+                    manual_interlaced_phase_state = _build_manual_interlaced_phase_snapshot(
+                        prev_roi_state,
+                        (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h)),
+                        prev_shift_state,
+                        (float(roi_shift_target_x), float(roi_shift_target_y)),
+                    )
+                    manual_interlaced_phase_until_ts = time.perf_counter() + 0.12
+                    manual_interlaced_phase_pending = True
+                else:
+                    manual_interlaced_phase_state = None
+                    manual_interlaced_phase_until_ts = 0.0
+                    manual_interlaced_phase_pending = False
                 continue
 
             if command == "set_roi_subpixel_shift":
@@ -4576,6 +5429,25 @@ def run_processor_worker(
 
             if command == "set_roi_manual_drag_hold_seconds":
                 roi_manual_drag_hold_s = max(0.05, min(0.50, float(message.get("hold_seconds", roi_manual_drag_hold_s))))
+                continue
+
+            if command == "set_interlaced_phase_shift_scale":
+                # Deprecated; retained as a no-op for compatibility with stale
+                # clients that may still emit this command.
+                _safe_put({"type": "ack", "cmd": "set_interlaced_phase_shift_scale"})
+                continue
+
+            if command == "set_interlaced_field2_phase_fraction":
+                interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
+                    float(message.get("fraction", interlaced_field2_phase_fraction))
+                )
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_interlaced_field2_phase_fraction",
+                        "interlaced_field2_phase_fraction": float(interlaced_field2_phase_fraction),
+                    }
+                )
                 continue
 
             if command in {"set_basic_scaling_mode_auto", "set_sr_mode_auto"}:

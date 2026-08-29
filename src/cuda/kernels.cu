@@ -188,7 +188,9 @@ __global__ void UyvyCropZoomNearestKernel(
     int src_y = max(roi_y_min, min(roi_y_max, static_cast<int>(src_y_f + 0.5f)));
 
     if (preserve_field_parity != 0) {
-        const int desired_parity = y & 1;
+        // Anchor parity to ROI source phase so per-field ROI Y offsets
+        // (e.g. interlaced field2 phase) are preserved through scaling.
+        const int desired_parity = (y + roi_y) & 1;
         if ((src_y & 1) != desired_parity) {
             const int below = src_y - 1;
             const int above = src_y + 1;
