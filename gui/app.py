@@ -19,6 +19,7 @@ import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QTouchEvent, QWheelEvent
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -5732,6 +5734,22 @@ class MainWindow(QMainWindow):
             self._set_fullscreen_view(None)
             event.accept()
             return
+
+        key_slot = {
+            Qt.Key_1: 1,
+            Qt.Key_2: 2,
+            Qt.Key_3: 3,
+            Qt.Key_4: 4,
+        }.get(event.key())
+        if key_slot is not None:
+            disallowed_mods = Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier
+            focused = QApplication.focusWidget()
+            is_text_entry = isinstance(focused, (QAbstractSpinBox, QLineEdit, QComboBox))
+            if (not event.isAutoRepeat()) and (not (event.modifiers() & disallowed_mods)) and (not is_text_entry):
+                self._recall_roi_key_slot(key_slot)
+                event.accept()
+                return
+
         super().keyPressEvent(event)
 
     def _on_canvas_fullscreen_requested(self, view_name: str) -> None:
@@ -8179,6 +8197,9 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._recall_roi_key_slot(slot)
+
+    def _recall_roi_key_slot(self, slot: int) -> None:
         keyframe = self._roi_keyframes.get(slot)
         if keyframe is None:
             self._update_status(f"KEY {slot} is empty. Arm SAVE KEY to store it.")
@@ -8191,8 +8212,8 @@ class MainWindow(QMainWindow):
             requested_duration_frames = max(1, min(600, int(keyframe.duration_frames)))
 
         duration_frames = self._effective_roi_keyframe_duration_frames(keyframe.roi, requested_duration_frames)
-
         self._start_roi_keyframe_transition(keyframe.roi, duration_frames, keyframe.interpolation_mode)
+
         if override_duration:
             self._update_status(
                 f"Recalling KEY {slot} over {duration_frames} frames ({self._roi_interp_mode_label(keyframe.interpolation_mode)}, override)"
@@ -8242,7 +8263,7 @@ class MainWindow(QMainWindow):
                     button.setStyleSheet("")
                     button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
 
-    def _cancel_roi_keyframe_transition(self, reset_subpixel_shift: bool = True) -> None:
+    def _cancel_roi_keyframe_transition(self, reset_subpixel_shift: bool = True, notify_backend: bool = True) -> None:
         previous_state = self._roi_keyframe_transition
         if isinstance(previous_state, dict):
             current_estimate = previous_state.get("current_roi_estimate")
@@ -8256,7 +8277,7 @@ class MainWindow(QMainWindow):
         self._controller_filtered_target_roi = None
         self._controller_roi_interp_timer.stop()
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
-        if hasattr(self._controller, "cancel_roi_microstep_transition"):
+        if notify_backend and hasattr(self._controller, "cancel_roi_microstep_transition"):
             try:
                 self._controller.cancel_roi_microstep_transition(reset_subpixel_shift=reset_subpixel_shift)
             except Exception:
@@ -8286,7 +8307,10 @@ class MainWindow(QMainWindow):
         mode_name = str(interpolation_mode).strip().lower()
         if mode_name not in {"linear", "ease_in_out", "ease_out"}:
             mode_name = "linear"
-        self._cancel_roi_keyframe_transition(reset_subpixel_shift=False)
+        # Retarget without sending a standalone cancel command first. In worker
+        # mode, start_roi_microstep_transition can take over in-place from the
+        # current rendered ROI+shift, avoiding a one-frame jump between moves.
+        self._cancel_roi_keyframe_transition(reset_subpixel_shift=False, notify_backend=False)
 
         if total_frames <= 1:
             self._roi = target

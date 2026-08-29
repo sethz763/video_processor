@@ -2709,6 +2709,28 @@ def run_processor_worker(
 
         s_x, s_y, s_w, s_h = _normalize_worker_roi(*start_roi)
         t_x, t_y, t_w, t_h = _normalize_worker_roi(*target_roi)
+
+        prior_transition_state = roi_microstep_transition if isinstance(roi_microstep_transition, dict) else None
+        start_shift_x = float(roi_shift_applied_x)
+        start_shift_y = float(roi_shift_applied_y)
+
+        # When retargeting an in-flight interlaced transition, anchor from the
+        # latest rendered field phase (field1) so recall-to-recall handoff does
+        # not step backward before moving toward the new target.
+        if output_mode_is_interlaced and isinstance(prior_transition_state, dict):
+            prior_phase = prior_transition_state.get("interlaced_field_phase")
+            if isinstance(prior_phase, dict):
+                prior_roi1 = prior_phase.get("roi1")
+                if isinstance(prior_roi1, tuple) and len(prior_roi1) == 4:
+                    s_x, s_y, s_w, s_h = _normalize_worker_roi(
+                        int(prior_roi1[0]),
+                        int(prior_roi1[1]),
+                        int(prior_roi1[2]),
+                        int(prior_roi1[3]),
+                    )
+                start_shift_x = float(prior_phase.get("field1_x", start_shift_x))
+                start_shift_y = float(prior_phase.get("field1_y", start_shift_y))
+
         total_frames = max(1, min(600, int(duration_frames)))
         mode_name = str(interpolation_mode).strip().lower()
         if mode_name not in {"linear", "ease_in_out", "ease_out"}:
@@ -2716,8 +2738,8 @@ def run_processor_worker(
 
         sx = FRAME_W / max(1.0, float(s_w))
         sy = FRAME_H / max(1.0, float(s_h))
-        start_source_dx = -(float(roi_shift_applied_x) / sx) if sx > 1e-6 else 0.0
-        start_source_dy = -(float(roi_shift_applied_y) / sy) if sy > 1e-6 else 0.0
+        start_source_dx = -(float(start_shift_x) / sx) if sx > 1e-6 else 0.0
+        start_source_dy = -(float(start_shift_y) / sy) if sy > 1e-6 else 0.0
 
         roi_microstep_transition = {
             "start": (s_x, s_y, s_w, s_h),
@@ -2733,6 +2755,22 @@ def run_processor_worker(
             "overscan_percent": max(0.0, float(overscan_percent)),
             "enforce_full_frame_scale_1x": bool(enforce_full_frame_scale_1x),
         }
+
+        if output_mode_is_interlaced and _interlaced_phase_controls_active():
+            roi_microstep_transition["interlaced_field_shift"] = {
+                "field0_x": float(start_shift_x),
+                "field0_y": float(start_shift_y),
+                "field1_x": float(start_shift_x),
+                "field1_y": float(start_shift_y),
+            }
+            roi_microstep_transition["interlaced_field_phase"] = {
+                "roi0": (int(s_x), int(s_y), int(s_w), int(s_h)),
+                "roi1": (int(s_x), int(s_y), int(s_w), int(s_h)),
+                "field0_x": float(start_shift_x),
+                "field0_y": float(start_shift_y),
+                "field1_x": float(start_shift_x),
+                "field1_y": float(start_shift_y),
+            }
 
     def _cancel_roi_microstep_transition(reset_shift: bool = True) -> None:
         nonlocal roi_microstep_transition
