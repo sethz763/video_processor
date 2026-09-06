@@ -152,6 +152,24 @@ PYBIND11_MODULE(video_processor, m) {
             "Process one frame and write UYVY bytes into a caller-provided writable output buffer."
         )
         .def(
+            "process_frame_field_phase_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output, int field_phase) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameFieldPhaseBuffer(frame_ptr, frame_size, field_phase);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            py::arg("field_phase"),
+            "Process one interlaced field phase directly from the original UYVY frame."
+        )
+        .def(
             "process_frame_no_deinterlace",
             [](vp::VideoProcessor& self, const py::buffer& frame) {
                 const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);

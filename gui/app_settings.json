@@ -21,19 +21,19 @@
   "basic_scaling_manual": "2",
   "basic_scaling_method": "Bicubic (Balanced)",
   "basic_scaling_mode": "Auto",
-  "color_range": "Full (Data)",
+  "color_range": "Limited (Video)",
   "color_space": "Rec.709 (SDR)",
   "decklink_auto_detect": true,
   "decklink_enable_format_detection": true,
   "decklink_fps_priority_guard": false,
   "decklink_input_device": 1,
   "decklink_input_mode_text": "1080i59.94 (1920x1080, 29.97fps)",
-  "decklink_output_buffer_frames": 3,
+  "decklink_output_buffer_frames": 1,
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080i59.94 (1920x1080, 29.97fps)",
   "deinterlace_enabled": true,
-  "deinterlace_method": "Motion Adaptive (Broadcast: Deinterlace->Scale->Interlace)",
-  "denoise_method": "Luma Median 3x3 (Stronger)",
+  "deinterlace_method": "Blend (Stable)",
+  "denoise_method": "Off",
   "denoise_strength": 0.35,
   "display_splitter_sizes": [
     428,
@@ -58,20 +58,20 @@
       "duration_frames": 15,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        432,
-        72,
-        756,
-        425
+        490,
+        272,
+        652,
+        367
       ]
     },
     "2": {
       "duration_frames": 15,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        884,
-        535,
-        756,
-        425
+        944,
+        318,
+        800,
+        450
       ]
     },
     "3": {
@@ -85,7 +85,7 @@
       ]
     },
     "4": {
-      "duration_frames": 30,
+      "duration_frames": 15,
       "interpolation_mode": "ease_in_out",
       "roi": [
         0,
@@ -98,7 +98,7 @@
   "roi_latency_smoothing_percent": 0,
   "roi_manual_drag_hold_s": 0.1,
   "roi_min_drag_nudge": 0.015,
-  "roi_smoothing_percent": 4,
+  "roi_smoothing_percent": 2,
   "roi_transition_duration_frames": 15,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,

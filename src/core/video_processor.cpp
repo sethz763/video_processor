@@ -913,6 +913,14 @@ std::string VideoProcessor::ProcessFrameBuffer(const uint8_t* input_frame, size_
     return ProcessFrameInternal(input_frame, input_size, false, false, false);
 }
 
+std::string VideoProcessor::ProcessFrameFieldPhaseBuffer(
+    const uint8_t* input_frame,
+    size_t input_size,
+    int field_phase
+) {
+    return ProcessFrameInternal(input_frame, input_size, false, true, false, field_phase & 1);
+}
+
 std::string VideoProcessor::ProcessFrameNoDeinterlaceBuffer(const uint8_t* input_frame, size_t input_size) {
     return ProcessFrameInternal(input_frame, input_size, false, false, true);
 }
@@ -1416,7 +1424,8 @@ std::string VideoProcessor::ProcessFrameInternal(
     size_t input_size,
     bool deinterlace_only,
     bool force_deinterlace,
-    bool force_disable_deinterlace
+    bool force_disable_deinterlace,
+    int field_phase_override
 ) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
 
@@ -1621,7 +1630,20 @@ std::string VideoProcessor::ProcessFrameInternal(
 
     const int color_matrix = ToColorMatrixId(color_space);
     const int color_range_id = ToColorRangeId(color_range);
-    cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, color_matrix, color_range_id, stream_);
+    if (field_phase_override >= 0) {
+        cuda_kernels::LaunchUyvyFieldToRgb(
+            d_uyvy_in_,
+            d_rgb_full_,
+            width_,
+            height_,
+            field_phase_override,
+            color_matrix,
+            color_range_id,
+            stream_
+        );
+    } else {
+        cuda_kernels::LaunchUyvyToRgb(d_uyvy_in_, d_rgb_full_, width_, height_, color_matrix, color_range_id, stream_);
+    }
 
     const uchar3* crop_input = d_rgb_full_;
     int crop_src_w = width_;

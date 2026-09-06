@@ -16,6 +16,17 @@ void LaunchUyvyToRgb(
     cudaStream_t stream
 );
 
+void LaunchUyvyFieldToRgb(
+    const uint8_t* d_uyvy,
+    uchar3* d_rgb,
+    int width,
+    int height,
+    int source_field_phase,
+    int color_matrix,
+    int color_range,
+    cudaStream_t stream
+);
+
 void LaunchUyvyCropZoomNearest(
     const uint8_t* d_uyvy_in,
     int src_width,

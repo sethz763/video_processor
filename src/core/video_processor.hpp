@@ -105,6 +105,7 @@ public:
         int out_h
     );
     std::string ProcessFrameBuffer(const uint8_t* input_frame, size_t input_size);
+    std::string ProcessFrameFieldPhaseBuffer(const uint8_t* input_frame, size_t input_size, int field_phase);
     std::string ProcessFrameNoDeinterlaceBuffer(const uint8_t* input_frame, size_t input_size);
     std::string ProcessFrameDeinterlaceOnlyBuffer(const uint8_t* input_frame, size_t input_size);
     std::string ProcessFramePreprocessOnlyBuffer(const uint8_t* input_frame, size_t input_size);
@@ -188,7 +189,8 @@ private:
         size_t input_size,
         bool deinterlace_only,
         bool force_deinterlace,
-        bool force_disable_deinterlace
+        bool force_disable_deinterlace,
+        int field_phase_override = -1
     );
     void InitializeBuffers();
     void ValidateConfiguration() const;

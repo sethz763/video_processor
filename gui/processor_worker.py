@@ -420,6 +420,66 @@ _OUTPUT_SCHEDULE_HEALTH_SAMPLE_EVERY = max(
     int(os.environ.get("VP_OUTPUT_BUFFER_HEALTH_SAMPLE_EVERY", "30")),
 )
 _OUTPUT_SCHEDULE_AUTO_REPRIME_ON_OVERFLOW = os.environ.get("VP_OUTPUT_BUFFER_AUTO_REPRIME_ON_OVERFLOW", "0") == "1"
+_OUTPUT_SCHEDULE_LOCAL_OVERFLOW_HEADROOM_FRAMES = max(
+    1,
+    int(os.environ.get("VP_OUTPUT_BUFFER_LOCAL_OVERFLOW_HEADROOM_FRAMES", "2")),
+)
+
+
+def _decklink_timecode_format_name(format_code: object) -> str:
+    try:
+        code = int(format_code) & 0xFFFFFFFF
+    except Exception:
+        return ""
+
+    format_map = {
+        int(getattr(d, "TIMECODE_FORMAT_RP188_VITC1", 0)) & 0xFFFFFFFF: "RP188 VITC1",
+        int(getattr(d, "TIMECODE_FORMAT_RP188_VITC2", 0)) & 0xFFFFFFFF: "RP188 VITC2",
+        int(getattr(d, "TIMECODE_FORMAT_RP188_LTC", 0)) & 0xFFFFFFFF: "RP188 LTC",
+        int(getattr(d, "TIMECODE_FORMAT_RP188_HIGH_FRAME_RATE", 0)) & 0xFFFFFFFF: "RP188 HFRTC",
+        int(getattr(d, "TIMECODE_FORMAT_RP188_ANY", 0)) & 0xFFFFFFFF: "RP188 Any",
+        int(getattr(d, "TIMECODE_FORMAT_VITC", 0)) & 0xFFFFFFFF: "VITC",
+        int(getattr(d, "TIMECODE_FORMAT_VITC_FIELD2", 0)) & 0xFFFFFFFF: "VITC Field 2",
+        int(getattr(d, "TIMECODE_FORMAT_SERIAL", 0)) & 0xFFFFFFFF: "Serial",
+    }
+    return format_map.get(code, f"0x{code:08X}")
+
+
+def _extract_frame_timecode_info(frame: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "present": False,
+        "text": "",
+        "format_code": 0,
+        "format_name": "",
+    }
+    if frame is None:
+        return payload
+
+    try:
+        has_timecode = bool(getattr(frame, "has_timecode", False))
+        timecode_text = ""
+        format_code = 0
+        if has_timecode:
+            getter = getattr(frame, "get_timecode", None)
+            raw_text = getter() if callable(getter) else getattr(frame, "timecode", "")
+            timecode_text = "" if raw_text is None else str(raw_text).strip()
+            format_code = int(getattr(frame, "timecode_format", 0))
+        elif bool(getattr(frame, "has_atc_timecode", False)):
+            getter = getattr(frame, "get_atc_timecode", None)
+            raw_text = getter() if callable(getter) else getattr(frame, "atc_timecode", "")
+            timecode_text = "" if raw_text is None else str(raw_text).strip()
+            format_code = int(getattr(frame, "atc_timecode_format", 0))
+            has_timecode = bool(timecode_text)
+        if not has_timecode or not timecode_text:
+            return payload
+
+        payload["present"] = True
+        payload["text"] = timecode_text
+        payload["format_code"] = format_code
+        payload["format_name"] = _decklink_timecode_format_name(format_code)
+        return payload
+    except Exception:
+        return payload
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 _OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES: dict[int, int] = {}
 
@@ -1589,6 +1649,29 @@ def _tight_uyvy_bytes(frame: object) -> bytes:
     return raw_np[:expected_total].reshape(FRAME_H, row_bytes)[:, :UYVY_ROW_BYTES].tobytes()
 
 
+def _estimate_output_schedule_buffered_frames(state: dict[str, object], now_ts: float | None = None) -> int:
+    if now_ts is None:
+        now_ts = time.perf_counter()
+
+    if not bool(state.get("started", False)):
+        return max(0, int(state.get("queued_before_start", 0)))
+
+    frame_duration = int(state.get("frame_duration", 0))
+    time_scale = int(state.get("time_scale", 0))
+    display_time = int(state.get("display_time", 0))
+    schedule_epoch_perf_ts = float(state.get("schedule_epoch_perf_ts", 0.0))
+
+    if frame_duration <= 0 or time_scale <= 0:
+        return max(0, int(state.get("queued_before_start", 0)))
+
+    if schedule_epoch_perf_ts <= 0.0:
+        return max(0, int(math.ceil(float(display_time) / float(frame_duration))))
+
+    elapsed_ticks = max(0.0, (float(now_ts) - schedule_epoch_perf_ts) * float(time_scale))
+    queued_ticks = max(0.0, float(display_time) - elapsed_ticks)
+    return max(0, int(math.ceil(queued_ticks / float(frame_duration))))
+
+
 def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
     out_id = id(out)
     state = _OUTPUT_SCHEDULE_STATE.get(out_id)
@@ -1651,6 +1734,35 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
         frame_period_s = float(state.get("frame_period_s", 0.0))
         if frame_duration > 0 and time_scale > 0:
             try:
+                now_ts = time.perf_counter()
+                target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
+                estimated_buffered_before = _estimate_output_schedule_buffered_frames(state, now_ts)
+                state["last_buffered_count"] = estimated_buffered_before
+
+                if bool(state.get("started", False)) and estimated_buffered_before <= 0:
+                    state["starved_streak"] = int(state.get("starved_streak", 0)) + 1
+                else:
+                    state["starved_streak"] = 0
+
+                overflow_threshold = target_start_frames + _OUTPUT_SCHEDULE_LOCAL_OVERFLOW_HEADROOM_FRAMES
+                if bool(state.get("started", False)) and estimated_buffered_before > overflow_threshold:
+                    state["overflow_events"] = int(state.get("overflow_events", 0)) + 1
+                    _reprime_output_schedule(out, reason="local_overflow")
+                    state = _OUTPUT_SCHEDULE_STATE.get(out_id, state)
+
+                since_last_reprime = now_ts - float(state.get("last_auto_reprime_ts", 0.0))
+                if (
+                    bool(state.get("started", False))
+                    and target_start_frames > 0
+                    and int(state.get("starved_streak", 0)) >= _OUTPUT_SCHEDULE_STARVED_STREAK_THRESHOLD
+                    and since_last_reprime >= _OUTPUT_SCHEDULE_AUTO_REPRIME_MIN_INTERVAL_S
+                ):
+                    state["starvation_events"] = int(state.get("starvation_events", 0)) + 1
+                    state["auto_reprime_events"] = int(state.get("auto_reprime_events", 0)) + 1
+                    state["last_auto_reprime_ts"] = now_ts
+                    _reprime_output_schedule(out, reason="local_starvation")
+                    state = _OUTPUT_SCHEDULE_STATE.get(out_id, state)
+
                 display_time = int(state.get("display_time", 0))
                 out.schedule_frame_copy(
                     payload,
@@ -1662,7 +1774,6 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                 state["scheduled_frames"] = int(state.get("scheduled_frames", 0)) + 1
 
                 if not bool(state.get("started", False)):
-                    target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                     state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
                     should_start = False
                     if target_start_frames <= 0:
@@ -1682,22 +1793,23 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                         out.start_scheduled_playback(0, time_scale, 1.0)
                         state["started"] = True
                         state["queued_before_start"] = 0
+                        state["schedule_epoch_perf_ts"] = now_ts
+                        state["last_clock_resync_ts"] = now_ts
+                        state["last_buffered_count"] = _estimate_output_schedule_buffered_frames(state, now_ts)
                         if frame_period_s > 0.0:
                             state["sync_next_emit_ts"] = 0.0
 
-                if (
-                    _OUTPUT_SCHEDULE_ENABLE_HEALTH_POLLING
-                    and bool(state.get("started", False))
-                    and bool(state.get("can_query_buffered", False))
-                ):
+                if _OUTPUT_SCHEDULE_ENABLE_HEALTH_POLLING and bool(state.get("started", False)):
                     try:
                         if (int(state.get("scheduled_frames", 0)) % _OUTPUT_SCHEDULE_HEALTH_SAMPLE_EVERY) != 0:
                             return True
 
-                        buffered_count = int(out.buffered_video_frame_count())
+                        if bool(state.get("can_query_buffered", False)):
+                            buffered_count = int(out.buffered_video_frame_count())
+                        else:
+                            buffered_count = _estimate_output_schedule_buffered_frames(state, time.perf_counter())
                         state["last_buffered_count"] = buffered_count
 
-                        target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                         overflow_threshold = max(target_start_frames + 8, 12)
 
                         if buffered_count <= 0:
@@ -2039,6 +2151,12 @@ def run_processor_worker(
     upscale_drop_count = 0
     latest_input_frame: bytes | None = None
     latest_output_frame: bytes | None = None
+    latest_timecode_info: dict[str, object] = {
+        "present": False,
+        "text": "",
+        "format_code": 0,
+        "format_name": "",
+    }
     latest_effective_sr_scale = 1
     latest_rtx_vsr_applied = False
     latest_rtx_effect_mean_abs_luma = 0.0
@@ -2736,6 +2854,41 @@ def run_processor_worker(
             bool(r0 or r1),
             bool(n0 and n1),
         )
+
+    def _render_dual_phase_basic_scaling_reinterlace(
+        input_bytes: bytes,
+        phase: dict[str, object],
+    ) -> tuple[bytes, bool, bool, float] | None:
+        if (
+            _denoise_enabled()
+            or reusable_process_frame_out is None
+            or not hasattr(processor, "process_frame_field_phase_into")
+        ):
+            return None
+
+        roi0 = tuple(phase.get("roi0", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        roi1 = tuple(phase.get("roi1", (current_roi_x, current_roi_y, current_roi_w, current_roi_h)))
+        field0_x = float(phase.get("field0_x", 0.0))
+        field0_y = float(phase.get("field0_y", 0.0))
+        field1_x = float(phase.get("field1_x", 0.0))
+        field1_y = float(phase.get("field1_y", 0.0))
+        field0_phase = 1 if int(output_field_dominance_code or 0) == 1 else 0
+        field1_phase = 1 - field0_phase
+        native_shift_applied = True
+        stage_start_ts = time.perf_counter()
+
+        _apply_processor_roi_for_phase(roi0)
+        native_shift_applied = _set_native_subpixel_shift(field0_x, field0_y) and native_shift_applied
+        processor.process_frame_field_phase_into(input_bytes, reusable_process_frame_out, field0_phase)
+        out0_frozen = bytes(reusable_process_frame_out)
+
+        _apply_processor_roi_for_phase(roi1)
+        native_shift_applied = _set_native_subpixel_shift(field1_x, field1_y) and native_shift_applied
+        processor.process_frame_field_phase_into(input_bytes, reusable_process_frame_out, field1_phase)
+        out1_frozen = bytes(reusable_process_frame_out)
+
+        stage_ms = max(0.0, (time.perf_counter() - stage_start_ts) * 1000.0)
+        return _weave_interlaced_fields(out0_frozen, out1_frozen), True, native_shift_applied, stage_ms
 
     def _apply_roi_curve(t: float, mode: str) -> float:
         clamped_t = max(0.0, min(1.0, float(t)))
@@ -3717,6 +3870,7 @@ def run_processor_worker(
     def _stop_live_pipeline() -> None:
         nonlocal pipeline_running, capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal upscale_extra_threads, parallel_basic_processors, parallel_basic_worker_count
+        nonlocal latest_timecode_info
         if not pipeline_running:
             return
         pipeline_stop_event.set()
@@ -3731,6 +3885,12 @@ def run_processor_worker(
         output_thread = None
         parallel_basic_processors = []
         parallel_basic_worker_count = 1
+        latest_timecode_info = {
+            "present": False,
+            "text": "",
+            "format_code": 0,
+            "format_name": "",
+        }
         pipeline_running = False
 
     def _start_live_pipeline() -> None:
@@ -3739,7 +3899,7 @@ def run_processor_worker(
         nonlocal frame_id_counter, capture_drop_count, preprocess_drop_count, upscale_drop_count
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal upscale_extra_threads, parallel_basic_processors, parallel_basic_worker_count
-        nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
+        nonlocal latest_input_frame, latest_output_frame, latest_timecode_info, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
         nonlocal output_nominal_fps, output_frame_period_s, output_mode_is_interlaced, output_transition_units_per_frame
         nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
@@ -3791,6 +3951,12 @@ def run_processor_worker(
         upscale_drop_count = 0
         latest_input_frame = None
         latest_output_frame = None
+        latest_timecode_info = {
+            "present": False,
+            "text": "",
+            "format_code": 0,
+            "format_name": "",
+        }
         latest_effective_sr_scale = 1
         latest_rtx_vsr_applied = False
         latest_rtx_effect_mean_abs_luma = 0.0
@@ -3924,6 +4090,7 @@ def run_processor_worker(
             nonlocal frame_id_counter, capture_drop_count
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
+            nonlocal latest_timecode_info
             nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
             nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
             nonlocal last_stage_stack
@@ -3935,6 +4102,7 @@ def run_processor_worker(
                     frame = None
                 if frame is None:
                     continue
+                frame_timecode_info = _extract_frame_timecode_info(frame)
                 try:
                     input_bytes = _tight_uyvy_bytes(frame)
                 except Exception as exc:
@@ -3954,6 +4122,7 @@ def run_processor_worker(
                 # Keep input preview live even when processing is backlogged.
                 with state_lock:
                     latest_input_frame = input_bytes
+                    latest_timecode_info = dict(frame_timecode_info)
 
                 if _is_live_passthrough_mode():
                     # In zero-processing mode, avoid staged queueing and preserve output cadence.
@@ -4067,12 +4236,16 @@ def run_processor_worker(
                             if reinterlace_phase is None:
                                 reinterlace_phase = _build_static_interlaced_phase_for_reinterlace(shift_x, shift_y)
                             interlaced_phase = reinterlace_phase
-                            output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
-                                input_bytes,
-                                reinterlace_phase,
-                            )
-                            _ = preprocess_applied, ai_applied, rtx_applied
-                            basic_stage_ms = 0.0
+                            direct_field_result = _render_dual_phase_basic_scaling_reinterlace(input_bytes, reinterlace_phase)
+                            if direct_field_result is not None:
+                                output_bytes, basic_applied, native_shift_applied, basic_stage_ms = direct_field_result
+                            else:
+                                output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
+                                    input_bytes,
+                                    reinterlace_phase,
+                                )
+                                _ = preprocess_applied, ai_applied, rtx_applied
+                                basic_stage_ms = 0.0
                         elif interlaced_phase is not None:
                             output_bytes, basic_applied, native_shift_applied, basic_stage_ms = _render_dual_phase_basic_scaling(
                                 input_bytes,
@@ -5185,6 +5358,7 @@ def run_processor_worker(
                     current_counter = int(processed_frame_counter)
                     current_rtx_applied = bool(latest_rtx_vsr_applied)
                     current_rtx_delta = float(latest_rtx_effect_mean_abs_luma)
+                    current_timecode_info = dict(latest_timecode_info)
                     timing_frames_emitted_snapshot = int(timing_frames_emitted)
                     timing_deadline_miss_events_snapshot = int(timing_deadline_miss_events)
                     timing_deadline_miss_streak_snapshot = int(timing_deadline_miss_streak)
@@ -5391,6 +5565,7 @@ def run_processor_worker(
                     "roi_transition": roi_transition_payload,
                     "output_buffer_health": output_schedule_stats,
                     "pipeline_timing_health": pipeline_timing_health,
+                    "timecode_info": current_timecode_info,
                 }
                 if include_frames:
                     payload["input_frame_bytes"] = _freeze_frame_bytes(current_input)

@@ -127,6 +127,35 @@ __global__ void UyvyToRgbKernel(const uint8_t* uyvy, uchar3* rgb, int width, int
     rgb[y * width + x] = MakeRgbFromYuv(luma, u, v, color_matrix, color_range);
 }
 
+__global__ void UyvyFieldToRgbKernel(
+    const uint8_t* uyvy,
+    uchar3* rgb,
+    int width,
+    int height,
+    int source_field_phase,
+    int color_matrix,
+    int color_range
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int source_y = min(height - 1, ((y >> 1) << 1) + (source_field_phase & 1));
+    const int pair_x = x >> 1;
+    const int pair_index = (source_y * (width >> 1) + pair_x) * 4;
+
+    const uint8_t u = uyvy[pair_index + 0];
+    const uint8_t y0 = uyvy[pair_index + 1];
+    const uint8_t v = uyvy[pair_index + 2];
+    const uint8_t y1 = uyvy[pair_index + 3];
+
+    const uint8_t luma = (x & 1) ? y1 : y0;
+    rgb[y * width + x] = MakeRgbFromYuv(luma, u, v, color_matrix, color_range);
+}
+
 __device__ inline void SampleUyvyPixel(
     const uint8_t* uyvy,
     int width,
@@ -1353,6 +1382,30 @@ void LaunchUyvyToRgb(
         color_range
     );
     CheckKernelLaunch("UyvyToRgbKernel launch");
+}
+
+void LaunchUyvyFieldToRgb(
+    const uint8_t* d_uyvy,
+    uchar3* d_rgb,
+    int width,
+    int height,
+    int source_field_phase,
+    int color_matrix,
+    int color_range,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    UyvyFieldToRgbKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_uyvy,
+        d_rgb,
+        width,
+        height,
+        source_field_phase,
+        color_matrix,
+        color_range
+    );
+    CheckKernelLaunch("UyvyFieldToRgbKernel launch");
 }
 
 void LaunchUyvyCropZoomNearest(

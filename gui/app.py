@@ -150,6 +150,76 @@ def _mode_name_is_interlaced(mode_label: str) -> bool:
         return True
     return ("i" in mode_name) and any(ch.isdigit() for ch in mode_name)
 
+
+def _decklink_timecode_format_name(format_code: object) -> str:
+    try:
+        code = int(format_code) & 0xFFFFFFFF
+    except Exception:
+        return ""
+
+    if d is not None:
+        format_map = {
+            int(getattr(d, "TIMECODE_FORMAT_RP188_VITC1", 0)) & 0xFFFFFFFF: "RP188 VITC1",
+            int(getattr(d, "TIMECODE_FORMAT_RP188_VITC2", 0)) & 0xFFFFFFFF: "RP188 VITC2",
+            int(getattr(d, "TIMECODE_FORMAT_RP188_LTC", 0)) & 0xFFFFFFFF: "RP188 LTC",
+            int(getattr(d, "TIMECODE_FORMAT_RP188_HIGH_FRAME_RATE", 0)) & 0xFFFFFFFF: "RP188 HFRTC",
+            int(getattr(d, "TIMECODE_FORMAT_RP188_ANY", 0)) & 0xFFFFFFFF: "RP188 Any",
+            int(getattr(d, "TIMECODE_FORMAT_VITC", 0)) & 0xFFFFFFFF: "VITC",
+            int(getattr(d, "TIMECODE_FORMAT_VITC_FIELD2", 0)) & 0xFFFFFFFF: "VITC Field 2",
+            int(getattr(d, "TIMECODE_FORMAT_SERIAL", 0)) & 0xFFFFFFFF: "Serial",
+        }
+        if code in format_map:
+            return format_map[code]
+
+    fallback_map = {
+        0x72707631: "RP188 VITC1",
+        0x72703132: "RP188 VITC2",
+        0x72706C74: "RP188 LTC",
+        0x72706872: "RP188 HFRTC",
+        0x72703138: "RP188 Any",
+        0x76697463: "VITC",
+        0x76697432: "VITC Field 2",
+        0x73657269: "Serial",
+    }
+    return fallback_map.get(code, f"0x{code:08X}")
+
+
+def _extract_decklink_frame_timecode_info(frame: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "present": False,
+        "text": "",
+        "format_code": 0,
+        "format_name": "",
+    }
+    if frame is None:
+        return payload
+
+    try:
+        has_timecode = bool(getattr(frame, "has_timecode", False))
+        timecode_text = ""
+        format_code = 0
+        if has_timecode:
+            getter = getattr(frame, "get_timecode", None)
+            raw_text = getter() if callable(getter) else getattr(frame, "timecode", "")
+            timecode_text = "" if raw_text is None else str(raw_text).strip()
+            format_code = int(getattr(frame, "timecode_format", 0))
+        elif bool(getattr(frame, "has_atc_timecode", False)):
+            getter = getattr(frame, "get_atc_timecode", None)
+            raw_text = getter() if callable(getter) else getattr(frame, "atc_timecode", "")
+            timecode_text = "" if raw_text is None else str(raw_text).strip()
+            format_code = int(getattr(frame, "atc_timecode_format", 0))
+            has_timecode = bool(timecode_text)
+        if not has_timecode or not timecode_text:
+            return payload
+
+        payload["present"] = True
+        payload["text"] = timecode_text
+        payload["format_code"] = format_code
+        payload["format_name"] = _decklink_timecode_format_name(format_code)
+    except Exception:
+        return payload
+    return payload
+
 try:
     import decklink_wrapper as d
 except Exception:
@@ -453,6 +523,12 @@ def _call_decklink_api_in_mta_thread(api_name: str, *args: object) -> object:
 def _call_decklink_api(api_name: str, *args: object) -> object:
     if d is None:
         raise RuntimeError("decklink_wrapper is not available")
+
+    if sys.platform == "win32":
+        # Qt typically initializes the GUI thread in a different COM apartment
+        # than the DeckLink wrapper expects. Route catalog/mode queries through
+        # a short-lived MTA thread instead of probing the GUI thread first.
+        return _call_decklink_api_in_mta_thread(api_name, *args)
 
     api = getattr(d, api_name)
     try:
@@ -1768,6 +1844,9 @@ class VideoProcessorController:
     def decklink_roi_transition_state(self) -> dict[str, object]:
         return {}
 
+    def decklink_timecode_info(self) -> dict[str, object]:
+        return {}
+
     def set_preview_fps(self, preview_fps: float) -> None:
         # In-process backend does not use worker tick preview throttling.
         _ = preview_fps
@@ -1995,6 +2074,12 @@ class ProcessVideoProcessorController:
         }
         self._decklink_output_buffer_health: dict[str, object] = {}
         self._decklink_pipeline_timing_health: dict[str, object] = {}
+        self._decklink_timecode_info: dict[str, object] = {
+            "present": False,
+            "text": "",
+            "format_code": 0,
+            "format_name": "",
+        }
         self._decklink_applied_roi: Roi | None = None
         self._decklink_roi_transition_state: dict[str, object] = {}
         self._last_interlaced_phase_log_signature: str = ""
@@ -2019,6 +2104,12 @@ class ProcessVideoProcessorController:
         self._decklink_ai_refresh_fps = 0.0
         self._decklink_ai_latest_age_ms = -1.0
         self._decklink_ai_timing_ms = {}
+        self._decklink_timecode_info = {
+            "present": False,
+            "text": "",
+            "format_code": 0,
+            "format_name": "",
+        }
         self._decklink_applied_roi = None
         self._decklink_roi_transition_state = {}
 
@@ -2126,6 +2217,12 @@ class ProcessVideoProcessorController:
             0.0,
             float(message.get("output_nominal_fps", self._decklink_output_nominal_fps)),
         )
+        if self._decklink_output_nominal_fps > 0.0:
+            self._decklink_processed_fps_smoothed = min(
+                self._decklink_processed_fps_smoothed,
+                self._decklink_output_nominal_fps,
+            )
+            self._decklink_processed_fps = self._decklink_processed_fps_smoothed
         self._decklink_output_is_interlaced = bool(
             message.get("output_mode_is_interlaced", self._decklink_output_is_interlaced)
         )
@@ -2176,6 +2273,7 @@ class ProcessVideoProcessorController:
         self._decklink_pipeline_timing_health = dict(
             message.get("pipeline_timing_health", self._decklink_pipeline_timing_health)
         )
+        self._decklink_timecode_info = dict(message.get("timecode_info", self._decklink_timecode_info))
 
         roi_payload = message.get("roi_applied")
         if isinstance(roi_payload, dict):
@@ -2287,6 +2385,9 @@ class ProcessVideoProcessorController:
 
     def decklink_pipeline_timing_health(self) -> dict[str, object]:
         return dict(self._decklink_pipeline_timing_health)
+
+    def decklink_timecode_info(self) -> dict[str, object]:
+        return dict(self._decklink_timecode_info)
 
     def create(self, roi: Roi) -> None:
         self.close()
@@ -2579,6 +2680,12 @@ class ProcessVideoProcessorController:
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
                 self._decklink_frame_updated = False
+                self._decklink_timecode_info = {
+                    "present": False,
+                    "text": "",
+                    "format_code": 0,
+                    "format_name": "",
+                }
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
                 self._decklink_tick_pending = False
                 self._decklink_tick_pending_since = 0.0
@@ -2876,6 +2983,12 @@ class ProcessVideoProcessorController:
             if message_type == "decklink_no_frame":
                 self._latest_decklink_frame = None
                 self._decklink_frame_updated = False
+                self._decklink_timecode_info = {
+                    "present": False,
+                    "text": "",
+                    "format_code": 0,
+                    "format_name": "",
+                }
                 self._decklink_no_frame_reason = str(message.get("reason", "unknown"))
                 self._decklink_tick_pending = False
                 self._decklink_tick_pending_since = 0.0
@@ -3305,6 +3418,7 @@ class MainWindow(QMainWindow):
         self._decklink_sessions_running = False
         self._last_frame_error: str | None = None
         self._no_frame_counter = 0
+        self._decklink_timecode_display_text = "Timecode: --"
         self._roi_smoothing_percent = 4
         self._roi_latency_smoothing_percent = 0
         self._roi_drag_x_hysteresis_px = max(0.10, min(1.20, float(os.environ.get("VP_ROI_DRAG_X_HYSTERESIS_PX", "0.45"))))
@@ -3378,6 +3492,10 @@ class MainWindow(QMainWindow):
         self._decklink_buffer_guard_floor_frames = max(
             1,
             min(10, int(os.environ.get("VP_DECKLINK_BUFFER_GUARD_FLOOR", "2"))),
+        )
+        self._decklink_buffer_guard_transition_floor_frames = max(
+            int(self._decklink_buffer_guard_floor_frames),
+            min(10, int(os.environ.get("VP_DECKLINK_BUFFER_GUARD_TRANSITION_FLOOR", "4"))),
         )
         self._decklink_buffer_guard_engage_miss_ratio = max(
             0.0,
@@ -3466,6 +3584,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_keyframe_side_panels: dict[str, QWidget] = {}
         self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
+        self._fullscreen_roi_transition_labels: dict[str, QLabel] = {}
         self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
         self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
         self._fullscreen_decklink_output_buffer_spins: dict[str, QSpinBox] = {}
@@ -3483,7 +3602,7 @@ class MainWindow(QMainWindow):
         input_header_layout = QHBoxLayout(self._input_header)
         input_header_layout.setContentsMargins(0, 0, 0, 0)
         input_header_layout.setSpacing(8)
-        self._input_title_label = QLabel("Input View (ROI controls are locked to this view)")
+        self._input_title_label = QLabel("Input View")
         input_header_layout.addWidget(self._input_title_label)
         input_fullscreen_btn = QPushButton("Full screen")
         input_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view("input"))
@@ -3512,7 +3631,7 @@ class MainWindow(QMainWindow):
         output_header_layout = QHBoxLayout(self._output_header)
         output_header_layout.setContentsMargins(0, 0, 0, 0)
         output_header_layout.setSpacing(8)
-        self._output_title_label = QLabel("Output View (processed result only)")
+        self._output_title_label = QLabel("Output View")
         output_header_layout.addWidget(self._output_title_label)
         output_fullscreen_btn = QPushButton("Full screen")
         output_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view("output"))
@@ -3597,6 +3716,7 @@ class MainWindow(QMainWindow):
         self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
         self._sync_fullscreen_decklink_output_buffer_from_main(self.decklink_output_buffer_spin.value())
         self._sync_fullscreen_button_states()
+        self._sync_roi_transition_unit_labels()
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
         self._apply_manual_drag_tuning_to_controller()
@@ -3606,6 +3726,7 @@ class MainWindow(QMainWindow):
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
         self._on_source_mode_changed()
+        self._sync_roi_transition_unit_labels()
         self._refresh_ai_sr_runtime_panel()
         self._refresh_rtx_vsr_runtime_panel()
         self._update_status("Ready")
@@ -4845,7 +4966,8 @@ class MainWindow(QMainWindow):
         self.roi_transition_frames_spin = QSpinBox()
         self.roi_transition_frames_spin.setRange(1, 600)
         self.roi_transition_frames_spin.setValue(int(self._roi_keyframe_transition_default_frames))
-        roi_form.addRow("Transition (frames)", self.roi_transition_frames_spin)
+        self.roi_transition_units_label = QLabel("Transition (frames)")
+        roi_form.addRow(self.roi_transition_units_label, self.roi_transition_frames_spin)
 
         self.roi_interp_mode_combo = QComboBox()
         self.roi_interp_mode_combo.addItems(["Linear", "Ease In/Out", "Ease Out"])
@@ -4891,6 +5013,22 @@ class MainWindow(QMainWindow):
 
         roi_form.addRow(keyframe_row)
 
+        timecode_row = QWidget()
+        timecode_row_layout = QHBoxLayout(timecode_row)
+        timecode_row_layout.setContentsMargins(0, 0, 0, 0)
+        timecode_row_layout.setSpacing(8)
+
+        self.decklink_timecode_label = QLabel(self._decklink_timecode_display_text)
+        self.decklink_timecode_label.setWordWrap(True)
+        timecode_row_layout.addWidget(self.decklink_timecode_label, 1)
+
+        self.decklink_timecode_refresh_btn = QPushButton("Refresh")
+        self.decklink_timecode_refresh_btn.setMaximumWidth(84)
+        self.decklink_timecode_refresh_btn.clicked.connect(self._on_decklink_timecode_refresh_clicked)
+        timecode_row_layout.addWidget(self.decklink_timecode_refresh_btn, 0)
+
+        roi_form.addRow(timecode_row)
+
         keyframe_spacing_row = QWidget()
         keyframe_spacing_row.setFixedHeight(16)
         roi_form.addRow(keyframe_spacing_row)
@@ -4924,13 +5062,13 @@ class MainWindow(QMainWindow):
         )
         controls_hint.setWordWrap(True)
 
+        layout.addWidget(roi_box)
         layout.addWidget(decklink_box)
         layout.addWidget(deinterlace_box)
         layout.addWidget(denoise_box)
         layout.addWidget(upscaling_box)
         layout.addWidget(rtx_vsr_box)
         layout.addWidget(settings_box)
-        layout.addWidget(roi_box)
         layout.addWidget(ai_sr_postprocess_box)
         layout.addWidget(post_vsr_scaling_box)
         layout.addWidget(controls_hint)
@@ -5048,11 +5186,32 @@ class MainWindow(QMainWindow):
         panel_layout.addStretch(1)
 
         self._fullscreen_keyframe_side_panels[view_name] = panel
+        self._fullscreen_roi_transition_labels[view_name] = transition_label
         self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
         self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
         self._fullscreen_decklink_output_buffer_spins[view_name] = buffer_spin
         panel.setVisible(False)
         return panel
+
+    def _roi_transition_unit_label_text(self) -> str:
+        if self.source_mode_combo.currentText() != "Blackmagic DeckLink":
+            return "frames"
+        return "fields" if self._decklink_output_mode_is_interlaced() else "frames"
+
+    def _sync_roi_transition_unit_labels(self) -> None:
+        unit = self._roi_transition_unit_label_text()
+        self.roi_transition_units_label.setText(f"Transition ({unit})")
+
+        for label in self._fullscreen_roi_transition_labels.values():
+            label.setText(f"Transition ({unit})")
+
+        self.roi_keyframe_duration_override_btn.setToolTip(
+            f"When enabled, uses Transition ({unit}) instead of keyframe-stored duration during recall."
+        )
+        for button in self._fullscreen_roi_duration_override_buttons.values():
+            button.setToolTip(
+                f"Use Transition ({unit}) as recall duration instead of the keyframe's stored duration."
+            )
 
     def _on_fullscreen_transition_rate_changed(self, value: int) -> None:
         normalized = max(1, min(600, int(value)))
@@ -5197,11 +5356,13 @@ class MainWindow(QMainWindow):
                             "DeckLink worker active but no input frames yet; check source signal and input mode",
                             suppress_repeat_window_s=10.0,
                         )
+                    self._update_decklink_timecode_from_controller(placeholder="Timecode: waiting for DeckLink frames...")
                     return
 
                 input_frame, output_frame = decklink_frame
                 self._no_frame_counter = 0
                 self._sync_backend_roi_from_worker()
+                self._update_decklink_timecode_from_controller(placeholder="Timecode: none detected")
                 preview_updated = True
                 if hasattr(self._controller, "consume_decklink_frame_updated"):
                     preview_updated = bool(self._controller.consume_decklink_frame_updated())
@@ -6045,6 +6206,7 @@ class MainWindow(QMainWindow):
         deadline_miss_streak: int,
         starvation_delta: int,
         buffered_count: int,
+        interaction_active: bool,
     ) -> None:
         if self._source_mode != "Blackmagic DeckLink":
             return
@@ -6054,6 +6216,11 @@ class MainWindow(QMainWindow):
             return
         requested_frames = int(self._decklink_output_buffer_user_target_frames)
         guard_floor = int(self._decklink_buffer_guard_floor_frames)
+        if interaction_active:
+            guard_floor = max(
+                guard_floor,
+                int(self._decklink_buffer_guard_transition_floor_frames),
+            )
         if requested_frames >= guard_floor:
             self._decklink_buffer_guard_active = False
             self._decklink_buffer_guard_stable_windows = 0
@@ -6078,7 +6245,8 @@ class MainWindow(QMainWindow):
                         (
                             "DeckLink buffer guard engaged: requested "
                             f"{requested_frames}, temporarily applying {guard_floor} "
-                            f"(dl_miss={deadline_miss_ratio * 100.0:.1f}%, streak={deadline_miss_streak})"
+                            f"(dl_miss={deadline_miss_ratio * 100.0:.1f}%, streak={deadline_miss_streak}, "
+                            f"interaction={'yes' if interaction_active else 'no'})"
                         )
                     )
                 except Exception:
@@ -7622,6 +7790,7 @@ class MainWindow(QMainWindow):
             deadline_miss_streak=deadline_miss_streak,
             starvation_delta=starvation_delta,
             buffered_count=buffered_count,
+            interaction_active=interaction_active,
         )
 
         health_level = "ok"
@@ -7775,8 +7944,10 @@ class MainWindow(QMainWindow):
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
         self._update_timer_interval()
+        self._sync_roi_transition_unit_labels()
         if self._source_mode == "Synthetic":
             self._stop_decklink_sessions()
+            self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
             self.decklink_status_label.setText("Synthetic mode active")
             self._update_fps_control_lock()
             return
@@ -7789,6 +7960,7 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
         self._apply_mode_aware_deinterlace_default_if_needed()
+        self._sync_roi_transition_unit_labels()
         self._sync_blackmagic_controls_enabled_state()
         self._update_fps_control_lock()
         self._update_status("DeckLink settings changed. Click Apply DeckLink Settings to apply.")
@@ -7824,6 +7996,7 @@ class MainWindow(QMainWindow):
 
         if self._source_mode != "Blackmagic DeckLink":
             self._stop_decklink_sessions()
+            self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
             self.decklink_status_label.setText("Synthetic mode active")
             self._update_status("Applied source mode: Synthetic")
             return
@@ -7957,7 +8130,9 @@ class MainWindow(QMainWindow):
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
             f"fps={fps_text}; backend={backend_text}"
         )
+        self._set_decklink_timecode_display(None, placeholder="Timecode: waiting for DeckLink frames...")
         self._decklink_sessions_running = True
+        self._sync_roi_transition_unit_labels()
         LOGGER.info(
             "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s",
             input_name,
@@ -8122,6 +8297,7 @@ class MainWindow(QMainWindow):
                     break
 
         self._apply_mode_aware_deinterlace_default_if_needed()
+        self._sync_roi_transition_unit_labels()
 
         self._apply_mode_aware_deinterlace_default_if_needed()
 
@@ -8258,6 +8434,7 @@ class MainWindow(QMainWindow):
             self._capture_session = None
 
         self._decklink_sessions_running = False
+        self._set_decklink_timecode_display(None, placeholder="Timecode: --")
 
         LOGGER.info("DeckLink sessions stopped")
 
@@ -8276,10 +8453,12 @@ class MainWindow(QMainWindow):
             self._no_frame_counter += 1
             if self._no_frame_counter % 20 == 0:
                 LOGGER.warning("No DeckLink input frames yet (count=%d)", self._no_frame_counter)
+            self._set_decklink_timecode_display(None, placeholder="Timecode: waiting for DeckLink frames...")
             if self._last_frame_error != "No input signal frames received":
                 self._last_frame_error = "No input signal frames received"
                 self._update_status("DeckLink connected but no input frames yet; check source signal and input mode")
             return None
+        self._set_decklink_timecode_display(_extract_decklink_frame_timecode_info(frame), placeholder="Timecode: none detected")
         frame_bytes = tight_uyvy_bytes(frame)
 
         self._no_frame_counter = 0
@@ -8466,6 +8645,64 @@ class MainWindow(QMainWindow):
                 else:
                     button.setStyleSheet("")
                     button.setToolTip("No keyframe stored. Arm SAVE KEY then click to store.")
+
+    def _set_decklink_timecode_display(self, info: dict[str, object] | None, placeholder: str | None = None) -> None:
+        display_text = placeholder or "Timecode: --"
+        if isinstance(info, dict) and bool(info.get("present", False)):
+            timecode_text = str(info.get("text", "")).strip()
+            format_name = str(info.get("format_name", "")).strip()
+            if timecode_text:
+                display_text = f"Timecode: {timecode_text}"
+                if format_name:
+                    display_text += f" ({format_name})"
+
+        self._decklink_timecode_display_text = display_text
+        if hasattr(self, "decklink_timecode_label"):
+            self.decklink_timecode_label.setText(display_text)
+
+    def _update_decklink_timecode_from_controller(self, placeholder: str | None = None) -> None:
+        info: dict[str, object] | None = None
+        if hasattr(self._controller, "decklink_timecode_info"):
+            try:
+                info = dict(self._controller.decklink_timecode_info())
+            except Exception:
+                info = None
+        self._set_decklink_timecode_display(info, placeholder=placeholder)
+
+    def _on_decklink_timecode_refresh_clicked(self) -> None:
+        if self._source_mode != "Blackmagic DeckLink":
+            self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
+            return
+
+        if self._controller_backend == "worker-process":
+            if not self._decklink_sessions_running:
+                self._set_decklink_timecode_display(None, placeholder="Timecode: DeckLink sessions not running")
+                return
+            try:
+                self._controller.decklink_tick(timeout_ms=5)
+            except Exception:
+                LOGGER.exception("Manual timecode refresh failed during worker tick")
+            self._update_decklink_timecode_from_controller(placeholder="Timecode: none detected")
+            return
+
+        if self._capture_session is None:
+            self._set_decklink_timecode_display(None, placeholder="Timecode: DeckLink sessions not running")
+            return
+
+        try:
+            frame = self._capture_session.acquire(timeout_ms=5)
+        except Exception:
+            LOGGER.exception("Manual timecode refresh failed during capture poll")
+            frame = None
+
+        if frame is None:
+            self._set_decklink_timecode_display(None, placeholder="Timecode: waiting for DeckLink frames...")
+            return
+
+        self._set_decklink_timecode_display(
+            _extract_decklink_frame_timecode_info(frame),
+            placeholder="Timecode: none detected",
+        )
 
     def _cancel_roi_keyframe_transition(self, reset_subpixel_shift: bool = True, notify_backend: bool = True) -> None:
         previous_state = self._roi_keyframe_transition
@@ -8994,6 +9231,21 @@ def load_video_processor_module():
         project_root / "build" / "src" / "RelWithDebInfo",
         project_root / "build" / "src" / "Debug",
     ]
+    path_prefixes = [
+        project_root / "venv" / "Scripts",
+        *preferred_paths,
+    ]
+    existing_path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    existing_path_keys = {part.lower() for part in existing_path_parts}
+    prepended_paths: list[str] = []
+    for candidate in path_prefixes:
+        candidate_str = str(candidate)
+        if candidate.exists() and candidate_str.lower() not in existing_path_keys:
+            prepended_paths.append(candidate_str)
+            existing_path_keys.add(candidate_str.lower())
+    if prepended_paths:
+        os.environ["PATH"] = os.pathsep.join(prepended_paths + existing_path_parts)
+
     for candidate in reversed(preferred_paths):
         if candidate.exists() and str(candidate) not in sys.path:
             sys.path.insert(0, str(candidate))
