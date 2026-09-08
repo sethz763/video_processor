@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QTouchEvent, QWheelEvent
+from PySide6.QtGui import QAction, QEventPoint, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QTouchEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -983,6 +983,7 @@ class SyntheticUyvySource:
 class RoiCanvas(QWidget):
     roiChanged = Signal(int, int, int, int)
     scaleChanged = Signal(float)
+    tapCenterRequested = Signal(float, float)
     fullscreenRequested = Signal(str)
     adjustmentStarted = Signal()
     adjustmentFinished = Signal()
@@ -1002,9 +1003,17 @@ class RoiCanvas(QWidget):
         self._visual_roi_overlay_drag: tuple[float, float, float, float] | None = None
 
         self._drag_mode = "none"
+        self._drag_started = False
         self._adjustment_active = False
         self._drag_start_pos = QPointF()
         self._drag_start_roi = self._roi
+        self._press_started_ts = 0.0
+        self._tap_max_duration_s = 0.35
+        self._tap_move_threshold_px = 6.0
+        self._pinch_active = False
+        self._pinch_start_distance = 0.0
+        self._pinch_start_scale = 1.0
+        self._suppress_mouse_until_ts = 0.0
 
         self._last_touch_emit_ts = 0.0
         self._default_touch_emit_interval_s = 1.0 / 60.0
@@ -1228,43 +1237,64 @@ class RoiCanvas(QWidget):
         super().keyReleaseEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.LeftButton or self._pinch_active or time.perf_counter() < self._suppress_mouse_until_ts:
             return
 
+        self._pointer_press(event.position())
+        event.accept()
+
+    def _pointer_press(self, position: QPointF) -> None:
         self._cancel_interaction_interpolation()
         self.setFocus(Qt.MouseFocusReason)
-        self._drag_start_pos = event.position()
+        self._drag_start_pos = QPointF(position)
         self._drag_start_roi = self._roi
+        self._drag_started = False
+        self._press_started_ts = time.perf_counter()
 
         roi_rect = self._frame_to_widget_rect(self._roi)
         handle_rect = self._resize_handle_rect(roi_rect)
 
-        if handle_rect.contains(event.position()):
+        if handle_rect.contains(position):
             self._drag_mode = "resize"
-        elif roi_rect.contains(event.position()):
+        elif roi_rect.contains(position):
             self._drag_mode = "move"
         else:
             self._drag_mode = "none"
 
-        if self._drag_mode != "none":
-            self._begin_adjustment()
-            self._set_drag_visual_roi_overlay(
-                float(self._roi.x),
-                float(self._roi.y),
-                float(self._roi.w),
-                float(self._roi.h),
-            )
-            if self._drag_mode == "move":
-                self._touch_emit_interval_s = self._drag_move_touch_emit_interval_s
-            else:
-                self._touch_emit_interval_s = self._default_touch_emit_interval_s
+    def _start_pointer_drag(self) -> None:
+        if self._drag_mode == "none" or self._drag_started:
+            return
+        self._drag_started = True
+        self._begin_adjustment()
+        self._set_drag_visual_roi_overlay(
+            float(self._roi.x),
+            float(self._roi.y),
+            float(self._roi.w),
+            float(self._roi.h),
+        )
+        if self._drag_mode == "move":
+            self._touch_emit_interval_s = self._drag_move_touch_emit_interval_s
+        else:
+            self._touch_emit_interval_s = self._default_touch_emit_interval_s
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._pinch_active or time.perf_counter() < self._suppress_mouse_until_ts:
+            return
+        self._pointer_move(event.position())
+        event.accept()
+
+    def _pointer_move(self, position: QPointF) -> None:
+        dx = position.x() - self._drag_start_pos.x()
+        dy = position.y() - self._drag_start_pos.y()
+        if not self._drag_started:
+            if math.hypot(dx, dy) < self._tap_move_threshold_px:
+                return
+            if self._drag_mode == "none":
+                return
+            self._start_pointer_drag()
+
         if self._drag_mode == "none":
             return
-
-        dx = event.position().x() - self._drag_start_pos.x()
-        dy = event.position().y() - self._drag_start_pos.y()
 
         image_rect = self._image_rect()
         if image_rect.width() <= 0 or image_rect.height() <= 0:
@@ -1332,10 +1362,56 @@ class RoiCanvas(QWidget):
         )
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        del event
+        if event.button() != Qt.LeftButton:
+            return
+        if self._pinch_active or time.perf_counter() < self._suppress_mouse_until_ts:
+            event.accept()
+            return
+        self._pointer_release(event.position())
+        event.accept()
+
+    def _pointer_release(self, position: QPointF) -> None:
+        elapsed = time.perf_counter() - self._press_started_ts
+        moved = math.hypot(
+            position.x() - self._drag_start_pos.x(),
+            position.y() - self._drag_start_pos.y(),
+        )
+        is_tap = not self._drag_started and elapsed <= self._tap_max_duration_s and moved < self._tap_move_threshold_px
+        had_drag = self._drag_started
         self._drag_mode = "none"
+        self._drag_started = False
         self._touch_emit_interval_s = self._default_touch_emit_interval_s
         self._clear_drag_visual_roi_overlay()
+        if had_drag:
+            self._flush_interaction_emit()
+            self._finish_adjustment()
+        if is_tap:
+            frame_point = self._widget_to_frame(position)
+            self.tapCenterRequested.emit(frame_point.x(), frame_point.y())
+
+    def _begin_pinch(self, first: QPointF, second: QPointF) -> None:
+        self._cancel_interaction_interpolation()
+        self._drag_mode = "none"
+        self._drag_started = False
+        self._clear_drag_visual_roi_overlay()
+        self._pinch_active = True
+        self._pinch_start_distance = max(1.0, math.hypot(second.x() - first.x(), second.y() - first.y()))
+        self._pinch_start_scale = roi_scale_from_roi(self._roi)
+        self._touch_emit_interval_s = self._default_touch_emit_interval_s
+        self._begin_adjustment()
+
+    def _update_pinch(self, first: QPointF, second: QPointF) -> None:
+        distance = max(1.0, math.hypot(second.x() - first.x(), second.y() - first.y()))
+        midpoint = QPointF((first.x() + second.x()) * 0.5, (first.y() + second.y()) * 0.5)
+        target_scale = self._pinch_start_scale * (distance / self._pinch_start_distance)
+        self._apply_scale(target_scale, self._widget_to_frame(midpoint), touch_throttle=True)
+
+    def _finish_pinch(self) -> None:
+        if not self._pinch_active:
+            return
+        self._pinch_active = False
+        self._pinch_start_distance = 0.0
+        self._suppress_mouse_until_ts = time.perf_counter() + 0.25
         self._flush_interaction_emit()
         self._finish_adjustment()
 
@@ -1367,8 +1443,24 @@ class RoiCanvas(QWidget):
 
     def event(self, event) -> bool:
         et = event.type()
-        if et in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd):
-            # Pinch touch input is intentionally disabled due to unstable tablet behavior.
+        if et in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd, QEvent.Type.TouchCancel):
+            points = [point for point in event.points() if point.state() != QEventPoint.State.Released]
+            if len(points) >= 2:
+                first = points[0].position()
+                second = points[1].position()
+                if not self._pinch_active:
+                    self._begin_pinch(first, second)
+                self._update_pinch(first, second)
+            elif self._pinch_active:
+                self._finish_pinch()
+            elif et == QEvent.Type.TouchBegin and len(points) == 1:
+                self._pointer_press(points[0].position())
+            elif et == QEvent.Type.TouchUpdate and len(points) == 1:
+                self._pointer_move(points[0].position())
+            elif et == QEvent.Type.TouchEnd:
+                released_points = event.points()
+                release_position = released_points[0].position() if released_points else self._drag_start_pos
+                self._pointer_release(release_position)
             event.accept()
             return True
         return super().event(event)
@@ -1618,7 +1710,7 @@ class RoiCanvas(QWidget):
             self._set_roi_and_emit(target_roi, emit_scale=emit_scale)
 
         self._flush_pending_touch_emit()
-        if self._drag_mode == "none":
+        if self._drag_mode == "none" and not self._pinch_active:
             self._finish_adjustment()
 
     def _schedule_interaction_emit_flush(self) -> None:
@@ -3915,6 +4007,7 @@ class MainWindow(QMainWindow):
         self._input_canvas.adjustmentFinished.connect(self._on_roi_adjustment_finished)
         self._input_canvas.roiChanged.connect(self._on_roi_from_canvas)
         self._input_canvas.scaleChanged.connect(self._on_scale_from_canvas)
+        self._input_canvas.tapCenterRequested.connect(self._on_roi_tap_center_requested)
         self._input_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
         self._output_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
 
@@ -7210,7 +7303,9 @@ class MainWindow(QMainWindow):
             return {}
 
         state = self._roi_keyframe_transition
-        if not (isinstance(state, dict) and bool(state.get("backend_driven", False))):
+        backend_transition_active = isinstance(state, dict) and bool(state.get("backend_driven", False))
+        timecode_visual_active = bool(self._timecode_keyframing_enabled) and (not self._timecode_adjustment_paused)
+        if not backend_transition_active and not timecode_visual_active:
             return {}
 
         if not hasattr(self._controller, "decklink_applied_roi"):
@@ -7235,17 +7330,20 @@ class MainWindow(QMainWindow):
             return worker_transition_state
 
         worker_roi = clamp_roi(worker_roi)
-        state["current_roi_estimate"] = worker_roi
-        # Never snap canvas ROI directly during a backend-driven transition.
-        # We render a smoothed visual overlay and commit once complete.
-        self._roi = worker_roi
-
+        if backend_transition_active:
+            state["current_roi_estimate"] = worker_roi
+            # Never snap canvas ROI directly during a backend-driven transition.
+            # We render a smoothed visual overlay and commit once complete.
+            self._roi = worker_roi
+        else:
+            self._roi = worker_roi
+            self._input_canvas._apply_roi_local(worker_roi)
         self._controller_roi_applied = worker_roi
         self._schedule_roi_controls_sync(worker_roi)
 
         # Render GUI interpolation from worker transition phase so the on-screen
         # ROI appears smooth between quantized applied-ROI steps.
-        if transition_active:
+        if backend_transition_active and transition_active:
             try:
                 start_raw = worker_transition_state.get("start_roi", {})
                 target_raw = worker_transition_state.get("target_roi", {})
@@ -7285,7 +7383,7 @@ class MainWindow(QMainWindow):
                 self._input_canvas.set_visual_roi_overlay(overlay_x, overlay_y, overlay_w, overlay_h)
             except Exception:
                 self._input_canvas.clear_visual_roi_overlay()
-        else:
+        elif backend_transition_active:
             self._input_canvas.clear_visual_roi_overlay()
 
         return worker_transition_state
@@ -9312,6 +9410,17 @@ class MainWindow(QMainWindow):
         self._timecode_last_applied_frame = frame_number
         if self._controller_backend != "worker-process":
             self._apply_timecode_roi_sample(sample)
+        else:
+            carrier_roi = self._timecode_roi_carrier(sample)
+            self._roi = carrier_roi
+            self._input_canvas.set_roi(carrier_roi)
+            self._input_canvas.set_visual_roi_overlay(
+                float(sample[0]),
+                float(sample[1]),
+                float(sample[2]),
+                float(sample[3]),
+            )
+            self._schedule_roi_controls_sync(carrier_roi)
         if frame_number in self._timecode_roi_keyframes:
             self._timecode_selected_frame = frame_number
             self._update_timecode_keyframe_display()
@@ -9356,6 +9465,24 @@ class MainWindow(QMainWindow):
         self._timecode_last_applied_frame = frame_number
         self._sync_worker_timecode_roi_keyframes()
         self._update_status(f"ROI interpolation recalculated from {_normalize_timecode_display(timecode)}")
+
+    def _on_roi_tap_center_requested(self, frame_x: float, frame_y: float) -> None:
+        current = clamp_roi(self._roi)
+        target = clamp_roi(
+            Roi(
+                int(round(float(frame_x) - (current.w * 0.5))),
+                int(round(float(frame_y) - (current.h * 0.5))),
+                current.w,
+                current.h,
+            )
+        )
+        duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
+        self._start_roi_keyframe_transition(
+            target,
+            self._effective_roi_keyframe_duration_frames(target, duration_frames),
+            self._roi_interp_mode_name(),
+            manual_adjustment=True,
+        )
 
     def _on_roi_save_key_toggled(self, checked: bool) -> None:
         self._roi_key_save_armed = bool(checked)
@@ -9555,9 +9682,17 @@ class MainWindow(QMainWindow):
                 pass
         if reset_subpixel_shift and hasattr(self._controller, "set_roi_subpixel_shift"):
             self._controller.set_roi_subpixel_shift(0.0, 0.0)
+        if isinstance(previous_state, dict) and bool(previous_state.get("manual_adjustment", False)):
+            self._on_roi_adjustment_finished()
         self._update_timer_interval()
 
-    def _start_roi_keyframe_transition(self, target_roi: Roi, duration_frames: int, interpolation_mode: str) -> None:
+    def _start_roi_keyframe_transition(
+        self,
+        target_roi: Roi,
+        duration_frames: int,
+        interpolation_mode: str,
+        manual_adjustment: bool = False,
+    ) -> None:
         previous_state = self._roi_keyframe_transition
         if isinstance(previous_state, dict):
             current_estimate = previous_state.get("current_roi_estimate")
@@ -9582,6 +9717,8 @@ class MainWindow(QMainWindow):
         # mode, start_roi_microstep_transition can take over in-place from the
         # current rendered ROI+shift, avoiding a one-frame jump between moves.
         self._cancel_roi_keyframe_transition(reset_subpixel_shift=False, notify_backend=False)
+        if manual_adjustment:
+            self._on_roi_adjustment_started()
 
         if total_frames <= 1:
             self._roi = target
@@ -9589,6 +9726,8 @@ class MainWindow(QMainWindow):
             self._input_canvas.clear_visual_roi_overlay()
             self._apply_controller_roi_immediate(target)
             self._sync_controls_from_roi(target)
+            if manual_adjustment:
+                self._on_roi_adjustment_finished()
             return
 
         self._roi_keyframe_transition = {
@@ -9602,6 +9741,7 @@ class MainWindow(QMainWindow):
             "last_subpixel_shift": {"x": 0.0, "y": 0.0},
             "pending_frame_advance": 0.0,
             "worker_transition_seen": False,
+            "manual_adjustment": bool(manual_adjustment),
         }
 
         backend_driven = bool(
@@ -9793,6 +9933,7 @@ class MainWindow(QMainWindow):
 
             transition_complete = (not worker_transition_active) or is_final_frame
             if transition_complete:
+                finish_manual_adjustment = bool(state.get("manual_adjustment", False))
                 self._roi_keyframe_transition = None
                 self._roi_keyframe_transition_timer.stop()
                 self._input_canvas.clear_visual_roi_overlay()
@@ -9816,6 +9957,8 @@ class MainWindow(QMainWindow):
                 self._sync_controls_from_roi(self._roi)
                 self._roi_keyframe_last_step_ts = 0.0
                 self._update_timer_interval()
+                if finish_manual_adjustment:
+                    self._on_roi_adjustment_finished()
             return
 
         residual = state.get("quant_residual")
@@ -9997,6 +10140,7 @@ class MainWindow(QMainWindow):
                 self._apply_controller_roi_immediate(interpolated, reset_subpixel_shift=False)
 
         if transition_complete:
+            finish_manual_adjustment = bool(state.get("manual_adjustment", False))
             self._roi_keyframe_transition = None
             self._roi_keyframe_transition_timer.stop()
             self._input_canvas.clear_visual_roi_overlay()
@@ -10017,6 +10161,8 @@ class MainWindow(QMainWindow):
 
             self._sync_controls_from_roi(self._roi)
             self._roi_keyframe_last_step_ts = 0.0
+            if finish_manual_adjustment:
+                self._on_roi_adjustment_finished()
 
     def _sync_controls_from_roi(self, roi: Roi) -> None:
         self._updating_controls = True

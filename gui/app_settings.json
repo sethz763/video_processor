@@ -37,8 +37,8 @@
   "denoise_method": "Off",
   "denoise_strength": 0.35,
   "display_splitter_sizes": [
-    428,
-    424
+    427,
+    425
   ],
   "fps": 60,
   "interlaced_field2_phase_fraction": 0.5,
@@ -56,23 +56,23 @@
   "roi_keyframe_duration_override": false,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 15,
+      "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1162,
-        122,
-        610,
-        343
+        540,
+        193,
+        796,
+        448
       ]
     },
     "2": {
-      "duration_frames": 15,
+      "duration_frames": 30,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        454,
-        490,
-        610,
-        343
+        0,
+        0,
+        1920,
+        1080
       ]
     },
     "3": {
@@ -102,7 +102,7 @@
   "roi_min_drag_nudge": 0.015,
   "roi_smoothing_percent": 2,
   "roi_timecode_keyframes": [],
-  "roi_transition_duration_frames": 15,
+  "roi_transition_duration_frames": 30,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
