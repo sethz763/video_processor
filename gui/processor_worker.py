@@ -451,6 +451,10 @@ def _extract_frame_timecode_info(frame: object) -> dict[str, object]:
         "text": "",
         "format_code": 0,
         "format_name": "",
+        "bcd": 0,
+        "flags": 0,
+        "field_mark": False,
+        "drop_frame": False,
     }
     if frame is None:
         return payload
@@ -477,6 +481,10 @@ def _extract_frame_timecode_info(frame: object) -> dict[str, object]:
         payload["text"] = timecode_text
         payload["format_code"] = format_code
         payload["format_name"] = _decklink_timecode_format_name(format_code)
+        payload["bcd"] = int(getattr(frame, "timecode_bcd", 0))
+        payload["flags"] = int(getattr(frame, "timecode_flags", 0))
+        payload["field_mark"] = bool(getattr(frame, "timecode_field_mark", False))
+        payload["drop_frame"] = bool(getattr(frame, "timecode_drop_frame", ";" in timecode_text))
         return payload
     except Exception:
         return payload
@@ -5109,12 +5117,20 @@ def run_processor_worker(
             nonlocal capture_session, output_session
             _stop_sessions()
 
+            selected_timecode_format = int(
+                message.get(
+                    "timecode_format",
+                    getattr(d, "TIMECODE_FORMAT_RP188_VITC1", 0x72707631),
+                )
+            )
+
             capture_session = d.CaptureSession(
                 device_index=int(message["in_device"]),
                 display_mode=resolved_in_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
                 max_queue_frames=8,
                 enable_format_detection=bool(enable_format_detection),
+                timecode_format=selected_timecode_format,
             )
             output_session = d.OutputSession(
                 device_index=int(message["out_device"]),

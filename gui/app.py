@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import bisect
 import math
 import multiprocessing as mp
 import os
@@ -184,12 +185,41 @@ def _decklink_timecode_format_name(format_code: object) -> str:
     return fallback_map.get(code, f"0x{code:08X}")
 
 
+def _decklink_timecode_format_options() -> list[tuple[str, int]]:
+    fallback_codes = {
+        "RP188 VITC1": 0x72707631,
+        "RP188 VITC2": 0x72703132,
+        "RP188 LTC": 0x72706C74,
+        "RP188 HFRTC": 0x72706872,
+        "VITC": 0x76697463,
+        "VITC Field 2": 0x76697432,
+        "Serial": 0x73657269,
+    }
+    attribute_names = {
+        "RP188 VITC1": "TIMECODE_FORMAT_RP188_VITC1",
+        "RP188 VITC2": "TIMECODE_FORMAT_RP188_VITC2",
+        "RP188 LTC": "TIMECODE_FORMAT_RP188_LTC",
+        "RP188 HFRTC": "TIMECODE_FORMAT_RP188_HIGH_FRAME_RATE",
+        "VITC": "TIMECODE_FORMAT_VITC",
+        "VITC Field 2": "TIMECODE_FORMAT_VITC_FIELD2",
+        "Serial": "TIMECODE_FORMAT_SERIAL",
+    }
+    return [
+        (label, int(getattr(d, attribute_names[label], fallback_code)))
+        for label, fallback_code in fallback_codes.items()
+    ]
+
+
 def _extract_decklink_frame_timecode_info(frame: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "present": False,
         "text": "",
         "format_code": 0,
         "format_name": "",
+        "bcd": 0,
+        "flags": 0,
+        "field_mark": False,
+        "drop_frame": False,
     }
     if frame is None:
         return payload
@@ -216,6 +246,10 @@ def _extract_decklink_frame_timecode_info(frame: object) -> dict[str, object]:
         payload["text"] = timecode_text
         payload["format_code"] = format_code
         payload["format_name"] = _decklink_timecode_format_name(format_code)
+        payload["bcd"] = int(getattr(frame, "timecode_bcd", 0))
+        payload["flags"] = int(getattr(frame, "timecode_flags", 0))
+        payload["field_mark"] = bool(getattr(frame, "timecode_field_mark", False))
+        payload["drop_frame"] = bool(getattr(frame, "timecode_drop_frame", ";" in timecode_text))
     except Exception:
         return payload
     return payload
@@ -558,6 +592,121 @@ class RoiKeyframe:
     interpolation_mode: str
 
 
+@dataclass
+class TimecodeRoiKeyframe:
+    timecode: str
+    frame_number: int
+    roi: Roi
+    interpolation_mode: str
+    drop_frame: bool = False
+    field_mark: bool = False
+
+
+def _timecode_to_frame_number(timecode: str, nominal_fps: int) -> int | None:
+    raw_timecode = str(timecode).strip()
+    drop_frame = ";" in raw_timecode
+    normalized = raw_timecode.replace(";", ":").replace(".", ":")
+    parts = normalized.split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        hours, minutes, seconds, frames = (int(part) for part in parts)
+    except ValueError:
+        return None
+    fps = max(1, int(nominal_fps))
+    if hours < 0 or minutes not in range(60) or seconds not in range(60) or frames not in range(fps):
+        return None
+    frame_number = (((hours * 60) + minutes) * 60 + seconds) * fps + frames
+    if drop_frame and fps in {30, 60}:
+        drop_count = 2 if fps == 30 else 4
+        total_minutes = (hours * 60) + minutes
+        frame_number -= drop_count * (total_minutes - (total_minutes // 10))
+    return frame_number
+
+
+def _timecode_count_fps(timecode_format: str, video_fps: float) -> int:
+    rounded_video_fps = max(1, int(round(float(video_fps))))
+    if str(timecode_format).strip() == "RP188 HFRTC":
+        return rounded_video_fps
+    if rounded_video_fps > 30:
+        return max(1, int(round(float(video_fps) / 2.0)))
+    return rounded_video_fps
+
+
+def _timecode_to_internal_frame_number(
+    timecode: str,
+    count_fps: int,
+    field_mark: bool = False,
+) -> int | None:
+    base_frame = _timecode_to_frame_number(timecode, count_fps)
+    if base_frame is None:
+        return None
+    if count_fps == 30:
+        return (base_frame * 2) + (1 if field_mark else 0)
+    if count_fps == 60:
+        return base_frame
+    return int(round(base_frame * (60.0 / max(1, count_fps))))
+
+
+def _normalize_timecode_display(timecode: str) -> str:
+    normalized = str(timecode).strip().replace(";", ":").replace(".", ":")
+    parts = normalized.split(":")
+    if len(parts) != 4:
+        return str(timecode).strip()
+    return f"{parts[0]}:{parts[1]}:{parts[2]}.{parts[3]}"
+
+
+def _timecode_with_drop_frame_separator(timecode: str, drop_frame: bool) -> str:
+    normalized = _normalize_timecode_display(timecode)
+    if drop_frame and "." in normalized:
+        return normalized.rsplit(".", 1)[0] + ";" + normalized.rsplit(".", 1)[1]
+    return normalized
+
+
+def _infer_legacy_drop_frame(timecode: str, stored_frame_number: int, count_fps: int) -> bool:
+    for candidate_fps in {max(1, count_fps), max(1, count_fps * 2)}:
+        drop_frame_number = _timecode_to_frame_number(
+            _timecode_with_drop_frame_separator(timecode, True),
+            candidate_fps,
+        )
+        non_drop_frame_number = _timecode_to_frame_number(timecode, candidate_fps)
+        if (
+            drop_frame_number is not None
+            and non_drop_frame_number is not None
+            and drop_frame_number != non_drop_frame_number
+            and int(stored_frame_number) == drop_frame_number
+        ):
+            return True
+    return False
+
+
+def _timecode_interpolation_curve(values: np.ndarray, interpolation_mode: str) -> np.ndarray:
+    mode = str(interpolation_mode).strip().lower()
+    if mode == "ease_in_out":
+        return values * values * (3.0 - (2.0 * values))
+    if mode == "ease_out":
+        return 1.0 - np.square(1.0 - values)
+    return values
+
+
+def _build_timecode_roi_segment(
+    start_key: TimecodeRoiKeyframe,
+    end_key: TimecodeRoiKeyframe,
+) -> np.ndarray:
+    frame_count = max(1, int(end_key.frame_number) - int(start_key.frame_number))
+    progress = np.linspace(0.0, 1.0, frame_count + 1, dtype=np.float32)
+    curved = _timecode_interpolation_curve(progress, end_key.interpolation_mode)[:, np.newaxis]
+    start = np.array(
+        [start_key.roi.x, start_key.roi.y, start_key.roi.w, start_key.roi.h],
+        dtype=np.float32,
+    )
+    end = np.array(
+        [end_key.roi.x, end_key.roi.y, end_key.roi.w, end_key.roi.h],
+        dtype=np.float32,
+    )
+    return start + ((end - start) * curved)
+
+
 def clamp_roi(roi: Roi, width: int = FRAME_W, height: int = FRAME_H) -> Roi:
     # Keep ROI size stable while moving: clamp size first, then clamp position.
     max_w_frame = max(2, width)
@@ -835,6 +984,8 @@ class RoiCanvas(QWidget):
     roiChanged = Signal(int, int, int, int)
     scaleChanged = Signal(float)
     fullscreenRequested = Signal(str)
+    adjustmentStarted = Signal()
+    adjustmentFinished = Signal()
 
     def __init__(self, view_name: str = "input") -> None:
         super().__init__()
@@ -851,6 +1002,7 @@ class RoiCanvas(QWidget):
         self._visual_roi_overlay_drag: tuple[float, float, float, float] | None = None
 
         self._drag_mode = "none"
+        self._adjustment_active = False
         self._drag_start_pos = QPointF()
         self._drag_start_roi = self._roi
 
@@ -1023,9 +1175,11 @@ class RoiCanvas(QWidget):
         roi = self._roi
 
         if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self._begin_adjustment()
             self._apply_scale(roi_scale_from_roi(roi) * 1.08, self._roi_center())
             return
         if event.key() == Qt.Key_Minus:
+            self._begin_adjustment()
             self._apply_scale(roi_scale_from_roi(roi) / 1.08, self._roi_center())
             return
 
@@ -1054,7 +1208,24 @@ class RoiCanvas(QWidget):
                 super().keyPressEvent(event)
                 return
 
+        self._begin_adjustment()
         self._set_roi_and_emit(clamp_roi(roi))
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        adjustment_keys = {
+            Qt.Key_Plus,
+            Qt.Key_Equal,
+            Qt.Key_Minus,
+            Qt.Key_Left,
+            Qt.Key_Right,
+            Qt.Key_Up,
+            Qt.Key_Down,
+        }
+        if event.key() in adjustment_keys and not event.isAutoRepeat():
+            self._finish_adjustment()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.LeftButton:
@@ -1076,6 +1247,7 @@ class RoiCanvas(QWidget):
             self._drag_mode = "none"
 
         if self._drag_mode != "none":
+            self._begin_adjustment()
             self._set_drag_visual_roi_overlay(
                 float(self._roi.x),
                 float(self._roi.y),
@@ -1165,6 +1337,7 @@ class RoiCanvas(QWidget):
         self._touch_emit_interval_s = self._default_touch_emit_interval_s
         self._clear_drag_visual_roi_overlay()
         self._flush_interaction_emit()
+        self._finish_adjustment()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         super().mouseDoubleClickEvent(event)
@@ -1180,6 +1353,7 @@ class RoiCanvas(QWidget):
             return
 
         effective_delta = float(delta)
+        self._begin_adjustment()
 
         # Exponential scaling keeps wheel notches crisp while smoothing high-rate
         # touchpad/pinch delta bursts.
@@ -1384,6 +1558,18 @@ class RoiCanvas(QWidget):
         self._interaction_target_emit_scale = False
         self._interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
 
+    def _begin_adjustment(self) -> None:
+        if self._adjustment_active:
+            return
+        self._adjustment_active = True
+        self.adjustmentStarted.emit()
+
+    def _finish_adjustment(self) -> None:
+        if not self._adjustment_active:
+            return
+        self._adjustment_active = False
+        self.adjustmentFinished.emit()
+
     def _set_roi_and_emit(self, roi: Roi, emit_scale: bool = True) -> None:
         self._cancel_interaction_interpolation()
         self._apply_roi_local(roi)
@@ -1432,6 +1618,8 @@ class RoiCanvas(QWidget):
             self._set_roi_and_emit(target_roi, emit_scale=emit_scale)
 
         self._flush_pending_touch_emit()
+        if self._drag_mode == "none":
+            self._finish_adjustment()
 
     def _schedule_interaction_emit_flush(self) -> None:
         # Trailing-edge flush ensures the final zoom state is always propagated.
@@ -1811,7 +1999,15 @@ class VideoProcessorController:
         self.rtx_vsr_active = False
         self.rtx_vsr_error = "RTX VSR is only available with worker backend"
 
-    def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
+    def start_decklink(
+        self,
+        in_device: int,
+        in_mode: object,
+        out_device: int,
+        out_mode: object,
+        enable_format_detection: bool,
+        timecode_format: int,
+    ) -> None:
         raise RuntimeError("DeckLink capture/output in worker is unavailable for in-process backend")
 
     def stop_decklink(self) -> None:
@@ -3009,7 +3205,15 @@ class ProcessVideoProcessorController:
             diag_parts.append(f"decklink_no_frame_reason={self._decklink_no_frame_reason}")
         raise RuntimeError(f"Timed out waiting for worker ack: {expected_cmd} | {' | '.join(diag_parts)}")
 
-    def start_decklink(self, in_device: int, in_mode: object, out_device: int, out_mode: object, enable_format_detection: bool) -> None:
+    def start_decklink(
+        self,
+        in_device: int,
+        in_mode: object,
+        out_device: int,
+        out_mode: object,
+        enable_format_detection: bool,
+        timecode_format: int,
+    ) -> None:
         self._drain_responses()
         self._latest_decklink_frame = None
         self._decklink_frame_updated = False
@@ -3027,6 +3231,7 @@ class ProcessVideoProcessorController:
                 "out_device": int(out_device),
                 "out_mode": out_mode,
                 "enable_format_detection": bool(enable_format_detection),
+                "timecode_format": int(timecode_format),
                 "decklink_output_buffer_frames": int(self.decklink_output_buffer_frames),
             }
         )
@@ -3435,6 +3640,17 @@ class MainWindow(QMainWindow):
         self._roi_keyframes: dict[int, RoiKeyframe] = {}
         self._roi_keyframe_slots = (1, 2, 3, 4)
         self._roi_key_save_armed = False
+        self._timecode_keyframing_enabled = False
+        self._timecode_roi_keyframes: dict[int, TimecodeRoiKeyframe] = {}
+        self._timecode_adjustment_anchor: TimecodeRoiKeyframe | None = None
+        self._timecode_adjustment_paused = False
+        self._timecode_roi_lookup_keyframes: dict[int, TimecodeRoiKeyframe] = {}
+        self._timecode_roi_ordered_frames: list[int] = []
+        self._timecode_roi_segment_starts: list[int] = []
+        self._timecode_roi_segments: list[tuple[int, int, np.ndarray]] = []
+        self._timecode_selected_frame: int | None = None
+        self._timecode_last_applied_frame: int | None = None
+        self._decklink_timecode_info: dict[str, object] = {}
         self._roi_keyframe_transition_default_frames = 30
         self._roi_keyframe_transition: dict[str, object] | None = None
         self._roi_keyframe_last_step_ts = 0.0
@@ -3582,6 +3798,15 @@ class MainWindow(QMainWindow):
         root.setSpacing(6)
         self._fullscreen_keyframe_toolbars: dict[str, QWidget] = {}
         self._fullscreen_keyframe_side_panels: dict[str, QWidget] = {}
+        self._fullscreen_manual_keyframe_rows: dict[str, QWidget] = {}
+        self._fullscreen_timecode_keyframe_rows: dict[str, QWidget] = {}
+        self._fullscreen_keyframing_mode_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_timecode_display_labels: dict[str, QLabel] = {}
+        self._fullscreen_timecode_key_labels: dict[str, QLabel] = {}
+        self._fullscreen_timecode_delete_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_timecode_delete_all_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_timecode_previous_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_timecode_next_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
         self._fullscreen_roi_transition_labels: dict[str, QLabel] = {}
@@ -3677,6 +3902,8 @@ class MainWindow(QMainWindow):
         root.addWidget(self._main_splitter, 1)
 
         self._input_canvas.set_roi(self._roi)
+        self._input_canvas.adjustmentStarted.connect(self._on_roi_adjustment_started)
+        self._input_canvas.adjustmentFinished.connect(self._on_roi_adjustment_finished)
         self._input_canvas.roiChanged.connect(self._on_roi_from_canvas)
         self._input_canvas.scaleChanged.connect(self._on_scale_from_canvas)
         self._input_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
@@ -3700,6 +3927,11 @@ class MainWindow(QMainWindow):
         self._roi_controls_sync_timer.setSingleShot(True)
         self._roi_controls_sync_timer.setInterval(33)
         self._roi_controls_sync_timer.timeout.connect(self._flush_pending_roi_controls_sync)
+
+        self._roi_control_adjustment_timer = QTimer(self)
+        self._roi_control_adjustment_timer.setSingleShot(True)
+        self._roi_control_adjustment_timer.setInterval(150)
+        self._roi_control_adjustment_timer.timeout.connect(self._on_roi_adjustment_finished)
 
         self._roi_keyframe_transition_timer = QTimer(self)
         self._roi_keyframe_transition_timer.setInterval(16)
@@ -3832,6 +4064,7 @@ class MainWindow(QMainWindow):
             self.decklink_output_device_combo,
             self.decklink_input_mode_combo,
             self.decklink_output_mode_combo,
+            self.decklink_timecode_format_combo,
             self.worker_priority_combo,
             self.roi_interp_mode_combo,
         ]
@@ -3903,6 +4136,17 @@ class MainWindow(QMainWindow):
         keyframe_payload: dict[str, object] = {}
         for slot, keyframe in self._roi_keyframes.items():
             keyframe_payload[str(slot)] = self._serialize_roi_keyframe(keyframe)
+        timecode_keyframe_payload = [
+            {
+                "timecode": keyframe.timecode,
+                "frame_number": int(keyframe.frame_number),
+                "roi": [keyframe.roi.x, keyframe.roi.y, keyframe.roi.w, keyframe.roi.h],
+                "interpolation_mode": keyframe.interpolation_mode,
+                "drop_frame": bool(keyframe.drop_frame),
+                "field_mark": bool(keyframe.field_mark),
+            }
+            for keyframe in sorted(self._timecode_roi_keyframes.values(), key=lambda item: item.frame_number)
+        ]
 
         return {
             "version": 1,
@@ -3923,6 +4167,8 @@ class MainWindow(QMainWindow):
             "roi_interpolation_mode": str(self.roi_interp_mode_combo.currentText()),
             "roi_keyframe_duration_override": bool(self.roi_keyframe_duration_override_btn.isChecked()),
             "roi_keyframes": keyframe_payload,
+            "roi_keyframing_mode": "timecode" if self._timecode_keyframing_enabled else "manual",
+            "roi_timecode_keyframes": timecode_keyframe_payload,
             "basic_scaling_mode": str(self.sr_mode_combo.currentText()),
             "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
             "basic_scaling_manual": str(self.sr_manual_combo.currentText()),
@@ -3966,6 +4212,7 @@ class MainWindow(QMainWindow):
             "decklink_output_device": self.decklink_output_device_combo.currentData(),
             "decklink_input_mode_text": str(self.decklink_input_mode_combo.currentText()),
             "decklink_output_mode_text": str(self.decklink_output_mode_combo.currentText()),
+            "decklink_timecode_format": str(self.decklink_timecode_format_combo.currentText()),
             "decklink_enable_format_detection": bool(self.decklink_enable_format_detection.isChecked()),
             "decklink_fps_priority_guard": bool(self.decklink_fps_priority_guard_checkbox.isChecked()),
             "worker_process_priority": str(self.worker_priority_combo.currentText()),
@@ -4129,6 +4376,11 @@ class MainWindow(QMainWindow):
             self.rtx_thdr_max_luminance_spin.setValue(int(raw.get("rtx_thdr_max_luminance", self.rtx_thdr_max_luminance_spin.value())))
 
             self.source_mode_combo.setCurrentText(str(raw.get("source_mode", self.source_mode_combo.currentText())))
+            persisted_timecode_format = str(
+                raw.get("decklink_timecode_format", self.decklink_timecode_format_combo.currentText())
+            )
+            if self.decklink_timecode_format_combo.findText(persisted_timecode_format) >= 0:
+                self.decklink_timecode_format_combo.setCurrentText(persisted_timecode_format)
             self.decklink_auto_detect_devices.setChecked(bool(raw.get("decklink_auto_detect", self.decklink_auto_detect_devices.isChecked())))
             self.decklink_enable_format_detection.setChecked(
                 bool(raw.get("decklink_enable_format_detection", self.decklink_enable_format_detection.isChecked()))
@@ -4193,6 +4445,8 @@ class MainWindow(QMainWindow):
             self._main_splitter.setSizes([int(main_sizes[0]), int(main_sizes[1])])
 
         self._restore_roi_keyframes(raw.get("roi_keyframes"))
+        self._restore_timecode_roi_keyframes(raw.get("roi_timecode_keyframes"))
+        self._set_roi_keyframing_mode(str(raw.get("roi_keyframing_mode", "manual")) == "timecode", save=False)
         self._update_roi_key_buttons()
 
         self._update_timer_interval()
@@ -4792,6 +5046,13 @@ class MainWindow(QMainWindow):
         self.decklink_input_mode_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
         decklink_form.addRow("Input mode", self.decklink_input_mode_combo)
 
+        self.decklink_timecode_format_combo = QComboBox()
+        for label, format_code in _decklink_timecode_format_options():
+            self.decklink_timecode_format_combo.addItem(label, format_code)
+        self.decklink_timecode_format_combo.setCurrentText("RP188 VITC1")
+        self.decklink_timecode_format_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
+        decklink_form.addRow("Input timecode type", self.decklink_timecode_format_combo)
+
         self.decklink_output_mode_combo = QComboBox()
         self.decklink_output_mode_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
         decklink_form.addRow("Output mode", self.decklink_output_mode_combo)
@@ -4868,22 +5129,26 @@ class MainWindow(QMainWindow):
         self.roi_x_spin = QSpinBox()
         self.roi_x_spin.setRange(0, FRAME_W - 2)
         self.roi_x_spin.valueChanged.connect(self._on_roi_spin_changed)
+        self.roi_x_spin.editingFinished.connect(self._on_roi_adjustment_finished)
         roi_form.addRow("x", self.roi_x_spin)
 
         self.roi_y_spin = QSpinBox()
         self.roi_y_spin.setRange(0, FRAME_H - 2)
         self.roi_y_spin.valueChanged.connect(self._on_roi_spin_changed)
+        self.roi_y_spin.editingFinished.connect(self._on_roi_adjustment_finished)
         roi_form.addRow("y", self.roi_y_spin)
 
         self.roi_w_spin = QSpinBox()
         self.roi_w_spin.setRange(2, FRAME_W)
         self.roi_w_spin.setSingleStep(2)
         self.roi_w_spin.valueChanged.connect(self._on_roi_spin_changed)
+        self.roi_w_spin.editingFinished.connect(self._on_roi_adjustment_finished)
         roi_form.addRow("w", self.roi_w_spin)
 
         self.roi_h_spin = QSpinBox()
         self.roi_h_spin.setRange(2, FRAME_H)
         self.roi_h_spin.valueChanged.connect(self._on_roi_spin_changed)
+        self.roi_h_spin.editingFinished.connect(self._on_roi_adjustment_finished)
         roi_form.addRow("h", self.roi_h_spin)
 
         self.scale_spin = QDoubleSpinBox()
@@ -4891,6 +5156,7 @@ class MainWindow(QMainWindow):
         self.scale_spin.setSingleStep(0.1)
         self.scale_spin.setDecimals(2)
         self.scale_spin.valueChanged.connect(self._on_scale_spin_changed)
+        self.scale_spin.editingFinished.connect(self._on_roi_adjustment_finished)
         roi_form.addRow("Scale", self.scale_spin)
 
         self.roi_smoothing_slider = QSlider(Qt.Horizontal)
@@ -4979,6 +5245,15 @@ class MainWindow(QMainWindow):
         self.roi_keyframe_duration_override_btn.setToolTip("When enabled, uses Transition (frames) instead of keyframe-stored duration during recall.")
         roi_form.addRow(self.roi_keyframe_duration_override_btn)
 
+        self.roi_manual_keyframe_widget = QWidget()
+        manual_keyframe_layout = QVBoxLayout(self.roi_manual_keyframe_widget)
+        manual_keyframe_layout.setContentsMargins(0, 0, 0, 0)
+        manual_keyframe_layout.setSpacing(8)
+
+        self.roi_timecode_mode_btn = QPushButton("Timecode Based Keyframing")
+        self.roi_timecode_mode_btn.clicked.connect(lambda: self._set_roi_keyframing_mode(True))
+        manual_keyframe_layout.addWidget(self.roi_timecode_mode_btn)
+
         keyframe_row = QWidget()
         keyframe_layout = QHBoxLayout(keyframe_row)
         keyframe_layout.setContentsMargins(0, 0, 0, 0)
@@ -5011,7 +5286,50 @@ class MainWindow(QMainWindow):
         self.roi_key4_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(4))
         keyframe_layout.addWidget(self.roi_key4_btn)
 
-        roi_form.addRow(keyframe_row)
+        manual_keyframe_layout.addWidget(keyframe_row)
+        roi_form.addRow(self.roi_manual_keyframe_widget)
+
+        self.roi_timecode_keyframe_widget = QWidget()
+        timecode_keyframe_layout = QVBoxLayout(self.roi_timecode_keyframe_widget)
+        timecode_keyframe_layout.setContentsMargins(0, 0, 0, 0)
+        timecode_keyframe_layout.setSpacing(8)
+
+        self.roi_manual_mode_btn = QPushButton("Manual Keyframing")
+        self.roi_manual_mode_btn.clicked.connect(lambda: self._set_roi_keyframing_mode(False))
+        timecode_keyframe_layout.addWidget(self.roi_manual_mode_btn)
+
+        timecode_edit_row = QWidget()
+        timecode_edit_layout = QHBoxLayout(timecode_edit_row)
+        timecode_edit_layout.setContentsMargins(0, 0, 0, 0)
+        timecode_edit_layout.setSpacing(8)
+        self.roi_timecode_add_btn = QPushButton("Add Keyframe")
+        self.roi_timecode_add_btn.clicked.connect(self._on_timecode_add_keyframe)
+        timecode_edit_layout.addWidget(self.roi_timecode_add_btn)
+        self.roi_timecode_delete_btn = QPushButton("Delete Keyframe")
+        self.roi_timecode_delete_btn.clicked.connect(self._on_timecode_delete_keyframe)
+        timecode_edit_layout.addWidget(self.roi_timecode_delete_btn)
+        self.roi_timecode_delete_all_btn = QPushButton("Delete All Keys")
+        self.roi_timecode_delete_all_btn.clicked.connect(self._on_timecode_delete_all_keyframes)
+        timecode_edit_layout.addWidget(self.roi_timecode_delete_all_btn)
+        timecode_keyframe_layout.addWidget(timecode_edit_row)
+
+        timecode_nav_row = QWidget()
+        timecode_nav_layout = QHBoxLayout(timecode_nav_row)
+        timecode_nav_layout.setContentsMargins(0, 0, 0, 0)
+        timecode_nav_layout.setSpacing(8)
+        self.roi_timecode_previous_btn = QPushButton("Previous Keyframe")
+        self.roi_timecode_previous_btn.clicked.connect(lambda: self._navigate_timecode_keyframe(-1))
+        timecode_nav_layout.addWidget(self.roi_timecode_previous_btn)
+        self.roi_timecode_next_btn = QPushButton("Next Keyframe")
+        self.roi_timecode_next_btn.clicked.connect(lambda: self._navigate_timecode_keyframe(1))
+        timecode_nav_layout.addWidget(self.roi_timecode_next_btn)
+        timecode_keyframe_layout.addWidget(timecode_nav_row)
+
+        self.roi_timecode_key_label = QLabel("Key 0/0 :: --:--:--.--")
+        self.roi_timecode_key_label.setAlignment(Qt.AlignCenter)
+        timecode_keyframe_layout.addWidget(self.roi_timecode_key_label)
+        roi_form.addRow(self.roi_timecode_keyframe_widget)
+        self.roi_timecode_keyframe_widget.hide()
 
         timecode_row = QWidget()
         timecode_row_layout = QHBoxLayout(timecode_row)
@@ -5078,39 +5396,84 @@ class MainWindow(QMainWindow):
 
     def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
         toolbar = QWidget()
-        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout = QVBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
-        toolbar_layout.setSpacing(8)
+        toolbar_layout.setSpacing(0)
+
+        manual_row = QWidget()
+        manual_layout = QHBoxLayout(manual_row)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
+        manual_layout.setSpacing(8)
 
         save_btn = QPushButton("SAVE KEY")
         save_btn.setCheckable(True)
         save_btn.setMinimumHeight(120)
         save_btn.toggled.connect(self._on_roi_save_key_toggled)
-        toolbar_layout.addWidget(save_btn)
+        manual_layout.addWidget(save_btn)
 
         key1_btn = QPushButton("KEY 1")
         key1_btn.setMinimumHeight(120)
         key1_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(1))
-        toolbar_layout.addWidget(key1_btn)
+        manual_layout.addWidget(key1_btn)
 
         key2_btn = QPushButton("KEY 2")
         key2_btn.setMinimumHeight(120)
         key2_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(2))
-        toolbar_layout.addWidget(key2_btn)
+        manual_layout.addWidget(key2_btn)
 
         key3_btn = QPushButton("KEY 3")
         key3_btn.setMinimumHeight(120)
         key3_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(3))
-        toolbar_layout.addWidget(key3_btn)
+        manual_layout.addWidget(key3_btn)
 
         key4_btn = QPushButton("KEY 4")
         key4_btn.setMinimumHeight(120)
         key4_btn.clicked.connect(lambda: self._on_roi_key_slot_pressed(4))
-        toolbar_layout.addWidget(key4_btn)
+        manual_layout.addWidget(key4_btn)
+
+        timecode_row = QWidget()
+        timecode_layout = QHBoxLayout(timecode_row)
+        timecode_layout.setContentsMargins(0, 0, 0, 0)
+        timecode_layout.setSpacing(8)
+
+        add_btn = QPushButton("ADD\nKEYFRAME")
+        add_btn.setMinimumHeight(120)
+        add_btn.clicked.connect(self._on_timecode_add_keyframe)
+        timecode_layout.addWidget(add_btn)
+
+        delete_btn = QPushButton("DELETE\nKEYFRAME")
+        delete_btn.setMinimumHeight(120)
+        delete_btn.clicked.connect(self._on_timecode_delete_keyframe)
+        timecode_layout.addWidget(delete_btn)
+
+        delete_all_btn = QPushButton("DELETE\nALL KEYS")
+        delete_all_btn.setMinimumHeight(120)
+        delete_all_btn.clicked.connect(self._on_timecode_delete_all_keyframes)
+        timecode_layout.addWidget(delete_all_btn)
+
+        previous_btn = QPushButton("PREVIOUS\nKEYFRAME")
+        previous_btn.setMinimumHeight(120)
+        previous_btn.clicked.connect(lambda: self._navigate_timecode_keyframe(-1))
+        timecode_layout.addWidget(previous_btn)
+
+        next_btn = QPushButton("NEXT\nKEYFRAME")
+        next_btn.setMinimumHeight(120)
+        next_btn.clicked.connect(lambda: self._navigate_timecode_keyframe(1))
+        timecode_layout.addWidget(next_btn)
+
+        toolbar_layout.addWidget(manual_row)
+        toolbar_layout.addWidget(timecode_row)
 
         self._fullscreen_keyframe_toolbars[view_name] = toolbar
+        self._fullscreen_manual_keyframe_rows[view_name] = manual_row
+        self._fullscreen_timecode_keyframe_rows[view_name] = timecode_row
+        self._fullscreen_timecode_delete_buttons[view_name] = delete_btn
+        self._fullscreen_timecode_delete_all_buttons[view_name] = delete_all_btn
+        self._fullscreen_timecode_previous_buttons[view_name] = previous_btn
+        self._fullscreen_timecode_next_buttons[view_name] = next_btn
         self._fullscreen_roi_save_key_buttons[view_name] = save_btn
         self._fullscreen_roi_key_slot_buttons[view_name] = (key1_btn, key2_btn, key3_btn, key4_btn)
+        timecode_row.setVisible(False)
         toolbar.setVisible(False)
         return toolbar
 
@@ -5131,6 +5494,27 @@ class MainWindow(QMainWindow):
         exit_fullscreen_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
         exit_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view(None))
         panel_layout.addWidget(exit_fullscreen_btn)
+
+        mode_btn = QPushButton("TIMECODE BASED\nKEYFRAMING")
+        mode_btn.setMinimumWidth(150)
+        mode_btn.setMinimumHeight(96)
+        mode_btn.setStyleSheet("QPushButton { font-size: 15px; font-weight: 700; padding: 8px; }")
+        mode_btn.clicked.connect(self._toggle_roi_keyframing_mode)
+        panel_layout.addWidget(mode_btn)
+
+        timecode_display_label = QLabel(self._decklink_timecode_display_text)
+        timecode_display_label.setAlignment(Qt.AlignCenter)
+        timecode_display_label.setWordWrap(True)
+        timecode_display_label.setMinimumWidth(150)
+        timecode_display_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; padding: 6px; }")
+        panel_layout.addWidget(timecode_display_label)
+
+        timecode_key_label = QLabel("Key 0/0 :: --:--:--.--")
+        timecode_key_label.setAlignment(Qt.AlignCenter)
+        timecode_key_label.setWordWrap(True)
+        timecode_key_label.setMinimumWidth(150)
+        timecode_key_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 700; padding: 6px; }")
+        panel_layout.addWidget(timecode_key_label)
 
         transition_label = QLabel("Transition\n(frames)")
         transition_label.setAlignment(Qt.AlignCenter)
@@ -5186,12 +5570,40 @@ class MainWindow(QMainWindow):
         panel_layout.addStretch(1)
 
         self._fullscreen_keyframe_side_panels[view_name] = panel
+        self._fullscreen_keyframing_mode_buttons[view_name] = mode_btn
+        self._fullscreen_timecode_display_labels[view_name] = timecode_display_label
+        self._fullscreen_timecode_key_labels[view_name] = timecode_key_label
         self._fullscreen_roi_transition_labels[view_name] = transition_label
         self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
         self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
         self._fullscreen_decklink_output_buffer_spins[view_name] = buffer_spin
+        timecode_display_label.setVisible(False)
+        timecode_key_label.setVisible(False)
         panel.setVisible(False)
         return panel
+
+    def _toggle_roi_keyframing_mode(self) -> None:
+        self._set_roi_keyframing_mode(not self._timecode_keyframing_enabled)
+
+    def _sync_fullscreen_keyframing_mode(self) -> None:
+        timecode_enabled = bool(self._timecode_keyframing_enabled)
+        for button in self._fullscreen_keyframing_mode_buttons.values():
+            button.setText("MANUAL\nKEYFRAMING" if timecode_enabled else "TIMECODE BASED\nKEYFRAMING")
+        for row in self._fullscreen_manual_keyframe_rows.values():
+            row.setVisible(not timecode_enabled)
+        for row in self._fullscreen_timecode_keyframe_rows.values():
+            row.setVisible(timecode_enabled)
+        for label in self._fullscreen_timecode_display_labels.values():
+            label.setVisible(timecode_enabled)
+        for label in self._fullscreen_timecode_key_labels.values():
+            label.setVisible(timecode_enabled)
+        for label in self._fullscreen_roi_transition_labels.values():
+            label.setVisible(not timecode_enabled)
+        for spin in self._fullscreen_roi_transition_rate_spins.values():
+            spin.setVisible(not timecode_enabled)
+        for button in self._fullscreen_roi_duration_override_buttons.values():
+            button.setVisible(not timecode_enabled)
+        QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
 
     def _roi_transition_unit_label_text(self) -> str:
         if self.source_mode_combo.currentText() != "Blackmagic DeckLink":
@@ -5997,6 +6409,7 @@ class MainWindow(QMainWindow):
         self._controls_scroll.setVisible(False)
         self._input_panel.setVisible(view_name == "input")
         self._output_panel.setVisible(view_name == "output")
+        self._sync_fullscreen_keyframing_mode()
         for toolbar_view, toolbar in self._fullscreen_keyframe_toolbars.items():
             toolbar.setVisible(toolbar_view == view_name)
         for panel_view, side_panel in self._fullscreen_keyframe_side_panels.items():
@@ -6285,6 +6698,7 @@ class MainWindow(QMainWindow):
             LOGGER.exception("DeckLink buffer guard failed to restore requested buffer")
 
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
+        self._on_roi_adjustment_started()
         self._last_manual_roi_update_ts = time.perf_counter()
         self._roi_diag_canvas_events += 1
         had_active_keyframe_transition = self._roi_keyframe_transition is not None
@@ -7144,6 +7558,7 @@ class MainWindow(QMainWindow):
         if self._updating_controls:
             return
 
+        self._on_roi_adjustment_started()
         self._cancel_roi_keyframe_transition()
 
         sender = self.sender()
@@ -7167,11 +7582,14 @@ class MainWindow(QMainWindow):
         self._input_canvas.set_roi(roi)
         self._apply_controller_roi_immediate(roi)
         self._sync_controls_from_roi(roi)
+        if self._timecode_adjustment_paused:
+            self._roi_control_adjustment_timer.start()
 
     def _on_scale_spin_changed(self, value: float) -> None:
         if self._updating_controls:
             return
 
+        self._on_roi_adjustment_started()
         self._cancel_roi_keyframe_transition()
 
         center_x = self._roi.x + (self._roi.w / 2.0)
@@ -7181,6 +7599,8 @@ class MainWindow(QMainWindow):
         self._input_canvas.set_roi(roi)
         self._apply_controller_roi_immediate(roi)
         self._sync_controls_from_roi(roi)
+        if self._timecode_adjustment_paused:
+            self._roi_control_adjustment_timer.start()
 
     def _sync_ai_sr_basic_scaling_ui(self, notify: bool = False, runtime_force_disable: bool = False) -> None:
         ai_sr_selected = bool(self.enable_ai_sr_checkbox.isChecked())
@@ -7959,6 +8379,9 @@ class MainWindow(QMainWindow):
     def _on_blackmagic_combo_changed(self) -> None:
         if self._updating_controls:
             return
+        if self.sender() is self.decklink_timecode_format_combo:
+            self._reindex_timecode_keyframes_for_selected_format()
+            self._timecode_last_applied_frame = None
         self._apply_mode_aware_deinterlace_default_if_needed()
         self._sync_roi_transition_unit_labels()
         self._sync_blackmagic_controls_enabled_state()
@@ -7973,6 +8396,7 @@ class MainWindow(QMainWindow):
             self.decklink_auto_detect_devices,
             self.decklink_input_mode_combo,
             self.decklink_output_mode_combo,
+            self.decklink_timecode_format_combo,
             self.color_space_combo,
             self.color_range_combo,
             self.decklink_enable_format_detection,
@@ -8045,6 +8469,9 @@ class MainWindow(QMainWindow):
         out_mode = self._selected_combo_data(self.decklink_output_mode_combo)
         if in_mode is None or out_mode is None:
             raise RuntimeError("No compatible DeckLink input/output modes selected")
+        timecode_format = self._selected_combo_data(self.decklink_timecode_format_combo)
+        if timecode_format is None:
+            raise RuntimeError("No DeckLink input timecode type selected")
 
         input_fps = self._resolve_mode_fps(in_device, in_mode, input_side=True)
         output_fps = self._resolve_mode_fps(out_device, out_mode, input_side=False)
@@ -8063,6 +8490,7 @@ class MainWindow(QMainWindow):
                     out_device=out_device,
                     out_mode=out_mode,
                     enable_format_detection=self.decklink_enable_format_detection.isChecked(),
+                    timecode_format=int(timecode_format),
                 )
             except RuntimeError as exc:
                 error_text = str(exc)
@@ -8080,6 +8508,7 @@ class MainWindow(QMainWindow):
                     out_device=out_device,
                     out_mode=out_mode,
                     enable_format_detection=self.decklink_enable_format_detection.isChecked(),
+                    timecode_format=int(timecode_format),
                 )
             self._capture_session = None
             self._output_session = None
@@ -8090,6 +8519,7 @@ class MainWindow(QMainWindow):
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
                 max_queue_frames=8,
                 enable_format_detection=self.decklink_enable_format_detection.isChecked(),
+                timecode_format=int(timecode_format),
             )
 
             self._output_session = d.OutputSession(
@@ -8124,22 +8554,24 @@ class MainWindow(QMainWindow):
             output_name = output_label
 
         backend_text = "worker process" if self._controller_backend == "worker-process" else "GUI process"
+        timecode_format_name = self.decklink_timecode_format_combo.currentText()
         self.decklink_status_label.setText(
             "DeckLink configured: "
             f"in={input_name} mode='{in_mode_name}' ({in_mode}); "
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
-            f"fps={fps_text}; backend={backend_text}"
+            f"fps={fps_text}; timecode={timecode_format_name}; backend={backend_text}"
         )
         self._set_decklink_timecode_display(None, placeholder="Timecode: waiting for DeckLink frames...")
         self._decklink_sessions_running = True
         self._sync_roi_transition_unit_labels()
         LOGGER.info(
-            "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s",
+            "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s timecode=%s",
             input_name,
             in_mode_name,
             output_name,
             out_mode_name,
             fps_text,
+            timecode_format_name,
         )
 
     def _resolve_mode_fps(self, device_index: int, mode_value: object, input_side: bool) -> float | None:
@@ -8466,11 +8898,13 @@ class MainWindow(QMainWindow):
         return frame_bytes
 
     def _reset_roi(self) -> None:
+        self._on_roi_adjustment_started()
         self._cancel_roi_keyframe_transition()
         self._roi = Roi(0, 0, FRAME_W, FRAME_H)
         self._input_canvas.set_roi(self._roi)
         self._apply_controller_roi_immediate(self._roi)
         self._sync_controls_from_roi(self._roi)
+        self._on_roi_adjustment_finished()
 
     def _serialize_roi_keyframe(self, keyframe: RoiKeyframe) -> dict[str, object]:
         return {
@@ -8530,6 +8964,316 @@ class MainWindow(QMainWindow):
             restored[slot] = RoiKeyframe(roi=roi, duration_frames=duration, interpolation_mode=interp_mode)
 
         self._roi_keyframes = restored
+
+    def _restore_timecode_roi_keyframes(self, raw: object) -> None:
+        restored: dict[int, TimecodeRoiKeyframe] = {}
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                roi_values = item.get("roi")
+                if not isinstance(roi_values, list) or len(roi_values) != 4:
+                    continue
+                try:
+                    raw_timecode = str(item.get("timecode", ""))
+                    timecode = _normalize_timecode_display(raw_timecode)
+                    count_fps = self._timecode_nominal_fps()
+                    if "drop_frame" in item:
+                        drop_frame = bool(item.get("drop_frame"))
+                    elif ";" in raw_timecode:
+                        drop_frame = True
+                    else:
+                        drop_frame = _infer_legacy_drop_frame(
+                            timecode,
+                            int(item.get("frame_number", 0)),
+                            count_fps,
+                        )
+                    calculation_timecode = _timecode_with_drop_frame_separator(timecode, drop_frame)
+                    field_mark = bool(item.get("field_mark", False))
+                    parsed_frame_number = _timecode_to_internal_frame_number(
+                        calculation_timecode,
+                        count_fps,
+                        field_mark,
+                    )
+                    if parsed_frame_number is None:
+                        continue
+                    frame_number = max(0, parsed_frame_number)
+                    interpolation_mode = str(item.get("interpolation_mode", "linear")).strip().lower()
+                    if interpolation_mode not in {"linear", "ease_in_out", "ease_out"}:
+                        interpolation_mode = "linear"
+                    keyframe = TimecodeRoiKeyframe(
+                        timecode=timecode,
+                        frame_number=frame_number,
+                        roi=clamp_roi(Roi(*(int(value) for value in roi_values))),
+                        interpolation_mode=interpolation_mode,
+                        drop_frame=drop_frame,
+                        field_mark=field_mark,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if keyframe.timecode:
+                    restored[frame_number] = keyframe
+        self._timecode_roi_keyframes = restored
+        self._rebuild_timecode_roi_lookup()
+
+    def _set_roi_keyframing_mode(self, timecode_enabled: bool, save: bool = True) -> None:
+        self._timecode_keyframing_enabled = bool(timecode_enabled)
+        if not self._timecode_keyframing_enabled:
+            self._timecode_adjustment_paused = False
+            self._timecode_adjustment_anchor = None
+            self._rebuild_timecode_roi_lookup()
+        self.roi_manual_keyframe_widget.setVisible(not self._timecode_keyframing_enabled)
+        self.roi_timecode_keyframe_widget.setVisible(self._timecode_keyframing_enabled)
+        self.roi_transition_units_label.setVisible(not self._timecode_keyframing_enabled)
+        self.roi_transition_frames_spin.setVisible(not self._timecode_keyframing_enabled)
+        self.roi_keyframe_duration_override_btn.setVisible(not self._timecode_keyframing_enabled)
+        self._sync_fullscreen_keyframing_mode()
+        self._timecode_last_applied_frame = None
+        self._update_timecode_keyframe_display()
+        if self._timecode_keyframing_enabled:
+            self._apply_timecode_roi_for_current_timecode()
+        if save:
+            self._schedule_settings_save()
+
+    def _timecode_nominal_fps(self) -> int:
+        video_fps = 0.0
+        if hasattr(self._controller, "decklink_output_nominal_fps"):
+            try:
+                video_fps = float(self._controller.decklink_output_nominal_fps())
+            except Exception:
+                video_fps = 0.0
+        if video_fps <= 1.0:
+            video_fps = float(max(1, self.fps_spin.value()))
+        selected_format = self.decklink_timecode_format_combo.currentText()
+        return _timecode_count_fps(selected_format, video_fps)
+
+    def _reindex_timecode_keyframes_for_selected_format(self) -> None:
+        reindexed: dict[int, TimecodeRoiKeyframe] = {}
+        for keyframe in self._timecode_roi_keyframes.values():
+            calculation_timecode = _timecode_with_drop_frame_separator(keyframe.timecode, keyframe.drop_frame)
+            frame_number = _timecode_to_internal_frame_number(
+                calculation_timecode,
+                self._timecode_nominal_fps(),
+                keyframe.field_mark,
+            )
+            if frame_number is None:
+                continue
+            reindexed[frame_number] = TimecodeRoiKeyframe(
+                timecode=keyframe.timecode,
+                frame_number=frame_number,
+                roi=keyframe.roi,
+                interpolation_mode=keyframe.interpolation_mode,
+                drop_frame=keyframe.drop_frame,
+                field_mark=keyframe.field_mark,
+            )
+        self._timecode_roi_keyframes = reindexed
+        self._timecode_adjustment_anchor = None
+        self._timecode_selected_frame = None
+        self._rebuild_timecode_roi_lookup()
+        self._update_timecode_keyframe_display()
+
+    def _current_timecode_position(self) -> tuple[str, int] | None:
+        if not bool(self._decklink_timecode_info.get("present", False)):
+            return None
+        timecode = str(self._decklink_timecode_info.get("text", "")).strip()
+        drop_frame = bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode))
+        calculation_timecode = _timecode_with_drop_frame_separator(timecode, drop_frame)
+        frame_number = _timecode_to_internal_frame_number(
+            calculation_timecode,
+            self._timecode_nominal_fps(),
+            bool(self._decklink_timecode_info.get("field_mark", False)),
+        )
+        if frame_number is None:
+            return None
+        return timecode, frame_number
+
+    def _rebuild_timecode_roi_lookup(self) -> None:
+        effective_keyframes = dict(self._timecode_roi_keyframes)
+        if self._timecode_adjustment_anchor is not None:
+            effective_keyframes[self._timecode_adjustment_anchor.frame_number] = self._timecode_adjustment_anchor
+        self._timecode_roi_lookup_keyframes = effective_keyframes
+        ordered = sorted(effective_keyframes.values(), key=lambda item: item.frame_number)
+        self._timecode_roi_ordered_frames = [keyframe.frame_number for keyframe in ordered]
+        self._timecode_roi_segments = []
+        for start_key, end_key in zip(ordered, ordered[1:]):
+            if end_key.frame_number <= start_key.frame_number:
+                continue
+            values = _build_timecode_roi_segment(start_key, end_key)
+            self._timecode_roi_segments.append((start_key.frame_number, end_key.frame_number, values))
+        self._timecode_roi_segment_starts = [segment[0] for segment in self._timecode_roi_segments]
+        self._timecode_last_applied_frame = None
+
+    def _timecode_roi_at_frame(self, frame_number: int) -> Roi | None:
+        ordered_frames = self._timecode_roi_ordered_frames
+        if not ordered_frames:
+            return None
+        if frame_number <= ordered_frames[0]:
+            return self._timecode_roi_lookup_keyframes[ordered_frames[0]].roi
+        if frame_number >= ordered_frames[-1]:
+            return self._timecode_roi_lookup_keyframes[ordered_frames[-1]].roi
+        segment_index = bisect.bisect_right(self._timecode_roi_segment_starts, frame_number) - 1
+        if segment_index < 0:
+            return None
+        start_frame, end_frame, values = self._timecode_roi_segments[segment_index]
+        if frame_number > end_frame:
+            return None
+        sample = values[frame_number - start_frame]
+        return clamp_roi(Roi(*(int(round(float(value))) for value in sample)))
+
+    def _on_timecode_add_keyframe(self) -> None:
+        position = self._current_timecode_position()
+        if position is None:
+            self._update_status("Cannot add keyframe: no valid DeckLink timecode is available")
+            return
+        timecode, frame_number = position
+        drop_frame = bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode))
+        field_mark = bool(self._decklink_timecode_info.get("field_mark", False))
+        timecode = _normalize_timecode_display(timecode)
+        self._timecode_roi_keyframes[frame_number] = TimecodeRoiKeyframe(
+            timecode=timecode,
+            frame_number=frame_number,
+            roi=clamp_roi(self._roi),
+            interpolation_mode=self._roi_interp_mode_name(),
+            drop_frame=drop_frame,
+            field_mark=field_mark,
+        )
+        self._timecode_selected_frame = frame_number
+        self._rebuild_timecode_roi_lookup()
+        self._update_timecode_keyframe_display()
+        self._schedule_settings_save()
+        self._update_status(f"Stored timecode ROI keyframe at {timecode}")
+
+    def _on_timecode_delete_keyframe(self) -> None:
+        frame_number = self._timecode_selected_frame
+        if frame_number not in self._timecode_roi_keyframes:
+            self._update_status("No loaded timecode keyframe to delete")
+            return
+        deleted = self._timecode_roi_keyframes.pop(frame_number)
+        self._timecode_selected_frame = None
+        self._rebuild_timecode_roi_lookup()
+        self._update_timecode_keyframe_display()
+        self._schedule_settings_save()
+        self._update_status(f"Deleted timecode ROI keyframe at {deleted.timecode}")
+
+    def _on_timecode_delete_all_keyframes(self) -> None:
+        self._timecode_roi_keyframes.clear()
+        self._timecode_adjustment_anchor = None
+        self._timecode_selected_frame = None
+        self._rebuild_timecode_roi_lookup()
+        self._update_timecode_keyframe_display()
+        self._schedule_settings_save()
+        self._update_status("Deleted all timecode ROI keyframes")
+
+    def _navigate_timecode_keyframe(self, direction: int) -> None:
+        ordered_frames = sorted(self._timecode_roi_keyframes)
+        if not ordered_frames:
+            self._update_status("No timecode keyframes are stored")
+            return
+        if self._timecode_selected_frame in ordered_frames:
+            current_index = ordered_frames.index(self._timecode_selected_frame)
+            target_index = max(0, min(len(ordered_frames) - 1, current_index + (1 if direction > 0 else -1)))
+        else:
+            target_index = 0 if direction > 0 else len(ordered_frames) - 1
+        self._load_timecode_keyframe(ordered_frames[target_index])
+
+    def _load_timecode_keyframe(self, frame_number: int) -> None:
+        keyframe = self._timecode_roi_keyframes.get(frame_number)
+        if keyframe is None:
+            return
+        self._timecode_selected_frame = frame_number
+        self._roi = clamp_roi(keyframe.roi)
+        self._input_canvas.set_roi(self._roi)
+        self._apply_controller_roi_immediate(self._roi)
+        self._sync_controls_from_roi(self._roi)
+        self._update_timecode_keyframe_display()
+        self._update_status(f"Loaded timecode ROI keyframe at {keyframe.timecode}")
+
+    def _update_timecode_keyframe_display(self) -> None:
+        if not hasattr(self, "roi_timecode_key_label"):
+            return
+        ordered_frames = sorted(self._timecode_roi_keyframes)
+        total = len(ordered_frames)
+        if self._timecode_selected_frame in ordered_frames:
+            index = ordered_frames.index(self._timecode_selected_frame) + 1
+            timecode = self._timecode_roi_keyframes[self._timecode_selected_frame].timecode
+            display_text = f"Key {index}/{total} :: {timecode}"
+        else:
+            display_text = f"Key 0/{total} :: --:--:--.--"
+        self.roi_timecode_key_label.setText(display_text)
+        for label in self._fullscreen_timecode_key_labels.values():
+            label.setText(display_text)
+        has_selection = self._timecode_selected_frame in self._timecode_roi_keyframes
+        self.roi_timecode_delete_btn.setEnabled(has_selection)
+        self.roi_timecode_delete_all_btn.setEnabled(total > 0)
+        self.roi_timecode_previous_btn.setEnabled(total > 0)
+        self.roi_timecode_next_btn.setEnabled(total > 0)
+        for button in self._fullscreen_timecode_delete_buttons.values():
+            button.setEnabled(has_selection)
+        for button in self._fullscreen_timecode_delete_all_buttons.values():
+            button.setEnabled(total > 0)
+        for button in self._fullscreen_timecode_previous_buttons.values():
+            button.setEnabled(total > 0)
+        for button in self._fullscreen_timecode_next_buttons.values():
+            button.setEnabled(total > 0)
+
+    def _apply_timecode_roi_for_current_timecode(self) -> None:
+        if not self._timecode_keyframing_enabled or self._timecode_adjustment_paused:
+            return
+        position = self._current_timecode_position()
+        if position is None:
+            return
+        _, frame_number = position
+        if frame_number == self._timecode_last_applied_frame:
+            return
+        target_roi = self._timecode_roi_at_frame(frame_number)
+        if target_roi is None:
+            return
+        self._timecode_last_applied_frame = frame_number
+        self._roi = target_roi
+        self._input_canvas.set_roi(target_roi)
+        self._apply_controller_roi_immediate(target_roi)
+        self._sync_controls_from_roi(target_roi)
+        if frame_number in self._timecode_roi_keyframes:
+            self._timecode_selected_frame = frame_number
+            self._update_timecode_keyframe_display()
+
+    def _on_roi_adjustment_started(self) -> None:
+        if not self._timecode_keyframing_enabled:
+            return
+        self._timecode_adjustment_paused = True
+
+    def _on_roi_adjustment_finished(self) -> None:
+        if not self._timecode_adjustment_paused:
+            return
+        if hasattr(self, "_roi_control_adjustment_timer"):
+            self._roi_control_adjustment_timer.stop()
+        self._manual_roi_send_timer.stop()
+        self._pending_manual_controller_roi = None
+        self._manual_live_target_roi = None
+        self._manual_roi_target_history = []
+        self._manual_drag_interp_start_overlay = None
+        self._manual_drag_interp_end_overlay = None
+        self._manual_drag_last_event_ts = 0.0
+        self._apply_controller_roi_immediate(self._roi)
+        position = self._current_timecode_position()
+        if position is None:
+            self._timecode_adjustment_paused = False
+            self._timecode_last_applied_frame = None
+            self._update_status("ROI adjusted; interpolation will resume when valid timecode is available")
+            return
+        timecode, frame_number = position
+        self._timecode_adjustment_anchor = TimecodeRoiKeyframe(
+            timecode=_normalize_timecode_display(timecode),
+            frame_number=frame_number,
+            roi=clamp_roi(self._roi),
+            interpolation_mode=self._roi_interp_mode_name(),
+            drop_frame=bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode)),
+            field_mark=bool(self._decklink_timecode_info.get("field_mark", False)),
+        )
+        self._rebuild_timecode_roi_lookup()
+        self._timecode_adjustment_paused = False
+        self._timecode_last_applied_frame = frame_number
+        self._update_status(f"ROI interpolation recalculated from {_normalize_timecode_display(timecode)}")
 
     def _on_roi_save_key_toggled(self, checked: bool) -> None:
         self._roi_key_save_armed = bool(checked)
@@ -8648,6 +9392,7 @@ class MainWindow(QMainWindow):
 
     def _set_decklink_timecode_display(self, info: dict[str, object] | None, placeholder: str | None = None) -> None:
         display_text = placeholder or "Timecode: --"
+        self._decklink_timecode_info = dict(info) if isinstance(info, dict) else {}
         if isinstance(info, dict) and bool(info.get("present", False)):
             timecode_text = str(info.get("text", "")).strip()
             format_name = str(info.get("format_name", "")).strip()
@@ -8659,6 +9404,9 @@ class MainWindow(QMainWindow):
         self._decklink_timecode_display_text = display_text
         if hasattr(self, "decklink_timecode_label"):
             self.decklink_timecode_label.setText(display_text)
+        for label in self._fullscreen_timecode_display_labels.values():
+            label.setText(display_text)
+        self._apply_timecode_roi_for_current_timecode()
 
     def _update_decklink_timecode_from_controller(self, placeholder: str | None = None) -> None:
         info: dict[str, object] | None = None
