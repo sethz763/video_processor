@@ -59,8 +59,8 @@
       "duration_frames": 15,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        540,
-        360,
+        1162,
+        122,
         610,
         343
       ]
@@ -69,10 +69,10 @@
       "duration_frames": 15,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        944,
-        318,
-        800,
-        450
+        454,
+        490,
+        610,
+        343
       ]
     },
     "3": {
@@ -101,34 +101,7 @@
   "roi_manual_drag_hold_s": 0.1,
   "roi_min_drag_nudge": 0.015,
   "roi_smoothing_percent": 2,
-  "roi_timecode_keyframes": [
-    {
-      "drop_frame": true,
-      "field_mark": false,
-      "frame_number": 3123628,
-      "interpolation_mode": "ease_in_out",
-      "roi": [
-        460,
-        741,
-        370,
-        208
-      ],
-      "timecode": "14:28:32.18"
-    },
-    {
-      "drop_frame": true,
-      "field_mark": false,
-      "frame_number": 3124636,
-      "interpolation_mode": "ease_in_out",
-      "roi": [
-        210,
-        532,
-        370,
-        208
-      ],
-      "timecode": "14:28:49.12"
-    }
-  ],
+  "roi_timecode_keyframes": [],
   "roi_transition_duration_frames": 15,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,

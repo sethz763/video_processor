@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import queue
 import site
 import sys
@@ -17,6 +18,68 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+def _timecode_to_internal_position(info: dict[str, object], video_fps: float) -> int | None:
+    if not bool(info.get("present", False)):
+        return None
+    raw = str(info.get("text", "")).strip()
+    normalized = raw.replace(";", ":").replace(".", ":")
+    parts = normalized.split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        hours, minutes, seconds, frames = (int(part) for part in parts)
+    except ValueError:
+        return None
+
+    rounded_video_fps = max(1, int(round(float(video_fps))))
+    count_fps = rounded_video_fps
+    if str(info.get("format_name", "")).strip() != "RP188 HFRTC" and rounded_video_fps > 30:
+        count_fps = max(1, int(round(float(video_fps) / 2.0)))
+    if hours < 0 or minutes not in range(60) or seconds not in range(60) or frames not in range(count_fps):
+        return None
+
+    base_frame = (((hours * 60) + minutes) * 60 + seconds) * count_fps + frames
+    if bool(info.get("drop_frame", ";" in raw)) and count_fps in {30, 60}:
+        drop_count = 2 if count_fps == 30 else 4
+        total_minutes = (hours * 60) + minutes
+        base_frame -= drop_count * (total_minutes - (total_minutes // 10))
+    if count_fps == 30:
+        return (base_frame * 2) + (1 if bool(info.get("field_mark", False)) else 0)
+    if count_fps == 60:
+        return base_frame
+    return int(round(base_frame * (60.0 / max(1, count_fps))))
+
+
+def _timecode_roi_sample(
+    frame_number: int,
+    keyframes: list[dict[str, object]],
+    ordered_frames: list[int],
+) -> tuple[float, float, float, float] | None:
+    if not ordered_frames:
+        return None
+    if frame_number <= ordered_frames[0]:
+        key = keyframes[0]
+        return tuple(float(value) for value in key["roi"])
+    if frame_number >= ordered_frames[-1]:
+        key = keyframes[-1]
+        return tuple(float(value) for value in key["roi"])
+
+    end_index = bisect.bisect_right(ordered_frames, frame_number)
+    start_key = keyframes[end_index - 1]
+    end_key = keyframes[end_index]
+    start_frame = int(start_key["frame_number"])
+    end_frame = int(end_key["frame_number"])
+    progress = (float(frame_number) - float(start_frame)) / float(max(1, end_frame - start_frame))
+    mode = str(end_key.get("interpolation_mode", "linear")).strip().lower()
+    if mode == "ease_in_out":
+        progress = progress * progress * (3.0 - (2.0 * progress))
+    elif mode == "ease_out":
+        progress = 1.0 - ((1.0 - progress) * (1.0 - progress))
+    start_roi = tuple(float(value) for value in start_key["roi"])
+    end_roi = tuple(float(value) for value in end_key["roi"])
+    return tuple(start + ((end - start) * progress) for start, end in zip(start_roi, end_roi))
 
 
 def _bootstrap_project_venv_site() -> None:
@@ -2316,6 +2379,9 @@ def run_processor_worker(
     manual_interlaced_phase_pending = False
     roi_manual_drag_until_ts = 0.0
     roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
+    timecode_roi_enabled = False
+    timecode_roi_keyframes: list[dict[str, object]] = []
+    timecode_roi_ordered_frames: list[int] = []
     interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
         float(startup_config.get("interlaced_field2_phase_fraction", _INTERLACED_FIELD2_PHASE_FRACTION))
     )
@@ -4094,6 +4160,61 @@ def run_processor_worker(
                 else:
                     timing_deadline_miss_streak = 0
 
+        def _apply_timecode_roi_for_capture(frame_timecode_info: dict[str, object]) -> None:
+            nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition
+            if not timecode_roi_enabled or not timecode_roi_ordered_frames:
+                return
+            frame_number = _timecode_to_internal_position(frame_timecode_info, output_nominal_fps)
+            if frame_number is None:
+                return
+            sample = _timecode_roi_sample(
+                frame_number,
+                timecode_roi_keyframes,
+                timecode_roi_ordered_frames,
+            )
+            if sample is None:
+                return
+
+            desired_x, desired_y, desired_w, desired_h = sample
+            next_x, next_y, next_w, next_h = _normalize_worker_roi(
+                int(round(desired_x / 2.0)) * 2,
+                int(round(desired_y)),
+                max(2, int(round(desired_w / 2.0)) * 2),
+                int(round(desired_h)),
+            )
+            previous_w = current_roi_w
+            previous_h = current_roi_h
+            roi_changed = (
+                next_x != current_roi_x
+                or next_y != current_roi_y
+                or next_w != current_roi_w
+                or next_h != current_roi_h
+            )
+            current_roi_x, current_roi_y, current_roi_w, current_roi_h = next_x, next_y, next_w, next_h
+            if roi_changed:
+                if current_roi_w == previous_w and current_roi_h == previous_h:
+                    processor.set_roi_position(current_roi_x, current_roi_y)
+                else:
+                    processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                    if rtx_vsr_enabled:
+                        if rtx_vsr_engine is None:
+                            _ = _refresh_rtx_vsr_engine()
+                        elif current_roi_w != previous_w or current_roi_h != previous_h:
+                            _schedule_rtx_roi_rebuild()
+
+            desired_center_x = desired_x + (desired_w * 0.5)
+            desired_center_y = desired_y + (desired_h * 0.5)
+            carrier_center_x = float(current_roi_x) + (float(current_roi_w) * 0.5)
+            carrier_center_y = float(current_roi_y) + (float(current_roi_h) * 0.5)
+            scale_x = FRAME_W / max(1.0, float(current_roi_w))
+            scale_y = FRAME_H / max(1.0, float(current_roi_h))
+            max_shift_x = max(2.0, min(48.0, scale_x * 1.5))
+            max_shift_y = max(2.0, min(48.0, scale_y * 1.5))
+            shift_x = max(-max_shift_x, min(max_shift_x, -((desired_center_x - carrier_center_x) * scale_x)))
+            shift_y = max(-max_shift_y, min(max_shift_y, -((desired_center_y - carrier_center_y) * scale_y)))
+            _set_roi_shift_immediate(shift_x, shift_y)
+            roi_microstep_transition = None
+
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
@@ -4117,6 +4238,8 @@ def run_processor_worker(
                     _safe_put({"type": "warning", "warning": f"Capture frame conversion failed: {exc}"})
                     continue
                 frame_captured_ts = time.perf_counter()
+
+                _apply_timecode_roi_for_capture(frame_timecode_info)
 
                 # Advance transition phase before processing this frame so each
                 # emitted frame maps to the next field/frame step, avoiding
@@ -5664,6 +5787,35 @@ def run_processor_worker(
                     int(message["w"]),
                     int(message["h"]),
                 )
+                continue
+
+            if command == "set_timecode_roi_keyframes":
+                raw_keyframes = message.get("keyframes", [])
+                normalized_keyframes: list[dict[str, object]] = []
+                if isinstance(raw_keyframes, list):
+                    for raw_keyframe in raw_keyframes:
+                        if not isinstance(raw_keyframe, dict):
+                            continue
+                        raw_roi = raw_keyframe.get("roi")
+                        if not isinstance(raw_roi, (list, tuple)) or len(raw_roi) != 4:
+                            continue
+                        try:
+                            normalized_keyframes.append(
+                                {
+                                    "frame_number": int(raw_keyframe["frame_number"]),
+                                    "roi": [float(value) for value in raw_roi],
+                                    "interpolation_mode": str(raw_keyframe.get("interpolation_mode", "linear")),
+                                }
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                normalized_keyframes.sort(key=lambda item: int(item["frame_number"]))
+                timecode_roi_keyframes = normalized_keyframes
+                timecode_roi_ordered_frames = [int(item["frame_number"]) for item in normalized_keyframes]
+                timecode_roi_enabled = bool(message.get("enabled", False))
+                roi_microstep_transition = None
+                if not timecode_roi_enabled:
+                    _set_roi_shift_immediate(0.0, 0.0)
                 continue
 
             if command == "set_roi_position":

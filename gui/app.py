@@ -2972,6 +2972,15 @@ class ProcessVideoProcessorController:
             }
         )
 
+    def set_timecode_roi_keyframes(self, enabled: bool, keyframes: list[dict[str, object]]) -> None:
+        self._send_control(
+            {
+                "cmd": "set_timecode_roi_keyframes",
+                "enabled": bool(enabled),
+                "keyframes": keyframes,
+            }
+        )
+
     def set_roi_manual_drag_hold_seconds(self, hold_seconds: float) -> None:
         self._send_control(
             {
@@ -9022,12 +9031,15 @@ class MainWindow(QMainWindow):
             self._timecode_adjustment_paused = False
             self._timecode_adjustment_anchor = None
             self._rebuild_timecode_roi_lookup()
+            if hasattr(self._controller, "set_roi_subpixel_shift"):
+                self._controller.set_roi_subpixel_shift(0.0, 0.0)
         self.roi_manual_keyframe_widget.setVisible(not self._timecode_keyframing_enabled)
         self.roi_timecode_keyframe_widget.setVisible(self._timecode_keyframing_enabled)
         self.roi_transition_units_label.setVisible(not self._timecode_keyframing_enabled)
         self.roi_transition_frames_spin.setVisible(not self._timecode_keyframing_enabled)
         self.roi_keyframe_duration_override_btn.setVisible(not self._timecode_keyframing_enabled)
         self._sync_fullscreen_keyframing_mode()
+        self._sync_worker_timecode_roi_keyframes()
         self._timecode_last_applied_frame = None
         self._update_timecode_keyframe_display()
         if self._timecode_keyframing_enabled:
@@ -9102,23 +9114,92 @@ class MainWindow(QMainWindow):
             self._timecode_roi_segments.append((start_key.frame_number, end_key.frame_number, values))
         self._timecode_roi_segment_starts = [segment[0] for segment in self._timecode_roi_segments]
         self._timecode_last_applied_frame = None
+        self._sync_worker_timecode_roi_keyframes()
 
-    def _timecode_roi_at_frame(self, frame_number: int) -> Roi | None:
+    def _sync_worker_timecode_roi_keyframes(self) -> None:
+        if getattr(self, "_controller_backend", "") != "worker-process":
+            return
+        controller = getattr(self, "_controller", None)
+        if controller is None or not hasattr(controller, "set_timecode_roi_keyframes"):
+            return
+        keyframes = []
+        for frame_number in sorted(self._timecode_roi_lookup_keyframes):
+            keyframe = self._timecode_roi_lookup_keyframes[frame_number]
+            keyframes.append(
+                {
+                    "frame_number": int(frame_number),
+                    "roi": [
+                        float(keyframe.roi.x),
+                        float(keyframe.roi.y),
+                        float(keyframe.roi.w),
+                        float(keyframe.roi.h),
+                    ],
+                    "interpolation_mode": str(keyframe.interpolation_mode),
+                }
+            )
+        enabled = self._timecode_keyframing_enabled and not self._timecode_adjustment_paused
+        controller.set_timecode_roi_keyframes(enabled, keyframes)
+
+    def _timecode_roi_values_at_frame(self, frame_number: int) -> np.ndarray | None:
         ordered_frames = self._timecode_roi_ordered_frames
         if not ordered_frames:
             return None
         if frame_number <= ordered_frames[0]:
-            return self._timecode_roi_lookup_keyframes[ordered_frames[0]].roi
+            roi = self._timecode_roi_lookup_keyframes[ordered_frames[0]].roi
+            return np.array([roi.x, roi.y, roi.w, roi.h], dtype=np.float32)
         if frame_number >= ordered_frames[-1]:
-            return self._timecode_roi_lookup_keyframes[ordered_frames[-1]].roi
+            roi = self._timecode_roi_lookup_keyframes[ordered_frames[-1]].roi
+            return np.array([roi.x, roi.y, roi.w, roi.h], dtype=np.float32)
         segment_index = bisect.bisect_right(self._timecode_roi_segment_starts, frame_number) - 1
         if segment_index < 0:
             return None
         start_frame, end_frame, values = self._timecode_roi_segments[segment_index]
         if frame_number > end_frame:
             return None
-        sample = values[frame_number - start_frame]
-        return clamp_roi(Roi(*(int(round(float(value))) for value in sample)))
+        return values[frame_number - start_frame]
+
+    def _timecode_roi_at_frame(self, frame_number: int) -> Roi | None:
+        sample = self._timecode_roi_values_at_frame(frame_number)
+        if sample is None:
+            return None
+        return self._timecode_roi_carrier(sample)
+
+    def _timecode_roi_carrier(self, sample: np.ndarray) -> Roi:
+        return clamp_roi(
+            Roi(
+                int(round(float(sample[0]) / 2.0)) * 2,
+                int(round(float(sample[1]))),
+                max(2, int(round(float(sample[2]) / 2.0)) * 2),
+                int(round(float(sample[3]))),
+            )
+        )
+
+    def _apply_timecode_roi_sample(self, sample: np.ndarray) -> None:
+        target_roi = self._timecode_roi_carrier(sample)
+        self._roi = target_roi
+        self._input_canvas.set_roi(target_roi)
+
+        if hasattr(self._controller, "set_roi_with_subpixel"):
+            self._controller_roi_target = None
+            self._controller_roi_interp_timer.stop()
+            self._controller_filtered_target_roi = None
+            self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+            desired_center_x = float(sample[0]) + (float(sample[2]) * 0.5)
+            desired_center_y = float(sample[1]) + (float(sample[3]) * 0.5)
+            carrier_center_x = float(target_roi.x) + (float(target_roi.w) * 0.5)
+            carrier_center_y = float(target_roi.y) + (float(target_roi.h) * 0.5)
+            scale_x = FRAME_W / max(1.0, float(target_roi.w))
+            scale_y = FRAME_H / max(1.0, float(target_roi.h))
+            max_shift_x = max(2.0, min(48.0, scale_x * 1.5))
+            max_shift_y = max(2.0, min(48.0, scale_y * 1.5))
+            shift_x = max(-max_shift_x, min(max_shift_x, -((desired_center_x - carrier_center_x) * scale_x)))
+            shift_y = max(-max_shift_y, min(max_shift_y, -((desired_center_y - carrier_center_y) * scale_y)))
+            self._controller.set_roi_with_subpixel(target_roi, shift_x, shift_y)
+            self._controller_roi_applied = target_roi
+        else:
+            self._apply_controller_roi_immediate(target_roi)
+
+        self._sync_controls_from_roi(target_roi)
 
     def _on_timecode_add_keyframe(self) -> None:
         position = self._current_timecode_position()
@@ -9225,14 +9306,12 @@ class MainWindow(QMainWindow):
         _, frame_number = position
         if frame_number == self._timecode_last_applied_frame:
             return
-        target_roi = self._timecode_roi_at_frame(frame_number)
-        if target_roi is None:
+        sample = self._timecode_roi_values_at_frame(frame_number)
+        if sample is None:
             return
         self._timecode_last_applied_frame = frame_number
-        self._roi = target_roi
-        self._input_canvas.set_roi(target_roi)
-        self._apply_controller_roi_immediate(target_roi)
-        self._sync_controls_from_roi(target_roi)
+        if self._controller_backend != "worker-process":
+            self._apply_timecode_roi_sample(sample)
         if frame_number in self._timecode_roi_keyframes:
             self._timecode_selected_frame = frame_number
             self._update_timecode_keyframe_display()
@@ -9241,6 +9320,7 @@ class MainWindow(QMainWindow):
         if not self._timecode_keyframing_enabled:
             return
         self._timecode_adjustment_paused = True
+        self._sync_worker_timecode_roi_keyframes()
 
     def _on_roi_adjustment_finished(self) -> None:
         if not self._timecode_adjustment_paused:
@@ -9259,6 +9339,7 @@ class MainWindow(QMainWindow):
         if position is None:
             self._timecode_adjustment_paused = False
             self._timecode_last_applied_frame = None
+            self._sync_worker_timecode_roi_keyframes()
             self._update_status("ROI adjusted; interpolation will resume when valid timecode is available")
             return
         timecode, frame_number = position
@@ -9273,6 +9354,7 @@ class MainWindow(QMainWindow):
         self._rebuild_timecode_roi_lookup()
         self._timecode_adjustment_paused = False
         self._timecode_last_applied_frame = frame_number
+        self._sync_worker_timecode_roi_keyframes()
         self._update_status(f"ROI interpolation recalculated from {_normalize_timecode_display(timecode)}")
 
     def _on_roi_save_key_toggled(self, checked: bool) -> None:
