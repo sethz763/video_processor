@@ -20,8 +20,34 @@ from typing import Any
 import numpy as np
 
 
-def _timecode_to_internal_position(info: dict[str, object], video_fps: float) -> int | None:
+def _normalize_timecode_phase_synthesis_mode(mode_name: str) -> str:
+    normalized = str(mode_name).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"source_cadence", "cadence", "source", "fallback", "synthesized", "synthesize"}:
+        return "source_cadence"
+    return "strict"
+
+
+def _timecode_phase_multiplier(video_fps: float, count_fps: int, phase_mode: str) -> int:
+    if _normalize_timecode_phase_synthesis_mode(phase_mode) != "source_cadence":
+        return 1
+    ratio = float(video_fps) / float(max(1, count_fps))
+    rounded = int(round(ratio))
+    if rounded <= 1:
+        return 1
+    if abs(ratio - float(rounded)) > 0.15:
+        return 1
+    return rounded
+
+
+def _timecode_to_internal_position(
+    info: dict[str, object],
+    video_fps: float,
+    phase_mode: str,
+    phase_tracker: dict[str, object] | None = None,
+) -> int | None:
     if not bool(info.get("present", False)):
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
         return None
     raw = str(info.get("text", "")).strip()
     normalized = raw.replace(";", ":").replace(".", ":")
@@ -45,10 +71,55 @@ def _timecode_to_internal_position(info: dict[str, object], video_fps: float) ->
         drop_count = 2 if count_fps == 30 else 4
         total_minutes = (hours * 60) + minutes
         base_frame -= drop_count * (total_minutes - (total_minutes // 10))
+    field_mark = bool(info.get("field_mark", False))
+    phase_multiplier = _timecode_phase_multiplier(video_fps, count_fps, phase_mode)
+    if field_mark:
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
+        if count_fps == 30:
+            return (base_frame * 2) + 1
+        if count_fps == 60:
+            return base_frame
+        return int(round(base_frame * (60.0 / max(1, count_fps))))
+    if phase_multiplier > 1:
+        if not isinstance(phase_tracker, dict):
+            phase_tracker = {}
+        last_base = phase_tracker.get("last_base_frame")
+        last_phase = int(phase_tracker.get("last_phase_index", 0))
+        last_direction = int(phase_tracker.get("last_direction", 1))
+        last_multiplier = int(phase_tracker.get("last_phase_multiplier", phase_multiplier))
+
+        if not isinstance(last_base, int) or last_multiplier != phase_multiplier:
+            direction = 1
+            phase_index = 0
+        elif base_frame > last_base:
+            direction = 1
+            phase_index = 0
+        elif base_frame < last_base:
+            direction = -1
+            phase_index = phase_multiplier - 1
+        else:
+            direction = 1 if last_direction >= 0 else -1
+            if direction >= 0:
+                phase_index = min(phase_multiplier - 1, last_phase + 1)
+            else:
+                phase_index = max(0, last_phase - 1)
+
+        phase_tracker["last_base_frame"] = base_frame
+        phase_tracker["last_phase_index"] = phase_index
+        phase_tracker["last_direction"] = direction
+        phase_tracker["last_phase_multiplier"] = phase_multiplier
+        return (base_frame * phase_multiplier) + phase_index
     if count_fps == 30:
-        return (base_frame * 2) + (1 if bool(info.get("field_mark", False)) else 0)
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
+        return base_frame * 2
     if count_fps == 60:
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
         return base_frame
+    if isinstance(phase_tracker, dict):
+        phase_tracker.clear()
     return int(round(base_frame * (60.0 / max(1, count_fps))))
 
 
@@ -2379,7 +2450,10 @@ def run_processor_worker(
     manual_interlaced_phase_pending = False
     roi_manual_drag_until_ts = 0.0
     roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
+    last_roi_command_sequence = 0
     timecode_roi_enabled = False
+    timecode_phase_mode = "strict"
+    timecode_phase_tracker: dict[str, object] = {}
     timecode_roi_keyframes: list[dict[str, object]] = []
     timecode_roi_ordered_frames: list[int] = []
     interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
@@ -4164,7 +4238,12 @@ def run_processor_worker(
             nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition
             if not timecode_roi_enabled or not timecode_roi_ordered_frames:
                 return
-            frame_number = _timecode_to_internal_position(frame_timecode_info, output_nominal_fps)
+            frame_number = _timecode_to_internal_position(
+                frame_timecode_info,
+                output_nominal_fps,
+                timecode_phase_mode,
+                phase_tracker=timecode_phase_tracker,
+            )
             if frame_number is None:
                 return
             sample = _timecode_roi_sample(
@@ -5349,7 +5428,7 @@ def run_processor_worker(
             command = message.get("cmd")
             if command == "decklink_tick":
                 latest_roi_message = None
-                preserved_messages: list[dict[str, object]] = []
+                drained_messages: list[dict[str, object]] = []
                 while True:
                     try:
                         pending = request_queue.get_nowait()
@@ -5357,29 +5436,29 @@ def run_processor_worker(
                         break
 
                     pending_cmd = pending.get("cmd")
-                    if pending_cmd in {"set_roi", "set_roi_position", "set_roi_with_subpixel"}:
-                        latest_roi_message = pending
-                        continue
+                    if pending_cmd in {"set_roi", "set_roi_settled", "set_roi_position", "set_roi_with_subpixel"}:
+                        if latest_roi_message is None:
+                            latest_roi_message = pending
+                        else:
+                            pending_sequence = int(pending.get("roi_sequence", 0))
+                            latest_sequence = int(latest_roi_message.get("roi_sequence", 0))
+                            if pending_sequence <= 0 or latest_sequence <= 0 or pending_sequence > latest_sequence:
+                                latest_roi_message = pending
+                    drained_messages.append(pending)
+
+                for pending in drained_messages:
+                    pending_cmd = pending.get("cmd")
                     if pending_cmd == "decklink_tick":
                         continue
-                    preserved_messages.append(pending)
-
-                for pending in preserved_messages:
+                    if pending_cmd in {"set_roi", "set_roi_settled", "set_roi_position", "set_roi_with_subpixel"}:
+                        if pending is not latest_roi_message:
+                            continue
                     try:
                         request_queue.put_nowait(pending)
                     except queue.Full:
                         break
 
-                # Keep one latest ROI update queued, but always service this tick.
-                # Replacing tick with ROI here can leave GUI tick requests pending
-                # until timeout, collapsing preview FPS while output keeps running.
-                if latest_roi_message is not None:
-                    try:
-                        request_queue.put_nowait(latest_roi_message)
-                    except queue.Full:
-                        pass
-
-            if command in {"set_roi", "set_roi_position", "set_roi_with_subpixel", "set_roi_subpixel_shift"}:
+            if command in {"set_roi", "set_roi_settled", "set_roi_position", "set_roi_with_subpixel", "set_roi_subpixel_shift"}:
                 latest_roi_message = message
                 latest_tick_message: dict[str, object] | None = None
                 preserved_messages: list[dict[str, object]] = []
@@ -5391,8 +5470,11 @@ def run_processor_worker(
                         break
 
                     pending_cmd = pending.get("cmd")
-                    if pending_cmd in {"set_roi", "set_roi_position", "set_roi_with_subpixel", "set_roi_subpixel_shift"}:
-                        latest_roi_message = pending
+                    if pending_cmd in {"set_roi", "set_roi_settled", "set_roi_position", "set_roi_with_subpixel", "set_roi_subpixel_shift"}:
+                        pending_sequence = int(pending.get("roi_sequence", 0))
+                        latest_sequence = int(latest_roi_message.get("roi_sequence", 0))
+                        if pending_sequence <= 0 or latest_sequence <= 0 or pending_sequence > latest_sequence:
+                            latest_roi_message = pending
                         continue
                     if pending_cmd == "decklink_tick":
                         latest_tick_message = pending
@@ -5413,6 +5495,12 @@ def run_processor_worker(
 
                 message = latest_roi_message
                 command = message.get("cmd")
+
+                roi_sequence = int(message.get("roi_sequence", 0))
+                if roi_sequence > 0:
+                    if roi_sequence < last_roi_command_sequence:
+                        continue
+                    last_roi_command_sequence = roi_sequence
 
             if command == "shutdown":
                 _stop_sessions()
@@ -5789,6 +5877,22 @@ def run_processor_worker(
                 )
                 continue
 
+            if command == "set_roi_settled":
+                timecode_roi_enabled = False
+                _cancel_roi_microstep_transition(reset_shift=False)
+                _apply_manual_roi_with_subpixel_compensation(
+                    int(message["x"]),
+                    int(message["y"]),
+                    int(message["w"]),
+                    int(message["h"]),
+                )
+                roi_manual_drag_until_ts = 0.0
+                manual_interlaced_phase_state = None
+                manual_interlaced_phase_until_ts = 0.0
+                manual_interlaced_phase_pending = False
+                _set_roi_shift_immediate(0.0, 0.0)
+                continue
+
             if command == "set_timecode_roi_keyframes":
                 raw_keyframes = message.get("keyframes", [])
                 normalized_keyframes: list[dict[str, object]] = []
@@ -5813,6 +5917,8 @@ def run_processor_worker(
                 timecode_roi_keyframes = normalized_keyframes
                 timecode_roi_ordered_frames = [int(item["frame_number"]) for item in normalized_keyframes]
                 timecode_roi_enabled = bool(message.get("enabled", False))
+                timecode_phase_mode = _normalize_timecode_phase_synthesis_mode(str(message.get("phase_mode", "strict")))
+                timecode_phase_tracker.clear()
                 roi_microstep_transition = None
                 if not timecode_roi_enabled:
                     _set_roi_shift_immediate(0.0, 0.0)
@@ -5860,6 +5966,8 @@ def run_processor_worker(
 
             if command == "set_roi_with_subpixel":
                 _cancel_roi_microstep_transition(reset_shift=False)
+                if bool(message.get("suspend_timecode", False)):
+                    timecode_roi_enabled = False
                 prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
                 prev_shift_state = (float(roi_shift_applied_x), float(roi_shift_applied_y))
                 if bool(message.get("manual_drag", False)):

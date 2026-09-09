@@ -633,6 +633,32 @@ def _timecode_count_fps(timecode_format: str, video_fps: float) -> int:
     return rounded_video_fps
 
 
+def _normalize_timecode_phase_synthesis_mode(mode_name: str) -> str:
+    normalized = str(mode_name).strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"source_cadence", "cadence", "source", "fallback", "synthesized", "synthesize"}:
+        return "source_cadence"
+    return "strict"
+
+
+def _timecode_phase_synthesis_options() -> list[tuple[str, str]]:
+    return [
+        ("Strict hardware phase", "strict"),
+        ("Source cadence fallback", "source_cadence"),
+    ]
+
+
+def _timecode_phase_multiplier(video_fps: float, count_fps: int, phase_mode: str) -> int:
+    if _normalize_timecode_phase_synthesis_mode(phase_mode) != "source_cadence":
+        return 1
+    ratio = float(video_fps) / float(max(1, count_fps))
+    rounded = int(round(ratio))
+    if rounded <= 1:
+        return 1
+    if abs(ratio - float(rounded)) > 0.15:
+        return 1
+    return rounded
+
+
 def _timecode_to_internal_frame_number(
     timecode: str,
     count_fps: int,
@@ -646,6 +672,81 @@ def _timecode_to_internal_frame_number(
     if count_fps == 60:
         return base_frame
     return int(round(base_frame * (60.0 / max(1, count_fps))))
+
+
+def _timecode_position_from_info(
+    info: dict[str, object],
+    timecode_format: str,
+    video_fps: float,
+    phase_mode: str,
+    phase_tracker: dict[str, object] | None = None,
+    source_seq: object | None = None,
+) -> int | None:
+    timecode = str(info.get("text", "")).strip()
+    if not bool(info.get("present", False)) or not timecode:
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
+        return None
+
+    drop_frame = bool(info.get("drop_frame", ";" in timecode))
+    calculation_timecode = _timecode_with_drop_frame_separator(timecode, drop_frame)
+    count_fps = _timecode_count_fps(timecode_format, video_fps)
+    field_mark = bool(info.get("field_mark", False))
+
+    phase_multiplier = _timecode_phase_multiplier(video_fps, count_fps, phase_mode)
+    if field_mark or phase_multiplier <= 1:
+        frame_number = _timecode_to_internal_frame_number(calculation_timecode, count_fps, field_mark)
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
+            if source_seq is not None:
+                phase_tracker["last_source_seq"] = source_seq
+                phase_tracker["cached_frame_number"] = frame_number
+        return frame_number
+
+    base_frame = _timecode_to_frame_number(calculation_timecode, count_fps)
+    if base_frame is None:
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
+        return None
+
+    if isinstance(phase_tracker, dict) and source_seq is not None and phase_tracker.get("last_source_seq") == source_seq:
+        cached = phase_tracker.get("cached_frame_number")
+        if isinstance(cached, int):
+            return cached
+
+    if not isinstance(phase_tracker, dict):
+        phase_tracker = {}
+
+    last_base = phase_tracker.get("last_base_frame")
+    last_phase = int(phase_tracker.get("last_phase_index", 0))
+    last_direction = int(phase_tracker.get("last_direction", 1))
+    last_multiplier = int(phase_tracker.get("last_phase_multiplier", phase_multiplier))
+
+    if not isinstance(last_base, int) or last_multiplier != phase_multiplier:
+        direction = 1
+        phase_index = 0
+    elif base_frame > last_base:
+        direction = 1
+        phase_index = 0
+    elif base_frame < last_base:
+        direction = -1
+        phase_index = phase_multiplier - 1
+    else:
+        direction = 1 if last_direction >= 0 else -1
+        if direction >= 0:
+            phase_index = min(phase_multiplier - 1, last_phase + 1)
+        else:
+            phase_index = max(0, last_phase - 1)
+
+    frame_number = (base_frame * phase_multiplier) + phase_index
+    phase_tracker["last_base_frame"] = base_frame
+    phase_tracker["last_phase_index"] = phase_index
+    phase_tracker["last_direction"] = direction
+    phase_tracker["last_phase_multiplier"] = phase_multiplier
+    if source_seq is not None:
+        phase_tracker["last_source_seq"] = source_seq
+    phase_tracker["cached_frame_number"] = frame_number
+    return frame_number
 
 
 def _normalize_timecode_display(timecode: str) -> str:
@@ -1001,9 +1102,11 @@ class RoiCanvas(QWidget):
         self._roi = Roi(0, 0, FRAME_W, FRAME_H)
         self._visual_roi_overlay_transition: tuple[float, float, float, float] | None = None
         self._visual_roi_overlay_drag: tuple[float, float, float, float] | None = None
+        self._visual_roi_overlay_pinch: tuple[float, float, float, float] | None = None
 
         self._drag_mode = "none"
         self._drag_started = False
+        self._pointer_pressed = False
         self._adjustment_active = False
         self._drag_start_pos = QPointF()
         self._drag_start_roi = self._roi
@@ -1013,6 +1116,9 @@ class RoiCanvas(QWidget):
         self._pinch_active = False
         self._pinch_start_distance = 0.0
         self._pinch_start_scale = 1.0
+        self._pinch_start_roi = self._roi
+        self._pinch_start_midpoint_frame = QPointF()
+        self._pinch_anchor_fraction = QPointF(0.5, 0.5)
         self._suppress_mouse_until_ts = 0.0
 
         self._last_touch_emit_ts = 0.0
@@ -1045,6 +1151,7 @@ class RoiCanvas(QWidget):
         self._cancel_interaction_interpolation()
         self._visual_roi_overlay_transition = None
         self._visual_roi_overlay_drag = None
+        self._visual_roi_overlay_pinch = None
         self._apply_roi_local(roi)
         self._interaction_target_roi = roi
 
@@ -1054,6 +1161,19 @@ class RoiCanvas(QWidget):
         self._cancel_interaction_interpolation()
         self._touch_emit_pending = False
         self._touch_emit_pending_scale = False
+
+    def reset_interaction_state(self) -> None:
+        self.cancel_pending_interaction_updates()
+        self._pointer_pressed = False
+        self._drag_mode = "none"
+        self._drag_started = False
+        self._pinch_active = False
+        self._pinch_start_distance = 0.0
+        self._adjustment_active = False
+        self._visual_roi_overlay_drag = None
+        self._visual_roi_overlay_pinch = None
+        self._visual_roi_overlay_transition = None
+        self.update()
 
     def set_visual_roi_overlay(self, x: float, y: float, w: float, h: float) -> None:
         self._visual_roi_overlay_transition = (float(x), float(y), float(w), float(h))
@@ -1083,6 +1203,12 @@ class RoiCanvas(QWidget):
 
     def drag_visual_roi_overlay(self) -> tuple[float, float, float, float] | None:
         return self._visual_roi_overlay_drag
+
+    def pinch_visual_roi_overlay(self) -> tuple[float, float, float, float] | None:
+        return self._visual_roi_overlay_pinch
+
+    def is_pinch_active(self) -> bool:
+        return bool(self._pinch_active)
 
     def roi(self) -> Roi:
         return self._roi
@@ -1156,23 +1282,34 @@ class RoiCanvas(QWidget):
         if self._image is not None:
             p.drawImage(image_rect, self._image)
 
-        overlay = self._visual_roi_overlay_drag
+        overlay = self._visual_roi_overlay_pinch
+        if overlay is None:
+            overlay = self._visual_roi_overlay_drag
         if overlay is None:
             overlay = self._visual_roi_overlay_transition
 
         if overlay is not None:
             overlay_x, overlay_y, overlay_w, overlay_h = overlay
             roi_rect_w = self._frame_to_widget_rect_float(overlay_x, overlay_y, overlay_w, overlay_h)
+            display_roi = clamp_roi(
+                Roi(
+                    int(round(overlay_x)),
+                    int(round(overlay_y)),
+                    int(round(overlay_w)),
+                    int(round(overlay_h)),
+                )
+            )
         else:
             roi_rect_w = self._frame_to_widget_rect(self._roi)
+            display_roi = self._roi
         p.setRenderHint(QPainter.Antialiasing, True)
 
         p.setPen(QPen(Qt.yellow, 2))
         p.drawRect(roi_rect_w)
 
         p.setPen(QPen(Qt.green, 1))
-        scale = roi_scale_from_roi(self._roi)
-        p.drawText(12, 24, f"ROI: x={self._roi.x} y={self._roi.y} w={self._roi.w} h={self._roi.h}")
+        scale = roi_scale_from_roi(display_roi)
+        p.drawText(12, 24, f"ROI: x={display_roi.x} y={display_roi.y} w={display_roi.w} h={display_roi.h}")
         p.drawText(12, 44, f"Scale: {scale:.2f}x")
 
         # Keep the handle in the bottom-right corner without consuming tiny ROIs.
@@ -1246,6 +1383,7 @@ class RoiCanvas(QWidget):
     def _pointer_press(self, position: QPointF) -> None:
         self._cancel_interaction_interpolation()
         self.setFocus(Qt.MouseFocusReason)
+        self._pointer_pressed = True
         self._drag_start_pos = QPointF(position)
         self._drag_start_roi = self._roi
         self._drag_started = False
@@ -1371,6 +1509,9 @@ class RoiCanvas(QWidget):
         event.accept()
 
     def _pointer_release(self, position: QPointF) -> None:
+        if not self._pointer_pressed:
+            return
+        self._pointer_pressed = False
         elapsed = time.perf_counter() - self._press_started_ts
         moved = math.hypot(
             position.x() - self._drag_start_pos.x(),
@@ -1391,20 +1532,60 @@ class RoiCanvas(QWidget):
 
     def _begin_pinch(self, first: QPointF, second: QPointF) -> None:
         self._cancel_interaction_interpolation()
+        self._pointer_pressed = False
         self._drag_mode = "none"
         self._drag_started = False
         self._clear_drag_visual_roi_overlay()
+        self._visual_roi_overlay_transition = None
         self._pinch_active = True
         self._pinch_start_distance = max(1.0, math.hypot(second.x() - first.x(), second.y() - first.y()))
-        self._pinch_start_scale = roi_scale_from_roi(self._roi)
+        self._pinch_start_roi = self._roi
+        self._pinch_start_scale = roi_scale_from_roi(self._pinch_start_roi)
+        midpoint = QPointF((first.x() + second.x()) * 0.5, (first.y() + second.y()) * 0.5)
+        self._pinch_start_midpoint_frame = self._widget_to_frame(midpoint)
+        self._pinch_anchor_fraction = QPointF(
+            (self._pinch_start_midpoint_frame.x() - float(self._pinch_start_roi.x))
+            / max(1.0, float(self._pinch_start_roi.w)),
+            (self._pinch_start_midpoint_frame.y() - float(self._pinch_start_roi.y))
+            / max(1.0, float(self._pinch_start_roi.h)),
+        )
+        self._visual_roi_overlay_pinch = (
+            float(self._roi.x),
+            float(self._roi.y),
+            float(self._roi.w),
+            float(self._roi.h),
+        )
         self._touch_emit_interval_s = self._default_touch_emit_interval_s
         self._begin_adjustment()
+        self.update()
 
     def _update_pinch(self, first: QPointF, second: QPointF) -> None:
         distance = max(1.0, math.hypot(second.x() - first.x(), second.y() - first.y()))
         midpoint = QPointF((first.x() + second.x()) * 0.5, (first.y() + second.y()) * 0.5)
         target_scale = self._pinch_start_scale * (distance / self._pinch_start_distance)
-        self._apply_scale(target_scale, self._widget_to_frame(midpoint), touch_throttle=True)
+        midpoint_frame = self._widget_to_frame(midpoint)
+        sized_roi = roi_from_scale(max(1.0, min(target_scale, 16.0)), 0.0, 0.0)
+        target_roi = clamp_roi(
+            Roi(
+                int(round(midpoint_frame.x() - (self._pinch_anchor_fraction.x() * float(sized_roi.w)))),
+                int(round(midpoint_frame.y() - (self._pinch_anchor_fraction.y() * float(sized_roi.h)))),
+                sized_roi.w,
+                sized_roi.h,
+            )
+        )
+        self._visual_roi_overlay_pinch = (
+            float(target_roi.x),
+            float(target_roi.y),
+            float(target_roi.w),
+            float(target_roi.h),
+        )
+        self.update()
+        self._queue_interpolated_roi(
+            target_roi,
+            emit_scale=True,
+            anchor_to_current=True,
+            apply_latency_filter=True,
+        )
 
     def _finish_pinch(self) -> None:
         if not self._pinch_active:
@@ -1412,7 +1593,10 @@ class RoiCanvas(QWidget):
         self._pinch_active = False
         self._pinch_start_distance = 0.0
         self._suppress_mouse_until_ts = time.perf_counter() + 0.25
+        self._visual_roi_overlay_pinch = None
+        self._visual_roi_overlay_transition = None
         self._flush_interaction_emit()
+        self.update()
         self._finish_adjustment()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -1444,6 +1628,7 @@ class RoiCanvas(QWidget):
     def event(self, event) -> bool:
         et = event.type()
         if et in (QEvent.Type.TouchBegin, QEvent.Type.TouchUpdate, QEvent.Type.TouchEnd, QEvent.Type.TouchCancel):
+            self._suppress_mouse_until_ts = time.perf_counter() + 0.25
             points = [point for point in event.points() if point.state() != QEventPoint.State.Released]
             if len(points) >= 2:
                 first = points[0].position()
@@ -1873,6 +2058,10 @@ class VideoProcessorController:
             self.processor.set_roi(roi.x, roi.y, roi.w, roi.h)
         return True
 
+    def set_roi_settled(self, roi: Roi) -> bool:
+        self.set_roi_subpixel_shift(0.0, 0.0)
+        return self.set_roi(roi)
+
     def set_roi_position(self, roi_x: int, roi_y: int) -> bool:
         if self.processor is not None and hasattr(self.processor, "set_roi_position"):
             self.processor.set_roi_position(int(roi_x), int(roi_y))
@@ -2151,8 +2340,15 @@ class VideoProcessorController:
         if self.processor is not None and hasattr(self.processor, "set_subpixel_shift"):
             self.processor.set_subpixel_shift(float(shift_x), float(shift_y))
 
-    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float, manual_drag: bool = False) -> bool:
-        _ = manual_drag
+    def set_roi_with_subpixel(
+        self,
+        roi: Roi,
+        shift_x: float,
+        shift_y: float,
+        manual_drag: bool = False,
+        suspend_timecode: bool = False,
+    ) -> bool:
+        _ = manual_drag, suspend_timecode
         clamped = clamp_roi(roi)
         if self.processor is not None:
             moving_only = hasattr(self.processor, "set_roi_position")
@@ -2206,6 +2402,7 @@ class VideoProcessorController:
 
 class ProcessVideoProcessorController:
     def __init__(self) -> None:
+        self._roi_command_sequence = 0
         self.enable_basic_scaling = True
         self.deinterlace_enabled = True
         self.reinterlace_enabled = os.environ.get("VP_REINTERLACE_ENABLE", "0") == "1"
@@ -2830,6 +3027,7 @@ class ProcessVideoProcessorController:
         cmd = str(command.get("cmd", ""))
         latest_wins_roi_cmds = {
             "set_roi",
+            "set_roi_settled",
             "set_roi_position",
             "set_roi_with_subpixel",
         }
@@ -2840,6 +3038,7 @@ class ProcessVideoProcessorController:
             "decklink_tick",
             # Live ROI interaction commands should never block the GUI thread.
             "set_roi",
+            "set_roi_settled",
             "set_roi_position",
             "set_roi_subpixel_shift",
             "set_roi_with_subpixel",
@@ -2945,6 +3144,10 @@ class ProcessVideoProcessorController:
             )
             return True
 
+    def _next_roi_command_sequence(self) -> int:
+        self._roi_command_sequence += 1
+        return self._roi_command_sequence
+
     def _drain_responses(self) -> None:
         if self._response_queue is None:
             return
@@ -3036,10 +3239,38 @@ class ProcessVideoProcessorController:
                 )
 
     def set_roi(self, roi: Roi) -> bool:
-        return self._send_control({"cmd": "set_roi", "x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h})
+        return self._send_control(
+            {
+                "cmd": "set_roi",
+                "x": roi.x,
+                "y": roi.y,
+                "w": roi.w,
+                "h": roi.h,
+                "roi_sequence": self._next_roi_command_sequence(),
+            }
+        )
+
+    def set_roi_settled(self, roi: Roi) -> bool:
+        return self._send_control(
+            {
+                "cmd": "set_roi_settled",
+                "x": int(roi.x),
+                "y": int(roi.y),
+                "w": int(roi.w),
+                "h": int(roi.h),
+                "roi_sequence": self._next_roi_command_sequence(),
+            }
+        )
 
     def set_roi_position(self, roi_x: int, roi_y: int) -> bool:
-        return self._send_control({"cmd": "set_roi_position", "x": int(roi_x), "y": int(roi_y)})
+        return self._send_control(
+            {
+                "cmd": "set_roi_position",
+                "x": int(roi_x),
+                "y": int(roi_y),
+                "roi_sequence": self._next_roi_command_sequence(),
+            }
+        )
 
     def set_roi_subpixel_shift(self, shift_x: float, shift_y: float) -> None:
         self._send_control(
@@ -3047,10 +3278,18 @@ class ProcessVideoProcessorController:
                 "cmd": "set_roi_subpixel_shift",
                 "shift_x": float(shift_x),
                 "shift_y": float(shift_y),
+                "roi_sequence": self._next_roi_command_sequence(),
             }
         )
 
-    def set_roi_with_subpixel(self, roi: Roi, shift_x: float, shift_y: float, manual_drag: bool = False) -> bool:
+    def set_roi_with_subpixel(
+        self,
+        roi: Roi,
+        shift_x: float,
+        shift_y: float,
+        manual_drag: bool = False,
+        suspend_timecode: bool = False,
+    ) -> bool:
         return self._send_control(
             {
                 "cmd": "set_roi_with_subpixel",
@@ -3061,15 +3300,23 @@ class ProcessVideoProcessorController:
                 "shift_x": float(shift_x),
                 "shift_y": float(shift_y),
                 "manual_drag": bool(manual_drag),
+                "suspend_timecode": bool(suspend_timecode),
+                "roi_sequence": self._next_roi_command_sequence(),
             }
         )
 
-    def set_timecode_roi_keyframes(self, enabled: bool, keyframes: list[dict[str, object]]) -> None:
+    def set_timecode_roi_keyframes(
+        self,
+        enabled: bool,
+        keyframes: list[dict[str, object]],
+        phase_mode: str,
+    ) -> None:
         self._send_control(
             {
                 "cmd": "set_timecode_roi_keyframes",
                 "enabled": bool(enabled),
                 "keyframes": keyframes,
+                "phase_mode": str(phase_mode),
             }
         )
 
@@ -3745,12 +3992,20 @@ class MainWindow(QMainWindow):
         self._timecode_roi_keyframes: dict[int, TimecodeRoiKeyframe] = {}
         self._timecode_adjustment_anchor: TimecodeRoiKeyframe | None = None
         self._timecode_adjustment_paused = False
+        self._timecode_adjustment_finish_pending = False
+        self._timecode_resume_debounce_ms = max(
+            0,
+            min(1000, int(float(os.environ.get("VP_TIMECODE_MANUAL_RESUME_DEBOUNCE_MS", "180")))),
+        )
+        self._timecode_resume_status = ""
         self._timecode_roi_lookup_keyframes: dict[int, TimecodeRoiKeyframe] = {}
         self._timecode_roi_ordered_frames: list[int] = []
         self._timecode_roi_segment_starts: list[int] = []
         self._timecode_roi_segments: list[tuple[int, int, np.ndarray]] = []
         self._timecode_selected_frame: int | None = None
         self._timecode_last_applied_frame: int | None = None
+        self._timecode_phase_tracker: dict[str, object] = {}
+        self._decklink_timecode_info_sequence = 0
         self._decklink_timecode_info: dict[str, object] = {}
         self._roi_keyframe_transition_default_frames = 30
         self._roi_keyframe_transition: dict[str, object] | None = None
@@ -4035,6 +4290,10 @@ class MainWindow(QMainWindow):
         self._roi_control_adjustment_timer.setInterval(150)
         self._roi_control_adjustment_timer.timeout.connect(self._on_roi_adjustment_finished)
 
+        self._timecode_resume_timer = QTimer(self)
+        self._timecode_resume_timer.setSingleShot(True)
+        self._timecode_resume_timer.timeout.connect(self._resume_timecode_after_manual_adjustment)
+
         self._roi_keyframe_transition_timer = QTimer(self)
         self._roi_keyframe_transition_timer.setInterval(16)
         self._roi_keyframe_transition_timer.setTimerType(Qt.PreciseTimer)
@@ -4167,6 +4426,7 @@ class MainWindow(QMainWindow):
             self.decklink_input_mode_combo,
             self.decklink_output_mode_combo,
             self.decklink_timecode_format_combo,
+            self.decklink_timecode_phase_combo,
             self.worker_priority_combo,
             self.roi_interp_mode_combo,
         ]
@@ -4315,6 +4575,7 @@ class MainWindow(QMainWindow):
             "decklink_input_mode_text": str(self.decklink_input_mode_combo.currentText()),
             "decklink_output_mode_text": str(self.decklink_output_mode_combo.currentText()),
             "decklink_timecode_format": str(self.decklink_timecode_format_combo.currentText()),
+            "decklink_timecode_phase_mode": str(self.decklink_timecode_phase_combo.currentData()),
             "decklink_enable_format_detection": bool(self.decklink_enable_format_detection.isChecked()),
             "decklink_fps_priority_guard": bool(self.decklink_fps_priority_guard_checkbox.isChecked()),
             "worker_process_priority": str(self.worker_priority_combo.currentText()),
@@ -4483,6 +4744,12 @@ class MainWindow(QMainWindow):
             )
             if self.decklink_timecode_format_combo.findText(persisted_timecode_format) >= 0:
                 self.decklink_timecode_format_combo.setCurrentText(persisted_timecode_format)
+            persisted_phase_mode = _normalize_timecode_phase_synthesis_mode(
+                str(raw.get("decklink_timecode_phase_mode", self.decklink_timecode_phase_combo.currentData()))
+            )
+            phase_index = self.decklink_timecode_phase_combo.findData(persisted_phase_mode)
+            if phase_index >= 0:
+                self.decklink_timecode_phase_combo.setCurrentIndex(phase_index)
             self.decklink_auto_detect_devices.setChecked(bool(raw.get("decklink_auto_detect", self.decklink_auto_detect_devices.isChecked())))
             self.decklink_enable_format_detection.setChecked(
                 bool(raw.get("decklink_enable_format_detection", self.decklink_enable_format_detection.isChecked()))
@@ -5154,6 +5421,16 @@ class MainWindow(QMainWindow):
         self.decklink_timecode_format_combo.setCurrentText("RP188 VITC1")
         self.decklink_timecode_format_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
         decklink_form.addRow("Input timecode type", self.decklink_timecode_format_combo)
+
+        self.decklink_timecode_phase_combo = QComboBox()
+        for label, mode_name in _timecode_phase_synthesis_options():
+            self.decklink_timecode_phase_combo.addItem(label, mode_name)
+        self.decklink_timecode_phase_combo.setCurrentIndex(0)
+        self.decklink_timecode_phase_combo.setToolTip(
+            "Use source-frame cadence to synthesize HFR phase when the capture device cannot provide HFRTC or field-mark metadata."
+        )
+        self.decklink_timecode_phase_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
+        decklink_form.addRow("HFR timecode phase", self.decklink_timecode_phase_combo)
 
         self.decklink_output_mode_combo = QComboBox()
         self.decklink_output_mode_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
@@ -6821,18 +7098,22 @@ class MainWindow(QMainWindow):
         self._controller_roi_interp_timer.stop()
 
         drag_overlay = self._input_canvas.drag_visual_roi_overlay()
-
+        pinch_overlay = self._input_canvas.pinch_visual_roi_overlay()
         # Treat manual updates as a continuous live keyframe stream: keep only
         # the latest target and interpolate from applied ROI on each send tick.
         if self._manual_live_target_roi is None:
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
             self._manual_roi_target_history = []
         raw_curve_target: Roi | tuple[float, float, float, float]
-        if drag_overlay is not None:
+        if pinch_overlay is not None:
+            raw_curve_target = tuple(float(v) for v in pinch_overlay)
+            smoothed_target = self._smooth_manual_roi_target(raw_curve_target)
+        elif drag_overlay is not None:
             raw_curve_target = tuple(float(v) for v in drag_overlay)
+            smoothed_target = self._smooth_manual_roi_target(raw_curve_target)
         else:
             raw_curve_target = self._roi
-        smoothed_target = self._smooth_manual_roi_target(raw_curve_target)
+            smoothed_target = self._smooth_manual_roi_target(raw_curve_target)
         self._manual_live_target_roi = smoothed_target
 
         if drag_overlay is not None:
@@ -6936,6 +7217,7 @@ class MainWindow(QMainWindow):
                         step_shift_x,
                         step_shift_y,
                         manual_drag=manual_interaction,
+                        suspend_timecode=self._timecode_adjustment_paused,
                     )
                 )
             else:
@@ -6952,9 +7234,9 @@ class MainWindow(QMainWindow):
             if sent:
                 self._roi_diag_controller_send_success += 1
                 self._manual_roi_last_send_ts = time.perf_counter()
+                self._controller_roi_applied = step_roi
             else:
                 self._roi_diag_controller_send_drops += 1
-            self._controller_roi_applied = step_roi
         except Exception as exc:
             self._roi_diag_controller_send_drops += 1
             self._update_status(f"ROI update failed: {exc}")
@@ -6962,12 +7244,7 @@ class MainWindow(QMainWindow):
         # Continue stepping while target is not reached, or while new user
         # updates keep arriving.
         manual_drag_active = self._input_canvas.drag_visual_roi_overlay() is not None
-        if self._is_controller_roi_close(self._controller_roi_applied, target) and not manual_drag_active:
-            if use_subpixel_microstep:
-                try:
-                    self._controller.set_roi_with_subpixel(target, 0.0, 0.0, manual_drag=False)
-                except Exception:
-                    pass
+        if sent and self._is_controller_roi_close(self._controller_roi_applied, target) and not manual_drag_active:
             self._manual_live_target_roi = None
             self._manual_roi_target_history = []
             self._manual_drag_interp_start_overlay = None
@@ -6981,6 +7258,8 @@ class MainWindow(QMainWindow):
                 interval_ms = min(24, interval_ms + 4)
             self._manual_roi_send_timer.setInterval(interval_ms)
             self._manual_roi_send_timer.start()
+        elif self._timecode_adjustment_finish_pending:
+            self._complete_timecode_adjustment()
 
     def _manual_roi_send_interval_ms(self, zoom_scale: float, moving_only: bool = False) -> int:
         z = max(1.0, float(zoom_scale))
@@ -7304,8 +7583,7 @@ class MainWindow(QMainWindow):
 
         state = self._roi_keyframe_transition
         backend_transition_active = isinstance(state, dict) and bool(state.get("backend_driven", False))
-        timecode_visual_active = bool(self._timecode_keyframing_enabled) and (not self._timecode_adjustment_paused)
-        if not backend_transition_active and not timecode_visual_active:
+        if not backend_transition_active:
             return {}
 
         if not hasattr(self._controller, "decklink_applied_roi"):
@@ -7445,12 +7723,21 @@ class MainWindow(QMainWindow):
         if not self._controller_roi_interp_timer.isActive():
             self._controller_roi_interp_timer.start()
 
-    def _apply_controller_roi_immediate(self, roi: Roi, reset_subpixel_shift: bool = True) -> None:
+    def _apply_controller_roi_immediate(
+        self,
+        roi: Roi,
+        reset_subpixel_shift: bool = True,
+        settle_interlaced: bool = False,
+    ) -> None:
         clamped = clamp_roi(roi)
         self._controller_roi_target = None
         self._controller_roi_interp_timer.stop()
         self._controller_filtered_target_roi = None
         self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
+        if settle_interlaced and hasattr(self._controller, "set_roi_settled"):
+            self._controller.set_roi_settled(clamped)
+            self._controller_roi_applied = clamped
+            return
         if reset_subpixel_shift and hasattr(self._controller, "set_roi_subpixel_shift"):
             self._controller.set_roi_subpixel_shift(0.0, 0.0)
         moving_only = (
@@ -8489,6 +8776,10 @@ class MainWindow(QMainWindow):
         if self.sender() is self.decklink_timecode_format_combo:
             self._reindex_timecode_keyframes_for_selected_format()
             self._timecode_last_applied_frame = None
+            self._timecode_phase_tracker.clear()
+        if self.sender() is self.decklink_timecode_phase_combo:
+            self._timecode_last_applied_frame = None
+            self._timecode_phase_tracker.clear()
         self._apply_mode_aware_deinterlace_default_if_needed()
         self._sync_roi_transition_unit_labels()
         self._sync_blackmagic_controls_enabled_state()
@@ -9124,6 +9415,18 @@ class MainWindow(QMainWindow):
         self._rebuild_timecode_roi_lookup()
 
     def _set_roi_keyframing_mode(self, timecode_enabled: bool, save: bool = True) -> None:
+        self._timecode_resume_timer.stop()
+        self._timecode_resume_status = ""
+        self._manual_roi_send_timer.stop()
+        self._pending_manual_controller_roi = None
+        self._manual_live_target_roi = None
+        self._manual_roi_target_history = []
+        self._manual_drag_interp_start_overlay = None
+        self._manual_drag_interp_end_overlay = None
+        self._manual_drag_last_event_ts = 0.0
+        self._timecode_adjustment_finish_pending = False
+        self._input_canvas.reset_interaction_state()
+        self._input_canvas.set_roi(self._roi)
         self._timecode_keyframing_enabled = bool(timecode_enabled)
         if not self._timecode_keyframing_enabled:
             self._timecode_adjustment_paused = False
@@ -9184,20 +9487,33 @@ class MainWindow(QMainWindow):
 
     def _current_timecode_position(self) -> tuple[str, int] | None:
         if not bool(self._decklink_timecode_info.get("present", False)):
+            self._timecode_phase_tracker.clear()
             return None
         timecode = str(self._decklink_timecode_info.get("text", "")).strip()
-        drop_frame = bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode))
-        calculation_timecode = _timecode_with_drop_frame_separator(timecode, drop_frame)
-        frame_number = _timecode_to_internal_frame_number(
-            calculation_timecode,
-            self._timecode_nominal_fps(),
-            bool(self._decklink_timecode_info.get("field_mark", False)),
+        frame_number = _timecode_position_from_info(
+            self._decklink_timecode_info,
+            self.decklink_timecode_format_combo.currentText(),
+            self._timecode_output_fps_for_tracking(),
+            str(self.decklink_timecode_phase_combo.currentData()),
+            phase_tracker=self._timecode_phase_tracker,
+            source_seq=self._decklink_timecode_info.get("_seq"),
         )
         if frame_number is None:
             return None
         return timecode, frame_number
 
-    def _rebuild_timecode_roi_lookup(self) -> None:
+    def _timecode_output_fps_for_tracking(self) -> float:
+        video_fps = 0.0
+        if hasattr(self._controller, "decklink_output_nominal_fps"):
+            try:
+                video_fps = float(self._controller.decklink_output_nominal_fps())
+            except Exception:
+                video_fps = 0.0
+        if video_fps <= 1.0:
+            video_fps = float(max(1, self.fps_spin.value()))
+        return video_fps
+
+    def _rebuild_timecode_roi_lookup(self, sync_worker: bool = True) -> None:
         effective_keyframes = dict(self._timecode_roi_keyframes)
         if self._timecode_adjustment_anchor is not None:
             effective_keyframes[self._timecode_adjustment_anchor.frame_number] = self._timecode_adjustment_anchor
@@ -9212,7 +9528,8 @@ class MainWindow(QMainWindow):
             self._timecode_roi_segments.append((start_key.frame_number, end_key.frame_number, values))
         self._timecode_roi_segment_starts = [segment[0] for segment in self._timecode_roi_segments]
         self._timecode_last_applied_frame = None
-        self._sync_worker_timecode_roi_keyframes()
+        if sync_worker:
+            self._sync_worker_timecode_roi_keyframes()
 
     def _sync_worker_timecode_roi_keyframes(self) -> None:
         if getattr(self, "_controller_backend", "") != "worker-process":
@@ -9236,7 +9553,7 @@ class MainWindow(QMainWindow):
                 }
             )
         enabled = self._timecode_keyframing_enabled and not self._timecode_adjustment_paused
-        controller.set_timecode_roi_keyframes(enabled, keyframes)
+        controller.set_timecode_roi_keyframes(enabled, keyframes, str(self.decklink_timecode_phase_combo.currentData()))
 
     def _timecode_roi_values_at_frame(self, frame_number: int) -> np.ndarray | None:
         ordered_frames = self._timecode_roi_ordered_frames
@@ -9428,14 +9745,61 @@ class MainWindow(QMainWindow):
     def _on_roi_adjustment_started(self) -> None:
         if not self._timecode_keyframing_enabled:
             return
+        self._timecode_resume_timer.stop()
+        self._timecode_resume_status = ""
+        self._timecode_adjustment_finish_pending = False
+        self._input_canvas.clear_visual_roi_overlay()
+        was_paused = self._timecode_adjustment_paused
         self._timecode_adjustment_paused = True
+        if not was_paused:
+            self._sync_worker_timecode_roi_keyframes()
+
+    def _resume_timecode_after_manual_adjustment(self) -> None:
+        if not self._timecode_keyframing_enabled or not self._timecode_adjustment_paused:
+            return
+        position = self._current_timecode_position()
+        anchor = self._timecode_adjustment_anchor
+        if position is not None and anchor is not None:
+            timecode, frame_number = position
+            self._timecode_adjustment_anchor = TimecodeRoiKeyframe(
+                timecode=_normalize_timecode_display(timecode),
+                frame_number=frame_number,
+                roi=anchor.roi,
+                interpolation_mode=anchor.interpolation_mode,
+                drop_frame=bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode)),
+                field_mark=bool(self._decklink_timecode_info.get("field_mark", False)),
+            )
+            self._rebuild_timecode_roi_lookup(sync_worker=False)
+            self._timecode_last_applied_frame = frame_number
+        else:
+            self._timecode_last_applied_frame = None
+        self._timecode_adjustment_paused = False
         self._sync_worker_timecode_roi_keyframes()
+        if self._timecode_resume_status:
+            self._update_status(self._timecode_resume_status)
+        self._timecode_resume_status = ""
 
     def _on_roi_adjustment_finished(self) -> None:
         if not self._timecode_adjustment_paused:
             return
         if hasattr(self, "_roi_control_adjustment_timer"):
             self._roi_control_adjustment_timer.stop()
+        final_roi = clamp_roi(self._roi)
+        if self._pending_manual_controller_roi is not None or self._manual_live_target_roi is not None:
+            self._timecode_adjustment_finish_pending = True
+            self._pending_manual_controller_roi = final_roi
+            self._manual_live_target_roi = final_roi
+            self._manual_roi_target_history = []
+            if not self._manual_roi_send_timer.isActive():
+                self._manual_roi_send_timer.start()
+            return
+        self._complete_timecode_adjustment()
+
+    def _complete_timecode_adjustment(self) -> None:
+        if not self._timecode_keyframing_enabled or not self._timecode_adjustment_paused:
+            self._timecode_adjustment_finish_pending = False
+            return
+        self._timecode_adjustment_finish_pending = False
         self._manual_roi_send_timer.stop()
         self._pending_manual_controller_roi = None
         self._manual_live_target_roi = None
@@ -9443,28 +9807,26 @@ class MainWindow(QMainWindow):
         self._manual_drag_interp_start_overlay = None
         self._manual_drag_interp_end_overlay = None
         self._manual_drag_last_event_ts = 0.0
-        self._apply_controller_roi_immediate(self._roi)
+        self._apply_controller_roi_immediate(self._roi, settle_interlaced=True)
         position = self._current_timecode_position()
         if position is None:
-            self._timecode_adjustment_paused = False
-            self._timecode_last_applied_frame = None
-            self._sync_worker_timecode_roi_keyframes()
-            self._update_status("ROI adjusted; interpolation will resume when valid timecode is available")
+            self._timecode_resume_status = "ROI adjusted; interpolation will resume when valid timecode is available"
+            self._timecode_resume_timer.start(self._timecode_resume_debounce_ms)
             return
         timecode, frame_number = position
+        anchor_roi = clamp_roi(self._roi)
         self._timecode_adjustment_anchor = TimecodeRoiKeyframe(
             timecode=_normalize_timecode_display(timecode),
             frame_number=frame_number,
-            roi=clamp_roi(self._roi),
+            roi=anchor_roi,
             interpolation_mode=self._roi_interp_mode_name(),
             drop_frame=bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode)),
             field_mark=bool(self._decklink_timecode_info.get("field_mark", False)),
         )
-        self._rebuild_timecode_roi_lookup()
-        self._timecode_adjustment_paused = False
+        self._rebuild_timecode_roi_lookup(sync_worker=False)
         self._timecode_last_applied_frame = frame_number
-        self._sync_worker_timecode_roi_keyframes()
-        self._update_status(f"ROI interpolation recalculated from {_normalize_timecode_display(timecode)}")
+        self._timecode_resume_status = f"ROI interpolation recalculated from {_normalize_timecode_display(timecode)}"
+        self._timecode_resume_timer.start(self._timecode_resume_debounce_ms)
 
     def _on_roi_tap_center_requested(self, frame_x: float, frame_y: float) -> None:
         current = clamp_roi(self._roi)
@@ -9601,7 +9963,13 @@ class MainWindow(QMainWindow):
 
     def _set_decklink_timecode_display(self, info: dict[str, object] | None, placeholder: str | None = None) -> None:
         display_text = placeholder or "Timecode: --"
-        self._decklink_timecode_info = dict(info) if isinstance(info, dict) else {}
+        if isinstance(info, dict):
+            self._decklink_timecode_info_sequence += 1
+            self._decklink_timecode_info = dict(info)
+            self._decklink_timecode_info["_seq"] = self._decklink_timecode_info_sequence
+        else:
+            self._decklink_timecode_info = {}
+            self._timecode_phase_tracker.clear()
         if isinstance(info, dict) and bool(info.get("present", False)):
             timecode_text = str(info.get("text", "")).strip()
             format_name = str(info.get("format_name", "")).strip()

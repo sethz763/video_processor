@@ -32,13 +32,14 @@
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_timecode_format": "RP188 LTC",
+  "decklink_timecode_phase_mode": "source_cadence",
   "deinterlace_enabled": false,
   "deinterlace_method": "Blend (Stable)",
   "denoise_method": "Off",
   "denoise_strength": 0.35,
   "display_splitter_sizes": [
-    427,
-    425
+    428,
+    424
   ],
   "fps": 60,
   "interlaced_field2_phase_fraction": 0.5,
