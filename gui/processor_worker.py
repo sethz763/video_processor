@@ -2149,6 +2149,7 @@ class _StageFrame:
     native_shift_applied: bool = False
     interlaced_field_phase: dict[str, object] | None = None
     interlaced_phase_rendered: bool = False
+    roi_motion_trace: dict[str, object] | None = None
 
 
 def run_processor_worker(
@@ -2374,6 +2375,26 @@ def run_processor_worker(
     rtx_effect_sample_counter = 0
     processed_frame_counter = 0
     started_perf_ts = 0.0
+    roi_motion_trace_enabled = os.environ.get("VP_ROI_MOTION_TRACE", "1") != "0"
+    roi_motion_trace_file = None
+    roi_motion_trace_lock = threading.Lock()
+    roi_motion_trace_last_ts = 0.0
+    roi_motion_trace_last_effective_x: float | None = None
+    roi_motion_trace_last_effective_y: float | None = None
+    roi_motion_trace_last_mode = ""
+    if roi_motion_trace_enabled:
+        try:
+            roi_motion_trace_path = Path(__file__).resolve().parent / "logs" / "roi_motion.csv"
+            roi_motion_trace_path.parent.mkdir(parents=True, exist_ok=True)
+            roi_motion_trace_file = roi_motion_trace_path.open("w", encoding="utf-8", buffering=1)
+            roi_motion_trace_file.write(
+                "timestamp,mode,processed_frame,command_sequence,dt_ms,carrier_x,carrier_y,roi_w,roi_h,"
+                "target_shift_x,target_shift_y,applied_shift_x,applied_shift_y,target_effective_x,"
+                "target_effective_y,applied_effective_x,applied_effective_y,delta_effective_x,"
+                "delta_effective_y,transition_progress,transition_total\n"
+            )
+        except Exception:
+            roi_motion_trace_file = None
     output_nominal_fps = 0.0
     output_frame_period_s = 0.0
     output_mode_is_interlaced = False
@@ -2519,6 +2540,7 @@ def run_processor_worker(
     manual_interlaced_phase_pending = False
     roi_manual_drag_until_ts = 0.0
     roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
+    roi_manual_frame_target: dict[str, object] | None = None
     last_roi_command_sequence = 0
     timecode_roi_enabled = False
     timecode_phase_mode = "strict"
@@ -2649,6 +2671,92 @@ def run_processor_worker(
         roi_shift_accel_y = 0.0
 
         return float(roi_shift_applied_x), float(roi_shift_applied_y)
+
+    def _snapshot_roi_motion_trace(applied_shift_x: float, applied_shift_y: float) -> dict[str, object]:
+        now = time.perf_counter()
+        transition = roi_microstep_transition if isinstance(roi_microstep_transition, dict) else None
+        mode = "keyframe" if transition is not None else ("manual" if now <= float(roi_manual_drag_until_ts) else "idle")
+        return {
+            "mode": mode,
+            "command_sequence": int(last_roi_command_sequence),
+            "roi_x": int(current_roi_x),
+            "roi_y": int(current_roi_y),
+            "roi_w": int(current_roi_w),
+            "roi_h": int(current_roi_h),
+            "target_shift_x": float(roi_shift_target_x),
+            "target_shift_y": float(roi_shift_target_y),
+            "applied_shift_x": float(applied_shift_x),
+            "applied_shift_y": float(applied_shift_y),
+            "transition_progress": float(transition.get("frame_progress", 0.0)) if transition is not None else 0.0,
+            "transition_total": int(transition.get("total_frames", 0)) if transition is not None else 0,
+        }
+
+    def _trace_emitted_roi_motion(frame_id: int, snapshot: dict[str, object]) -> None:
+        nonlocal roi_motion_trace_last_ts
+        nonlocal roi_motion_trace_last_effective_x, roi_motion_trace_last_effective_y
+        nonlocal roi_motion_trace_last_mode
+
+        trace_file = roi_motion_trace_file
+        if trace_file is None:
+            return
+
+        now = time.perf_counter()
+        mode = str(snapshot.get("mode", "idle"))
+
+        if mode == "idle":
+            roi_motion_trace_last_ts = 0.0
+            roi_motion_trace_last_effective_x = None
+            roi_motion_trace_last_effective_y = None
+            roi_motion_trace_last_mode = ""
+            return
+
+        roi_x = int(snapshot["roi_x"])
+        roi_y = int(snapshot["roi_y"])
+        roi_w = int(snapshot["roi_w"])
+        roi_h = int(snapshot["roi_h"])
+        target_shift_x = float(snapshot["target_shift_x"])
+        target_shift_y = float(snapshot["target_shift_y"])
+        applied_shift_x = float(snapshot["applied_shift_x"])
+        applied_shift_y = float(snapshot["applied_shift_y"])
+        scale_x = FRAME_W / max(1.0, float(roi_w))
+        scale_y = FRAME_H / max(1.0, float(roi_h))
+        carrier_center_x = float(roi_x) + (float(roi_w) * 0.5)
+        carrier_center_y = float(roi_y) + (float(roi_h) * 0.5)
+        target_effective_x = carrier_center_x - (target_shift_x / scale_x)
+        target_effective_y = carrier_center_y - (target_shift_y / scale_y)
+        applied_effective_x = carrier_center_x - (applied_shift_x / scale_x)
+        applied_effective_y = carrier_center_y - (applied_shift_y / scale_y)
+
+        same_run = roi_motion_trace_last_mode == mode and roi_motion_trace_last_ts > 0.0
+        dt_ms = ((now - roi_motion_trace_last_ts) * 1000.0) if same_run else 0.0
+        delta_x = (
+            applied_effective_x - float(roi_motion_trace_last_effective_x)
+            if same_run and roi_motion_trace_last_effective_x is not None
+            else 0.0
+        )
+        delta_y = (
+            applied_effective_y - float(roi_motion_trace_last_effective_y)
+            if same_run and roi_motion_trace_last_effective_y is not None
+            else 0.0
+        )
+        line = (
+            f"{now:.9f},{mode},{int(frame_id)},{int(snapshot['command_sequence'])},"
+            f"{dt_ms:.4f},{roi_x},{roi_y},{roi_w},{roi_h},"
+            f"{target_shift_x:.6f},{target_shift_y:.6f},{applied_shift_x:.6f},{applied_shift_y:.6f},"
+            f"{target_effective_x:.6f},{target_effective_y:.6f},"
+            f"{applied_effective_x:.6f},{applied_effective_y:.6f},{delta_x:.6f},{delta_y:.6f},"
+            f"{float(snapshot['transition_progress']):.4f},{int(snapshot['transition_total'])}\n"
+        )
+        try:
+            with roi_motion_trace_lock:
+                trace_file.write(line)
+        except Exception:
+            return
+
+        roi_motion_trace_last_ts = now
+        roi_motion_trace_last_effective_x = applied_effective_x
+        roi_motion_trace_last_effective_y = applied_effective_y
+        roi_motion_trace_last_mode = mode
 
     def _set_roi_shift_target(next_target_x: float, next_target_y: float) -> None:
         nonlocal roi_shift_target_x, roi_shift_target_y
@@ -3126,8 +3234,10 @@ def run_processor_worker(
         overscan_percent: float,
         enforce_full_frame_scale_1x: bool = False,
     ) -> None:
-        nonlocal roi_microstep_transition
+        nonlocal roi_microstep_transition, roi_manual_frame_target
         nonlocal roi_shift_applied_x, roi_shift_applied_y
+
+        roi_manual_frame_target = None
 
         s_x, s_y, s_w, s_h = _normalize_worker_roi(*start_roi)
         t_x, t_y, t_w, t_h = _normalize_worker_roi(*target_roi)
@@ -3195,8 +3305,9 @@ def run_processor_worker(
             }
 
     def _cancel_roi_microstep_transition(reset_shift: bool = True) -> None:
-        nonlocal roi_microstep_transition
+        nonlocal roi_microstep_transition, roi_manual_frame_target
         roi_microstep_transition = None
+        roi_manual_frame_target = None
         if reset_shift:
             _set_roi_shift_target(0.0, 0.0)
 
@@ -3330,6 +3441,73 @@ def run_processor_worker(
             manual_interlaced_phase_state = None
             manual_interlaced_phase_until_ts = 0.0
             manual_interlaced_phase_pending = False
+
+    def _advance_manual_roi_frame_segment() -> None:
+        nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h
+        nonlocal roi_manual_frame_target
+        nonlocal manual_interlaced_phase_state, manual_interlaced_phase_until_ts, manual_interlaced_phase_pending
+
+        state = roi_manual_frame_target
+        if not isinstance(state, dict):
+            return
+
+        target_w = int(state["roi_w"])
+        target_h = int(state["roi_h"])
+        if target_w != current_roi_w or target_h != current_roi_h:
+            roi_manual_frame_target = None
+            return
+
+        scale_x = FRAME_W / max(1.0, float(current_roi_w))
+        scale_y = FRAME_H / max(1.0, float(current_roi_h))
+        current_center_x = float(current_roi_x) + (float(current_roi_w) * 0.5) - (float(roi_shift_applied_x) / scale_x)
+        current_center_y = float(current_roi_y) + (float(current_roi_h) * 0.5) - (float(roi_shift_applied_y) / scale_y)
+        target_center_x = float(state["center_x"])
+        target_center_y = float(state["center_y"])
+        remaining_frames = max(1, int(state.get("remaining_frames", 1)))
+        frame_fraction = 1.0 / float(remaining_frames)
+        desired_center_x = current_center_x + ((target_center_x - current_center_x) * frame_fraction)
+        desired_center_y = current_center_y + ((target_center_y - current_center_y) * frame_fraction)
+
+        desired_x = desired_center_x - (float(current_roi_w) * 0.5)
+        desired_y = desired_center_y - (float(current_roi_h) * 0.5)
+        next_x, next_y, _, _ = _normalize_worker_roi(
+            int(round(desired_x / 2.0)) * 2,
+            int(round(desired_y)),
+            current_roi_w,
+            current_roi_h,
+        )
+        carrier_center_x = float(next_x) + (float(current_roi_w) * 0.5)
+        carrier_center_y = float(next_y) + (float(current_roi_h) * 0.5)
+        shift_x = -((desired_center_x - carrier_center_x) * scale_x)
+        shift_y = -((desired_center_y - carrier_center_y) * scale_y)
+        max_shift_x = max(2.0, min(48.0, scale_x * 1.5))
+        max_shift_y = max(2.0, min(48.0, scale_y * 1.5))
+        shift_x = max(-max_shift_x, min(max_shift_x, shift_x))
+        shift_y = max(-max_shift_y, min(max_shift_y, shift_y))
+
+        prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
+        prev_shift_state = (float(roi_shift_applied_x), float(roi_shift_applied_y))
+        if next_x != current_roi_x or next_y != current_roi_y:
+            current_roi_x = next_x
+            current_roi_y = next_y
+            processor.set_roi_position(current_roi_x, current_roi_y)
+        _set_roi_shift_immediate(shift_x, shift_y)
+
+        if output_mode_is_interlaced and _interlaced_phase_controls_active():
+            manual_interlaced_phase_state = _build_manual_interlaced_phase_snapshot(
+                prev_roi_state,
+                (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h)),
+                prev_shift_state,
+                (float(roi_shift_applied_x), float(roi_shift_applied_y)),
+            )
+            manual_interlaced_phase_until_ts = time.perf_counter() + 0.12
+            manual_interlaced_phase_pending = True
+
+        if remaining_frames <= 1:
+            if roi_manual_frame_target is state:
+                roi_manual_frame_target = None
+        else:
+            state["remaining_frames"] = remaining_frames - 1
 
     def _advance_roi_microstep_transition_one_frame(progress_units: float | None = None) -> None:
         nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition, output_transition_units_per_frame
@@ -3627,6 +3805,7 @@ def run_processor_worker(
     def _advance_roi_microstep_transition_for_output_frame() -> None:
         nonlocal roi_microstep_transition, output_mode_is_interlaced
         if roi_microstep_transition is None:
+            _advance_manual_roi_frame_segment()
             return
 
         if not output_mode_is_interlaced:
@@ -4430,6 +4609,7 @@ def run_processor_worker(
                     process_start_ts = time.perf_counter()
                     output_bytes = input_bytes
                     shift_x, shift_y = _step_smoothed_roi_shift()
+                    roi_motion_trace = _snapshot_roi_motion_trace(shift_x, shift_y)
                     native_shift_applied = False
                     interlaced_phase = interlaced_phase_snapshot
                     if interlaced_phase is not None:
@@ -4488,6 +4668,7 @@ def run_processor_worker(
                         if emitted:
                             processed_frame_counter += 1
                     if emitted:
+                        _trace_emitted_roi_motion(processed_frame_counter, roi_motion_trace)
                         with state_lock:
                             roi_transition_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
                             roi_x_snapshot = int(current_roi_x)
@@ -4519,6 +4700,7 @@ def run_processor_worker(
                             roi_w=int(current_roi_w),
                             roi_h=int(current_roi_h),
                             interlaced_field_phase=interlaced_phase_snapshot,
+                            roi_motion_trace=_snapshot_roi_motion_trace(shift_x, shift_y),
                         )
                         if _put_stage_frame_fifo_drop_newest(q_capture_to_preprocess, item):
                             capture_drop_count += 1
@@ -4530,6 +4712,7 @@ def run_processor_worker(
                     # reduce Python scheduling overhead at 1080p60.
                     process_start_ts = time.perf_counter()
                     shift_x, shift_y = _step_smoothed_roi_shift()
+                    roi_motion_trace = _snapshot_roi_motion_trace(shift_x, shift_y)
                     interlaced_phase = interlaced_phase_snapshot
                     try:
                         if _reinterlace_enabled_for_output():
@@ -4625,6 +4808,7 @@ def run_processor_worker(
                         if emitted:
                             processed_frame_counter += 1
                     if emitted:
+                        _trace_emitted_roi_motion(processed_frame_counter, roi_motion_trace)
                         with state_lock:
                             roi_transition_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
                             roi_x_snapshot = int(current_roi_x)
@@ -4653,6 +4837,7 @@ def run_processor_worker(
                     roi_w=int(current_roi_w),
                     roi_h=int(current_roi_h),
                     interlaced_field_phase=interlaced_phase_snapshot,
+                    roi_motion_trace=_snapshot_roi_motion_trace(shift_x, shift_y),
                 )
                 if _put_latest_stage_frame(q_capture_to_preprocess, item):
                     capture_drop_count += 1
@@ -4961,6 +5146,8 @@ def run_processor_worker(
                     if emitted:
                         processed_frame_counter += 1
                 if emitted:
+                    if item.roi_motion_trace is not None:
+                        _trace_emitted_roi_motion(processed_frame_counter, item.roi_motion_trace)
                     with state_lock:
                         roi_transition_snapshot = dict(roi_microstep_transition) if isinstance(roi_microstep_transition, dict) else None
                         roi_x_snapshot = int(current_roi_x)
@@ -6014,6 +6201,7 @@ def run_processor_worker(
                 timecode_phase_mode = _normalize_timecode_phase_synthesis_mode(str(message.get("phase_mode", "strict")))
                 timecode_phase_tracker.clear()
                 roi_microstep_transition = None
+                roi_manual_frame_target = None
                 if not timecode_roi_enabled:
                     _set_roi_shift_immediate(0.0, 0.0)
                 continue
@@ -6059,12 +6247,13 @@ def run_processor_worker(
                 continue
 
             if command == "set_roi_with_subpixel":
-                _cancel_roi_microstep_transition(reset_shift=False)
+                roi_microstep_transition = None
                 if bool(message.get("suspend_timecode", False)):
                     timecode_roi_enabled = False
                 prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
                 prev_shift_state = (float(roi_shift_applied_x), float(roi_shift_applied_y))
-                if bool(message.get("manual_drag", False)):
+                manual_drag = bool(message.get("manual_drag", False))
+                if manual_drag:
                     roi_manual_drag_until_ts = time.perf_counter() + float(roi_manual_drag_hold_s)
                 next_roi_x, next_roi_y, next_roi_w, next_roi_h = _normalize_worker_roi(
                     int(message["x"]),
@@ -6072,6 +6261,21 @@ def run_processor_worker(
                     int(message["w"]),
                     int(message["h"]),
                 )
+                next_shift_x = float(message.get("shift_x", 0.0))
+                next_shift_y = float(message.get("shift_y", 0.0))
+                if manual_drag and next_roi_w == current_roi_w and next_roi_h == current_roi_h:
+                    scale_x = FRAME_W / max(1.0, float(next_roi_w))
+                    scale_y = FRAME_H / max(1.0, float(next_roi_h))
+                    roi_manual_frame_target = {
+                        "roi_w": int(next_roi_w),
+                        "roi_h": int(next_roi_h),
+                        "center_x": float(next_roi_x) + (float(next_roi_w) * 0.5) - (next_shift_x / scale_x),
+                        "center_y": float(next_roi_y) + (float(next_roi_h) * 0.5) - (next_shift_y / scale_y),
+                        "remaining_frames": 2,
+                    }
+                    continue
+
+                roi_manual_frame_target = None
                 prev_roi_w = current_roi_w
                 prev_roi_h = current_roi_h
                 current_roi_x, current_roi_y, current_roi_w, current_roi_h = (
@@ -6089,10 +6293,13 @@ def run_processor_worker(
                             rtx_vsr_error = _refresh_rtx_vsr_engine()
                         elif current_roi_w != prev_roi_w or current_roi_h != prev_roi_h:
                             _schedule_rtx_roi_rebuild()
-                _set_roi_shift_target(
-                    float(message.get("shift_x", 0.0)),
-                    float(message.get("shift_y", 0.0)),
-                )
+                if manual_drag:
+                    # The carrier and fractional phase describe one atomic
+                    # sample position. Delaying only the phase exposes the
+                    # integer carrier step, while keyframes apply both tightly.
+                    _set_roi_shift_immediate(next_shift_x, next_shift_y)
+                else:
+                    _set_roi_shift_target(next_shift_x, next_shift_y)
                 if output_mode_is_interlaced and _interlaced_phase_controls_active():
                     manual_interlaced_phase_state = _build_manual_interlaced_phase_snapshot(
                         prev_roi_state,

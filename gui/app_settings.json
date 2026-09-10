@@ -26,11 +26,11 @@
   "decklink_auto_detect": true,
   "decklink_enable_format_detection": true,
   "decklink_fps_priority_guard": false,
-  "decklink_input_device": null,
-  "decklink_input_mode_text": "",
+  "decklink_input_device": 1,
+  "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_output_buffer_frames": 1,
-  "decklink_output_device": null,
-  "decklink_output_mode_text": "",
+  "decklink_output_device": 0,
+  "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_timecode_format": "RP188 LTC",
   "decklink_timecode_phase_mode": "source_cadence",
   "deinterlace_enabled": false,
@@ -47,7 +47,7 @@
     300,
     400
   ],
-  "fullscreen_selected_scale_index": null,
+  "fullscreen_selected_scale_index": 0,
   "interlaced_field2_phase_fraction": 0.5,
   "main_splitter_sizes": [
     722,
@@ -63,23 +63,23 @@
   "roi_keyframe_duration_override": false,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 30,
+      "duration_frames": 60,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        540,
-        193,
-        796,
-        448
+        0,
+        370,
+        640,
+        360
       ]
     },
     "2": {
-      "duration_frames": 30,
+      "duration_frames": 60,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        0,
-        0,
-        1920,
-        1080
+        1280,
+        414,
+        640,
+        360
       ]
     },
     "3": {
@@ -104,42 +104,10 @@
     }
   },
   "roi_keyframing_mode": "manual",
-  "roi_latency_smoothing_percent": 0,
   "roi_manual_drag_hold_s": 0.1,
-  "roi_min_drag_nudge": 0.015,
-  "roi_smoothing_percent": 2,
-  "roi_timecode_keyframes": [
-    {
-      "drop_frame": true,
-      "field_mark": false,
-      "frame_number": 4637258,
-      "interpolation_mode": "ease_in_out",
-      "roi": [
-        502,
-        273,
-        962,
-        541
-      ],
-      "timecode": "21:29:25.01",
-      "timecode_format": "RP188 VITC1"
-    },
-    {
-      "drop_frame": true,
-      "field_mark": false,
-      "frame_number": 4637338,
-      "interpolation_mode": "ease_in_out",
-      "roi": [
-        502,
-        273,
-        962,
-        541
-      ],
-      "timecode": "21:29:26.11",
-      "timecode_format": "RP188 VITC1"
-    }
-  ],
+  "roi_timecode_keyframes": [],
   "roi_timecode_playback_enabled": false,
-  "roi_transition_duration_frames": 30,
+  "roi_transition_duration_frames": 60,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
