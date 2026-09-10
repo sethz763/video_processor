@@ -54,7 +54,7 @@
   "reinterlace_enabled": false,
   "roi_drag_x_hysteresis_px": 0.15,
   "roi_interpolation_mode": "Ease In/Out",
-  "roi_keyframe_duration_override": false,
+  "roi_keyframe_duration_override": true,
   "roi_keyframes": {
     "1": {
       "duration_frames": 30,
@@ -102,7 +102,37 @@
   "roi_manual_drag_hold_s": 0.1,
   "roi_min_drag_nudge": 0.015,
   "roi_smoothing_percent": 2,
-  "roi_timecode_keyframes": [],
+  "roi_timecode_keyframes": [
+    {
+      "drop_frame": true,
+      "field_mark": false,
+      "frame_number": 4637258,
+      "interpolation_mode": "ease_in_out",
+      "roi": [
+        502,
+        273,
+        962,
+        541
+      ],
+      "timecode": "21:29:25.01",
+      "timecode_format": "RP188 VITC1"
+    },
+    {
+      "drop_frame": true,
+      "field_mark": false,
+      "frame_number": 4637338,
+      "interpolation_mode": "ease_in_out",
+      "roi": [
+        502,
+        273,
+        962,
+        541
+      ],
+      "timecode": "21:29:26.11",
+      "timecode_format": "RP188 VITC1"
+    }
+  ],
+  "roi_timecode_playback_enabled": false,
   "roi_transition_duration_frames": 30,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,

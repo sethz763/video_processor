@@ -152,6 +152,14 @@ def _mode_name_is_interlaced(mode_label: str) -> bool:
     return ("i" in mode_name) and any(ch.isdigit() for ch in mode_name)
 
 
+_SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
+
+
+def _detect_source_cadence(run_length: int, position_step: int = 1) -> int:
+    observed = max(1.0, float(run_length) / float(max(1, position_step)))
+    return min(_SUPPORTED_SOURCE_CADENCES, key=lambda cadence: (abs(cadence - observed), cadence))
+
+
 def _decklink_timecode_format_name(format_code: object) -> str:
     try:
         code = int(format_code) & 0xFFFFFFFF
@@ -218,6 +226,11 @@ def _extract_decklink_frame_timecode_info(frame: object) -> dict[str, object]:
         "format_name": "",
         "bcd": 0,
         "flags": 0,
+        "hours": 0,
+        "minutes": 0,
+        "seconds": 0,
+        "frames": 0,
+        "subframe": 0,
         "field_mark": False,
         "drop_frame": False,
     }
@@ -248,6 +261,11 @@ def _extract_decklink_frame_timecode_info(frame: object) -> dict[str, object]:
         payload["format_name"] = _decklink_timecode_format_name(format_code)
         payload["bcd"] = int(getattr(frame, "timecode_bcd", 0))
         payload["flags"] = int(getattr(frame, "timecode_flags", 0))
+        payload["hours"] = int(getattr(frame, "timecode_hours", 0))
+        payload["minutes"] = int(getattr(frame, "timecode_minutes", 0))
+        payload["seconds"] = int(getattr(frame, "timecode_seconds", 0))
+        payload["frames"] = int(getattr(frame, "timecode_frames", 0))
+        payload["subframe"] = int(getattr(frame, "timecode_subframe", 0))
         payload["field_mark"] = bool(getattr(frame, "timecode_field_mark", False))
         payload["drop_frame"] = bool(getattr(frame, "timecode_drop_frame", ";" in timecode_text))
     except Exception:
@@ -598,6 +616,7 @@ class TimecodeRoiKeyframe:
     frame_number: int
     roi: Roi
     interpolation_mode: str
+    timecode_format: str = ""
     drop_frame: bool = False
     field_mark: bool = False
 
@@ -681,7 +700,7 @@ def _timecode_position_from_info(
     phase_mode: str,
     phase_tracker: dict[str, object] | None = None,
     source_seq: object | None = None,
-) -> int | None:
+) -> float | None:
     timecode = str(info.get("text", "")).strip()
     if not bool(info.get("present", False)) or not timecode:
         if isinstance(phase_tracker, dict):
@@ -694,6 +713,63 @@ def _timecode_position_from_info(
     field_mark = bool(info.get("field_mark", False))
 
     phase_multiplier = _timecode_phase_multiplier(video_fps, count_fps, phase_mode)
+    normalized_format = str(timecode_format).strip()
+    base_frame = _timecode_to_frame_number(calculation_timecode, count_fps)
+    if base_frame is None:
+        if isinstance(phase_tracker, dict):
+            phase_tracker.clear()
+        return None
+
+    if count_fps == 30 and normalized_format in {"RP188 VITC1", "RP188 VITC2"}:
+        hardware_position = (base_frame * 2) + (1 if field_mark else 0)
+        if _normalize_timecode_phase_synthesis_mode(phase_mode) != "source_cadence":
+            if isinstance(phase_tracker, dict):
+                phase_tracker.clear()
+            return hardware_position
+        if not isinstance(phase_tracker, dict):
+            phase_tracker = {}
+        if source_seq is not None and phase_tracker.get("last_source_seq") == source_seq:
+            cached = phase_tracker.get("cached_frame_number")
+            if isinstance(cached, (int, float)):
+                return float(cached)
+        last_position = phase_tracker.get("last_hardware_position")
+        last_direction = int(phase_tracker.get("last_direction", 1))
+        current_run_length = max(1, int(phase_tracker.get("current_run_length", 1)))
+        estimated_run_length = max(1, int(phase_tracker.get("estimated_run_length", 1)))
+        position_step = max(1, int(phase_tracker.get("position_step", 1)))
+        if not isinstance(last_position, int):
+            direction = 1
+            run_index = 0
+            current_run_length = 1
+        elif hardware_position != last_position:
+            direction = 1 if hardware_position > last_position else -1
+            observed_step = abs(hardware_position - last_position)
+            if observed_step in {1, 2}:
+                position_step = observed_step
+                detected_cadence = _detect_source_cadence(current_run_length, position_step)
+                estimated_run_length = detected_cadence * position_step
+            run_index = 0
+            current_run_length = 1
+        else:
+            direction = 1 if last_direction >= 0 else -1
+            run_index = current_run_length
+            current_run_length += 1
+        phase_step = float(position_step) / float(estimated_run_length)
+        max_phase = float(position_step) - phase_step
+        phase = min(max_phase, float(run_index) * phase_step)
+        if direction < 0:
+            phase = max_phase - phase
+        frame_number = hardware_position + phase
+        phase_tracker["last_hardware_position"] = hardware_position
+        phase_tracker["last_direction"] = direction
+        phase_tracker["current_run_length"] = current_run_length
+        phase_tracker["estimated_run_length"] = estimated_run_length
+        phase_tracker["position_step"] = position_step
+        phase_tracker["detected_cadence"] = _detect_source_cadence(estimated_run_length, position_step)
+        if source_seq is not None:
+            phase_tracker["last_source_seq"] = source_seq
+        phase_tracker["cached_frame_number"] = frame_number
+        return frame_number
     if field_mark or phase_multiplier <= 1:
         frame_number = _timecode_to_internal_frame_number(calculation_timecode, count_fps, field_mark)
         if isinstance(phase_tracker, dict):
@@ -702,12 +778,6 @@ def _timecode_position_from_info(
                 phase_tracker["last_source_seq"] = source_seq
                 phase_tracker["cached_frame_number"] = frame_number
         return frame_number
-
-    base_frame = _timecode_to_frame_number(calculation_timecode, count_fps)
-    if base_frame is None:
-        if isinstance(phase_tracker, dict):
-            phase_tracker.clear()
-        return None
 
     if isinstance(phase_tracker, dict) and source_seq is not None and phase_tracker.get("last_source_seq") == source_seq:
         cached = phase_tracker.get("cached_frame_number")
@@ -718,31 +788,39 @@ def _timecode_position_from_info(
         phase_tracker = {}
 
     last_base = phase_tracker.get("last_base_frame")
-    last_phase = int(phase_tracker.get("last_phase_index", 0))
     last_direction = int(phase_tracker.get("last_direction", 1))
     last_multiplier = int(phase_tracker.get("last_phase_multiplier", phase_multiplier))
+    current_run_length = max(1, int(phase_tracker.get("current_run_length", 1)))
+    estimated_run_length = max(1, int(phase_tracker.get("estimated_run_length", phase_multiplier)))
 
     if not isinstance(last_base, int) or last_multiplier != phase_multiplier:
         direction = 1
-        phase_index = 0
-    elif base_frame > last_base:
-        direction = 1
-        phase_index = 0
-    elif base_frame < last_base:
-        direction = -1
-        phase_index = phase_multiplier - 1
+        run_index = 0
+        current_run_length = 1
+        estimated_run_length = phase_multiplier
+    elif base_frame != last_base:
+        direction = 1 if base_frame > last_base else -1
+        if abs(base_frame - last_base) == 1:
+            estimated_run_length = current_run_length
+        run_index = 0
+        current_run_length = 1
     else:
         direction = 1 if last_direction >= 0 else -1
-        if direction >= 0:
-            phase_index = min(phase_multiplier - 1, last_phase + 1)
-        else:
-            phase_index = max(0, last_phase - 1)
+        run_index = current_run_length
+        current_run_length += 1
 
-    frame_number = (base_frame * phase_multiplier) + phase_index
+    phase_step = float(phase_multiplier) / float(estimated_run_length)
+    max_phase = float(phase_multiplier) - phase_step
+    phase = min(max_phase, float(run_index) * phase_step)
+    if direction < 0:
+        phase = max_phase - phase
+
+    frame_number = (base_frame * phase_multiplier) + phase
     phase_tracker["last_base_frame"] = base_frame
-    phase_tracker["last_phase_index"] = phase_index
     phase_tracker["last_direction"] = direction
     phase_tracker["last_phase_multiplier"] = phase_multiplier
+    phase_tracker["current_run_length"] = current_run_length
+    phase_tracker["estimated_run_length"] = estimated_run_length
     if source_seq is not None:
         phase_tracker["last_source_seq"] = source_seq
     phase_tracker["cached_frame_number"] = frame_number
@@ -3989,6 +4067,7 @@ class MainWindow(QMainWindow):
         self._roi_keyframe_slots = (1, 2, 3, 4)
         self._roi_key_save_armed = False
         self._timecode_keyframing_enabled = False
+        self._timecode_playback_enabled = True
         self._timecode_roi_keyframes: dict[int, TimecodeRoiKeyframe] = {}
         self._timecode_adjustment_anchor: TimecodeRoiKeyframe | None = None
         self._timecode_adjustment_paused = False
@@ -4003,7 +4082,7 @@ class MainWindow(QMainWindow):
         self._timecode_roi_segment_starts: list[int] = []
         self._timecode_roi_segments: list[tuple[int, int, np.ndarray]] = []
         self._timecode_selected_frame: int | None = None
-        self._timecode_last_applied_frame: int | None = None
+        self._timecode_last_applied_frame: float | None = None
         self._timecode_phase_tracker: dict[str, object] = {}
         self._decklink_timecode_info_sequence = 0
         self._decklink_timecode_info: dict[str, object] = {}
@@ -4163,6 +4242,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_timecode_delete_all_buttons: dict[str, QPushButton] = {}
         self._fullscreen_timecode_previous_buttons: dict[str, QPushButton] = {}
         self._fullscreen_timecode_next_buttons: dict[str, QPushButton] = {}
+        self._fullscreen_timecode_playback_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
         self._fullscreen_roi_transition_labels: dict[str, QLabel] = {}
@@ -4504,6 +4584,7 @@ class MainWindow(QMainWindow):
                 "frame_number": int(keyframe.frame_number),
                 "roi": [keyframe.roi.x, keyframe.roi.y, keyframe.roi.w, keyframe.roi.h],
                 "interpolation_mode": keyframe.interpolation_mode,
+                "timecode_format": keyframe.timecode_format,
                 "drop_frame": bool(keyframe.drop_frame),
                 "field_mark": bool(keyframe.field_mark),
             }
@@ -4530,6 +4611,7 @@ class MainWindow(QMainWindow):
             "roi_keyframe_duration_override": bool(self.roi_keyframe_duration_override_btn.isChecked()),
             "roi_keyframes": keyframe_payload,
             "roi_keyframing_mode": "timecode" if self._timecode_keyframing_enabled else "manual",
+            "roi_timecode_playback_enabled": bool(self._timecode_playback_enabled),
             "roi_timecode_keyframes": timecode_keyframe_payload,
             "basic_scaling_mode": str(self.sr_mode_combo.currentText()),
             "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
@@ -4815,6 +4897,7 @@ class MainWindow(QMainWindow):
 
         self._restore_roi_keyframes(raw.get("roi_keyframes"))
         self._restore_timecode_roi_keyframes(raw.get("roi_timecode_keyframes"))
+        self._timecode_playback_enabled = bool(raw.get("roi_timecode_playback_enabled", True))
         self._set_roi_keyframing_mode(str(raw.get("roi_keyframing_mode", "manual")) == "timecode", save=False)
         self._update_roi_key_buttons()
 
@@ -5420,7 +5503,7 @@ class MainWindow(QMainWindow):
             self.decklink_timecode_format_combo.addItem(label, format_code)
         self.decklink_timecode_format_combo.setCurrentText("RP188 VITC1")
         self.decklink_timecode_format_combo.currentIndexChanged.connect(self._on_blackmagic_combo_changed)
-        decklink_form.addRow("Input timecode type", self.decklink_timecode_format_combo)
+        decklink_form.addRow("Fallback timecode type", self.decklink_timecode_format_combo)
 
         self.decklink_timecode_phase_combo = QComboBox()
         for label, mode_name in _timecode_phase_synthesis_options():
@@ -5677,6 +5760,12 @@ class MainWindow(QMainWindow):
         self.roi_manual_mode_btn.clicked.connect(lambda: self._set_roi_keyframing_mode(False))
         timecode_keyframe_layout.addWidget(self.roi_manual_mode_btn)
 
+        self.roi_timecode_playback_btn = QPushButton()
+        self.roi_timecode_playback_btn.setCheckable(True)
+        self.roi_timecode_playback_btn.toggled.connect(self._on_timecode_playback_toggled)
+        timecode_keyframe_layout.addWidget(self.roi_timecode_playback_btn)
+        self._update_timecode_playback_mode_control()
+
         timecode_edit_row = QWidget()
         timecode_edit_layout = QHBoxLayout(timecode_edit_row)
         timecode_edit_layout.setContentsMargins(0, 0, 0, 0)
@@ -5840,6 +5929,12 @@ class MainWindow(QMainWindow):
         next_btn.clicked.connect(lambda: self._navigate_timecode_keyframe(1))
         timecode_layout.addWidget(next_btn)
 
+        playback_btn = QPushButton()
+        playback_btn.setCheckable(True)
+        playback_btn.setMinimumHeight(120)
+        playback_btn.toggled.connect(self._on_timecode_playback_toggled)
+        timecode_layout.addWidget(playback_btn)
+
         toolbar_layout.addWidget(manual_row)
         toolbar_layout.addWidget(timecode_row)
 
@@ -5850,9 +5945,11 @@ class MainWindow(QMainWindow):
         self._fullscreen_timecode_delete_all_buttons[view_name] = delete_all_btn
         self._fullscreen_timecode_previous_buttons[view_name] = previous_btn
         self._fullscreen_timecode_next_buttons[view_name] = next_btn
+        self._fullscreen_timecode_playback_buttons[view_name] = playback_btn
         self._fullscreen_roi_save_key_buttons[view_name] = save_btn
         self._fullscreen_roi_key_slot_buttons[view_name] = (key1_btn, key2_btn, key3_btn, key4_btn)
         timecode_row.setVisible(False)
+        self._update_timecode_playback_mode_control()
         toolbar.setVisible(False)
         return toolbar
 
@@ -8780,6 +8877,7 @@ class MainWindow(QMainWindow):
         if self.sender() is self.decklink_timecode_phase_combo:
             self._timecode_last_applied_frame = None
             self._timecode_phase_tracker.clear()
+            self._sync_worker_timecode_roi_keyframes()
         self._apply_mode_aware_deinterlace_default_if_needed()
         self._sync_roi_transition_unit_labels()
         self._sync_blackmagic_controls_enabled_state()
@@ -8953,23 +9051,26 @@ class MainWindow(QMainWindow):
 
         backend_text = "worker process" if self._controller_backend == "worker-process" else "GUI process"
         timecode_format_name = self.decklink_timecode_format_combo.currentText()
+        hfrtc_supported = getattr(self, "_decklink_hfrtc_support_by_index", {}).get(int(in_device))
+        hfrtc_text = "unknown" if hfrtc_supported is None else ("supported" if hfrtc_supported else "unsupported")
         self.decklink_status_label.setText(
             "DeckLink configured: "
             f"in={input_name} mode='{in_mode_name}' ({in_mode}); "
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
-            f"fps={fps_text}; timecode={timecode_format_name}; backend={backend_text}"
+            f"fps={fps_text}; timecode={timecode_format_name}; HFRTC={hfrtc_text}; backend={backend_text}"
         )
         self._set_decklink_timecode_display(None, placeholder="Timecode: waiting for DeckLink frames...")
         self._decklink_sessions_running = True
         self._sync_roi_transition_unit_labels()
         LOGGER.info(
-            "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s timecode=%s",
+            "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s timecode=%s HFRTC=%s",
             input_name,
             in_mode_name,
             output_name,
             out_mode_name,
             fps_text,
             timecode_format_name,
+            hfrtc_text,
         )
 
     def _resolve_mode_fps(self, device_index: int, mode_value: object, input_side: bool) -> float | None:
@@ -9016,6 +9117,10 @@ class MainWindow(QMainWindow):
             return
 
         LOGGER.info("DeckLink refresh: detected %d device(s)", len(devices))
+        self._decklink_hfrtc_support_by_index = {
+            int(dev.index): bool(getattr(dev, "supports_high_frame_rate_timecode", False))
+            for dev in devices
+        }
 
         self.decklink_input_device_combo.blockSignals(True)
         self.decklink_output_device_combo.blockSignals(True)
@@ -9375,7 +9480,10 @@ class MainWindow(QMainWindow):
                 try:
                     raw_timecode = str(item.get("timecode", ""))
                     timecode = _normalize_timecode_display(raw_timecode)
-                    count_fps = self._timecode_nominal_fps()
+                    timecode_format = str(item.get("timecode_format", "")).strip()
+                    if not timecode_format:
+                        timecode_format = self.decklink_timecode_format_combo.currentText()
+                    count_fps = _timecode_count_fps(timecode_format, self._timecode_output_fps_for_tracking())
                     if "drop_frame" in item:
                         drop_frame = bool(item.get("drop_frame"))
                     elif ";" in raw_timecode:
@@ -9404,6 +9512,7 @@ class MainWindow(QMainWindow):
                         frame_number=frame_number,
                         roi=clamp_roi(Roi(*(int(value) for value in roi_values))),
                         interpolation_mode=interpolation_mode,
+                        timecode_format=timecode_format,
                         drop_frame=drop_frame,
                         field_mark=field_mark,
                     )
@@ -9440,13 +9549,49 @@ class MainWindow(QMainWindow):
         self.roi_transition_frames_spin.setVisible(not self._timecode_keyframing_enabled)
         self.roi_keyframe_duration_override_btn.setVisible(not self._timecode_keyframing_enabled)
         self._sync_fullscreen_keyframing_mode()
+        self._update_timecode_playback_mode_control()
         self._sync_worker_timecode_roi_keyframes()
         self._timecode_last_applied_frame = None
         self._update_timecode_keyframe_display()
-        if self._timecode_keyframing_enabled:
+        if self._timecode_keyframing_enabled and self._timecode_playback_enabled:
             self._apply_timecode_roi_for_current_timecode()
         if save:
             self._schedule_settings_save()
+
+    def _update_timecode_playback_mode_control(self) -> None:
+        playback_active = bool(self._timecode_playback_enabled and not self._timecode_adjustment_paused)
+        buttons = []
+        if hasattr(self, "roi_timecode_playback_btn"):
+            buttons.append(self.roi_timecode_playback_btn)
+        buttons.extend(getattr(self, "_fullscreen_timecode_playback_buttons", {}).values())
+        for button in buttons:
+            was_blocked = button.blockSignals(True)
+            button.setChecked(playback_active)
+            button.setText("Playback Mode" if playback_active else "Edit Mode")
+            button.setToolTip(
+                "Timecode drives the keyframed ROI" if playback_active
+                else "Timecode playback is disabled; stored keyframes can be selected and edited"
+            )
+            button.blockSignals(was_blocked)
+
+    def _on_timecode_playback_toggled(self, enabled: bool) -> None:
+        if not self._timecode_keyframing_enabled:
+            return
+        self._timecode_resume_timer.stop()
+        self._timecode_resume_status = ""
+        self._timecode_adjustment_finish_pending = False
+        self._timecode_adjustment_paused = False
+        self._timecode_playback_enabled = bool(enabled)
+        self._update_timecode_playback_mode_control()
+        self._sync_worker_timecode_roi_keyframes()
+        self._timecode_last_applied_frame = None
+        if self._timecode_playback_enabled:
+            self._apply_timecode_roi_for_current_timecode()
+            self._update_status("Timecode ROI playback enabled")
+        else:
+            self._input_canvas.clear_visual_roi_overlay()
+            self._update_status("Timecode ROI playback disabled; Edit Mode enabled")
+        self._schedule_settings_save()
 
     def _timecode_nominal_fps(self) -> int:
         video_fps = 0.0
@@ -9464,9 +9609,11 @@ class MainWindow(QMainWindow):
         reindexed: dict[int, TimecodeRoiKeyframe] = {}
         for keyframe in self._timecode_roi_keyframes.values():
             calculation_timecode = _timecode_with_drop_frame_separator(keyframe.timecode, keyframe.drop_frame)
+            timecode_format = keyframe.timecode_format or self.decklink_timecode_format_combo.currentText()
+            count_fps = _timecode_count_fps(timecode_format, self._timecode_output_fps_for_tracking())
             frame_number = _timecode_to_internal_frame_number(
                 calculation_timecode,
-                self._timecode_nominal_fps(),
+                count_fps,
                 keyframe.field_mark,
             )
             if frame_number is None:
@@ -9476,6 +9623,7 @@ class MainWindow(QMainWindow):
                 frame_number=frame_number,
                 roi=keyframe.roi,
                 interpolation_mode=keyframe.interpolation_mode,
+                timecode_format=timecode_format,
                 drop_frame=keyframe.drop_frame,
                 field_mark=keyframe.field_mark,
             )
@@ -9485,14 +9633,17 @@ class MainWindow(QMainWindow):
         self._rebuild_timecode_roi_lookup()
         self._update_timecode_keyframe_display()
 
-    def _current_timecode_position(self) -> tuple[str, int] | None:
+    def _current_timecode_position(self) -> tuple[str, float] | None:
         if not bool(self._decklink_timecode_info.get("present", False)):
             self._timecode_phase_tracker.clear()
             return None
         timecode = str(self._decklink_timecode_info.get("text", "")).strip()
+        detected_format = str(self._decklink_timecode_info.get("format_name", "")).strip()
+        if not detected_format:
+            detected_format = self.decklink_timecode_format_combo.currentText()
         frame_number = _timecode_position_from_info(
             self._decklink_timecode_info,
-            self.decklink_timecode_format_combo.currentText(),
+            detected_format,
             self._timecode_output_fps_for_tracking(),
             str(self.decklink_timecode_phase_combo.currentData()),
             phase_tracker=self._timecode_phase_tracker,
@@ -9552,10 +9703,14 @@ class MainWindow(QMainWindow):
                     "interpolation_mode": str(keyframe.interpolation_mode),
                 }
             )
-        enabled = self._timecode_keyframing_enabled and not self._timecode_adjustment_paused
+        enabled = (
+            self._timecode_keyframing_enabled
+            and self._timecode_playback_enabled
+            and not self._timecode_adjustment_paused
+        )
         controller.set_timecode_roi_keyframes(enabled, keyframes, str(self.decklink_timecode_phase_combo.currentData()))
 
-    def _timecode_roi_values_at_frame(self, frame_number: int) -> np.ndarray | None:
+    def _timecode_roi_values_at_frame(self, frame_number: float) -> np.ndarray | None:
         ordered_frames = self._timecode_roi_ordered_frames
         if not ordered_frames:
             return None
@@ -9571,7 +9726,11 @@ class MainWindow(QMainWindow):
         start_frame, end_frame, values = self._timecode_roi_segments[segment_index]
         if frame_number > end_frame:
             return None
-        return values[frame_number - start_frame]
+        relative_frame = max(0.0, float(frame_number) - float(start_frame))
+        lower_index = min(len(values) - 1, int(math.floor(relative_frame)))
+        upper_index = min(len(values) - 1, lower_index + 1)
+        fraction = relative_frame - float(lower_index)
+        return values[lower_index] + ((values[upper_index] - values[lower_index]) * fraction)
 
     def _timecode_roi_at_frame(self, frame_number: int) -> Roi | None:
         sample = self._timecode_roi_values_at_frame(frame_number)
@@ -9622,14 +9781,17 @@ class MainWindow(QMainWindow):
             self._update_status("Cannot add keyframe: no valid DeckLink timecode is available")
             return
         timecode, frame_number = position
+        frame_number = int(round(frame_number))
         drop_frame = bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode))
         field_mark = bool(self._decklink_timecode_info.get("field_mark", False))
+        timecode_format = str(self._decklink_timecode_info.get("format_name", "")).strip()
         timecode = _normalize_timecode_display(timecode)
         self._timecode_roi_keyframes[frame_number] = TimecodeRoiKeyframe(
             timecode=timecode,
             frame_number=frame_number,
             roi=clamp_roi(self._roi),
             interpolation_mode=self._roi_interp_mode_name(),
+            timecode_format=timecode_format,
             drop_frame=drop_frame,
             field_mark=field_mark,
         )
@@ -9670,6 +9832,8 @@ class MainWindow(QMainWindow):
             target_index = max(0, min(len(ordered_frames) - 1, current_index + (1 if direction > 0 else -1)))
         else:
             target_index = 0 if direction > 0 else len(ordered_frames) - 1
+        if self._timecode_playback_enabled:
+            self._on_timecode_playback_toggled(False)
         self._load_timecode_keyframe(ordered_frames[target_index])
 
     def _load_timecode_keyframe(self, frame_number: int) -> None:
@@ -9713,7 +9877,11 @@ class MainWindow(QMainWindow):
             button.setEnabled(total > 0)
 
     def _apply_timecode_roi_for_current_timecode(self) -> None:
-        if not self._timecode_keyframing_enabled or self._timecode_adjustment_paused:
+        if (
+            not self._timecode_keyframing_enabled
+            or not self._timecode_playback_enabled
+            or self._timecode_adjustment_paused
+        ):
             return
         position = self._current_timecode_position()
         if position is None:
@@ -9751,6 +9919,7 @@ class MainWindow(QMainWindow):
         self._input_canvas.clear_visual_roi_overlay()
         was_paused = self._timecode_adjustment_paused
         self._timecode_adjustment_paused = True
+        self._update_timecode_playback_mode_control()
         if not was_paused:
             self._sync_worker_timecode_roi_keyframes()
 
@@ -9761,11 +9930,13 @@ class MainWindow(QMainWindow):
         anchor = self._timecode_adjustment_anchor
         if position is not None and anchor is not None:
             timecode, frame_number = position
+            frame_number = int(round(frame_number))
             self._timecode_adjustment_anchor = TimecodeRoiKeyframe(
                 timecode=_normalize_timecode_display(timecode),
                 frame_number=frame_number,
                 roi=anchor.roi,
                 interpolation_mode=anchor.interpolation_mode,
+                timecode_format=str(self._decklink_timecode_info.get("format_name", "")).strip(),
                 drop_frame=bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode)),
                 field_mark=bool(self._decklink_timecode_info.get("field_mark", False)),
             )
@@ -9774,6 +9945,7 @@ class MainWindow(QMainWindow):
         else:
             self._timecode_last_applied_frame = None
         self._timecode_adjustment_paused = False
+        self._update_timecode_playback_mode_control()
         self._sync_worker_timecode_roi_keyframes()
         if self._timecode_resume_status:
             self._update_status(self._timecode_resume_status)
@@ -9808,18 +9980,45 @@ class MainWindow(QMainWindow):
         self._manual_drag_interp_end_overlay = None
         self._manual_drag_last_event_ts = 0.0
         self._apply_controller_roi_immediate(self._roi, settle_interlaced=True)
+        if not self._timecode_playback_enabled:
+            selected_key = self._timecode_roi_keyframes.get(self._timecode_selected_frame)
+            if selected_key is not None:
+                self._timecode_roi_keyframes[selected_key.frame_number] = TimecodeRoiKeyframe(
+                    timecode=selected_key.timecode,
+                    frame_number=selected_key.frame_number,
+                    roi=clamp_roi(self._roi),
+                    interpolation_mode=self._roi_interp_mode_name(),
+                    timecode_format=selected_key.timecode_format,
+                    drop_frame=selected_key.drop_frame,
+                    field_mark=selected_key.field_mark,
+                )
+                self._timecode_adjustment_anchor = None
+                self._timecode_adjustment_paused = False
+                self._rebuild_timecode_roi_lookup()
+                self._update_timecode_playback_mode_control()
+                self._update_timecode_keyframe_display()
+                self._schedule_settings_save()
+                self._update_status(f"Updated timecode ROI keyframe at {selected_key.timecode}")
+                return
+            self._timecode_adjustment_paused = False
+            self._update_timecode_playback_mode_control()
+            self._sync_worker_timecode_roi_keyframes()
+            self._update_status("ROI adjusted in Edit Mode; select or add a keyframe to store it")
+            return
         position = self._current_timecode_position()
         if position is None:
             self._timecode_resume_status = "ROI adjusted; interpolation will resume when valid timecode is available"
             self._timecode_resume_timer.start(self._timecode_resume_debounce_ms)
             return
         timecode, frame_number = position
+        frame_number = int(round(frame_number))
         anchor_roi = clamp_roi(self._roi)
         self._timecode_adjustment_anchor = TimecodeRoiKeyframe(
             timecode=_normalize_timecode_display(timecode),
             frame_number=frame_number,
             roi=anchor_roi,
             interpolation_mode=self._roi_interp_mode_name(),
+            timecode_format=str(self._decklink_timecode_info.get("format_name", "")).strip(),
             drop_frame=bool(self._decklink_timecode_info.get("drop_frame", ";" in timecode)),
             field_mark=bool(self._decklink_timecode_info.get("field_mark", False)),
         )
@@ -9973,10 +10172,27 @@ class MainWindow(QMainWindow):
         if isinstance(info, dict) and bool(info.get("present", False)):
             timecode_text = str(info.get("text", "")).strip()
             format_name = str(info.get("format_name", "")).strip()
+            if format_name in {"RP188 LTC", "RP188 VITC1", "RP188 VITC2"}:
+                format_name = "RP188 auto"
+            try:
+                detected_cadence = max(
+                    1,
+                    int(info.get("detected_cadence", self._timecode_phase_tracker.get("detected_cadence", 1))),
+                )
+            except (TypeError, ValueError):
+                detected_cadence = 1
+            if detected_cadence > 1:
+                format_name += f", {detected_cadence}x"
             if timecode_text:
                 display_text = f"Timecode: {timecode_text}"
                 if format_name:
                     display_text += f" ({format_name})"
+                internal_position = info.get("internal_position")
+                if isinstance(internal_position, (int, float)) and self._timecode_roi_ordered_frames:
+                    if float(internal_position) < float(self._timecode_roi_ordered_frames[0]):
+                        display_text += " [before first ROI key]"
+                    elif float(internal_position) > float(self._timecode_roi_ordered_frames[-1]):
+                        display_text += " [after last ROI key]"
 
         self._decklink_timecode_display_text = display_text
         if hasattr(self, "decklink_timecode_label"):

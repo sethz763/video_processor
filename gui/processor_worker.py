@@ -20,6 +20,14 @@ from typing import Any
 import numpy as np
 
 
+_SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
+
+
+def _detect_source_cadence(run_length: int, position_step: int = 1) -> int:
+    observed = max(1.0, float(run_length) / float(max(1, position_step)))
+    return min(_SUPPORTED_SOURCE_CADENCES, key=lambda cadence: (abs(cadence - observed), cadence))
+
+
 def _normalize_timecode_phase_synthesis_mode(mode_name: str) -> str:
     normalized = str(mode_name).strip().lower().replace("-", "_").replace(" ", "_")
     if normalized in {"source_cadence", "cadence", "source", "fallback", "synthesized", "synthesize"}:
@@ -44,7 +52,7 @@ def _timecode_to_internal_position(
     video_fps: float,
     phase_mode: str,
     phase_tracker: dict[str, object] | None = None,
-) -> int | None:
+) -> float | None:
     if not bool(info.get("present", False)):
         if isinstance(phase_tracker, dict):
             phase_tracker.clear()
@@ -73,6 +81,49 @@ def _timecode_to_internal_position(
         base_frame -= drop_count * (total_minutes - (total_minutes // 10))
     field_mark = bool(info.get("field_mark", False))
     phase_multiplier = _timecode_phase_multiplier(video_fps, count_fps, phase_mode)
+    format_name = str(info.get("format_name", "")).strip()
+    if count_fps == 30 and format_name in {"RP188 VITC1", "RP188 VITC2"}:
+        hardware_position = (base_frame * 2) + (1 if field_mark else 0)
+        if _normalize_timecode_phase_synthesis_mode(phase_mode) != "source_cadence":
+            if isinstance(phase_tracker, dict):
+                phase_tracker.clear()
+            return hardware_position
+        if not isinstance(phase_tracker, dict):
+            phase_tracker = {}
+        last_position = phase_tracker.get("last_hardware_position")
+        last_direction = int(phase_tracker.get("last_direction", 1))
+        current_run_length = max(1, int(phase_tracker.get("current_run_length", 1)))
+        estimated_run_length = max(1, int(phase_tracker.get("estimated_run_length", 1)))
+        position_step = max(1, int(phase_tracker.get("position_step", 1)))
+        if not isinstance(last_position, int):
+            direction = 1
+            run_index = 0
+            current_run_length = 1
+        elif hardware_position != last_position:
+            direction = 1 if hardware_position > last_position else -1
+            observed_step = abs(hardware_position - last_position)
+            if observed_step in {1, 2}:
+                position_step = observed_step
+                detected_cadence = _detect_source_cadence(current_run_length, position_step)
+                estimated_run_length = detected_cadence * position_step
+            run_index = 0
+            current_run_length = 1
+        else:
+            direction = 1 if last_direction >= 0 else -1
+            run_index = current_run_length
+            current_run_length += 1
+        phase_step = float(position_step) / float(estimated_run_length)
+        max_phase = float(position_step) - phase_step
+        phase = min(max_phase, float(run_index) * phase_step)
+        if direction < 0:
+            phase = max_phase - phase
+        phase_tracker["last_hardware_position"] = hardware_position
+        phase_tracker["last_direction"] = direction
+        phase_tracker["current_run_length"] = current_run_length
+        phase_tracker["estimated_run_length"] = estimated_run_length
+        phase_tracker["position_step"] = position_step
+        phase_tracker["detected_cadence"] = _detect_source_cadence(estimated_run_length, position_step)
+        return hardware_position + phase
     if field_mark:
         if isinstance(phase_tracker, dict):
             phase_tracker.clear()
@@ -85,31 +136,39 @@ def _timecode_to_internal_position(
         if not isinstance(phase_tracker, dict):
             phase_tracker = {}
         last_base = phase_tracker.get("last_base_frame")
-        last_phase = int(phase_tracker.get("last_phase_index", 0))
         last_direction = int(phase_tracker.get("last_direction", 1))
         last_multiplier = int(phase_tracker.get("last_phase_multiplier", phase_multiplier))
+        current_run_length = max(1, int(phase_tracker.get("current_run_length", 1)))
+        estimated_run_length = max(1, int(phase_tracker.get("estimated_run_length", phase_multiplier)))
 
         if not isinstance(last_base, int) or last_multiplier != phase_multiplier:
             direction = 1
-            phase_index = 0
-        elif base_frame > last_base:
-            direction = 1
-            phase_index = 0
-        elif base_frame < last_base:
-            direction = -1
-            phase_index = phase_multiplier - 1
+            run_index = 0
+            current_run_length = 1
+            estimated_run_length = phase_multiplier
+        elif base_frame != last_base:
+            direction = 1 if base_frame > last_base else -1
+            if abs(base_frame - last_base) == 1:
+                estimated_run_length = current_run_length
+            run_index = 0
+            current_run_length = 1
         else:
             direction = 1 if last_direction >= 0 else -1
-            if direction >= 0:
-                phase_index = min(phase_multiplier - 1, last_phase + 1)
-            else:
-                phase_index = max(0, last_phase - 1)
+            run_index = current_run_length
+            current_run_length += 1
+
+        phase_step = float(phase_multiplier) / float(estimated_run_length)
+        max_phase = float(phase_multiplier) - phase_step
+        phase = min(max_phase, float(run_index) * phase_step)
+        if direction < 0:
+            phase = max_phase - phase
 
         phase_tracker["last_base_frame"] = base_frame
-        phase_tracker["last_phase_index"] = phase_index
         phase_tracker["last_direction"] = direction
         phase_tracker["last_phase_multiplier"] = phase_multiplier
-        return (base_frame * phase_multiplier) + phase_index
+        phase_tracker["current_run_length"] = current_run_length
+        phase_tracker["estimated_run_length"] = estimated_run_length
+        return (base_frame * phase_multiplier) + phase
     if count_fps == 30:
         if isinstance(phase_tracker, dict):
             phase_tracker.clear()
@@ -124,7 +183,7 @@ def _timecode_to_internal_position(
 
 
 def _timecode_roi_sample(
-    frame_number: int,
+    frame_number: float,
     keyframes: list[dict[str, object]],
     ordered_frames: list[int],
 ) -> tuple[float, float, float, float] | None:
@@ -587,6 +646,11 @@ def _extract_frame_timecode_info(frame: object) -> dict[str, object]:
         "format_name": "",
         "bcd": 0,
         "flags": 0,
+        "hours": 0,
+        "minutes": 0,
+        "seconds": 0,
+        "frames": 0,
+        "subframe": 0,
         "field_mark": False,
         "drop_frame": False,
     }
@@ -617,6 +681,11 @@ def _extract_frame_timecode_info(frame: object) -> dict[str, object]:
         payload["format_name"] = _decklink_timecode_format_name(format_code)
         payload["bcd"] = int(getattr(frame, "timecode_bcd", 0))
         payload["flags"] = int(getattr(frame, "timecode_flags", 0))
+        payload["hours"] = int(getattr(frame, "timecode_hours", 0))
+        payload["minutes"] = int(getattr(frame, "timecode_minutes", 0))
+        payload["seconds"] = int(getattr(frame, "timecode_seconds", 0))
+        payload["frames"] = int(getattr(frame, "timecode_frames", 0))
+        payload["subframe"] = int(getattr(frame, "timecode_subframe", 0))
         payload["field_mark"] = bool(getattr(frame, "timecode_field_mark", False))
         payload["drop_frame"] = bool(getattr(frame, "timecode_drop_frame", ";" in timecode_text))
         return payload
@@ -2936,11 +3005,11 @@ def run_processor_worker(
         field1_y = float(phase.get("field1_y", 0.0))
 
         _apply_processor_roi_for_phase(roi0)
-        out0, p0, b0, a0, r0, n0 = _process_pipeline_frame(input_bytes, field0_x, field0_y)
+        out0, p0, b0, a0, r0, n0 = _process_pipeline_frame(input_bytes, field0_x, field0_y, roi0)
         out0_frozen = bytes(out0)
 
         _apply_processor_roi_for_phase(roi1)
-        out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(input_bytes, field1_x, field1_y)
+        out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(input_bytes, field1_x, field1_y, roi1)
         out1_frozen = bytes(out1)
 
         return (
@@ -2987,11 +3056,11 @@ def run_processor_worker(
         field1_y = float(phase.get("field1_y", 0.0))
 
         _apply_processor_roi_for_phase(roi0)
-        out0, p0, b0, a0, r0, n0 = _process_pipeline_frame(field0_input, field0_x, field0_y)
+        out0, p0, b0, a0, r0, n0 = _process_pipeline_frame(field0_input, field0_x, field0_y, roi0)
         out0_frozen = bytes(out0)
 
         _apply_processor_roi_for_phase(roi1)
-        out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(field1_input, field1_x, field1_y)
+        out1, p1, b1, a1, r1, n1 = _process_pipeline_frame(field1_input, field1_x, field1_y, roi1)
         out1_frozen = bytes(out1)
 
         return (
@@ -3933,13 +4002,17 @@ def run_processor_worker(
             basic_scaling_avg_frame_ms = (0.92 * float(basic_scaling_avg_frame_ms)) + (0.08 * sample_ms)
         basic_scaling_max_frame_ms = max(float(basic_scaling_max_frame_ms), sample_ms)
 
-    def _apply_rtx_stage(frame_bytes: bytes) -> tuple[bytes, bool]:
+    def _apply_rtx_stage(
+        frame_bytes: bytes,
+        roi: tuple[int, int, int, int] | None = None,
+    ) -> tuple[bytes, bool]:
         if not (rtx_vsr_enabled and rtx_vsr_engine is not None):
             return frame_bytes, False
         try:
+            active_roi = roi or (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
             rtx_out = _apply_rtx_vsr(
                 frame_bytes,
-                (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
+                active_roi,
             )
             if _looks_zeroed_uyvy_frame(rtx_out):
                 return frame_bytes, False
@@ -3967,7 +4040,12 @@ def run_processor_worker(
             stack.append("basic_scaling")
         return stack
 
-    def _process_pipeline_frame(frame_bytes: bytes, shift_x: float, shift_y: float) -> tuple[bytes, bool, bool, bool, bool, bool]:
+    def _process_pipeline_frame(
+        frame_bytes: bytes,
+        shift_x: float,
+        shift_y: float,
+        roi: tuple[int, int, int, int] | None = None,
+    ) -> tuple[bytes, bool, bool, bool, bool, bool]:
         # Canonical plugin chain:
         # preprocess (deinterlace/denoise) -> AI SR -> RTX VSR -> basic scaling.
         stage_stack = _build_stage_stack()
@@ -3980,6 +4058,7 @@ def run_processor_worker(
         rtx_applied = False
         basic_applied = False
         native_shift_applied = False
+        active_roi = roi or (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
 
         for stage_name in stage_stack:
             if stage_name == "preprocess":
@@ -3989,7 +4068,7 @@ def run_processor_worker(
             if stage_name == "ai_sr":
                 ai_out, ai_applied = _apply_ai_sr(
                     working,
-                    (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
+                    active_roi,
                     current_basic_scaling_method,
                 )
                 if _looks_zeroed_uyvy_frame(ai_out):
@@ -3999,7 +4078,7 @@ def run_processor_worker(
                 continue
 
             if stage_name == "rtx_vsr":
-                working, rtx_applied = _apply_rtx_stage(working)
+                working, rtx_applied = _apply_rtx_stage(working, active_roi)
                 continue
 
             if stage_name == "basic_scaling":
@@ -4236,8 +4315,6 @@ def run_processor_worker(
 
         def _apply_timecode_roi_for_capture(frame_timecode_info: dict[str, object]) -> None:
             nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition
-            if not timecode_roi_enabled or not timecode_roi_ordered_frames:
-                return
             frame_number = _timecode_to_internal_position(
                 frame_timecode_info,
                 output_nominal_fps,
@@ -4245,6 +4322,10 @@ def run_processor_worker(
                 phase_tracker=timecode_phase_tracker,
             )
             if frame_number is None:
+                return
+            frame_timecode_info["internal_position"] = float(frame_number)
+            frame_timecode_info["detected_cadence"] = int(timecode_phase_tracker.get("detected_cadence", 1))
+            if not timecode_roi_enabled or not timecode_roi_ordered_frames:
                 return
             sample = _timecode_roi_sample(
                 frame_number,
@@ -4255,6 +4336,12 @@ def run_processor_worker(
                 return
 
             desired_x, desired_y, desired_w, desired_h = sample
+            frame_timecode_info["desired_roi"] = [
+                float(desired_x),
+                float(desired_y),
+                float(desired_w),
+                float(desired_h),
+            ]
             next_x, next_y, next_w, next_h = _normalize_worker_roi(
                 int(round(desired_x / 2.0)) * 2,
                 int(round(desired_y)),
@@ -4270,16 +4357,20 @@ def run_processor_worker(
                 or next_h != current_roi_h
             )
             current_roi_x, current_roi_y, current_roi_w, current_roi_h = next_x, next_y, next_w, next_h
+            apply_to_shared_processor = _is_live_passthrough_mode() or (
+                _is_live_basic_scaling_fast_mode() and parallel_basic_worker_count <= 1
+            )
             if roi_changed:
-                if current_roi_w == previous_w and current_roi_h == previous_h:
-                    processor.set_roi_position(current_roi_x, current_roi_y)
-                else:
-                    processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
-                    if rtx_vsr_enabled:
-                        if rtx_vsr_engine is None:
-                            _ = _refresh_rtx_vsr_engine()
-                        elif current_roi_w != previous_w or current_roi_h != previous_h:
-                            _schedule_rtx_roi_rebuild()
+                if apply_to_shared_processor:
+                    if current_roi_w == previous_w and current_roi_h == previous_h:
+                        processor.set_roi_position(current_roi_x, current_roi_y)
+                    else:
+                        processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                if rtx_vsr_enabled:
+                    if rtx_vsr_engine is None:
+                        _ = _refresh_rtx_vsr_engine()
+                    elif current_roi_w != previous_w or current_roi_h != previous_h:
+                        _schedule_rtx_roi_rebuild()
 
             desired_center_x = desired_x + (desired_w * 0.5)
             desired_center_y = desired_y + (desired_h * 0.5)
@@ -4715,6 +4806,8 @@ def run_processor_worker(
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
                     item.process_start_ts = time.perf_counter()
+                    item_roi = (int(item.roi_x), int(item.roi_y), int(item.roi_w), int(item.roi_h))
+                    _apply_processor_roi_for_phase(item_roi)
                     interlaced_phase = item.interlaced_field_phase if isinstance(item.interlaced_field_phase, dict) else None
                     if output_mode_is_interlaced and _reinterlace_enabled_for_output():
                         if interlaced_phase is None:
@@ -4735,6 +4828,7 @@ def run_processor_worker(
                             preprocessed,
                             float(item.shift_x),
                             float(item.shift_y),
+                            item_roi,
                         )
                         item.interlaced_phase_rendered = False
                     item.process_end_ts = time.perf_counter()
