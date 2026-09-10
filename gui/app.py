@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -2016,14 +2017,19 @@ class RoiCanvas(QWidget):
 
 class ImageCanvas(QWidget):
     fullscreenRequested = Signal(str)
+    tapCenterRequested = Signal(float, float)
 
     def __init__(self, view_name: str = "output") -> None:
         super().__init__()
+        self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setMinimumSize(160, 90)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._image: QImage | None = None
         self._image_backing: np.ndarray | None = None
         self._view_name = view_name
+        self._press_position: QPointF | None = None
+        self._press_started_ts = 0.0
+        self._suppress_mouse_until_ts = 0.0
 
     def set_image(self, image: QImage, backing: np.ndarray | None = None) -> None:
         self._image = image
@@ -2042,6 +2048,58 @@ class ImageCanvas(QWidget):
         if self.width() <= 1 or self.height() <= 1:
             return QRectF(0, 0, 1, 1)
         return QRectF(0.0, 0.0, float(self.width()), float(self.height()))
+
+    def _emit_tap(self, position: QPointF) -> None:
+        image_rect = self._image_rect()
+        frame_x = (position.x() - image_rect.left()) * FRAME_W / max(1.0, image_rect.width())
+        frame_y = (position.y() - image_rect.top()) * FRAME_H / max(1.0, image_rect.height())
+        self.tapCenterRequested.emit(
+            max(0.0, min(float(FRAME_W), frame_x)),
+            max(0.0, min(float(FRAME_H), frame_y)),
+        )
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and time.perf_counter() >= self._suppress_mouse_until_ts:
+            self._press_position = QPointF(event.position())
+            self._press_started_ts = time.perf_counter()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        press_position = self._press_position
+        self._press_position = None
+        if event.button() == Qt.LeftButton and press_position is not None:
+            elapsed = time.perf_counter() - self._press_started_ts
+            moved = math.hypot(event.position().x() - press_position.x(), event.position().y() - press_position.y())
+            if elapsed <= 0.35 and moved < 6.0:
+                self._emit_tap(event.position())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def event(self, event) -> bool:
+        if event.type() in (QEvent.Type.TouchBegin, QEvent.Type.TouchEnd, QEvent.Type.TouchCancel):
+            self._suppress_mouse_until_ts = time.perf_counter() + 0.25
+            points = event.points()
+            if event.type() == QEvent.Type.TouchBegin and len(points) == 1:
+                self._press_position = QPointF(points[0].position())
+                self._press_started_ts = time.perf_counter()
+            elif event.type() == QEvent.Type.TouchEnd and self._press_position is not None and points:
+                release_position = points[0].position()
+                elapsed = time.perf_counter() - self._press_started_ts
+                moved = math.hypot(
+                    release_position.x() - self._press_position.x(),
+                    release_position.y() - self._press_position.y(),
+                )
+                self._press_position = None
+                if elapsed <= 0.35 and moved < 6.0:
+                    self._emit_tap(release_position)
+            else:
+                self._press_position = None
+            event.accept()
+            return True
+        return super().event(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         super().mouseDoubleClickEvent(event)
@@ -4087,6 +4145,8 @@ class MainWindow(QMainWindow):
         self._decklink_timecode_info_sequence = 0
         self._decklink_timecode_info: dict[str, object] = {}
         self._roi_keyframe_transition_default_frames = 30
+        self._fullscreen_scale_presets = [200, 300, 400]
+        self._fullscreen_selected_scale_index: int | None = None
         self._roi_keyframe_transition: dict[str, object] | None = None
         self._roi_keyframe_last_step_ts = 0.0
         self._roi_keyframe_target_fps = 60.0
@@ -4199,6 +4259,7 @@ class MainWindow(QMainWindow):
         self._has_persisted_deinterlace_method = False
         self._deinterlace_method_user_selected = False
         self._windowed_geometry_before_fullscreen: QRect | None = None
+        self._windowed_available_geometry_before_fullscreen: QRect | None = None
         self._windowed_was_maximized_before_fullscreen = False
         self._settings_path = Path(__file__).resolve().parent / "app_settings.json"
         self._settings_save_timer = QTimer(self)
@@ -4233,6 +4294,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(6)
         self._fullscreen_keyframe_toolbars: dict[str, QWidget] = {}
         self._fullscreen_keyframe_side_panels: dict[str, QWidget] = {}
+        self._fullscreen_keyframe_title_labels: dict[str, QLabel] = {}
         self._fullscreen_manual_keyframe_rows: dict[str, QWidget] = {}
         self._fullscreen_timecode_keyframe_rows: dict[str, QWidget] = {}
         self._fullscreen_keyframing_mode_buttons: dict[str, QPushButton] = {}
@@ -4248,7 +4310,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_roi_transition_labels: dict[str, QLabel] = {}
         self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
         self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
-        self._fullscreen_decklink_output_buffer_spins: dict[str, QSpinBox] = {}
+        self._fullscreen_scale_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton]] = {}
         self._fullscreen_enter_buttons: dict[str, QPushButton] = {}
         viewers = QWidget()
         viewers_layout = QVBoxLayout(viewers)
@@ -4277,7 +4339,7 @@ class MainWindow(QMainWindow):
         input_viewer_row_layout.setContentsMargins(0, 0, 0, 0)
         input_viewer_row_layout.setSpacing(12)
         self._input_fullscreen_keyframe_side_panel = self._build_fullscreen_keyframe_side_panel("input")
-        input_viewer_row_layout.addWidget(self._input_fullscreen_keyframe_side_panel, 0, alignment=Qt.AlignTop)
+        input_viewer_row_layout.addWidget(self._input_fullscreen_keyframe_side_panel, 0)
         input_viewer_row_layout.addWidget(self._input_canvas, 1, alignment=Qt.AlignCenter)
         input_layout.addWidget(self._input_viewer_row, 1)
 
@@ -4306,7 +4368,7 @@ class MainWindow(QMainWindow):
         output_viewer_row_layout.setContentsMargins(0, 0, 0, 0)
         output_viewer_row_layout.setSpacing(12)
         self._output_fullscreen_keyframe_side_panel = self._build_fullscreen_keyframe_side_panel("output")
-        output_viewer_row_layout.addWidget(self._output_fullscreen_keyframe_side_panel, 0, alignment=Qt.AlignTop)
+        output_viewer_row_layout.addWidget(self._output_fullscreen_keyframe_side_panel, 0)
         output_viewer_row_layout.addWidget(self._output_canvas, 1, alignment=Qt.AlignCenter)
         output_layout.addWidget(self._output_viewer_row, 1)
 
@@ -4344,6 +4406,7 @@ class MainWindow(QMainWindow):
         self._input_canvas.scaleChanged.connect(self._on_scale_from_canvas)
         self._input_canvas.tapCenterRequested.connect(self._on_roi_tap_center_requested)
         self._input_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
+        self._output_canvas.tapCenterRequested.connect(self._on_output_roi_tap_center_requested)
         self._output_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
 
         self._timer = QTimer(self)
@@ -4383,11 +4446,9 @@ class MainWindow(QMainWindow):
         self._connect_settings_persistence_signals()
         self.roi_transition_frames_spin.valueChanged.connect(self._sync_fullscreen_transition_rate_from_main)
         self.roi_keyframe_duration_override_btn.toggled.connect(self._sync_fullscreen_override_duration_from_main)
-        self.decklink_output_buffer_spin.valueChanged.connect(self._sync_fullscreen_decklink_output_buffer_from_main)
         self._update_roi_key_buttons()
         self._sync_fullscreen_transition_rate_from_main(self.roi_transition_frames_spin.value())
         self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
-        self._sync_fullscreen_decklink_output_buffer_from_main(self.decklink_output_buffer_spin.value())
         self._sync_fullscreen_button_states()
         self._sync_roi_transition_unit_labels()
         self._sync_controls_from_roi(self._roi)
@@ -4609,6 +4670,8 @@ class MainWindow(QMainWindow):
             "roi_transition_duration_frames": int(self.roi_transition_frames_spin.value()),
             "roi_interpolation_mode": str(self.roi_interp_mode_combo.currentText()),
             "roi_keyframe_duration_override": bool(self.roi_keyframe_duration_override_btn.isChecked()),
+            "fullscreen_scale_presets": list(self._fullscreen_scale_presets),
+            "fullscreen_selected_scale_index": self._fullscreen_selected_scale_index,
             "roi_keyframes": keyframe_payload,
             "roi_keyframing_mode": "timecode" if self._timecode_keyframing_enabled else "manual",
             "roi_timecode_playback_enabled": bool(self._timecode_playback_enabled),
@@ -4720,6 +4783,15 @@ class MainWindow(QMainWindow):
             self.roi_keyframe_duration_override_btn.setChecked(
                 bool(raw.get("roi_keyframe_duration_override", self.roi_keyframe_duration_override_btn.isChecked()))
             )
+            raw_scale_presets = raw.get("fullscreen_scale_presets", self._fullscreen_scale_presets)
+            if isinstance(raw_scale_presets, list) and len(raw_scale_presets) == 3:
+                self._fullscreen_scale_presets = [max(100, min(1000000, int(value))) for value in raw_scale_presets]
+            raw_selected_scale_index = raw.get("fullscreen_selected_scale_index")
+            if isinstance(raw_selected_scale_index, int) and 0 <= raw_selected_scale_index < 3:
+                self._fullscreen_selected_scale_index = raw_selected_scale_index
+            else:
+                self._fullscreen_selected_scale_index = None
+            self._sync_fullscreen_scale_buttons()
 
             self.preview_downsample_combo.setCurrentText(str(raw.get("preview_downsample", self.preview_downsample_combo.currentText())))
             self.color_space_combo.setCurrentText(str(raw.get("color_space", self.color_space_combo.currentText())))
@@ -5955,25 +6027,27 @@ class MainWindow(QMainWindow):
 
     def _build_fullscreen_keyframe_side_panel(self, view_name: str) -> QWidget:
         panel = QWidget()
+        panel.setFixedWidth(170)
+        panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Ignored)
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.setSpacing(10)
+        panel_layout.setSpacing(6)
 
-        title = QLabel("KEYFRAME")
+        title = QLabel("MANUAL KEYFRAME")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("QLabel { font-size: 18px; font-weight: 700; }")
         panel_layout.addWidget(title)
 
         exit_fullscreen_btn = QPushButton("EXIT\nFULL SCREEN")
         exit_fullscreen_btn.setMinimumWidth(150)
-        exit_fullscreen_btn.setMinimumHeight(96)
+        exit_fullscreen_btn.setMinimumHeight(48)
         exit_fullscreen_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
         exit_fullscreen_btn.clicked.connect(lambda: self._set_fullscreen_view(None))
         panel_layout.addWidget(exit_fullscreen_btn)
 
         mode_btn = QPushButton("TIMECODE BASED\nKEYFRAMING")
         mode_btn.setMinimumWidth(150)
-        mode_btn.setMinimumHeight(96)
+        mode_btn.setMinimumHeight(48)
         mode_btn.setStyleSheet("QPushButton { font-size: 15px; font-weight: 700; padding: 8px; }")
         mode_btn.clicked.connect(self._toggle_roi_keyframing_mode)
         panel_layout.addWidget(mode_btn)
@@ -6001,7 +6075,7 @@ class MainWindow(QMainWindow):
         transition_spin.setRange(1, 600)
         transition_spin.setValue(int(self._roi_keyframe_transition_default_frames))
         transition_spin.setMinimumWidth(150)
-        transition_spin.setMinimumHeight(72)
+        transition_spin.setMinimumHeight(44)
         transition_spin.setStyleSheet(
             "QSpinBox { font-size: 22px; font-weight: 700; padding: 8px 12px; }"
             "QSpinBox::up-button, QSpinBox::down-button { width: 34px; }"
@@ -6012,47 +6086,48 @@ class MainWindow(QMainWindow):
         override_btn = QPushButton("OVERRIDE\nKEY DURATION")
         override_btn.setCheckable(True)
         override_btn.setMinimumWidth(150)
-        override_btn.setMinimumHeight(96)
+        override_btn.setMinimumHeight(48)
         override_btn.setToolTip("Use Transition (frames) as recall duration instead of the keyframe's stored duration.")
         override_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
         override_btn.toggled.connect(self._on_fullscreen_override_duration_toggled)
         panel_layout.addWidget(override_btn)
 
-        buffer_label = QLabel("DeckLink buffer\n(frames)")
-        buffer_label.setAlignment(Qt.AlignCenter)
-        buffer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; }")
-        panel_layout.addWidget(buffer_label)
+        full_scale_btn = QPushButton("100%")
+        full_scale_btn.setMinimumWidth(150)
+        full_scale_btn.setMinimumHeight(44)
+        full_scale_btn.setStyleSheet("QPushButton { font-size: 18px; font-weight: 700; padding: 8px; }")
+        full_scale_btn.setToolTip("Interpolate the ROI to the full frame.")
+        full_scale_btn.clicked.connect(self._interpolate_roi_to_full_frame)
+        panel_layout.addWidget(full_scale_btn)
 
-        buffer_spin = QSpinBox()
-        buffer_spin.setRange(0, 10)
-        buffer_spin.setValue(int(self._decklink_output_buffer_frames))
-        buffer_spin.setMinimumWidth(150)
-        buffer_spin.setMinimumHeight(72)
-        buffer_spin.setStyleSheet(
-            "QSpinBox { font-size: 22px; font-weight: 700; padding: 8px 12px; }"
-            "QSpinBox::up-button, QSpinBox::down-button { width: 34px; }"
-        )
-        buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames.")
-        buffer_spin.valueChanged.connect(self._on_fullscreen_decklink_output_buffer_changed)
-        panel_layout.addWidget(buffer_spin)
-
-        reset_roi_btn = QPushButton("RESET\nROI")
-        reset_roi_btn.setMinimumWidth(150)
-        reset_roi_btn.setMinimumHeight(96)
-        reset_roi_btn.setStyleSheet("QPushButton { font-size: 16px; font-weight: 700; padding: 8px; }")
-        reset_roi_btn.clicked.connect(self._reset_roi)
-        panel_layout.addWidget(reset_roi_btn)
+        scale_buttons: list[QPushButton] = []
+        for index in range(3):
+            scale_btn = QPushButton()
+            scale_btn.setCheckable(True)
+            scale_btn.setMinimumWidth(150)
+            scale_btn.setMinimumHeight(44)
+            scale_btn.setStyleSheet("QPushButton { font-size: 18px; font-weight: 700; padding: 8px; }")
+            scale_btn.setToolTip("Select the scale used when tapping the preview. Right-click to change this percentage.")
+            scale_btn.clicked.connect(lambda checked, preset_index=index: self._on_fullscreen_scale_toggled(preset_index, checked))
+            scale_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            scale_btn.customContextMenuRequested.connect(
+                lambda _position, preset_index=index: self._edit_fullscreen_scale_preset(preset_index)
+            )
+            panel_layout.addWidget(scale_btn)
+            scale_buttons.append(scale_btn)
 
         panel_layout.addStretch(1)
 
         self._fullscreen_keyframe_side_panels[view_name] = panel
+        self._fullscreen_keyframe_title_labels[view_name] = title
         self._fullscreen_keyframing_mode_buttons[view_name] = mode_btn
         self._fullscreen_timecode_display_labels[view_name] = timecode_display_label
         self._fullscreen_timecode_key_labels[view_name] = timecode_key_label
         self._fullscreen_roi_transition_labels[view_name] = transition_label
         self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
         self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
-        self._fullscreen_decklink_output_buffer_spins[view_name] = buffer_spin
+        self._fullscreen_scale_buttons[view_name] = tuple(scale_buttons)
+        self._sync_fullscreen_scale_buttons()
         timecode_display_label.setVisible(False)
         timecode_key_label.setVisible(False)
         panel.setVisible(False)
@@ -6063,6 +6138,8 @@ class MainWindow(QMainWindow):
 
     def _sync_fullscreen_keyframing_mode(self) -> None:
         timecode_enabled = bool(self._timecode_keyframing_enabled)
+        for label in self._fullscreen_keyframe_title_labels.values():
+            label.setText("TIMECODE KEYFRAME" if timecode_enabled else "MANUAL KEYFRAME")
         for button in self._fullscreen_keyframing_mode_buttons.values():
             button.setText("MANUAL\nKEYFRAMING" if timecode_enabled else "TIMECODE BASED\nKEYFRAMING")
         for row in self._fullscreen_manual_keyframe_rows.values():
@@ -6129,19 +6206,49 @@ class MainWindow(QMainWindow):
             button.setChecked(target)
             button.blockSignals(previous_block)
 
-    def _on_fullscreen_decklink_output_buffer_changed(self, value: int) -> None:
-        normalized = max(0, min(10, int(value)))
-        if self.decklink_output_buffer_spin.value() != normalized:
-            self.decklink_output_buffer_spin.setValue(normalized)
-        else:
-            self._sync_fullscreen_decklink_output_buffer_from_main(normalized)
+    def _sync_fullscreen_scale_buttons(self) -> None:
+        for buttons in self._fullscreen_scale_buttons.values():
+            for index, button in enumerate(buttons):
+                previous_block = button.blockSignals(True)
+                button.setText(f"{self._fullscreen_scale_presets[index]}%")
+                button.setChecked(self._fullscreen_selected_scale_index == index)
+                button.blockSignals(previous_block)
 
-    def _sync_fullscreen_decklink_output_buffer_from_main(self, value: int) -> None:
-        normalized = max(0, min(10, int(value)))
-        for spin in self._fullscreen_decklink_output_buffer_spins.values():
-            previous_block = spin.blockSignals(True)
-            spin.setValue(normalized)
-            spin.blockSignals(previous_block)
+    def _on_fullscreen_scale_toggled(self, preset_index: int, checked: bool) -> None:
+        index = max(0, min(2, int(preset_index)))
+        if checked:
+            self._fullscreen_selected_scale_index = index
+        elif self._fullscreen_selected_scale_index == index:
+            self._fullscreen_selected_scale_index = None
+        self._sync_fullscreen_scale_buttons()
+        self._schedule_settings_save()
+
+    def _edit_fullscreen_scale_preset(self, preset_index: int) -> None:
+        index = max(0, min(2, int(preset_index)))
+        value, accepted = QInputDialog.getInt(
+            self,
+            "Set preview scale",
+            "Scale percentage:",
+            int(self._fullscreen_scale_presets[index]),
+            100,
+            1000000,
+            1,
+        )
+        if not accepted:
+            return
+        self._fullscreen_scale_presets[index] = int(value)
+        self._sync_fullscreen_scale_buttons()
+        self._schedule_settings_save()
+
+    def _interpolate_roi_to_full_frame(self) -> None:
+        target = Roi(0, 0, FRAME_W, FRAME_H)
+        duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
+        self._start_roi_keyframe_transition(
+            target,
+            self._effective_roi_keyframe_duration_frames(target, duration_frames),
+            self._roi_interp_mode_name(),
+            manual_adjustment=True,
+        )
 
     def _setup_shortcuts(self) -> None:
         reset_action = QAction(self)
@@ -6176,17 +6283,47 @@ class MainWindow(QMainWindow):
 
     def _capture_windowed_geometry_before_fullscreen(self) -> None:
         self._windowed_was_maximized_before_fullscreen = self.isMaximized()
-        self._windowed_geometry_before_fullscreen = self.geometry()
+        geometry = self.normalGeometry()
+        if not geometry.isValid():
+            geometry = self.geometry()
+        self._windowed_geometry_before_fullscreen = QRect(geometry)
+
+        screen = self.screen()
+        self._windowed_available_geometry_before_fullscreen = (
+            QRect(screen.availableGeometry()) if screen is not None else None
+        )
+
+    def _clamp_windowed_geometry_to_screen(self, geometry: QRect) -> QRect:
+        available = self._windowed_available_geometry_before_fullscreen
+        if available is None or not available.isValid():
+            screen = self.screen() or QApplication.primaryScreen()
+            available = QRect(screen.availableGeometry()) if screen is not None else QRect()
+        if not available.isValid():
+            return QRect(geometry)
+
+        width = max(1, min(geometry.width(), available.width()))
+        height = max(1, min(geometry.height(), available.height()))
+        x = max(available.left(), min(geometry.x(), available.right() - width + 1))
+        y = max(available.top(), min(geometry.y(), available.bottom() - height + 1))
+        return QRect(x, y, width, height)
 
     def _restore_windowed_geometry_after_fullscreen(self) -> None:
         geometry = self._windowed_geometry_before_fullscreen
         was_maximized = self._windowed_was_maximized_before_fullscreen
 
+        self.setWindowState(self.windowState() & ~Qt.WindowFullScreen)
         self.showNormal()
-        if geometry is not None and geometry.isValid():
-            self.setGeometry(geometry)
-        if was_maximized:
-            self.showMaximized()
+
+        def finish_restore() -> None:
+            if was_maximized:
+                self.showMaximized()
+            else:
+                self.setWindowState(Qt.WindowNoState)
+                if geometry is not None and geometry.isValid():
+                    self.setGeometry(self._clamp_windowed_geometry_to_screen(geometry))
+                self.show()
+
+        QTimer.singleShot(0, finish_restore)
 
     def _perf_add(self, stage_name: str, elapsed_ms: float) -> None:
         if stage_name not in self._perf_stage_sums_ms:
@@ -10029,14 +10166,18 @@ class MainWindow(QMainWindow):
 
     def _on_roi_tap_center_requested(self, frame_x: float, frame_y: float) -> None:
         current = clamp_roi(self._roi)
-        target = clamp_roi(
-            Roi(
-                int(round(float(frame_x) - (current.w * 0.5))),
-                int(round(float(frame_y) - (current.h * 0.5))),
-                current.w,
-                current.h,
+        if self._fullscreen_view_name is not None and self._fullscreen_selected_scale_index is not None:
+            scale_percent = self._fullscreen_scale_presets[self._fullscreen_selected_scale_index]
+            target = roi_from_scale(float(scale_percent) / 100.0, float(frame_x), float(frame_y))
+        else:
+            target = clamp_roi(
+                Roi(
+                    int(round(float(frame_x) - (current.w * 0.5))),
+                    int(round(float(frame_y) - (current.h * 0.5))),
+                    current.w,
+                    current.h,
+                )
             )
-        )
         duration_frames = max(1, min(600, int(self.roi_transition_frames_spin.value())))
         self._start_roi_keyframe_transition(
             target,
@@ -10044,6 +10185,10 @@ class MainWindow(QMainWindow):
             self._roi_interp_mode_name(),
             manual_adjustment=True,
         )
+
+    def _on_output_roi_tap_center_requested(self, frame_x: float, frame_y: float) -> None:
+        if self._fullscreen_view_name == "output":
+            self._on_roi_tap_center_requested(frame_x, frame_y)
 
     def _on_roi_save_key_toggled(self, checked: bool) -> None:
         self._roi_key_save_armed = bool(checked)
@@ -10833,7 +10978,6 @@ def main() -> int:
         target_w = min(int(available.width()), max(900, int(available.width() * 0.92)))
         target_h = min(int(available.height()), max(520, int(available.height() * 0.92)))
         window.resize(target_w, target_h)
-        window.setMaximumSize(available.size())
     else:
         window.resize(1400, 860)
     window.show()
