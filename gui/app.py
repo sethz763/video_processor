@@ -15,6 +15,7 @@ import ctypes
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from statistics import median
 
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedLayout,
     QSplitter,
     QLineEdit,
     QVBoxLayout,
@@ -491,8 +493,10 @@ LOGGER = setup_logger()
 
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 _RPC_E_CHANGED_MODE_HEX = "0x80010106"
+_WINDOWS_TIMER_PERIOD_ACTIVE = False
 
 _ROI_TELEMETRY_SLOT_COUNT = 16
+_MANUAL_ROI_MAILBOX_SLOT_COUNT = 12
 _ROI_TM_ACTIVE = 0
 _ROI_TM_FRAME_PROGRESS = 1
 _ROI_TM_TOTAL_FRAMES = 2
@@ -509,6 +513,77 @@ _ROI_TM_TARGET_X = 12
 _ROI_TM_TARGET_Y = 13
 _ROI_TM_TARGET_W = 14
 _ROI_TM_TARGET_H = 15
+
+
+def enable_windows_gui_keep_active() -> bool:
+    global _WINDOWS_TIMER_PERIOD_ACTIVE
+    if sys.platform != "win32" or os.environ.get("VP_KEEP_GUI_ACTIVE", "1") == "0":
+        return False
+
+    enabled = False
+    try:
+        winmm = ctypes.WinDLL("winmm", use_last_error=True)
+        if int(winmm.timeBeginPeriod(1)) == 0:
+            _WINDOWS_TIMER_PERIOD_ACTIVE = True
+            enabled = True
+        else:
+            LOGGER.warning("Windows GUI keep-active could not request 1 ms timer resolution")
+    except Exception as exc:
+        LOGGER.warning("Windows GUI keep-active timer setup failed: %s", exc)
+
+    try:
+        class ProcessPowerThrottlingState(ctypes.Structure):
+            _fields_ = [
+                ("Version", ctypes.c_ulong),
+                ("ControlMask", ctypes.c_ulong),
+                ("StateMask", ctypes.c_ulong),
+            ]
+
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        PROCESS_POWER_THROTTLING = 4
+        state = ProcessPowerThrottlingState(
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            0,
+        )
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        kernel32.SetProcessInformation.restype = ctypes.c_bool
+        process = kernel32.GetCurrentProcess()
+        if kernel32.SetProcessInformation(
+            process,
+            PROCESS_POWER_THROTTLING,
+            ctypes.byref(state),
+            ctypes.sizeof(state),
+        ):
+            enabled = True
+        else:
+            error_code = ctypes.get_last_error()
+            LOGGER.warning("Windows GUI keep-active power policy failed (WinError %d)", error_code)
+    except Exception as exc:
+        LOGGER.warning("Windows GUI keep-active power setup failed: %s", exc)
+
+    if enabled:
+        LOGGER.info("Windows GUI keep-active enabled (power throttling off, high-resolution timer requested)")
+    return enabled
+
+
+def disable_windows_gui_keep_active() -> None:
+    global _WINDOWS_TIMER_PERIOD_ACTIVE
+    if sys.platform != "win32" or not _WINDOWS_TIMER_PERIOD_ACTIVE:
+        return
+    try:
+        ctypes.WinDLL("winmm", use_last_error=True).timeEndPeriod(1)
+    except Exception as exc:
+        LOGGER.warning("Windows GUI keep-active timer cleanup failed: %s", exc)
+    _WINDOWS_TIMER_PERIOD_ACTIVE = False
 
 
 def initialize_com_for_decklink() -> None:
@@ -619,6 +694,23 @@ class TimecodeRoiKeyframe:
     timecode_format: str = ""
     drop_frame: bool = False
     field_mark: bool = False
+
+
+def _store_unique_timecode_keyframe(
+    keyframes: dict[int, TimecodeRoiKeyframe],
+    keyframe: TimecodeRoiKeyframe,
+) -> bool:
+    normalized_timecode = _normalize_timecode_display(keyframe.timecode)
+    matching_frames = [
+        frame_number
+        for frame_number, existing in keyframes.items()
+        if _normalize_timecode_display(existing.timecode) == normalized_timecode
+    ]
+    replaced = bool(matching_frames)
+    for frame_number in matching_frames:
+        keyframes.pop(frame_number, None)
+    keyframes[keyframe.frame_number] = keyframe
+    return replaced
 
 
 def _timecode_to_frame_number(timecode: str, nominal_fps: int) -> int | None:
@@ -1161,6 +1253,7 @@ class SyntheticUyvySource:
 
 class RoiCanvas(QWidget):
     roiChanged = Signal(int, int, int, int)
+    manualDragEndpointChanged = Signal(float, float, float, float)
     scaleChanged = Signal(float)
     tapCenterRequested = Signal(float, float)
     fullscreenRequested = Signal(str)
@@ -1181,6 +1274,9 @@ class RoiCanvas(QWidget):
         self._visual_roi_overlay_transition: tuple[float, float, float, float] | None = None
         self._visual_roi_overlay_drag: tuple[float, float, float, float] | None = None
         self._visual_roi_overlay_pinch: tuple[float, float, float, float] | None = None
+        self._drag_emit_overlay: tuple[float, float, float, float] | None = None
+        self._drag_emit_overlay_samples: list[tuple[float, float, float, float]] = []
+        self._drag_emit_median_samples = 3
 
         self._drag_mode = "none"
         self._drag_started = False
@@ -1191,6 +1287,11 @@ class RoiCanvas(QWidget):
         self._press_started_ts = 0.0
         self._tap_max_duration_s = 0.35
         self._tap_move_threshold_px = 6.0
+        self._pointer_input_source = "unknown"
+        self._pointer_input_last_ts = 0.0
+        self._pointer_input_last_position: QPointF | None = None
+        self._pointer_input_dt_ms = 0.0
+        self._pointer_input_delta_px = 0.0
         self._pinch_active = False
         self._pinch_start_distance = 0.0
         self._pinch_start_scale = 1.0
@@ -1228,6 +1329,8 @@ class RoiCanvas(QWidget):
         self._cancel_interaction_interpolation()
         self._visual_roi_overlay_transition = None
         self._visual_roi_overlay_drag = None
+        self._drag_emit_overlay = None
+        self._drag_emit_overlay_samples.clear()
         self._visual_roi_overlay_pinch = None
         self._apply_roi_local(roi)
         self._interaction_target_roi = roi
@@ -1248,6 +1351,8 @@ class RoiCanvas(QWidget):
         self._pinch_start_distance = 0.0
         self._adjustment_active = False
         self._visual_roi_overlay_drag = None
+        self._drag_emit_overlay = None
+        self._drag_emit_overlay_samples.clear()
         self._visual_roi_overlay_pinch = None
         self._visual_roi_overlay_transition = None
         self.update()
@@ -1270,22 +1375,63 @@ class RoiCanvas(QWidget):
         ox = max(0.0, min(float(FRAME_W) - ow, float(x)))
         oy = max(0.0, min(float(FRAME_H) - oh, float(y)))
         self._visual_roi_overlay_drag = (ox, oy, ow, oh)
+        self._drag_emit_overlay_samples.append(self._visual_roi_overlay_drag)
+        if len(self._drag_emit_overlay_samples) > self._drag_emit_median_samples:
+            del self._drag_emit_overlay_samples[:-self._drag_emit_median_samples]
+        coalesced = tuple(
+            float(median(sample[index] for sample in self._drag_emit_overlay_samples))
+            for index in range(4)
+        )
+        if coalesced != self._drag_emit_overlay:
+            self._drag_emit_overlay = coalesced
+            self.manualDragEndpointChanged.emit(*coalesced)
         self.update()
 
     def _clear_drag_visual_roi_overlay(self) -> None:
-        if self._visual_roi_overlay_drag is None:
-            return
+        had_overlay = self._visual_roi_overlay_drag is not None
         self._visual_roi_overlay_drag = None
-        self.update()
+        self._drag_emit_overlay = None
+        self._drag_emit_overlay_samples.clear()
+        if had_overlay:
+            self.update()
 
     def drag_visual_roi_overlay(self) -> tuple[float, float, float, float] | None:
-        return self._visual_roi_overlay_drag
+        if self._visual_roi_overlay_drag is None:
+            return None
+        return self._drag_emit_overlay or self._visual_roi_overlay_drag
+
+    def is_move_drag_active(self) -> bool:
+        return bool(self._drag_started and self._drag_mode == "move")
 
     def pinch_visual_roi_overlay(self) -> tuple[float, float, float, float] | None:
         return self._visual_roi_overlay_pinch
 
     def is_pinch_active(self) -> bool:
         return bool(self._pinch_active)
+
+    def pointer_input_diagnostics(self) -> dict[str, object]:
+        return {
+            "source": str(self._pointer_input_source),
+            "event_dt_ms": float(self._pointer_input_dt_ms),
+            "event_delta_px": float(self._pointer_input_delta_px),
+        }
+
+    def _record_pointer_input(self, source: str, position: QPointF) -> None:
+        now = time.perf_counter()
+        previous = self._pointer_input_last_position
+        self._pointer_input_source = str(source)
+        self._pointer_input_dt_ms = (
+            (now - float(self._pointer_input_last_ts)) * 1000.0
+            if self._pointer_input_last_ts > 0.0
+            else 0.0
+        )
+        self._pointer_input_delta_px = (
+            math.hypot(position.x() - previous.x(), position.y() - previous.y())
+            if previous is not None
+            else 0.0
+        )
+        self._pointer_input_last_ts = now
+        self._pointer_input_last_position = QPointF(position)
 
     def roi(self) -> Roi:
         return self._roi
@@ -1448,6 +1594,8 @@ class RoiCanvas(QWidget):
         if event.button() != Qt.LeftButton or self._pinch_active or time.perf_counter() < self._suppress_mouse_until_ts:
             return
 
+        mouse_source = getattr(event.source(), "name", str(event.source()))
+        self._record_pointer_input(f"mouse:{mouse_source}", event.position())
         self._pointer_press(event.position())
         event.accept()
 
@@ -1489,6 +1637,8 @@ class RoiCanvas(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._pinch_active or time.perf_counter() < self._suppress_mouse_until_ts:
             return
+        mouse_source = getattr(event.source(), "name", str(event.source()))
+        self._record_pointer_input(f"mouse:{mouse_source}", event.position())
         self._pointer_move(event.position())
         event.accept()
 
@@ -1589,12 +1739,20 @@ class RoiCanvas(QWidget):
         )
         is_tap = not self._drag_started and elapsed <= self._tap_max_duration_s and moved < self._tap_move_threshold_px
         had_drag = self._drag_started
+        finishing_move = had_drag and self._drag_mode == "move"
+        if finishing_move:
+            self._pointer_move(position)
+            self._drag_emit_overlay = self._visual_roi_overlay_drag
+            self._drag_emit_overlay_samples.clear()
+            if self._drag_emit_overlay is not None:
+                self.manualDragEndpointChanged.emit(*self._drag_emit_overlay)
         self._drag_mode = "none"
         self._drag_started = False
         self._touch_emit_interval_s = self._default_touch_emit_interval_s
-        self._clear_drag_visual_roi_overlay()
         if had_drag:
             self._flush_interaction_emit()
+        self._clear_drag_visual_roi_overlay()
+        if had_drag:
             self._finish_adjustment()
         if is_tap:
             frame_point = self._widget_to_frame(position)
@@ -1708,8 +1866,10 @@ class RoiCanvas(QWidget):
             elif self._pinch_active:
                 self._finish_pinch()
             elif et == QEvent.Type.TouchBegin and len(points) == 1:
+                self._record_pointer_input("touch", points[0].position())
                 self._pointer_press(points[0].position())
             elif et == QEvent.Type.TouchUpdate and len(points) == 1:
+                self._record_pointer_input("touch", points[0].position())
                 self._pointer_move(points[0].position())
             elif et == QEvent.Type.TouchEnd:
                 released_points = event.points()
@@ -2440,8 +2600,9 @@ class VideoProcessorController:
         shift_y: float,
         manual_drag: bool = False,
         suspend_timecode: bool = False,
+        motion_input: dict[str, object] | None = None,
     ) -> bool:
-        _ = manual_drag, suspend_timecode
+        _ = manual_drag, suspend_timecode, motion_input
         clamped = clamp_roi(roi)
         if self.processor is not None:
             moving_only = hasattr(self.processor, "set_roi_position")
@@ -2576,6 +2737,8 @@ class ProcessVideoProcessorController:
         self._roi_telemetry_shared = None
         self._roi_telemetry_seq = None
         self._roi_telemetry_last_seq = -1
+        self._manual_roi_mailbox_shared = None
+        self._manual_roi_mailbox_seq = None
 
         self._next_frame_id = 1
         self._latest_output_frame: bytes | None = None
@@ -3033,13 +3196,15 @@ class ProcessVideoProcessorController:
             "rtx_video_sdk_root": os.environ.get("RTX_VIDEO_SDK_ROOT", r"C:\Coding Projects\sdks\NVidia video SDK"),
         }
 
-        # Keep request queue larger than response queue so bursty UI events
-        # (ROI drag, tick polling) do not trip queue.Full in the GUI thread.
+        # Keep request queue larger than response queue so control changes and
+        # tick polling do not trip queue.Full in the GUI thread.
         self._request_queue = self._ctx.Queue(maxsize=32)
         self._response_queue = self._ctx.Queue(maxsize=64)
         self._roi_telemetry_shared = self._ctx.Array("d", _ROI_TELEMETRY_SLOT_COUNT)
         self._roi_telemetry_seq = self._ctx.Value("i", 0)
         self._roi_telemetry_last_seq = -1
+        self._manual_roi_mailbox_shared = self._ctx.Array("d", _MANUAL_ROI_MAILBOX_SLOT_COUNT)
+        self._manual_roi_mailbox_seq = self._ctx.Value("i", 0)
         self._process = self._ctx.Process(
             target=run_processor_worker,
             args=(
@@ -3048,6 +3213,8 @@ class ProcessVideoProcessorController:
                 startup_config,
                 self._roi_telemetry_shared,
                 self._roi_telemetry_seq,
+                self._manual_roi_mailbox_shared,
+                self._manual_roi_mailbox_seq,
             ),
             daemon=True,
             name="video-processor-worker",
@@ -3382,6 +3549,7 @@ class ProcessVideoProcessorController:
         shift_y: float,
         manual_drag: bool = False,
         suspend_timecode: bool = False,
+        motion_input: dict[str, object] | None = None,
     ) -> bool:
         return self._send_control(
             {
@@ -3394,9 +3562,82 @@ class ProcessVideoProcessorController:
                 "shift_y": float(shift_y),
                 "manual_drag": bool(manual_drag),
                 "suspend_timecode": bool(suspend_timecode),
+                "motion_input": dict(motion_input) if isinstance(motion_input, dict) else {},
                 "roi_sequence": self._next_roi_command_sequence(),
             }
         )
+
+    def publish_manual_roi_endpoint(
+        self,
+        roi: Roi,
+        shift_x: float,
+        shift_y: float,
+        suspend_timecode: bool = False,
+        motion_input: dict[str, object] | None = None,
+    ) -> bool:
+        shared = self._manual_roi_mailbox_shared
+        sequence = self._manual_roi_mailbox_seq
+        if shared is None or sequence is None:
+            return False
+
+        diagnostics = motion_input if isinstance(motion_input, dict) else {}
+        source = str(diagnostics.get("source", "unknown"))
+        source_code = float(
+            {
+                "touch": 1,
+                "mouse:MouseEventNotSynthesized": 2,
+                "mouse:MouseEventSynthesizedBySystem": 3,
+                "mouse:MouseEventSynthesizedByQt": 4,
+                "mouse:MouseEventSynthesizedByApplication": 5,
+            }.get(source, 0)
+        )
+        command_sequence = self._next_roi_command_sequence()
+        try:
+            with sequence.get_lock():
+                sequence.value = int(sequence.value) + 1
+            try:
+                with shared.get_lock():
+                    values = (
+                        1.0,
+                        float(roi.x),
+                        float(roi.y),
+                        float(roi.w),
+                        float(roi.h),
+                        float(shift_x),
+                        float(shift_y),
+                        1.0 if suspend_timecode else 0.0,
+                        source_code,
+                        float(diagnostics.get("event_dt_ms", 0.0)),
+                        float(diagnostics.get("event_delta_px", 0.0)),
+                        float(command_sequence),
+                    )
+                    for index, value in enumerate(values):
+                        shared[index] = value
+            finally:
+                with sequence.get_lock():
+                    sequence.value = int(sequence.value) + 1
+            return True
+        except Exception:
+            return False
+
+    def clear_manual_roi_endpoint(self) -> None:
+        shared = self._manual_roi_mailbox_shared
+        sequence = self._manual_roi_mailbox_seq
+        if shared is None or sequence is None:
+            return
+        command_sequence = self._next_roi_command_sequence()
+        try:
+            with sequence.get_lock():
+                sequence.value = int(sequence.value) + 1
+            try:
+                with shared.get_lock():
+                    shared[0] = 0.0
+                    shared[11] = float(command_sequence)
+            finally:
+                with sequence.get_lock():
+                    sequence.value = int(sequence.value) + 1
+        except Exception:
+            pass
 
     def set_timecode_roi_keyframes(
         self,
@@ -3844,6 +4085,8 @@ class ProcessVideoProcessorController:
         self._roi_telemetry_shared = None
         self._roi_telemetry_seq = None
         self._roi_telemetry_last_seq = -1
+        self._manual_roi_mailbox_shared = None
+        self._manual_roi_mailbox_seq = None
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
 
@@ -4181,11 +4424,6 @@ class MainWindow(QMainWindow):
         self._controller_roi_applied = self._roi
         self._manual_live_target_roi: Roi | None = None
         self._pending_manual_controller_roi: Roi | None = None
-        self._manual_drag_interp_start_overlay: tuple[float, float, float, float] | None = None
-        self._manual_drag_interp_end_overlay: tuple[float, float, float, float] | None = None
-        self._manual_drag_interp_started_ts = 0.0
-        self._manual_drag_interp_duration_s = 1.0 / 60.0
-        self._manual_drag_last_event_ts = 0.0
         self._pending_roi_controls_sync: Roi | None = None
         self._last_manual_roi_update_ts = 0.0
         self._manual_roi_preview_reduce_scale = max(
@@ -4212,6 +4450,9 @@ class MainWindow(QMainWindow):
         self._windowed_geometry_before_fullscreen: QRect | None = None
         self._windowed_available_geometry_before_fullscreen: QRect | None = None
         self._windowed_was_maximized_before_fullscreen = False
+        self._windowed_display_splitter_sizes: list[int] | None = None
+        self._windowed_main_splitter_sizes: list[int] | None = None
+        self._viewer_layout_transition_active = False
         self._settings_path = Path(__file__).resolve().parent / "app_settings.json"
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -4248,6 +4489,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_keyframe_title_labels: dict[str, QLabel] = {}
         self._fullscreen_manual_keyframe_rows: dict[str, QWidget] = {}
         self._fullscreen_timecode_keyframe_rows: dict[str, QWidget] = {}
+        self._fullscreen_keyframe_stacks: dict[str, QStackedLayout] = {}
         self._fullscreen_keyframing_mode_buttons: dict[str, QPushButton] = {}
         self._fullscreen_timecode_display_labels: dict[str, QLabel] = {}
         self._fullscreen_timecode_key_labels: dict[str, QLabel] = {}
@@ -4258,6 +4500,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_timecode_playback_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
+        self._fullscreen_roi_path_combos: dict[str, QComboBox] = {}
         self._fullscreen_roi_transition_labels: dict[str, QLabel] = {}
         self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
         self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
@@ -4338,6 +4581,7 @@ class MainWindow(QMainWindow):
         self._controls_panel = self._build_controls()
         self._controls_scroll = QScrollArea()
         self._controls_scroll.setWidgetResizable(True)
+        self._controls_scroll.setSizeAdjustPolicy(QScrollArea.SizeAdjustPolicy.AdjustIgnored)
         self._controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._controls_scroll.setWidget(self._controls_panel)
         self._controls_scroll.setMinimumWidth(420)
@@ -4353,6 +4597,7 @@ class MainWindow(QMainWindow):
         self._input_canvas.set_roi(self._roi)
         self._input_canvas.adjustmentStarted.connect(self._on_roi_adjustment_started)
         self._input_canvas.adjustmentFinished.connect(self._on_roi_adjustment_finished)
+        self._input_canvas.manualDragEndpointChanged.connect(self._on_manual_drag_endpoint)
         self._input_canvas.roiChanged.connect(self._on_roi_from_canvas)
         self._input_canvas.scaleChanged.connect(self._on_scale_from_canvas)
         self._input_canvas.tapCenterRequested.connect(self._on_roi_tap_center_requested)
@@ -4361,6 +4606,7 @@ class MainWindow(QMainWindow):
         self._output_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
 
         self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.timeout.connect(self._tick)
         self._update_timer_interval()
         self._timer.start()
@@ -4398,8 +4644,10 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._connect_settings_persistence_signals()
         self.roi_transition_frames_spin.valueChanged.connect(self._sync_fullscreen_transition_rate_from_main)
+        self.roi_interp_mode_combo.currentTextChanged.connect(self._sync_fullscreen_roi_path_from_main)
         self.roi_keyframe_duration_override_btn.toggled.connect(self._sync_fullscreen_override_duration_from_main)
         self._update_roi_key_buttons()
+        self._sync_fullscreen_roi_path_from_main(self.roi_interp_mode_combo.currentText())
         self._sync_fullscreen_transition_rate_from_main(self.roi_transition_frames_spin.value())
         self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
         self._sync_fullscreen_button_states()
@@ -4601,6 +4849,13 @@ class MainWindow(QMainWindow):
             }
             for keyframe in sorted(self._timecode_roi_keyframes.values(), key=lambda item: item.frame_number)
         ]
+        display_splitter_sizes = list(self._display_splitter.sizes())
+        main_splitter_sizes = list(self._main_splitter.sizes())
+        if self._fullscreen_view_name is not None:
+            if self._windowed_display_splitter_sizes is not None:
+                display_splitter_sizes = list(self._windowed_display_splitter_sizes)
+            if self._windowed_main_splitter_sizes is not None:
+                main_splitter_sizes = list(self._windowed_main_splitter_sizes)
 
         return {
             "version": 1,
@@ -4671,8 +4926,8 @@ class MainWindow(QMainWindow):
             "decklink_enable_format_detection": bool(self.decklink_enable_format_detection.isChecked()),
             "decklink_fps_priority_guard": bool(self.decklink_fps_priority_guard_checkbox.isChecked()),
             "worker_process_priority": str(self.worker_priority_combo.currentText()),
-            "display_splitter_sizes": list(self._display_splitter.sizes()),
-            "main_splitter_sizes": list(self._main_splitter.sizes()),
+            "display_splitter_sizes": display_splitter_sizes,
+            "main_splitter_sizes": main_splitter_sizes,
         }
 
     def _save_settings(self) -> None:
@@ -5834,7 +6089,7 @@ class MainWindow(QMainWindow):
 
     def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
         toolbar = QWidget()
-        toolbar_layout = QVBoxLayout(toolbar)
+        toolbar_layout = QStackedLayout(toolbar)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(0)
 
@@ -5907,10 +6162,12 @@ class MainWindow(QMainWindow):
 
         toolbar_layout.addWidget(manual_row)
         toolbar_layout.addWidget(timecode_row)
+        toolbar_layout.setCurrentWidget(manual_row)
 
         self._fullscreen_keyframe_toolbars[view_name] = toolbar
         self._fullscreen_manual_keyframe_rows[view_name] = manual_row
         self._fullscreen_timecode_keyframe_rows[view_name] = timecode_row
+        self._fullscreen_keyframe_stacks[view_name] = toolbar_layout
         self._fullscreen_timecode_delete_buttons[view_name] = delete_btn
         self._fullscreen_timecode_delete_all_buttons[view_name] = delete_all_btn
         self._fullscreen_timecode_previous_buttons[view_name] = previous_btn
@@ -5918,7 +6175,6 @@ class MainWindow(QMainWindow):
         self._fullscreen_timecode_playback_buttons[view_name] = playback_btn
         self._fullscreen_roi_save_key_buttons[view_name] = save_btn
         self._fullscreen_roi_key_slot_buttons[view_name] = (key1_btn, key2_btn, key3_btn, key4_btn)
-        timecode_row.setVisible(False)
         self._update_timecode_playback_mode_control()
         toolbar.setVisible(False)
         return toolbar
@@ -5964,6 +6220,16 @@ class MainWindow(QMainWindow):
         timecode_key_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 700; padding: 6px; }")
         panel_layout.addWidget(timecode_key_label)
 
+        path_combo = QComboBox()
+        path_combo.addItems(["Linear", "Ease In/Out", "Ease Out"])
+        path_combo.setCurrentText("Ease In/Out")
+        path_combo.setMinimumWidth(150)
+        path_combo.setMinimumHeight(44)
+        path_combo.setStyleSheet("QComboBox { font-size: 15px; font-weight: 600; padding: 6px 8px; }")
+        path_combo.setToolTip("Interpolation path used for ROI transitions and newly stored keyframes.")
+        path_combo.currentTextChanged.connect(self._on_fullscreen_roi_path_changed)
+        panel_layout.addWidget(path_combo)
+
         transition_label = QLabel("Transition\n(frames)")
         transition_label.setAlignment(Qt.AlignCenter)
         transition_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; }")
@@ -5990,9 +6256,11 @@ class MainWindow(QMainWindow):
         override_btn.toggled.connect(self._on_fullscreen_override_duration_toggled)
         panel_layout.addWidget(override_btn)
 
+        scale_buttons_height = 60
+
         full_scale_btn = QPushButton("100%")
         full_scale_btn.setMinimumWidth(150)
-        full_scale_btn.setMinimumHeight(44)
+        full_scale_btn.setMinimumHeight(scale_buttons_height)
         full_scale_btn.setStyleSheet("QPushButton { font-size: 18px; font-weight: 700; padding: 8px; }")
         full_scale_btn.setToolTip("Interpolate the ROI to the full frame.")
         full_scale_btn.clicked.connect(self._interpolate_roi_to_full_frame)
@@ -6003,7 +6271,7 @@ class MainWindow(QMainWindow):
             scale_btn = QPushButton()
             scale_btn.setCheckable(True)
             scale_btn.setMinimumWidth(150)
-            scale_btn.setMinimumHeight(44)
+            scale_btn.setMinimumHeight(scale_buttons_height)
             scale_btn.setStyleSheet("QPushButton { font-size: 18px; font-weight: 700; padding: 8px; }")
             scale_btn.setToolTip("Select the scale used when tapping the preview. Right-click to change this percentage.")
             scale_btn.clicked.connect(lambda checked, preset_index=index: self._on_fullscreen_scale_toggled(preset_index, checked))
@@ -6021,11 +6289,22 @@ class MainWindow(QMainWindow):
         self._fullscreen_keyframing_mode_buttons[view_name] = mode_btn
         self._fullscreen_timecode_display_labels[view_name] = timecode_display_label
         self._fullscreen_timecode_key_labels[view_name] = timecode_key_label
+        self._fullscreen_roi_path_combos[view_name] = path_combo
         self._fullscreen_roi_transition_labels[view_name] = transition_label
         self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
         self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
         self._fullscreen_scale_buttons[view_name] = tuple(scale_buttons)
         self._sync_fullscreen_scale_buttons()
+        for widget in (
+            timecode_display_label,
+            timecode_key_label,
+            transition_label,
+            transition_spin,
+            override_btn,
+        ):
+            size_policy = widget.sizePolicy()
+            size_policy.setRetainSizeWhenHidden(True)
+            widget.setSizePolicy(size_policy)
         timecode_display_label.setVisible(False)
         timecode_key_label.setVisible(False)
         panel.setVisible(False)
@@ -6040,10 +6319,13 @@ class MainWindow(QMainWindow):
             label.setText("TIMECODE KEYFRAME" if timecode_enabled else "MANUAL KEYFRAME")
         for button in self._fullscreen_keyframing_mode_buttons.values():
             button.setText("MANUAL\nKEYFRAMING" if timecode_enabled else "TIMECODE BASED\nKEYFRAMING")
-        for row in self._fullscreen_manual_keyframe_rows.values():
-            row.setVisible(not timecode_enabled)
-        for row in self._fullscreen_timecode_keyframe_rows.values():
-            row.setVisible(timecode_enabled)
+        for view_name, stack in self._fullscreen_keyframe_stacks.items():
+            target_row = (
+                self._fullscreen_timecode_keyframe_rows[view_name]
+                if timecode_enabled
+                else self._fullscreen_manual_keyframe_rows[view_name]
+            )
+            stack.setCurrentWidget(target_row)
         for label in self._fullscreen_timecode_display_labels.values():
             label.setVisible(timecode_enabled)
         for label in self._fullscreen_timecode_key_labels.values():
@@ -6082,6 +6364,18 @@ class MainWindow(QMainWindow):
             self.roi_transition_frames_spin.setValue(normalized)
         else:
             self._sync_fullscreen_transition_rate_from_main(normalized)
+
+    def _on_fullscreen_roi_path_changed(self, text: str) -> None:
+        if self.roi_interp_mode_combo.currentText() != text:
+            self.roi_interp_mode_combo.setCurrentText(text)
+        else:
+            self._sync_fullscreen_roi_path_from_main(text)
+
+    def _sync_fullscreen_roi_path_from_main(self, text: str) -> None:
+        for combo in self._fullscreen_roi_path_combos.values():
+            previous_block = combo.blockSignals(True)
+            combo.setCurrentText(text)
+            combo.blockSignals(previous_block)
 
     def _on_fullscreen_override_duration_toggled(self, checked: bool) -> None:
         target = bool(checked)
@@ -6190,6 +6484,8 @@ class MainWindow(QMainWindow):
         self._windowed_available_geometry_before_fullscreen = (
             QRect(screen.availableGeometry()) if screen is not None else None
         )
+        self._windowed_display_splitter_sizes = list(self._display_splitter.sizes())
+        self._windowed_main_splitter_sizes = list(self._main_splitter.sizes())
 
     def _clamp_windowed_geometry_to_screen(self, geometry: QRect) -> QRect:
         available = self._windowed_available_geometry_before_fullscreen
@@ -6220,6 +6516,13 @@ class MainWindow(QMainWindow):
                 if geometry is not None and geometry.isValid():
                     self.setGeometry(self._clamp_windowed_geometry_to_screen(geometry))
                 self.show()
+
+            if self._windowed_display_splitter_sizes is not None:
+                self._display_splitter.setSizes(self._windowed_display_splitter_sizes)
+            if self._windowed_main_splitter_sizes is not None:
+                self._main_splitter.setSizes(self._windowed_main_splitter_sizes)
+            self._viewer_layout_transition_active = False
+            QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
 
         QTimer.singleShot(0, finish_restore)
 
@@ -6291,7 +6594,7 @@ class MainWindow(QMainWindow):
                     preview_updated = bool(self._controller.consume_decklink_frame_updated())
 
                 interaction_scale = 1.0
-                if self._manual_roi_interaction_active():
+                if self._roi_preview_motion_active():
                     interaction_scale = self._manual_roi_preview_reduce_scale
 
                 self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
@@ -6794,6 +7097,9 @@ class MainWindow(QMainWindow):
         self._main_splitter_initialized = True
 
     def _fit_viewers_to_video_aspect(self) -> None:
+        if self._viewer_layout_transition_active:
+            return
+
         self._fit_canvas_in_panel(
             panel=self._input_panel,
             header_widget=self._input_header,
@@ -6808,6 +7114,11 @@ class MainWindow(QMainWindow):
             footer_widget=self._output_fullscreen_keyframe_toolbar,
             side_widget=self._output_fullscreen_keyframe_side_panel,
         )
+
+    def _release_viewer_size_constraints(self) -> None:
+        for canvas in (self._input_canvas, self._output_canvas):
+            canvas.setMinimumSize(160, 90)
+            canvas.setMaximumSize(16777215, 16777215)
 
     def _fit_canvas_in_panel(
         self,
@@ -6900,6 +7211,8 @@ class MainWindow(QMainWindow):
         self._fullscreen_view_name = view_name
         self._sync_fullscreen_button_states()
         if view_name is None:
+            self._viewer_layout_transition_active = True
+            self._release_viewer_size_constraints()
             self._controls_scroll.setVisible(True)
             self._input_panel.setVisible(True)
             self._output_panel.setVisible(True)
@@ -6913,10 +7226,12 @@ class MainWindow(QMainWindow):
                 self._restore_windowed_geometry_after_fullscreen()
             else:
                 self.showNormal()
-            self._splitter_initialized = False
-            QTimer.singleShot(0, self._apply_initial_viewer_layout)
+                self._viewer_layout_transition_active = False
+                QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
             return
 
+        self._viewer_layout_transition_active = True
+        self._release_viewer_size_constraints()
         self._controls_scroll.setVisible(False)
         self._input_panel.setVisible(view_name == "input")
         self._output_panel.setVisible(view_name == "output")
@@ -6928,7 +7243,12 @@ class MainWindow(QMainWindow):
         self._input_canvas.setEnabled(view_name == "input")
         self._output_canvas.setEnabled(view_name == "output")
         self.showFullScreen()
-        QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
+
+        def finish_fullscreen_layout() -> None:
+            self._viewer_layout_transition_active = False
+            self._fit_viewers_to_video_aspect()
+
+        QTimer.singleShot(0, finish_fullscreen_layout)
 
     def _preview_target_for_view(self, view_name: str) -> tuple[int, int] | None:
         if self._fullscreen_view_name is not None and self._fullscreen_view_name != view_name:
@@ -7123,6 +7443,27 @@ class MainWindow(QMainWindow):
             f"DeckLink output buffer applied: {int(self._decklink_output_buffer_frames)} frame(s)"
         )
 
+    def _prepare_decklink_buffer_for_roi_transition(self) -> None:
+        if not self._decklink_buffer_guard_enabled or not self._decklink_sessions_running:
+            return
+
+        requested_frames = int(self._decklink_output_buffer_user_target_frames)
+        transition_floor = int(self._decklink_buffer_guard_transition_floor_frames)
+        if requested_frames >= transition_floor or self._decklink_output_buffer_frames >= transition_floor:
+            return
+
+        try:
+            if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                self._controller.set_decklink_output_buffer_frames(transition_floor)
+            self._decklink_output_buffer_frames = transition_floor
+            self._decklink_buffer_guard_active = True
+            self._decklink_buffer_guard_stable_windows = 0
+            self._update_status(
+                f"DeckLink buffer guard prepared ROI transition: requested {requested_frames}, temporarily applying {transition_floor}"
+            )
+        except Exception:
+            LOGGER.exception("DeckLink buffer guard failed to prepare ROI transition")
+
     def _maybe_auto_stabilize_decklink_buffer(
         self,
         *,
@@ -7208,6 +7549,50 @@ class MainWindow(QMainWindow):
         except Exception:
             LOGGER.exception("DeckLink buffer guard failed to restore requested buffer")
 
+    def _on_manual_drag_endpoint(self, x: float, y: float, w: float, h: float) -> None:
+        if (
+            self._controller_backend != "worker-process"
+            or not self._input_canvas.is_move_drag_active()
+            or not hasattr(self._controller, "publish_manual_roi_endpoint")
+        ):
+            return
+
+        overlay = (float(x), float(y), float(w), float(h))
+        step_roi, step_shift_x, step_shift_y = self._manual_roi_step_with_subpixel_float_target(overlay)
+
+        self._on_roi_adjustment_started()
+        if self._roi_keyframe_transition is not None:
+            transition_state = self._roi_keyframe_transition
+            if isinstance(transition_state, dict):
+                current_estimate = transition_state.get("current_roi_estimate")
+                if isinstance(current_estimate, Roi):
+                    self._controller_roi_applied = clamp_roi(current_estimate)
+            self._cancel_roi_keyframe_transition()
+
+        self._last_manual_roi_update_ts = time.perf_counter()
+        started = time.perf_counter()
+        self._roi_diag_controller_send_attempts += 1
+        sent = bool(
+            self._controller.publish_manual_roi_endpoint(
+                step_roi,
+                step_shift_x,
+                step_shift_y,
+                suspend_timecode=self._timecode_adjustment_paused,
+                motion_input=self._input_canvas.pointer_input_diagnostics(),
+            )
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._roi_diag_controller_send_ms_sum += elapsed_ms
+        self._roi_diag_controller_send_ms_max = max(self._roi_diag_controller_send_ms_max, elapsed_ms)
+        if sent:
+            self._roi_diag_controller_send_success += 1
+            self._manual_roi_last_send_ts = time.perf_counter()
+            self._manual_live_target_roi = None
+            self._pending_manual_controller_roi = None
+            self._manual_roi_send_timer.stop()
+        else:
+            self._roi_diag_controller_send_drops += 1
+
     def _on_roi_from_canvas(self, x: int, y: int, w: int, h: int) -> None:
         self._on_roi_adjustment_started()
         self._last_manual_roi_update_ts = time.perf_counter()
@@ -7238,31 +7623,20 @@ class MainWindow(QMainWindow):
             live_target = self._roi
         self._manual_live_target_roi = live_target
 
-        if drag_overlay is not None:
-            now = time.perf_counter()
-            overlay = tuple(float(v) for v in drag_overlay)
-            prev_end = self._manual_drag_interp_end_overlay
-            if prev_end is None:
-                self._manual_drag_interp_start_overlay = overlay
-                self._manual_drag_interp_end_overlay = overlay
-                self._manual_drag_interp_started_ts = now
-                self._manual_drag_interp_duration_s = 1.0 / 60.0
-            else:
-                current_sample = self._sample_manual_drag_overlay_target(overlay)
-                dt = now - self._manual_drag_last_event_ts if self._manual_drag_last_event_ts > 0.0 else (1.0 / 60.0)
-                self._manual_drag_interp_start_overlay = (
-                    tuple(float(v) for v in current_sample)
-                    if current_sample is not None
-                    else tuple(float(v) for v in prev_end)
-                )
-                self._manual_drag_interp_end_overlay = overlay
-                self._manual_drag_interp_started_ts = now
-                self._manual_drag_interp_duration_s = max(1.0 / 180.0, min(1.0 / 45.0, dt))
-            self._manual_drag_last_event_ts = now
-        else:
-            self._manual_drag_interp_start_overlay = None
-            self._manual_drag_interp_end_overlay = None
-            self._manual_drag_last_event_ts = 0.0
+        mailbox_drag = bool(
+            drag_overlay is not None
+            and self._input_canvas.is_move_drag_active()
+            and self._controller_backend == "worker-process"
+            and hasattr(self._controller, "publish_manual_roi_endpoint")
+        )
+        if mailbox_drag:
+            self._manual_live_target_roi = None
+            self._pending_manual_controller_roi = None
+            self._manual_roi_send_timer.stop()
+            self._schedule_roi_controls_sync(self._roi)
+            return
+        elif hasattr(self._controller, "clear_manual_roi_endpoint"):
+            self._controller.clear_manual_roi_endpoint()
 
         self._pending_manual_controller_roi = live_target
         if not self._manual_roi_send_timer.isActive():
@@ -7297,11 +7671,12 @@ class MainWindow(QMainWindow):
             and step_roi.h == self._controller_roi_applied.h
         )
 
-        drag_overlay = self._sample_manual_drag_overlay_target(self._input_canvas.drag_visual_roi_overlay())
+        drag_overlay = self._input_canvas.drag_visual_roi_overlay()
         if use_subpixel_microstep and moving_only and drag_overlay is not None:
             step_roi, step_shift_x, step_shift_y = self._manual_roi_step_with_subpixel_float_target(
                 drag_overlay,
             )
+        single_bucket_drag = bool(use_subpixel_microstep and moving_only and drag_overlay is not None)
 
         should_close_snap = self._is_controller_roi_close(step_roi, target) and not (
             use_subpixel_microstep and moving_only and drag_overlay is not None
@@ -7344,6 +7719,7 @@ class MainWindow(QMainWindow):
                         step_shift_y,
                         manual_drag=manual_interaction,
                         suspend_timecode=self._timecode_adjustment_paused,
+                        motion_input=self._input_canvas.pointer_input_diagnostics(),
                     )
                 )
             else:
@@ -7367,14 +7743,13 @@ class MainWindow(QMainWindow):
             self._roi_diag_controller_send_drops += 1
             self._update_status(f"ROI update failed: {exc}")
 
-        # Continue stepping while target is not reached, or while new user
-        # updates keep arriving.
+        # Translation drags retire after one successful bucket send. Resize and
+        # control changes continue stepping until their target is reached.
         manual_drag_active = self._input_canvas.drag_visual_roi_overlay() is not None
-        if sent and self._is_controller_roi_close(self._controller_roi_applied, target) and not manual_drag_active:
+        if sent and single_bucket_drag:
             self._manual_live_target_roi = None
-            self._manual_drag_interp_start_overlay = None
-            self._manual_drag_interp_end_overlay = None
-            self._manual_drag_last_event_ts = 0.0
+        elif sent and self._is_controller_roi_close(self._controller_roi_applied, target) and not manual_drag_active:
+            self._manual_live_target_roi = None
             self._controller_interp_residual = {"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0}
         if self._pending_manual_controller_roi is not None or self._manual_live_target_roi is not None:
             interval_ms = self._manual_roi_send_interval_ms(target_scale, moving_only=moving_only)
@@ -7413,40 +7788,6 @@ class MainWindow(QMainWindow):
         if self._controller_backend != "worker-process":
             return None
         return self._decklink_output_field_interval_ms()
-
-    def _sample_manual_drag_overlay_target(
-        self,
-        live_overlay: tuple[float, float, float, float] | None,
-    ) -> tuple[float, float, float, float] | None:
-        if live_overlay is None:
-            self._manual_drag_interp_start_overlay = None
-            self._manual_drag_interp_end_overlay = None
-            self._manual_drag_last_event_ts = 0.0
-            return None
-
-        start = self._manual_drag_interp_start_overlay
-        end = self._manual_drag_interp_end_overlay
-        if start is None or end is None:
-            overlay = tuple(float(v) for v in live_overlay)
-            self._manual_drag_interp_start_overlay = overlay
-            self._manual_drag_interp_end_overlay = overlay
-            self._manual_drag_interp_started_ts = time.perf_counter()
-            self._manual_drag_interp_duration_s = 1.0 / 60.0
-            return overlay
-
-        now = time.perf_counter()
-        duration = max(1e-4, float(self._manual_drag_interp_duration_s))
-        t = max(0.0, min(1.0, (now - float(self._manual_drag_interp_started_ts)) / duration))
-        sampled = (
-            float(start[0]) + ((float(end[0]) - float(start[0])) * t),
-            float(start[1]) + ((float(end[1]) - float(start[1])) * t),
-            float(start[2]) + ((float(end[2]) - float(start[2])) * t),
-            float(start[3]) + ((float(end[3]) - float(start[3])) * t),
-        )
-        if t >= 1.0:
-            self._manual_drag_interp_start_overlay = end
-            self._manual_drag_interp_started_ts = now
-        return sampled
 
     def _manual_roi_step_with_subpixel_float_target(
         self,
@@ -7561,6 +7902,9 @@ class MainWindow(QMainWindow):
         if self._manual_roi_send_timer.isActive():
             return True
         return self._pending_manual_controller_roi is not None
+
+    def _roi_preview_motion_active(self) -> bool:
+        return self._roi_keyframe_transition is not None or self._manual_roi_interaction_active()
 
     def _sync_backend_roi_from_worker(self) -> dict[str, object]:
         if self._source_mode != "Blackmagic DeckLink" or self._controller_backend != "worker-process":
@@ -9366,19 +9710,21 @@ class MainWindow(QMainWindow):
                 except (TypeError, ValueError):
                     continue
                 if keyframe.timecode:
-                    restored[frame_number] = keyframe
+                    _store_unique_timecode_keyframe(restored, keyframe)
         self._timecode_roi_keyframes = restored
         self._rebuild_timecode_roi_lookup()
 
     def _set_roi_keyframing_mode(self, timecode_enabled: bool, save: bool = True) -> None:
+        windowed_geometry = (
+            QRect(self.geometry())
+            if self._fullscreen_view_name is None and self.isVisible()
+            else None
+        )
         self._timecode_resume_timer.stop()
         self._timecode_resume_status = ""
         self._manual_roi_send_timer.stop()
         self._pending_manual_controller_roi = None
         self._manual_live_target_roi = None
-        self._manual_drag_interp_start_overlay = None
-        self._manual_drag_interp_end_overlay = None
-        self._manual_drag_last_event_ts = 0.0
         self._timecode_adjustment_finish_pending = False
         self._input_canvas.reset_interaction_state()
         self._input_canvas.set_roi(self._roi)
@@ -9401,6 +9747,14 @@ class MainWindow(QMainWindow):
         self._update_timecode_keyframe_display()
         if self._timecode_keyframing_enabled and self._timecode_playback_enabled:
             self._apply_timecode_roi_for_current_timecode()
+        if windowed_geometry is not None and windowed_geometry.isValid():
+            self.setGeometry(windowed_geometry)
+
+            def restore_windowed_geometry() -> None:
+                if self._fullscreen_view_name is None:
+                    self.setGeometry(windowed_geometry)
+
+            QTimer.singleShot(0, restore_windowed_geometry)
         if save:
             self._schedule_settings_save()
 
@@ -9464,7 +9818,7 @@ class MainWindow(QMainWindow):
             )
             if frame_number is None:
                 continue
-            reindexed[frame_number] = TimecodeRoiKeyframe(
+            reindexed_keyframe = TimecodeRoiKeyframe(
                 timecode=keyframe.timecode,
                 frame_number=frame_number,
                 roi=keyframe.roi,
@@ -9473,6 +9827,7 @@ class MainWindow(QMainWindow):
                 drop_frame=keyframe.drop_frame,
                 field_mark=keyframe.field_mark,
             )
+            _store_unique_timecode_keyframe(reindexed, reindexed_keyframe)
         self._timecode_roi_keyframes = reindexed
         self._timecode_adjustment_anchor = None
         self._timecode_selected_frame = None
@@ -9632,7 +9987,7 @@ class MainWindow(QMainWindow):
         field_mark = bool(self._decklink_timecode_info.get("field_mark", False))
         timecode_format = str(self._decklink_timecode_info.get("format_name", "")).strip()
         timecode = _normalize_timecode_display(timecode)
-        self._timecode_roi_keyframes[frame_number] = TimecodeRoiKeyframe(
+        keyframe = TimecodeRoiKeyframe(
             timecode=timecode,
             frame_number=frame_number,
             roi=clamp_roi(self._roi),
@@ -9641,11 +9996,13 @@ class MainWindow(QMainWindow):
             drop_frame=drop_frame,
             field_mark=field_mark,
         )
+        replaced = _store_unique_timecode_keyframe(self._timecode_roi_keyframes, keyframe)
         self._timecode_selected_frame = frame_number
         self._rebuild_timecode_roi_lookup()
         self._update_timecode_keyframe_display()
         self._schedule_settings_save()
-        self._update_status(f"Stored timecode ROI keyframe at {timecode}")
+        action = "Replaced" if replaced else "Stored"
+        self._update_status(f"{action} timecode ROI keyframe at {timecode}")
 
     def _on_timecode_delete_keyframe(self) -> None:
         frame_number = self._timecode_selected_frame
@@ -9820,9 +10177,6 @@ class MainWindow(QMainWindow):
         self._manual_roi_send_timer.stop()
         self._pending_manual_controller_roi = None
         self._manual_live_target_roi = None
-        self._manual_drag_interp_start_overlay = None
-        self._manual_drag_interp_end_overlay = None
-        self._manual_drag_last_event_ts = 0.0
         self._apply_controller_roi_immediate(self._roi, settle_interlaced=True)
         if not self._timecode_playback_enabled:
             selected_key = self._timecode_roi_keyframes.get(self._timecode_selected_frame)
@@ -10186,6 +10540,8 @@ class MainWindow(QMainWindow):
             and hasattr(self._controller, "start_roi_microstep_transition")
         )
         self._roi_keyframe_transition["backend_driven"] = backend_driven
+
+        self._prepare_decklink_buffer_for_roi_transition()
 
         # Ensure no background controller interpolation remains active while
         # keyframe transition drives ROI updates directly.
@@ -10669,6 +11025,7 @@ def load_video_processor_module():
 
 
 def main() -> int:
+    enable_windows_gui_keep_active()
     app = QApplication(sys.argv)
     initialize_com_for_decklink()
 
@@ -10676,6 +11033,7 @@ def main() -> int:
         module = load_video_processor_module()
     except Exception as exc:
         print(f"Failed to import video_processor module: {exc}")
+        disable_windows_gui_keep_active()
         return 1
 
     window = MainWindow(module)
@@ -10688,7 +11046,10 @@ def main() -> int:
     else:
         window.resize(1400, 860)
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        disable_windows_gui_keep_active()
 
 
 if __name__ == "__main__":

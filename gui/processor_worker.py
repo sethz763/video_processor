@@ -1947,23 +1947,33 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
             try:
                 now_ts = time.perf_counter()
                 target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
-                estimated_buffered_before = _estimate_output_schedule_buffered_frames(state, now_ts)
-                state["last_buffered_count"] = estimated_buffered_before
+                buffered_before = _estimate_output_schedule_buffered_frames(state, now_ts)
+                if bool(state.get("can_query_buffered", False)):
+                    try:
+                        buffered_before = max(0, int(out.buffered_video_frame_count()))
+                    except Exception:
+                        state["can_query_buffered"] = False
+                state["last_buffered_count"] = buffered_before
 
-                if bool(state.get("started", False)) and estimated_buffered_before <= 0:
+                if bool(state.get("started", False)) and buffered_before <= 0:
                     state["starved_streak"] = int(state.get("starved_streak", 0)) + 1
                 else:
                     state["starved_streak"] = 0
 
                 overflow_threshold = target_start_frames + _OUTPUT_SCHEDULE_LOCAL_OVERFLOW_HEADROOM_FRAMES
-                if bool(state.get("started", False)) and estimated_buffered_before > overflow_threshold:
+                if (
+                    _OUTPUT_SCHEDULE_AUTO_REPRIME_ON_OVERFLOW
+                    and bool(state.get("started", False))
+                    and buffered_before > overflow_threshold
+                ):
                     state["overflow_events"] = int(state.get("overflow_events", 0)) + 1
                     _reprime_output_schedule(out, reason="local_overflow")
                     state = _OUTPUT_SCHEDULE_STATE.get(out_id, state)
 
                 since_last_reprime = now_ts - float(state.get("last_auto_reprime_ts", 0.0))
                 if (
-                    bool(state.get("started", False))
+                    _OUTPUT_SCHEDULE_ENABLE_AUTO_REPRIME
+                    and bool(state.get("started", False))
                     and target_start_frames > 0
                     and int(state.get("starved_streak", 0)) >= _OUTPUT_SCHEDULE_STARVED_STREAK_THRESHOLD
                     and since_last_reprime >= _OUTPUT_SCHEDULE_AUTO_REPRIME_MIN_INTERVAL_S
@@ -1986,19 +1996,21 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
 
                 if not bool(state.get("started", False)):
                     state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
+                    # Playback begins at stream time zero, consuming the first
+                    # scheduled frame immediately. Queue that presentation frame
+                    # in addition to the requested retained buffer depth.
+                    required_preroll_frames = max(1, target_start_frames + 1)
                     should_start = False
-                    if target_start_frames <= 0:
-                        should_start = True
                     if bool(state.get("can_query_buffered", False)):
                         try:
                             buffered_count = int(out.buffered_video_frame_count())
                             queued_before_start = int(state.get("queued_before_start", 0))
                             effective_buffered = max(buffered_count, queued_before_start)
-                            should_start = effective_buffered >= target_start_frames
+                            should_start = effective_buffered >= required_preroll_frames
                         except Exception:
                             state["can_query_buffered"] = False
                     else:
-                        should_start = int(state.get("queued_before_start", 0)) >= target_start_frames
+                        should_start = int(state.get("queued_before_start", 0)) >= required_preroll_frames
 
                     if should_start:
                         out.start_scheduled_playback(0, time_scale, 1.0)
@@ -2143,6 +2155,8 @@ class _StageFrame:
     roi_y: int = 0
     roi_w: int = FRAME_W
     roi_h: int = FRAME_H
+    basic_scaling_auto_mode: bool = True
+    basic_scaling_manual_scale: int = 4
     effective_sr_scale: int = 1
     ai_applied: bool = False
     rtx_applied: bool = False
@@ -2158,6 +2172,8 @@ def run_processor_worker(
     startup_config: dict[str, Any],
     roi_telemetry_shared=None,
     roi_telemetry_seq=None,
+    manual_roi_mailbox_shared=None,
+    manual_roi_mailbox_seq=None,
 ) -> None:
     _FRAME_MESSAGE_TYPES = {"frame", "decklink_frame", "decklink_no_frame"}
     _CONTROL_MESSAGE_TYPES = {"ready", "ack", "warning", "error"}
@@ -2375,7 +2391,7 @@ def run_processor_worker(
     rtx_effect_sample_counter = 0
     processed_frame_counter = 0
     started_perf_ts = 0.0
-    roi_motion_trace_enabled = os.environ.get("VP_ROI_MOTION_TRACE", "1") != "0"
+    roi_motion_trace_enabled = os.environ.get("VP_ROI_MOTION_TRACE", "0") == "1"
     roi_motion_trace_file = None
     roi_motion_trace_lock = threading.Lock()
     roi_motion_trace_last_ts = 0.0
@@ -2391,7 +2407,9 @@ def run_processor_worker(
                 "timestamp,mode,processed_frame,command_sequence,dt_ms,carrier_x,carrier_y,roi_w,roi_h,"
                 "target_shift_x,target_shift_y,applied_shift_x,applied_shift_y,target_effective_x,"
                 "target_effective_y,applied_effective_x,applied_effective_y,delta_effective_x,"
-                "delta_effective_y,transition_progress,transition_total\n"
+                    "delta_effective_y,transition_progress,transition_total,manual_segment_remaining,"
+                    "input_source,input_event_dt_ms,input_event_delta_px,feedback_velocity_x,"
+                    "feedback_velocity_y,feedback_error_x,feedback_error_y\n"
             )
         except Exception:
             roi_motion_trace_file = None
@@ -2540,7 +2558,12 @@ def run_processor_worker(
     manual_interlaced_phase_pending = False
     roi_manual_drag_until_ts = 0.0
     roi_manual_drag_hold_s = max(0.05, min(0.50, float(os.environ.get("VP_ROI_MANUAL_DRAG_HOLD_S", "0.24"))))
+    roi_manual_feedback_gain = max(0.10, min(1.0, float(os.environ.get("VP_MANUAL_ROI_FEEDBACK_GAIN", "0.45"))))
+    roi_manual_velocity_x = 0.0
+    roi_manual_velocity_y = 0.0
     roi_manual_frame_target: dict[str, object] | None = None
+    manual_roi_mailbox_last_seq = 0
+    roi_manual_input_diagnostics: dict[str, object] = {}
     last_roi_command_sequence = 0
     timecode_roi_enabled = False
     timecode_phase_mode = "strict"
@@ -2672,10 +2695,18 @@ def run_processor_worker(
 
         return float(roi_shift_applied_x), float(roi_shift_applied_y)
 
-    def _snapshot_roi_motion_trace(applied_shift_x: float, applied_shift_y: float) -> dict[str, object]:
+    def _snapshot_roi_motion_trace(applied_shift_x: float, applied_shift_y: float) -> dict[str, object] | None:
+        if roi_motion_trace_file is None:
+            return None
+
         now = time.perf_counter()
         transition = roi_microstep_transition if isinstance(roi_microstep_transition, dict) else None
         mode = "keyframe" if transition is not None else ("manual" if now <= float(roi_manual_drag_until_ts) else "idle")
+        scale_x = FRAME_W / max(1.0, float(current_roi_w))
+        scale_y = FRAME_H / max(1.0, float(current_roi_h))
+        applied_center_x = float(current_roi_x) + (float(current_roi_w) * 0.5) - (float(applied_shift_x) / scale_x)
+        applied_center_y = float(current_roi_y) + (float(current_roi_h) * 0.5) - (float(applied_shift_y) / scale_y)
+        manual_target = roi_manual_frame_target if isinstance(roi_manual_frame_target, dict) else None
         return {
             "mode": mode,
             "command_sequence": int(last_roi_command_sequence),
@@ -2689,15 +2720,35 @@ def run_processor_worker(
             "applied_shift_y": float(applied_shift_y),
             "transition_progress": float(transition.get("frame_progress", 0.0)) if transition is not None else 0.0,
             "transition_total": int(transition.get("total_frames", 0)) if transition is not None else 0,
+            "manual_segment_remaining": (
+                int(roi_manual_frame_target.get("remaining_frames", 0))
+                if isinstance(roi_manual_frame_target, dict)
+                else 0
+            ),
+            "input_source": str(roi_manual_input_diagnostics.get("source", "unknown")),
+            "input_event_dt_ms": float(roi_manual_input_diagnostics.get("event_dt_ms", 0.0)),
+            "input_event_delta_px": float(roi_manual_input_diagnostics.get("event_delta_px", 0.0)),
+            "feedback_velocity_x": float(roi_manual_velocity_x),
+            "feedback_velocity_y": float(roi_manual_velocity_y),
+            "feedback_error_x": (
+                float(manual_target["center_x"]) - applied_center_x
+                if manual_target is not None
+                else 0.0
+            ),
+            "feedback_error_y": (
+                float(manual_target["center_y"]) - applied_center_y
+                if manual_target is not None
+                else 0.0
+            ),
         }
 
-    def _trace_emitted_roi_motion(frame_id: int, snapshot: dict[str, object]) -> None:
+    def _trace_emitted_roi_motion(frame_id: int, snapshot: dict[str, object] | None) -> None:
         nonlocal roi_motion_trace_last_ts
         nonlocal roi_motion_trace_last_effective_x, roi_motion_trace_last_effective_y
         nonlocal roi_motion_trace_last_mode
 
         trace_file = roi_motion_trace_file
-        if trace_file is None:
+        if trace_file is None or snapshot is None:
             return
 
         now = time.perf_counter()
@@ -2745,7 +2796,12 @@ def run_processor_worker(
             f"{target_shift_x:.6f},{target_shift_y:.6f},{applied_shift_x:.6f},{applied_shift_y:.6f},"
             f"{target_effective_x:.6f},{target_effective_y:.6f},"
             f"{applied_effective_x:.6f},{applied_effective_y:.6f},{delta_x:.6f},{delta_y:.6f},"
-            f"{float(snapshot['transition_progress']):.4f},{int(snapshot['transition_total'])}\n"
+            f"{float(snapshot['transition_progress']):.4f},{int(snapshot['transition_total'])},"
+            f"{int(snapshot['manual_segment_remaining'])},"
+            f"{str(snapshot['input_source']).replace(',', '_')},"
+            f"{float(snapshot['input_event_dt_ms']):.4f},{float(snapshot['input_event_delta_px']):.4f},"
+            f"{float(snapshot['feedback_velocity_x']):.6f},{float(snapshot['feedback_velocity_y']):.6f},"
+            f"{float(snapshot['feedback_error_x']):.6f},{float(snapshot['feedback_error_y']):.6f}\n"
         )
         try:
             with roi_motion_trace_lock:
@@ -3226,6 +3282,172 @@ def run_processor_worker(
             return 1.0 - (inv * inv)
         return clamped_t
 
+    def _build_roi_microstep_schedule(
+        start_roi: tuple[int, int, int, int],
+        target_roi: tuple[int, int, int, int],
+        total_frames: int,
+        interpolation_mode: str,
+        overscan_percent: float,
+        start_shift_x: float,
+        start_shift_y: float,
+        field2_phase_fraction: float,
+    ) -> np.ndarray:
+        schedule = np.empty((total_frames + 1, 19), dtype=np.float64)
+        s_x, s_y, s_w, s_h = [float(value) for value in start_roi]
+        t_x, t_y, t_w, t_h = [float(value) for value in target_roi]
+        schedule[0] = (
+            0.0,
+            s_x, s_y, s_w, s_h,
+            start_shift_x, start_shift_y,
+            s_x, s_y, s_w, s_h,
+            s_x, s_y, s_w, s_h,
+            start_shift_x, start_shift_y,
+            start_shift_x, start_shift_y,
+        )
+
+        start_scale_x = FRAME_W / max(1.0, s_w)
+        start_scale_y = FRAME_H / max(1.0, s_h)
+        residual_x = -(float(start_shift_x) / start_scale_x) if start_scale_x > 1e-6 else 0.0
+        residual_y = -(float(start_shift_y) / start_scale_y) if start_scale_y > 1e-6 else 0.0
+        residual_w = 0.0
+        last_roi = tuple(int(value) for value in start_roi)
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(field2_phase_fraction)
+        target_scale = FRAME_W / max(1.0, t_w)
+        overscan_pct = max(0.0, float(overscan_percent))
+        d_x = int(target_roi[0]) - int(start_roi[0])
+        d_y = int(target_roi[1]) - int(start_roi[1])
+        d_w = int(target_roi[2]) - int(start_roi[2])
+        d_h = int(target_roi[3]) - int(start_roi[3])
+
+        def quantize_directional(value: float, delta: int, quantum: int) -> int:
+            scaled = value / float(max(1, int(quantum)))
+            if delta > 0:
+                return int(math.floor(scaled)) * quantum
+            if delta < 0:
+                return int(math.ceil(scaled)) * quantum
+            return int(round(scaled)) * quantum
+
+        for frame_progress in range(1, total_frames + 1):
+            t = float(frame_progress) / float(total_frames)
+            curved_t = _apply_roi_curve(t, interpolation_mode)
+            previous_progress = float(frame_progress - 1)
+            field0_t = previous_progress / float(total_frames)
+            field1_t = min(1.0, (previous_progress + phase_fraction) / float(total_frames))
+            curved_t_field0 = _apply_roi_curve(field0_t, interpolation_mode)
+            curved_t_field1 = _apply_roi_curve(field1_t, interpolation_mode)
+
+            start_cx = s_x + (s_w * 0.5)
+            start_cy = s_y + (s_h * 0.5)
+            target_cx = t_x + (t_w * 0.5)
+            target_cy = t_y + (t_h * 0.5)
+            ideal_cx = start_cx + ((target_cx - start_cx) * curved_t)
+            ideal_cy = start_cy + ((target_cy - start_cy) * curved_t)
+            ideal_w = s_w + ((t_w - s_w) * curved_t)
+            ideal_cx_field0 = start_cx + ((target_cx - start_cx) * curved_t_field0)
+            ideal_cy_field0 = start_cy + ((target_cy - start_cy) * curved_t_field0)
+            ideal_cx_field1 = start_cx + ((target_cx - start_cx) * curved_t_field1)
+            ideal_cy_field1 = start_cy + ((target_cy - start_cy) * curved_t_field1)
+            ideal_w_field0 = s_w + ((t_w - s_w) * curved_t_field0)
+            ideal_w_field1 = s_w + ((t_w - s_w) * curved_t_field1)
+
+            desired_cx = ideal_cx + residual_x
+            desired_cy = ideal_cy + residual_y
+            desired_w = ideal_w + residual_w
+            if target_scale >= 4.0 and overscan_pct > 0.0:
+                overscan_weight = max(0.0, 4.0 * curved_t * (1.0 - curved_t))
+                desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
+                field0_weight = max(0.0, 4.0 * curved_t_field0 * (1.0 - curved_t_field0))
+                field1_weight = max(0.0, 4.0 * curved_t_field1 * (1.0 - curved_t_field1))
+                desired_w_field0 = (ideal_w_field0 + residual_w) * (1.0 + ((overscan_pct / 100.0) * field0_weight))
+                desired_w_field1 = (ideal_w_field1 + residual_w) * (1.0 + ((overscan_pct / 100.0) * field1_weight))
+            else:
+                desired_w_backend = desired_w
+                desired_w_field0 = ideal_w_field0 + residual_w
+                desired_w_field1 = ideal_w_field1 + residual_w
+
+            quant_w = max(2, quantize_directional(desired_w_backend, d_w, 2) & ~1)
+            quant_h = max(2, int(round(quant_w * 9.0 / 16.0)))
+            quant_x = quantize_directional(desired_cx - (quant_w * 0.5), d_x, 2)
+            quant_y = quantize_directional(desired_cy - (quant_h * 0.5), d_y, 1)
+            roi_x, roi_y, roi_w, roi_h = _normalize_worker_roi(quant_x, quant_y, quant_w, quant_h)
+
+            if d_x > 0:
+                roi_x = max(roi_x, last_roi[0])
+            elif d_x < 0:
+                roi_x = min(roi_x, last_roi[0])
+            if d_y > 0:
+                roi_y = max(roi_y, last_roi[1])
+            elif d_y < 0:
+                roi_y = min(roi_y, last_roi[1])
+            if d_w > 0:
+                roi_w = max(roi_w, last_roi[2])
+            elif d_w < 0:
+                roi_w = min(roi_w, last_roi[2])
+            if d_h > 0:
+                roi_h = max(roi_h, last_roi[3])
+            elif d_h < 0:
+                roi_h = min(roi_h, last_roi[3])
+            roi_x, roi_y, roi_w, roi_h = _normalize_worker_roi(roi_x, roi_y, roi_w, roi_h)
+            last_roi = (roi_x, roi_y, roi_w, roi_h)
+
+            interp_cx = float(roi_x) + (float(roi_w) * 0.5)
+            interp_cy = float(roi_y) + (float(roi_h) * 0.5)
+            residual_x = desired_cx - interp_cx
+            residual_y = desired_cy - interp_cy
+            residual_w = desired_w_backend - float(roi_w)
+            scale_x = FRAME_W / max(1.0, float(roi_w))
+            scale_y = FRAME_H / max(1.0, float(roi_h))
+            max_shift_x = max(2.0, min(48.0, scale_x * 1.5))
+            max_shift_y = max(2.0, min(48.0, scale_y * 1.5))
+            shift_x = max(-max_shift_x, min(max_shift_x, -((ideal_cx - interp_cx) * scale_x)))
+            shift_y = max(-max_shift_y, min(max_shift_y, -((ideal_cy - interp_cy) * scale_y)))
+
+            field_values: list[float] = []
+            for field_cx, field_cy, field_w in (
+                (ideal_cx_field0, ideal_cy_field0, desired_w_field0),
+                (ideal_cx_field1, ideal_cy_field1, desired_w_field1),
+            ):
+                quant_field_w = max(2, quantize_directional(field_w, d_w, 2) & ~1)
+                quant_field_h = max(2, int(round(quant_field_w * 9.0 / 16.0)))
+                field_x = quantize_directional(field_cx - (quant_field_w * 0.5), d_x, 2)
+                field_y = quantize_directional(field_cy - (quant_field_h * 0.5), d_y, 1)
+                field_x, field_y, field_roi_w, field_roi_h = _normalize_worker_roi(
+                    field_x, field_y, quant_field_w, quant_field_h
+                )
+                field_interp_cx = float(field_x) + (float(field_roi_w) * 0.5)
+                field_interp_cy = float(field_y) + (float(field_roi_h) * 0.5)
+                field_scale_x = FRAME_W / max(1.0, float(field_roi_w))
+                field_scale_y = FRAME_H / max(1.0, float(field_roi_h))
+                field_max_shift_x = max(2.0, min(48.0, field_scale_x * 1.5))
+                field_max_shift_y = max(2.0, min(48.0, field_scale_y * 1.5))
+                field_shift_x = max(
+                    -field_max_shift_x,
+                    min(field_max_shift_x, -((field_cx - field_interp_cx) * field_scale_x)),
+                )
+                field_shift_y = max(
+                    -field_max_shift_y,
+                    min(field_max_shift_y, -((field_cy - field_interp_cy) * field_scale_y)),
+                )
+                field_values.extend((field_x, field_y, field_roi_w, field_roi_h, field_shift_x, field_shift_y))
+
+            schedule[frame_progress] = (
+                frame_progress,
+                roi_x, roi_y, roi_w, roi_h,
+                shift_x, shift_y,
+                field_values[0], field_values[1], field_values[2], field_values[3],
+                field_values[6], field_values[7], field_values[8], field_values[9],
+                field_values[4], field_values[5], field_values[10], field_values[11],
+            )
+
+        schedule[-1, 1:19] = (
+            t_x, t_y, t_w, t_h,
+            0.0, 0.0,
+            t_x, t_y, t_w, t_h,
+            t_x, t_y, t_w, t_h,
+            0.0, 0.0, 0.0, 0.0,
+        )
+        return schedule
+
     def _start_roi_microstep_transition(
         start_roi: tuple[int, int, int, int],
         target_roi: tuple[int, int, int, int],
@@ -3235,9 +3457,12 @@ def run_processor_worker(
         enforce_full_frame_scale_1x: bool = False,
     ) -> None:
         nonlocal roi_microstep_transition, roi_manual_frame_target
+        nonlocal roi_manual_velocity_x, roi_manual_velocity_y
         nonlocal roi_shift_applied_x, roi_shift_applied_y
 
         roi_manual_frame_target = None
+        roi_manual_velocity_x = 0.0
+        roi_manual_velocity_y = 0.0
 
         s_x, s_y, s_w, s_h = _normalize_worker_roi(*start_roi)
         t_x, t_y, t_w, t_h = _normalize_worker_roi(*target_roi)
@@ -3268,10 +3493,17 @@ def run_processor_worker(
         if mode_name not in {"linear", "ease_in_out", "ease_out"}:
             mode_name = "linear"
 
-        sx = FRAME_W / max(1.0, float(s_w))
-        sy = FRAME_H / max(1.0, float(s_h))
-        start_source_dx = -(float(start_shift_x) / sx) if sx > 1e-6 else 0.0
-        start_source_dy = -(float(start_shift_y) / sy) if sy > 1e-6 else 0.0
+        phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
+        schedule = _build_roi_microstep_schedule(
+            (s_x, s_y, s_w, s_h),
+            (t_x, t_y, t_w, t_h),
+            total_frames,
+            mode_name,
+            overscan_percent,
+            start_shift_x,
+            start_shift_y,
+            phase_fraction,
+        )
 
         roi_microstep_transition = {
             "start": (s_x, s_y, s_w, s_h),
@@ -3279,12 +3511,9 @@ def run_processor_worker(
             "total_frames": total_frames,
             "frame_progress": 0.0,
             "interpolation_mode": mode_name,
-            # Preserve the currently rendered subpixel-compensated center as
-            # the transition start state so the first transition frame is
-            # continuous with the pre-recall frame.
-            "residual": {"x": start_source_dx, "y": start_source_dy, "w": 0.0},
-            "last_roi": (s_x, s_y, s_w, s_h),
-            "overscan_percent": max(0.0, float(overscan_percent)),
+            "schedule": schedule,
+            "schedule_index": 0,
+            "phase_fraction_active": abs(phase_fraction) > 1e-4,
             "enforce_full_frame_scale_1x": bool(enforce_full_frame_scale_1x),
         }
 
@@ -3306,8 +3535,11 @@ def run_processor_worker(
 
     def _cancel_roi_microstep_transition(reset_shift: bool = True) -> None:
         nonlocal roi_microstep_transition, roi_manual_frame_target
+        nonlocal roi_manual_velocity_x, roi_manual_velocity_y
         roi_microstep_transition = None
         roi_manual_frame_target = None
+        roi_manual_velocity_x = 0.0
+        roi_manual_velocity_y = 0.0
         if reset_shift:
             _set_roi_shift_target(0.0, 0.0)
 
@@ -3444,8 +3676,60 @@ def run_processor_worker(
 
     def _advance_manual_roi_frame_segment() -> None:
         nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h
-        nonlocal roi_manual_frame_target
+        nonlocal roi_manual_frame_target, manual_roi_mailbox_last_seq
+        nonlocal roi_manual_velocity_x, roi_manual_velocity_y
+        nonlocal last_roi_command_sequence
+        nonlocal timecode_roi_enabled, roi_manual_input_diagnostics, roi_manual_drag_until_ts
         nonlocal manual_interlaced_phase_state, manual_interlaced_phase_until_ts, manual_interlaced_phase_pending
+
+        if manual_roi_mailbox_shared is not None and manual_roi_mailbox_seq is not None:
+            try:
+                mailbox_seq_before = int(manual_roi_mailbox_seq.value)
+                if mailbox_seq_before != manual_roi_mailbox_last_seq and mailbox_seq_before % 2 == 0:
+                    with manual_roi_mailbox_shared.get_lock():
+                        mailbox = [float(manual_roi_mailbox_shared[index]) for index in range(12)]
+                    mailbox_seq_after = int(manual_roi_mailbox_seq.value)
+                    if mailbox_seq_before == mailbox_seq_after:
+                        if mailbox[0] < 0.5:
+                            manual_roi_mailbox_last_seq = mailbox_seq_after
+                            roi_manual_frame_target = None
+                            roi_manual_velocity_x = 0.0
+                            roi_manual_velocity_y = 0.0
+                        else:
+                            next_roi_x, next_roi_y, next_roi_w, next_roi_h = _normalize_worker_roi(
+                                int(round(mailbox[1])),
+                                int(round(mailbox[2])),
+                                int(round(mailbox[3])),
+                                int(round(mailbox[4])),
+                            )
+                            manual_roi_mailbox_last_seq = mailbox_seq_after
+                            if mailbox[7] >= 0.5:
+                                timecode_roi_enabled = False
+                            source_code = int(round(mailbox[8]))
+                            source_name = {
+                                1: "touch",
+                                2: "mouse:MouseEventNotSynthesized",
+                                3: "mouse:MouseEventSynthesizedBySystem",
+                                4: "mouse:MouseEventSynthesizedByQt",
+                                5: "mouse:MouseEventSynthesizedByApplication",
+                            }.get(source_code, "unknown")
+                            roi_manual_input_diagnostics = {
+                                "source": source_name,
+                                "event_dt_ms": float(mailbox[9]),
+                                "event_delta_px": float(mailbox[10]),
+                            }
+                            mailbox_scale_x = FRAME_W / max(1.0, float(next_roi_w))
+                            mailbox_scale_y = FRAME_H / max(1.0, float(next_roi_h))
+                            roi_manual_drag_until_ts = time.perf_counter() + float(roi_manual_drag_hold_s)
+                            roi_manual_frame_target = {
+                                "roi_w": int(current_roi_w),
+                                "roi_h": int(current_roi_h),
+                                "center_x": float(next_roi_x) + (float(next_roi_w) * 0.5) - (float(mailbox[5]) / mailbox_scale_x),
+                                "center_y": float(next_roi_y) + (float(next_roi_h) * 0.5) - (float(mailbox[6]) / mailbox_scale_y),
+                                "remaining_frames": 1,
+                            }
+            except Exception:
+                pass
 
         state = roi_manual_frame_target
         if not isinstance(state, dict):
@@ -3455,6 +3739,8 @@ def run_processor_worker(
         target_h = int(state["roi_h"])
         if target_w != current_roi_w or target_h != current_roi_h:
             roi_manual_frame_target = None
+            roi_manual_velocity_x = 0.0
+            roi_manual_velocity_y = 0.0
             return
 
         scale_x = FRAME_W / max(1.0, float(current_roi_w))
@@ -3463,10 +3749,15 @@ def run_processor_worker(
         current_center_y = float(current_roi_y) + (float(current_roi_h) * 0.5) - (float(roi_shift_applied_y) / scale_y)
         target_center_x = float(state["center_x"])
         target_center_y = float(state["center_y"])
-        remaining_frames = max(1, int(state.get("remaining_frames", 1)))
-        frame_fraction = 1.0 / float(remaining_frames)
-        desired_center_x = current_center_x + ((target_center_x - current_center_x) * frame_fraction)
-        desired_center_y = current_center_y + ((target_center_y - current_center_y) * frame_fraction)
+        error_x = target_center_x - current_center_x
+        error_y = target_center_y - current_center_y
+        error_magnitude = math.hypot(error_x, error_y)
+        if error_magnitude <= 0.01:
+            desired_center_x = target_center_x
+            desired_center_y = target_center_y
+        else:
+            desired_center_x = current_center_x + (error_x * float(roi_manual_feedback_gain))
+            desired_center_y = current_center_y + (error_y * float(roi_manual_feedback_gain))
 
         desired_x = desired_center_x - (float(current_roi_w) * 0.5)
         desired_y = desired_center_y - (float(current_roi_h) * 0.5)
@@ -3493,6 +3784,11 @@ def run_processor_worker(
             processor.set_roi_position(current_roi_x, current_roi_y)
         _set_roi_shift_immediate(shift_x, shift_y)
 
+        applied_center_x = float(current_roi_x) + (float(current_roi_w) * 0.5) - (float(roi_shift_applied_x) / scale_x)
+        applied_center_y = float(current_roi_y) + (float(current_roi_h) * 0.5) - (float(roi_shift_applied_y) / scale_y)
+        roi_manual_velocity_x = applied_center_x - current_center_x
+        roi_manual_velocity_y = applied_center_y - current_center_y
+
         if output_mode_is_interlaced and _interlaced_phase_controls_active():
             manual_interlaced_phase_state = _build_manual_interlaced_phase_snapshot(
                 prev_roi_state,
@@ -3503,18 +3799,95 @@ def run_processor_worker(
             manual_interlaced_phase_until_ts = time.perf_counter() + 0.12
             manual_interlaced_phase_pending = True
 
-        if remaining_frames <= 1:
-            if roi_manual_frame_target is state:
-                roi_manual_frame_target = None
-        else:
-            state["remaining_frames"] = remaining_frames - 1
-
     def _advance_roi_microstep_transition_one_frame(progress_units: float | None = None) -> None:
         nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition, output_transition_units_per_frame
         nonlocal interlaced_field2_phase_fraction
+        nonlocal current_basic_scaling_auto_mode
 
         state = roi_microstep_transition
         if state is None:
+            return
+
+        schedule = state.get("schedule")
+        if isinstance(schedule, np.ndarray) and schedule.ndim == 2 and schedule.shape[0] > 0 and schedule.shape[1] >= 19:
+            if bool(state.get("completion_pending", False)):
+                _set_roi_shift_immediate(0.0, 0.0)
+                roi_microstep_transition = None
+                return
+
+            schedule_index = max(0, min(int(state.get("schedule_index", 0)), schedule.shape[0] - 1))
+            row = schedule[schedule_index]
+            state["schedule_index"] = min(schedule_index + 1, schedule.shape[0] - 1)
+            state["frame_progress"] = float(row[0])
+
+            next_x, next_y, next_w, next_h = (int(row[1]), int(row[2]), int(row[3]), int(row[4]))
+            shift_x, shift_y = float(row[5]), float(row[6])
+            if bool(state.get("phase_fraction_active", False)):
+                state["interlaced_field_shift"] = {
+                    "field0_x": float(row[15]),
+                    "field0_y": float(row[16]),
+                    "field1_x": float(row[17]),
+                    "field1_y": float(row[18]),
+                }
+                state["interlaced_field_phase"] = {
+                    "roi0": (int(row[7]), int(row[8]), int(row[9]), int(row[10])),
+                    "roi1": (int(row[11]), int(row[12]), int(row[13]), int(row[14])),
+                    "field0_x": float(row[15]),
+                    "field0_y": float(row[16]),
+                    "field1_x": float(row[17]),
+                    "field1_y": float(row[18]),
+                }
+            else:
+                state.pop("interlaced_field_shift", None)
+                state.pop("interlaced_field_phase", None)
+
+            _set_roi_shift_target(shift_x, shift_y)
+            roi_changed = (
+                next_x != current_roi_x
+                or next_y != current_roi_y
+                or next_w != current_roi_w
+                or next_h != current_roi_h
+            )
+            if roi_changed:
+                previous_w = current_roi_w
+                previous_h = current_roi_h
+                current_roi_x, current_roi_y, current_roi_w, current_roi_h = next_x, next_y, next_w, next_h
+                if current_roi_w == previous_w and current_roi_h == previous_h:
+                    processor.set_roi_position(current_roi_x, current_roi_y)
+                else:
+                    processor.set_roi(current_roi_x, current_roi_y, current_roi_w, current_roi_h)
+                    if rtx_vsr_enabled:
+                        if rtx_vsr_engine is None:
+                            _ = _refresh_rtx_vsr_engine()
+                        else:
+                            _schedule_rtx_roi_rebuild()
+
+            target_roi = tuple(state["target"])
+            is_final_frame = schedule_index >= schedule.shape[0] - 1
+            transition_complete = (
+                is_final_frame
+                and abs(current_roi_x - int(target_roi[0])) <= 2
+                and abs(current_roi_y - int(target_roi[1])) <= 1
+                and abs(current_roi_w - int(target_roi[2])) <= 2
+                and abs(current_roi_h - int(target_roi[3])) <= 2
+            )
+            if transition_complete:
+                enforce_full_frame_scale = bool(state.get("enforce_full_frame_scale_1x", False))
+                if (
+                    enforce_full_frame_scale
+                    and current_roi_x == 0
+                    and current_roi_y == 0
+                    and current_roi_w == FRAME_W
+                    and current_roi_h == FRAME_H
+                    and not current_basic_scaling_auto_mode
+                ):
+                    try:
+                        processor.set_sr_mode_auto()
+                        current_basic_scaling_auto_mode = True
+                    except Exception:
+                        pass
+                _set_roi_shift_target(0.0, 0.0)
+                state["completion_pending"] = True
             return
 
         start_roi = tuple(state["start"])
@@ -4699,6 +5072,8 @@ def run_processor_worker(
                             roi_y=int(current_roi_y),
                             roi_w=int(current_roi_w),
                             roi_h=int(current_roi_h),
+                            basic_scaling_auto_mode=bool(current_basic_scaling_auto_mode),
+                            basic_scaling_manual_scale=int(current_basic_scaling_manual_scale),
                             interlaced_field_phase=interlaced_phase_snapshot,
                             roi_motion_trace=_snapshot_roi_motion_trace(shift_x, shift_y),
                         )
@@ -4836,6 +5211,8 @@ def run_processor_worker(
                     roi_y=int(current_roi_y),
                     roi_w=int(current_roi_w),
                     roi_h=int(current_roi_h),
+                    basic_scaling_auto_mode=bool(current_basic_scaling_auto_mode),
+                    basic_scaling_manual_scale=int(current_basic_scaling_manual_scale),
                     interlaced_field_phase=interlaced_phase_snapshot,
                     roi_motion_trace=_snapshot_roi_motion_trace(shift_x, shift_y),
                 )
@@ -4895,19 +5272,19 @@ def run_processor_worker(
                             thread_parallel_proc.set_max_auto_sr_scale(int(current_max_auto_basic_scaling))
                             last_synced_max_auto_scale = int(current_max_auto_basic_scaling)
 
-                        if current_basic_scaling_auto_mode != last_synced_mode_auto:
-                            if current_basic_scaling_auto_mode:
+                        if item.basic_scaling_auto_mode != last_synced_mode_auto:
+                            if item.basic_scaling_auto_mode:
                                 thread_parallel_proc.set_sr_mode_auto()
                             else:
-                                thread_parallel_proc.set_sr_scale_manual(int(current_basic_scaling_manual_scale))
-                            last_synced_mode_auto = bool(current_basic_scaling_auto_mode)
+                                thread_parallel_proc.set_sr_scale_manual(int(item.basic_scaling_manual_scale))
+                            last_synced_mode_auto = bool(item.basic_scaling_auto_mode)
 
                         if (
-                            (not current_basic_scaling_auto_mode)
-                            and current_basic_scaling_manual_scale != last_synced_manual_scale
+                            (not item.basic_scaling_auto_mode)
+                            and item.basic_scaling_manual_scale != last_synced_manual_scale
                         ):
-                            thread_parallel_proc.set_sr_scale_manual(int(current_basic_scaling_manual_scale))
-                            last_synced_manual_scale = int(current_basic_scaling_manual_scale)
+                            thread_parallel_proc.set_sr_scale_manual(int(item.basic_scaling_manual_scale))
+                            last_synced_manual_scale = int(item.basic_scaling_manual_scale)
 
                         if current_deinterlace_enabled != last_synced_deinterlace_enabled:
                             thread_parallel_proc.set_deinterlace_enabled(bool(current_deinterlace_enabled))
@@ -6202,6 +6579,8 @@ def run_processor_worker(
                 timecode_phase_tracker.clear()
                 roi_microstep_transition = None
                 roi_manual_frame_target = None
+                roi_manual_velocity_x = 0.0
+                roi_manual_velocity_y = 0.0
                 if not timecode_roi_enabled:
                     _set_roi_shift_immediate(0.0, 0.0)
                 continue
@@ -6255,6 +6634,9 @@ def run_processor_worker(
                 manual_drag = bool(message.get("manual_drag", False))
                 if manual_drag:
                     roi_manual_drag_until_ts = time.perf_counter() + float(roi_manual_drag_hold_s)
+                    motion_input = message.get("motion_input")
+                    if isinstance(motion_input, dict):
+                        roi_manual_input_diagnostics = dict(motion_input)
                 next_roi_x, next_roi_y, next_roi_w, next_roi_h = _normalize_worker_roi(
                     int(message["x"]),
                     int(message["y"]),
@@ -6266,16 +6648,20 @@ def run_processor_worker(
                 if manual_drag and next_roi_w == current_roi_w and next_roi_h == current_roi_h:
                     scale_x = FRAME_W / max(1.0, float(next_roi_w))
                     scale_y = FRAME_H / max(1.0, float(next_roi_h))
+                    target_center_x = float(next_roi_x) + (float(next_roi_w) * 0.5) - (next_shift_x / scale_x)
+                    target_center_y = float(next_roi_y) + (float(next_roi_h) * 0.5) - (next_shift_y / scale_y)
                     roi_manual_frame_target = {
                         "roi_w": int(next_roi_w),
                         "roi_h": int(next_roi_h),
-                        "center_x": float(next_roi_x) + (float(next_roi_w) * 0.5) - (next_shift_x / scale_x),
-                        "center_y": float(next_roi_y) + (float(next_roi_h) * 0.5) - (next_shift_y / scale_y),
-                        "remaining_frames": 2,
+                        "center_x": target_center_x,
+                        "center_y": target_center_y,
+                        "remaining_frames": 1,
                     }
                     continue
 
                 roi_manual_frame_target = None
+                roi_manual_velocity_x = 0.0
+                roi_manual_velocity_y = 0.0
                 prev_roi_w = current_roi_w
                 prev_roi_h = current_roi_h
                 current_roi_x, current_roi_y, current_roi_w, current_roi_h = (

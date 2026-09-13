@@ -1458,15 +1458,16 @@ std::string VideoProcessor::ProcessFrameInternal(
         if (enable_placeholder_sr_ && auto_sr_scale_) {
             const int desired_scale = SelectAutoSrScale(width_, height_, roi_w_, roi_h_, max_auto_sr_scale_);
             if (desired_scale != sr_scale_) {
-                if (auto_sr_pending_scale_ != desired_scale) {
+                if (desired_scale == 1) {
+                    ConfigureSrScaleLocked(0, true);
+                } else if (auto_sr_pending_scale_ != desired_scale) {
                     auto_sr_pending_scale_ = desired_scale;
                     auto_sr_pending_frames_ = 1;
                 } else {
                     auto_sr_pending_frames_ += 1;
-                }
-
-                if (auto_sr_pending_frames_ >= auto_sr_settle_frames_) {
-                    ConfigureSrScaleLocked(0, true);
+                    if (auto_sr_pending_frames_ >= auto_sr_settle_frames_) {
+                        ConfigureSrScaleLocked(0, true);
+                    }
                 }
             } else {
                 auto_sr_pending_scale_ = -1;
@@ -1499,12 +1500,67 @@ std::string VideoProcessor::ProcessFrameInternal(
         }
     }
 
-    // Fast no-op path: when no stage modifies pixels and ROI is full-frame,
-    // skip GPU work entirely.
+    // Preserve byte-identical full-frame output. When basic scaling is enabled,
+    // exercise its selected GPU kernels so the first ROI transition is not cold.
     if (!deinterlace_only && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
         (!enable_placeholder_sr_ || sr_scale <= 1) &&
         roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_ &&
         !HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+        if (enable_placeholder_sr_) {
+            const int color_matrix = ToColorMatrixId(color_space);
+            const int color_range_id = ToColorRangeId(color_range);
+            CheckCuda(
+                cudaMemcpyAsync(d_uyvy_in_, input_frame, uyvy_bytes_, cudaMemcpyHostToDevice, stream_),
+                "cudaMemcpyAsync H2D full-frame warm path"
+            );
+            cuda_kernels::LaunchUyvyToRgb(
+                d_uyvy_in_,
+                d_rgb_full_,
+                width_,
+                height_,
+                color_matrix,
+                color_range_id,
+                stream_
+            );
+            switch (sr_flavor) {
+                case SrFlavor::Bilinear:
+                    cuda_kernels::LaunchCropZoomBilinear(
+                        d_rgb_full_, width_, height_, d_rgb_zoom_, width_, height_,
+                        0, 0, width_, height_, stream_
+                    );
+                    break;
+                case SrFlavor::BilinearSharp:
+                    cuda_kernels::LaunchCropZoomBilinearSharp(
+                        d_rgb_full_, width_, height_, d_rgb_zoom_, width_, height_,
+                        0, 0, width_, height_, stream_
+                    );
+                    break;
+                case SrFlavor::Bicubic:
+                case SrFlavor::BicubicSharpen:
+                    cuda_kernels::LaunchCropZoomBicubic(
+                        d_rgb_full_, width_, height_, d_rgb_zoom_, width_, height_,
+                        0, 0, width_, height_, stream_
+                    );
+                    break;
+            }
+            const uchar3* warm_output = d_rgb_zoom_;
+            if (sr_flavor == SrFlavor::BicubicSharpen) {
+                cuda_kernels::LaunchSharpen3x3(
+                    d_rgb_zoom_, d_rgb_bob_, width_, height_, true, stream_
+                );
+                warm_output = d_rgb_bob_;
+            }
+            cuda_kernels::LaunchRgbToUyvy(
+                warm_output,
+                d_uyvy_out_,
+                width_,
+                height_,
+                color_matrix,
+                color_range_id,
+                stream_
+            );
+            CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize full-frame warm path");
+        }
         return std::string(reinterpret_cast<const char*>(input_frame), uyvy_bytes_);
     }
 

@@ -1,10 +1,10 @@
 {
-  "ai_sr_detail_preserve_percent": 20.0,
+  "ai_sr_detail_preserve_percent": 99.0,
   "ai_sr_enabled": false,
   "ai_sr_inference_divisor": 1,
   "ai_sr_inference_fps": 10,
-  "ai_sr_input_align": "4",
-  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\rt4ksr_x2_fp16.onnx",
+  "ai_sr_input_align": "2",
+  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x4.onnx",
   "ai_sr_post_artifact_reduction_method": "Off",
   "ai_sr_post_artifact_reduction_strength": 1.0,
   "ai_sr_post_denoise_method": "Off",
@@ -38,16 +38,16 @@
   "denoise_method": "Off",
   "denoise_strength": 0.35,
   "display_splitter_sizes": [
-    431,
-    416
+    424,
+    423
   ],
   "fps": 60,
   "fullscreen_scale_presets": [
-    200,
+    250,
     300,
     400
   ],
-  "fullscreen_selected_scale_index": 0,
+  "fullscreen_selected_scale_index": 1,
   "interlaced_field2_phase_fraction": 0.5,
   "main_splitter_sizes": [
     722,
@@ -60,16 +60,16 @@
   "reinterlace_enabled": false,
   "roi_drag_x_hysteresis_px": 0.15,
   "roi_interpolation_mode": "Ease In/Out",
-  "roi_keyframe_duration_override": false,
+  "roi_keyframe_duration_override": true,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 60,
+      "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        0,
-        370,
-        640,
-        360
+        450,
+        402,
+        696,
+        392
       ]
     },
     "2": {
@@ -93,7 +93,7 @@
       ]
     },
     "4": {
-      "duration_frames": 15,
+      "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
         0,
@@ -106,8 +106,8 @@
   "roi_keyframing_mode": "manual",
   "roi_manual_drag_hold_s": 0.1,
   "roi_timecode_keyframes": [],
-  "roi_timecode_playback_enabled": false,
-  "roi_transition_duration_frames": 60,
+  "roi_timecode_playback_enabled": true,
+  "roi_transition_duration_frames": 40,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
