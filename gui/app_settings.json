@@ -1,10 +1,10 @@
 {
-  "ai_sr_detail_preserve_percent": 99.0,
-  "ai_sr_enabled": false,
+  "ai_sr_detail_preserve_percent": 90.0,
+  "ai_sr_enabled": true,
   "ai_sr_inference_divisor": 1,
-  "ai_sr_inference_fps": 10,
+  "ai_sr_inference_fps": 4,
   "ai_sr_input_align": "2",
-  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\RealEsrganONNX\\RealESRGAN_x4.onnx",
+  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\span_x4_int8.onnx",
   "ai_sr_post_artifact_reduction_method": "Off",
   "ai_sr_post_artifact_reduction_strength": 1.0,
   "ai_sr_post_denoise_method": "Off",
@@ -12,36 +12,36 @@
   "ai_sr_post_exaggeration_enabled": false,
   "ai_sr_post_exaggeration_gain": 3.0,
   "ai_sr_provider": "auto",
-  "ai_sr_require_gpu": true,
+  "ai_sr_require_gpu": false,
   "ai_sr_roi_overscan_percent": 0.0,
   "ai_sr_strict": false,
-  "ai_sr_trt_precision": "fp16",
+  "ai_sr_trt_precision": "int8",
   "basic_scaling_auto_max": "2",
-  "basic_scaling_enabled": true,
+  "basic_scaling_enabled": false,
   "basic_scaling_manual": "2",
   "basic_scaling_method": "Bicubic (Balanced)",
   "basic_scaling_mode": "Auto",
   "color_range": "Limited (Video)",
-  "color_space": "Rec.2020 HLG (HDR)",
+  "color_space": "Rec.709 (SDR)",
   "decklink_auto_detect": true,
   "decklink_enable_format_detection": true,
   "decklink_fps_priority_guard": false,
   "decklink_input_device": 1,
-  "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
-  "decklink_output_buffer_frames": 1,
+  "decklink_input_mode_text": "1080i59.94 (1920x1080, 29.97fps)",
+  "decklink_output_buffer_frames": 2,
   "decklink_output_device": 0,
-  "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
+  "decklink_output_mode_text": "1080i59.94 (1920x1080, 29.97fps)",
   "decklink_timecode_format": "RP188 LTC",
   "decklink_timecode_phase_mode": "source_cadence",
-  "deinterlace_enabled": false,
-  "deinterlace_method": "Blend (Stable)",
+  "deinterlace_enabled": true,
+  "deinterlace_method": "Motion Adaptive (Broadcast: Deinterlace->Scale->Interlace)",
   "denoise_method": "Off",
   "denoise_strength": 0.35,
   "display_splitter_sizes": [
-    424,
-    423
+    388,
+    388
   ],
-  "fps": 60,
+  "fps": 30,
   "fullscreen_scale_presets": [
     250,
     300,
@@ -50,26 +50,26 @@
   "fullscreen_selected_scale_index": 1,
   "interlaced_field2_phase_fraction": 0.5,
   "main_splitter_sizes": [
-    722,
-    721
+    760,
+    759
   ],
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
   "preview_poll_fps": 30,
   "preview_request_fps": 30,
-  "reinterlace_enabled": false,
+  "reinterlace_enabled": true,
   "roi_drag_x_hysteresis_px": 0.15,
   "roi_interpolation_mode": "Ease In/Out",
   "roi_keyframe_duration_override": true,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 40,
+      "duration_frames": 20,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        450,
-        402,
-        696,
-        392
+        488,
+        542,
+        410,
+        231
       ]
     },
     "2": {
@@ -83,11 +83,11 @@
       ]
     },
     "3": {
-      "duration_frames": 30,
+      "duration_frames": 20,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        686,
-        532,
+        1228,
+        445,
         572,
         322
       ]
@@ -104,10 +104,10 @@
     }
   },
   "roi_keyframing_mode": "manual",
-  "roi_manual_drag_hold_s": 0.1,
+  "roi_manual_drag_hold_s": 0.4,
   "roi_timecode_keyframes": [],
   "roi_timecode_playback_enabled": true,
-  "roi_transition_duration_frames": 40,
+  "roi_transition_duration_frames": 20,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,

@@ -18,7 +18,7 @@ from pathlib import Path
 from statistics import median
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QEventPoint, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QTouchEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
-    QStackedLayout,
     QSplitter,
     QLineEdit,
     QVBoxLayout,
@@ -155,11 +154,61 @@ def _mode_name_is_interlaced(mode_label: str) -> bool:
 
 
 _SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
+_MAX_SOURCE_CADENCE_RUN_LENGTH = max(_SUPPORTED_SOURCE_CADENCES) * 2
 
 
-def _detect_source_cadence(run_length: int, position_step: int = 1) -> int:
-    observed = max(1.0, float(run_length) / float(max(1, position_step)))
+def _detect_source_cadence(
+    run_length: int,
+    position_step: int = 1,
+    delivery_phases: int = 1,
+) -> int:
+    normalized_run_length = float(max(1, run_length))
+    normalized_position_step = float(max(1, position_step))
+    normalized_delivery_phases = max(1, int(delivery_phases))
+    if normalized_delivery_phases == 1:
+        observed = normalized_run_length / normalized_position_step
+    else:
+        observed = (
+            normalized_run_length * float(normalized_delivery_phases)
+        ) / normalized_position_step
+    observed = max(1.0, observed)
     return min(_SUPPORTED_SOURCE_CADENCES, key=lambda cadence: (abs(cadence - observed), cadence))
+
+
+def _detect_source_cadence_stable(
+    run_length: int,
+    position_step: int,
+    delivery_phases: int,
+    previous_cadence: int,
+) -> int:
+    detected = _detect_source_cadence(run_length, position_step, delivery_phases)
+    previous = int(previous_cadence)
+    if previous not in _SUPPORTED_SOURCE_CADENCES:
+        return detected
+    observed = (
+        float(max(1, run_length))
+        * float(max(1, delivery_phases))
+        / float(max(1, position_step))
+    )
+    if abs(observed - float(previous)) <= 1.0:
+        return previous
+    return detected
+
+
+def _effective_synthesis_cadence(info: dict[str, object], fallback: int = 1) -> int:
+    try:
+        phase_step = float(info.get("cadence_phase_step", 0.0))
+        delivery_phases = max(1, int(info.get("cadence_delivery_phases", 1)))
+    except (TypeError, ValueError):
+        phase_step = 0.0
+        delivery_phases = 1
+    if phase_step > 1e-6:
+        observed = float(delivery_phases) / phase_step
+        return min(_SUPPORTED_SOURCE_CADENCES, key=lambda cadence: (abs(float(cadence) - observed), cadence))
+    try:
+        return max(1, int(info.get("detected_cadence", fallback)))
+    except (TypeError, ValueError):
+        return max(1, int(fallback))
 
 
 def _decklink_timecode_format_name(format_code: object) -> str:
@@ -493,7 +542,6 @@ LOGGER = setup_logger()
 
 _OUTPUT_SCHEDULE_STATE: dict[int, dict[str, object]] = {}
 _RPC_E_CHANGED_MODE_HEX = "0x80010106"
-_WINDOWS_TIMER_PERIOD_ACTIVE = False
 
 _ROI_TELEMETRY_SLOT_COUNT = 16
 _MANUAL_ROI_MAILBOX_SLOT_COUNT = 12
@@ -513,77 +561,6 @@ _ROI_TM_TARGET_X = 12
 _ROI_TM_TARGET_Y = 13
 _ROI_TM_TARGET_W = 14
 _ROI_TM_TARGET_H = 15
-
-
-def enable_windows_gui_keep_active() -> bool:
-    global _WINDOWS_TIMER_PERIOD_ACTIVE
-    if sys.platform != "win32" or os.environ.get("VP_KEEP_GUI_ACTIVE", "1") == "0":
-        return False
-
-    enabled = False
-    try:
-        winmm = ctypes.WinDLL("winmm", use_last_error=True)
-        if int(winmm.timeBeginPeriod(1)) == 0:
-            _WINDOWS_TIMER_PERIOD_ACTIVE = True
-            enabled = True
-        else:
-            LOGGER.warning("Windows GUI keep-active could not request 1 ms timer resolution")
-    except Exception as exc:
-        LOGGER.warning("Windows GUI keep-active timer setup failed: %s", exc)
-
-    try:
-        class ProcessPowerThrottlingState(ctypes.Structure):
-            _fields_ = [
-                ("Version", ctypes.c_ulong),
-                ("ControlMask", ctypes.c_ulong),
-                ("StateMask", ctypes.c_ulong),
-            ]
-
-        PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
-        PROCESS_POWER_THROTTLING = 4
-        state = ProcessPowerThrottlingState(
-            PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-            0,
-        )
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-        kernel32.SetProcessInformation.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_ulong,
-        ]
-        kernel32.SetProcessInformation.restype = ctypes.c_bool
-        process = kernel32.GetCurrentProcess()
-        if kernel32.SetProcessInformation(
-            process,
-            PROCESS_POWER_THROTTLING,
-            ctypes.byref(state),
-            ctypes.sizeof(state),
-        ):
-            enabled = True
-        else:
-            error_code = ctypes.get_last_error()
-            LOGGER.warning("Windows GUI keep-active power policy failed (WinError %d)", error_code)
-    except Exception as exc:
-        LOGGER.warning("Windows GUI keep-active power setup failed: %s", exc)
-
-    if enabled:
-        LOGGER.info("Windows GUI keep-active enabled (power throttling off, high-resolution timer requested)")
-    return enabled
-
-
-def disable_windows_gui_keep_active() -> None:
-    global _WINDOWS_TIMER_PERIOD_ACTIVE
-    if sys.platform != "win32" or not _WINDOWS_TIMER_PERIOD_ACTIVE:
-        return
-    try:
-        ctypes.WinDLL("winmm", use_last_error=True).timeEndPeriod(1)
-    except Exception as exc:
-        LOGGER.warning("Windows GUI keep-active timer cleanup failed: %s", exc)
-    _WINDOWS_TIMER_PERIOD_ACTIVE = False
 
 
 def initialize_com_for_decklink() -> None:
@@ -792,6 +769,7 @@ def _timecode_position_from_info(
     phase_mode: str,
     phase_tracker: dict[str, object] | None = None,
     source_seq: object | None = None,
+    delivery_phases: int = 1,
 ) -> float | None:
     timecode = str(info.get("text", "")).strip()
     if not bool(info.get("present", False)) or not timecode:
@@ -812,7 +790,7 @@ def _timecode_position_from_info(
             phase_tracker.clear()
         return None
 
-    if count_fps == 30 and normalized_format in {"RP188 VITC1", "RP188 VITC2"}:
+    if count_fps == 30 and normalized_format in {"RP188 LTC", "RP188 VITC1", "RP188 VITC2"}:
         hardware_position = (base_frame * 2) + (1 if field_mark else 0)
         if _normalize_timecode_phase_synthesis_mode(phase_mode) != "source_cadence":
             if isinstance(phase_tracker, dict):
@@ -829,23 +807,41 @@ def _timecode_position_from_info(
         current_run_length = max(1, int(phase_tracker.get("current_run_length", 1)))
         estimated_run_length = max(1, int(phase_tracker.get("estimated_run_length", 1)))
         position_step = max(1, int(phase_tracker.get("position_step", 1)))
+        run_frozen = bool(phase_tracker.get("run_frozen", False))
         if not isinstance(last_position, int):
             direction = 1
             run_index = 0
             current_run_length = 1
+            run_frozen = False
         elif hardware_position != last_position:
             direction = 1 if hardware_position > last_position else -1
             observed_step = abs(hardware_position - last_position)
             if observed_step in {1, 2}:
                 position_step = observed_step
-                detected_cadence = _detect_source_cadence(current_run_length, position_step)
+                if run_frozen:
+                    detected_cadence = max(1, int(phase_tracker.get("detected_cadence", 1)))
+                else:
+                    detected_cadence = _detect_source_cadence_stable(
+                        current_run_length,
+                        position_step,
+                        delivery_phases,
+                        int(phase_tracker.get("detected_cadence", 1)),
+                    )
                 estimated_run_length = detected_cadence * position_step
+                estimated_run_length = max(
+                    1,
+                    int(round(float(estimated_run_length) / float(max(1, delivery_phases)))),
+                )
             run_index = 0
             current_run_length = 1
+            run_frozen = False
         else:
             direction = 1 if last_direction >= 0 else -1
             run_index = current_run_length
-            current_run_length += 1
+            if current_run_length >= _MAX_SOURCE_CADENCE_RUN_LENGTH:
+                run_frozen = True
+            else:
+                current_run_length += 1
         phase_step = float(position_step) / float(estimated_run_length)
         max_phase = float(position_step) - phase_step
         phase = min(max_phase, float(run_index) * phase_step)
@@ -857,7 +853,14 @@ def _timecode_position_from_info(
         phase_tracker["current_run_length"] = current_run_length
         phase_tracker["estimated_run_length"] = estimated_run_length
         phase_tracker["position_step"] = position_step
-        phase_tracker["detected_cadence"] = _detect_source_cadence(estimated_run_length, position_step)
+        phase_tracker["phase_step"] = phase_step
+        phase_tracker["run_frozen"] = run_frozen
+        phase_tracker["delivery_phases"] = max(1, int(delivery_phases))
+        phase_tracker["detected_cadence"] = _detect_source_cadence(
+            estimated_run_length,
+            position_step,
+            delivery_phases,
+        )
         if source_seq is not None:
             phase_tracker["last_source_seq"] = source_seq
         phase_tracker["cached_frame_number"] = frame_number
@@ -4447,12 +4450,10 @@ class MainWindow(QMainWindow):
         self._pending_persisted_output_mode_text = ""
         self._has_persisted_deinterlace_method = False
         self._deinterlace_method_user_selected = False
+        self._windowed_qt_geometry_before_fullscreen: QByteArray | None = None
         self._windowed_geometry_before_fullscreen: QRect | None = None
         self._windowed_available_geometry_before_fullscreen: QRect | None = None
         self._windowed_was_maximized_before_fullscreen = False
-        self._windowed_display_splitter_sizes: list[int] | None = None
-        self._windowed_main_splitter_sizes: list[int] | None = None
-        self._viewer_layout_transition_active = False
         self._settings_path = Path(__file__).resolve().parent / "app_settings.json"
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -4489,7 +4490,6 @@ class MainWindow(QMainWindow):
         self._fullscreen_keyframe_title_labels: dict[str, QLabel] = {}
         self._fullscreen_manual_keyframe_rows: dict[str, QWidget] = {}
         self._fullscreen_timecode_keyframe_rows: dict[str, QWidget] = {}
-        self._fullscreen_keyframe_stacks: dict[str, QStackedLayout] = {}
         self._fullscreen_keyframing_mode_buttons: dict[str, QPushButton] = {}
         self._fullscreen_timecode_display_labels: dict[str, QLabel] = {}
         self._fullscreen_timecode_key_labels: dict[str, QLabel] = {}
@@ -4500,9 +4500,9 @@ class MainWindow(QMainWindow):
         self._fullscreen_timecode_playback_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_save_key_buttons: dict[str, QPushButton] = {}
         self._fullscreen_roi_key_slot_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton, QPushButton]] = {}
-        self._fullscreen_roi_path_combos: dict[str, QComboBox] = {}
         self._fullscreen_roi_transition_labels: dict[str, QLabel] = {}
         self._fullscreen_roi_transition_rate_spins: dict[str, QSpinBox] = {}
+        self._fullscreen_roi_interp_mode_combos: dict[str, QComboBox] = {}
         self._fullscreen_roi_duration_override_buttons: dict[str, QPushButton] = {}
         self._fullscreen_scale_buttons: dict[str, tuple[QPushButton, QPushButton, QPushButton]] = {}
         self._fullscreen_enter_buttons: dict[str, QPushButton] = {}
@@ -4581,7 +4581,6 @@ class MainWindow(QMainWindow):
         self._controls_panel = self._build_controls()
         self._controls_scroll = QScrollArea()
         self._controls_scroll.setWidgetResizable(True)
-        self._controls_scroll.setSizeAdjustPolicy(QScrollArea.SizeAdjustPolicy.AdjustIgnored)
         self._controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._controls_scroll.setWidget(self._controls_panel)
         self._controls_scroll.setMinimumWidth(420)
@@ -4606,7 +4605,6 @@ class MainWindow(QMainWindow):
         self._output_canvas.fullscreenRequested.connect(self._on_canvas_fullscreen_requested)
 
         self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.timeout.connect(self._tick)
         self._update_timer_interval()
         self._timer.start()
@@ -4644,11 +4642,11 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._connect_settings_persistence_signals()
         self.roi_transition_frames_spin.valueChanged.connect(self._sync_fullscreen_transition_rate_from_main)
-        self.roi_interp_mode_combo.currentTextChanged.connect(self._sync_fullscreen_roi_path_from_main)
+        self.roi_interp_mode_combo.currentTextChanged.connect(self._sync_fullscreen_interp_mode_from_main)
         self.roi_keyframe_duration_override_btn.toggled.connect(self._sync_fullscreen_override_duration_from_main)
         self._update_roi_key_buttons()
-        self._sync_fullscreen_roi_path_from_main(self.roi_interp_mode_combo.currentText())
         self._sync_fullscreen_transition_rate_from_main(self.roi_transition_frames_spin.value())
+        self._sync_fullscreen_interp_mode_from_main(self.roi_interp_mode_combo.currentText())
         self._sync_fullscreen_override_duration_from_main(self.roi_keyframe_duration_override_btn.isChecked())
         self._sync_fullscreen_button_states()
         self._sync_roi_transition_unit_labels()
@@ -4849,13 +4847,6 @@ class MainWindow(QMainWindow):
             }
             for keyframe in sorted(self._timecode_roi_keyframes.values(), key=lambda item: item.frame_number)
         ]
-        display_splitter_sizes = list(self._display_splitter.sizes())
-        main_splitter_sizes = list(self._main_splitter.sizes())
-        if self._fullscreen_view_name is not None:
-            if self._windowed_display_splitter_sizes is not None:
-                display_splitter_sizes = list(self._windowed_display_splitter_sizes)
-            if self._windowed_main_splitter_sizes is not None:
-                main_splitter_sizes = list(self._windowed_main_splitter_sizes)
 
         return {
             "version": 1,
@@ -4926,8 +4917,8 @@ class MainWindow(QMainWindow):
             "decklink_enable_format_detection": bool(self.decklink_enable_format_detection.isChecked()),
             "decklink_fps_priority_guard": bool(self.decklink_fps_priority_guard_checkbox.isChecked()),
             "worker_process_priority": str(self.worker_priority_combo.currentText()),
-            "display_splitter_sizes": display_splitter_sizes,
-            "main_splitter_sizes": main_splitter_sizes,
+            "display_splitter_sizes": list(self._display_splitter.sizes()),
+            "main_splitter_sizes": list(self._main_splitter.sizes()),
         }
 
     def _save_settings(self) -> None:
@@ -6089,7 +6080,7 @@ class MainWindow(QMainWindow):
 
     def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
         toolbar = QWidget()
-        toolbar_layout = QStackedLayout(toolbar)
+        toolbar_layout = QVBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(0)
 
@@ -6162,12 +6153,10 @@ class MainWindow(QMainWindow):
 
         toolbar_layout.addWidget(manual_row)
         toolbar_layout.addWidget(timecode_row)
-        toolbar_layout.setCurrentWidget(manual_row)
 
         self._fullscreen_keyframe_toolbars[view_name] = toolbar
         self._fullscreen_manual_keyframe_rows[view_name] = manual_row
         self._fullscreen_timecode_keyframe_rows[view_name] = timecode_row
-        self._fullscreen_keyframe_stacks[view_name] = toolbar_layout
         self._fullscreen_timecode_delete_buttons[view_name] = delete_btn
         self._fullscreen_timecode_delete_all_buttons[view_name] = delete_all_btn
         self._fullscreen_timecode_previous_buttons[view_name] = previous_btn
@@ -6175,6 +6164,7 @@ class MainWindow(QMainWindow):
         self._fullscreen_timecode_playback_buttons[view_name] = playback_btn
         self._fullscreen_roi_save_key_buttons[view_name] = save_btn
         self._fullscreen_roi_key_slot_buttons[view_name] = (key1_btn, key2_btn, key3_btn, key4_btn)
+        timecode_row.setVisible(False)
         self._update_timecode_playback_mode_control()
         toolbar.setVisible(False)
         return toolbar
@@ -6220,16 +6210,6 @@ class MainWindow(QMainWindow):
         timecode_key_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 700; padding: 6px; }")
         panel_layout.addWidget(timecode_key_label)
 
-        path_combo = QComboBox()
-        path_combo.addItems(["Linear", "Ease In/Out", "Ease Out"])
-        path_combo.setCurrentText("Ease In/Out")
-        path_combo.setMinimumWidth(150)
-        path_combo.setMinimumHeight(44)
-        path_combo.setStyleSheet("QComboBox { font-size: 15px; font-weight: 600; padding: 6px 8px; }")
-        path_combo.setToolTip("Interpolation path used for ROI transitions and newly stored keyframes.")
-        path_combo.currentTextChanged.connect(self._on_fullscreen_roi_path_changed)
-        panel_layout.addWidget(path_combo)
-
         transition_label = QLabel("Transition\n(frames)")
         transition_label.setAlignment(Qt.AlignCenter)
         transition_label.setStyleSheet("QLabel { font-size: 14px; font-weight: 600; }")
@@ -6247,6 +6227,16 @@ class MainWindow(QMainWindow):
         transition_spin.valueChanged.connect(self._on_fullscreen_transition_rate_changed)
         panel_layout.addWidget(transition_spin)
 
+        interp_mode_combo = QComboBox()
+        interp_mode_combo.addItems(["Linear", "Ease In/Out", "Ease Out"])
+        interp_mode_combo.setCurrentText("Ease In/Out")
+        interp_mode_combo.setMinimumWidth(150)
+        interp_mode_combo.setMinimumHeight(44)
+        interp_mode_combo.setStyleSheet("QComboBox { font-size: 16px; font-weight: 600; padding: 6px 8px; }")
+        interp_mode_combo.setToolTip("Interpolation path used for ROI transitions.")
+        interp_mode_combo.currentTextChanged.connect(self._on_fullscreen_interp_mode_changed)
+        panel_layout.addWidget(interp_mode_combo)
+
         override_btn = QPushButton("OVERRIDE\nKEY DURATION")
         override_btn.setCheckable(True)
         override_btn.setMinimumWidth(150)
@@ -6256,11 +6246,9 @@ class MainWindow(QMainWindow):
         override_btn.toggled.connect(self._on_fullscreen_override_duration_toggled)
         panel_layout.addWidget(override_btn)
 
-        scale_buttons_height = 60
-
         full_scale_btn = QPushButton("100%")
         full_scale_btn.setMinimumWidth(150)
-        full_scale_btn.setMinimumHeight(scale_buttons_height)
+        full_scale_btn.setMinimumHeight(44)
         full_scale_btn.setStyleSheet("QPushButton { font-size: 18px; font-weight: 700; padding: 8px; }")
         full_scale_btn.setToolTip("Interpolate the ROI to the full frame.")
         full_scale_btn.clicked.connect(self._interpolate_roi_to_full_frame)
@@ -6271,7 +6259,7 @@ class MainWindow(QMainWindow):
             scale_btn = QPushButton()
             scale_btn.setCheckable(True)
             scale_btn.setMinimumWidth(150)
-            scale_btn.setMinimumHeight(scale_buttons_height)
+            scale_btn.setMinimumHeight(44)
             scale_btn.setStyleSheet("QPushButton { font-size: 18px; font-weight: 700; padding: 8px; }")
             scale_btn.setToolTip("Select the scale used when tapping the preview. Right-click to change this percentage.")
             scale_btn.clicked.connect(lambda checked, preset_index=index: self._on_fullscreen_scale_toggled(preset_index, checked))
@@ -6289,22 +6277,12 @@ class MainWindow(QMainWindow):
         self._fullscreen_keyframing_mode_buttons[view_name] = mode_btn
         self._fullscreen_timecode_display_labels[view_name] = timecode_display_label
         self._fullscreen_timecode_key_labels[view_name] = timecode_key_label
-        self._fullscreen_roi_path_combos[view_name] = path_combo
         self._fullscreen_roi_transition_labels[view_name] = transition_label
         self._fullscreen_roi_transition_rate_spins[view_name] = transition_spin
+        self._fullscreen_roi_interp_mode_combos[view_name] = interp_mode_combo
         self._fullscreen_roi_duration_override_buttons[view_name] = override_btn
         self._fullscreen_scale_buttons[view_name] = tuple(scale_buttons)
         self._sync_fullscreen_scale_buttons()
-        for widget in (
-            timecode_display_label,
-            timecode_key_label,
-            transition_label,
-            transition_spin,
-            override_btn,
-        ):
-            size_policy = widget.sizePolicy()
-            size_policy.setRetainSizeWhenHidden(True)
-            widget.setSizePolicy(size_policy)
         timecode_display_label.setVisible(False)
         timecode_key_label.setVisible(False)
         panel.setVisible(False)
@@ -6319,21 +6297,14 @@ class MainWindow(QMainWindow):
             label.setText("TIMECODE KEYFRAME" if timecode_enabled else "MANUAL KEYFRAME")
         for button in self._fullscreen_keyframing_mode_buttons.values():
             button.setText("MANUAL\nKEYFRAMING" if timecode_enabled else "TIMECODE BASED\nKEYFRAMING")
-        for view_name, stack in self._fullscreen_keyframe_stacks.items():
-            target_row = (
-                self._fullscreen_timecode_keyframe_rows[view_name]
-                if timecode_enabled
-                else self._fullscreen_manual_keyframe_rows[view_name]
-            )
-            stack.setCurrentWidget(target_row)
+        for row in self._fullscreen_manual_keyframe_rows.values():
+            row.setVisible(not timecode_enabled)
+        for row in self._fullscreen_timecode_keyframe_rows.values():
+            row.setVisible(timecode_enabled)
         for label in self._fullscreen_timecode_display_labels.values():
             label.setVisible(timecode_enabled)
         for label in self._fullscreen_timecode_key_labels.values():
             label.setVisible(timecode_enabled)
-        for label in self._fullscreen_roi_transition_labels.values():
-            label.setVisible(not timecode_enabled)
-        for spin in self._fullscreen_roi_transition_rate_spins.values():
-            spin.setVisible(not timecode_enabled)
         for button in self._fullscreen_roi_duration_override_buttons.values():
             button.setVisible(not timecode_enabled)
         QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
@@ -6365,17 +6336,11 @@ class MainWindow(QMainWindow):
         else:
             self._sync_fullscreen_transition_rate_from_main(normalized)
 
-    def _on_fullscreen_roi_path_changed(self, text: str) -> None:
+    def _on_fullscreen_interp_mode_changed(self, text: str) -> None:
         if self.roi_interp_mode_combo.currentText() != text:
             self.roi_interp_mode_combo.setCurrentText(text)
         else:
-            self._sync_fullscreen_roi_path_from_main(text)
-
-    def _sync_fullscreen_roi_path_from_main(self, text: str) -> None:
-        for combo in self._fullscreen_roi_path_combos.values():
-            previous_block = combo.blockSignals(True)
-            combo.setCurrentText(text)
-            combo.blockSignals(previous_block)
+            self._sync_fullscreen_interp_mode_from_main(text)
 
     def _on_fullscreen_override_duration_toggled(self, checked: bool) -> None:
         target = bool(checked)
@@ -6390,6 +6355,12 @@ class MainWindow(QMainWindow):
             previous_block = spin.blockSignals(True)
             spin.setValue(normalized)
             spin.blockSignals(previous_block)
+
+    def _sync_fullscreen_interp_mode_from_main(self, text: str) -> None:
+        for combo in self._fullscreen_roi_interp_mode_combos.values():
+            previous_block = combo.blockSignals(True)
+            combo.setCurrentText(text)
+            combo.blockSignals(previous_block)
 
     def _sync_fullscreen_override_duration_from_main(self, checked: bool) -> None:
         target = bool(checked)
@@ -6475,7 +6446,8 @@ class MainWindow(QMainWindow):
 
     def _capture_windowed_geometry_before_fullscreen(self) -> None:
         self._windowed_was_maximized_before_fullscreen = self.isMaximized()
-        geometry = self.normalGeometry()
+        self._windowed_qt_geometry_before_fullscreen = QByteArray(self.saveGeometry())
+        geometry = self.normalGeometry() if self._windowed_was_maximized_before_fullscreen else self.geometry()
         if not geometry.isValid():
             geometry = self.geometry()
         self._windowed_geometry_before_fullscreen = QRect(geometry)
@@ -6484,8 +6456,6 @@ class MainWindow(QMainWindow):
         self._windowed_available_geometry_before_fullscreen = (
             QRect(screen.availableGeometry()) if screen is not None else None
         )
-        self._windowed_display_splitter_sizes = list(self._display_splitter.sizes())
-        self._windowed_main_splitter_sizes = list(self._main_splitter.sizes())
 
     def _clamp_windowed_geometry_to_screen(self, geometry: QRect) -> QRect:
         available = self._windowed_available_geometry_before_fullscreen
@@ -6502,27 +6472,47 @@ class MainWindow(QMainWindow):
         return QRect(x, y, width, height)
 
     def _restore_windowed_geometry_after_fullscreen(self) -> None:
-        geometry = self._windowed_geometry_before_fullscreen
+        qt_geometry = QByteArray(self._windowed_qt_geometry_before_fullscreen or QByteArray())
+        geometry = QRect(self._windowed_geometry_before_fullscreen) if self._windowed_geometry_before_fullscreen is not None else None
+        saved_available_geometry = (
+            QRect(self._windowed_available_geometry_before_fullscreen)
+            if self._windowed_available_geometry_before_fullscreen is not None
+            else None
+        )
         was_maximized = self._windowed_was_maximized_before_fullscreen
 
         self.setWindowState(self.windowState() & ~Qt.WindowFullScreen)
         self.showNormal()
 
         def finish_restore() -> None:
+            if self._fullscreen_view_name is not None:
+                return
+
+            restored = bool(qt_geometry) and self.restoreGeometry(qt_geometry)
             if was_maximized:
                 self.showMaximized()
             else:
                 self.setWindowState(Qt.WindowNoState)
-                if geometry is not None and geometry.isValid():
+                if not restored and geometry is not None and geometry.isValid():
                     self.setGeometry(self._clamp_windowed_geometry_to_screen(geometry))
                 self.show()
 
-            if self._windowed_display_splitter_sizes is not None:
-                self._display_splitter.setSizes(self._windowed_display_splitter_sizes)
-            if self._windowed_main_splitter_sizes is not None:
-                self._main_splitter.setSizes(self._windowed_main_splitter_sizes)
-            self._viewer_layout_transition_active = False
-            QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
+                original_screen_available = bool(
+                    saved_available_geometry is not None
+                    and saved_available_geometry.isValid()
+                    and any(
+                        QRect(screen.availableGeometry()) == saved_available_geometry
+                        for screen in QApplication.screens()
+                    )
+                )
+                if geometry is not None and geometry.isValid() and original_screen_available:
+                    expected_geometry = QRect(geometry)
+
+                    def enforce_saved_geometry() -> None:
+                        if self._fullscreen_view_name is None and not self.isMaximized():
+                            self.setGeometry(expected_geometry)
+
+                    QTimer.singleShot(0, enforce_saved_geometry)
 
         QTimer.singleShot(0, finish_restore)
 
@@ -6594,7 +6584,7 @@ class MainWindow(QMainWindow):
                     preview_updated = bool(self._controller.consume_decklink_frame_updated())
 
                 interaction_scale = 1.0
-                if self._roi_preview_motion_active():
+                if self._manual_roi_interaction_active():
                     interaction_scale = self._manual_roi_preview_reduce_scale
 
                 self._perf_add("process", (time.perf_counter() - t0) * 1000.0)
@@ -7097,9 +7087,6 @@ class MainWindow(QMainWindow):
         self._main_splitter_initialized = True
 
     def _fit_viewers_to_video_aspect(self) -> None:
-        if self._viewer_layout_transition_active:
-            return
-
         self._fit_canvas_in_panel(
             panel=self._input_panel,
             header_widget=self._input_header,
@@ -7114,11 +7101,6 @@ class MainWindow(QMainWindow):
             footer_widget=self._output_fullscreen_keyframe_toolbar,
             side_widget=self._output_fullscreen_keyframe_side_panel,
         )
-
-    def _release_viewer_size_constraints(self) -> None:
-        for canvas in (self._input_canvas, self._output_canvas):
-            canvas.setMinimumSize(160, 90)
-            canvas.setMaximumSize(16777215, 16777215)
 
     def _fit_canvas_in_panel(
         self,
@@ -7211,8 +7193,6 @@ class MainWindow(QMainWindow):
         self._fullscreen_view_name = view_name
         self._sync_fullscreen_button_states()
         if view_name is None:
-            self._viewer_layout_transition_active = True
-            self._release_viewer_size_constraints()
             self._controls_scroll.setVisible(True)
             self._input_panel.setVisible(True)
             self._output_panel.setVisible(True)
@@ -7226,12 +7206,10 @@ class MainWindow(QMainWindow):
                 self._restore_windowed_geometry_after_fullscreen()
             else:
                 self.showNormal()
-                self._viewer_layout_transition_active = False
-                QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
+            self._splitter_initialized = False
+            QTimer.singleShot(0, self._apply_initial_viewer_layout)
             return
 
-        self._viewer_layout_transition_active = True
-        self._release_viewer_size_constraints()
         self._controls_scroll.setVisible(False)
         self._input_panel.setVisible(view_name == "input")
         self._output_panel.setVisible(view_name == "output")
@@ -7243,12 +7221,7 @@ class MainWindow(QMainWindow):
         self._input_canvas.setEnabled(view_name == "input")
         self._output_canvas.setEnabled(view_name == "output")
         self.showFullScreen()
-
-        def finish_fullscreen_layout() -> None:
-            self._viewer_layout_transition_active = False
-            self._fit_viewers_to_video_aspect()
-
-        QTimer.singleShot(0, finish_fullscreen_layout)
+        QTimer.singleShot(0, self._fit_viewers_to_video_aspect)
 
     def _preview_target_for_view(self, view_name: str) -> tuple[int, int] | None:
         if self._fullscreen_view_name is not None and self._fullscreen_view_name != view_name:
@@ -7442,27 +7415,6 @@ class MainWindow(QMainWindow):
         self._update_status(
             f"DeckLink output buffer applied: {int(self._decklink_output_buffer_frames)} frame(s)"
         )
-
-    def _prepare_decklink_buffer_for_roi_transition(self) -> None:
-        if not self._decklink_buffer_guard_enabled or not self._decklink_sessions_running:
-            return
-
-        requested_frames = int(self._decklink_output_buffer_user_target_frames)
-        transition_floor = int(self._decklink_buffer_guard_transition_floor_frames)
-        if requested_frames >= transition_floor or self._decklink_output_buffer_frames >= transition_floor:
-            return
-
-        try:
-            if hasattr(self._controller, "set_decklink_output_buffer_frames"):
-                self._controller.set_decklink_output_buffer_frames(transition_floor)
-            self._decklink_output_buffer_frames = transition_floor
-            self._decklink_buffer_guard_active = True
-            self._decklink_buffer_guard_stable_windows = 0
-            self._update_status(
-                f"DeckLink buffer guard prepared ROI transition: requested {requested_frames}, temporarily applying {transition_floor}"
-            )
-        except Exception:
-            LOGGER.exception("DeckLink buffer guard failed to prepare ROI transition")
 
     def _maybe_auto_stabilize_decklink_buffer(
         self,
@@ -7902,9 +7854,6 @@ class MainWindow(QMainWindow):
         if self._manual_roi_send_timer.isActive():
             return True
         return self._pending_manual_controller_roi is not None
-
-    def _roi_preview_motion_active(self) -> bool:
-        return self._roi_keyframe_transition is not None or self._manual_roi_interaction_active()
 
     def _sync_backend_roi_from_worker(self) -> dict[str, object]:
         if self._source_mode != "Blackmagic DeckLink" or self._controller_backend != "worker-process":
@@ -9715,11 +9664,6 @@ class MainWindow(QMainWindow):
         self._rebuild_timecode_roi_lookup()
 
     def _set_roi_keyframing_mode(self, timecode_enabled: bool, save: bool = True) -> None:
-        windowed_geometry = (
-            QRect(self.geometry())
-            if self._fullscreen_view_name is None and self.isVisible()
-            else None
-        )
         self._timecode_resume_timer.stop()
         self._timecode_resume_status = ""
         self._manual_roi_send_timer.stop()
@@ -9747,14 +9691,6 @@ class MainWindow(QMainWindow):
         self._update_timecode_keyframe_display()
         if self._timecode_keyframing_enabled and self._timecode_playback_enabled:
             self._apply_timecode_roi_for_current_timecode()
-        if windowed_geometry is not None and windowed_geometry.isValid():
-            self.setGeometry(windowed_geometry)
-
-            def restore_windowed_geometry() -> None:
-                if self._fullscreen_view_name is None:
-                    self.setGeometry(windowed_geometry)
-
-            QTimer.singleShot(0, restore_windowed_geometry)
         if save:
             self._schedule_settings_save()
 
@@ -9849,6 +9785,7 @@ class MainWindow(QMainWindow):
             str(self.decklink_timecode_phase_combo.currentData()),
             phase_tracker=self._timecode_phase_tracker,
             source_seq=self._decklink_timecode_info.get("_seq"),
+            delivery_phases=self._timecode_input_delivery_phases(),
         )
         if frame_number is None:
             return None
@@ -9864,6 +9801,11 @@ class MainWindow(QMainWindow):
         if video_fps <= 1.0:
             video_fps = float(max(1, self.fps_spin.value()))
         return video_fps
+
+    def _timecode_input_delivery_phases(self) -> int:
+        if self._source_mode != "Blackmagic DeckLink":
+            return 1
+        return 2 if _mode_name_is_interlaced(self.decklink_input_mode_combo.currentText()) else 1
 
     def _rebuild_timecode_roi_lookup(self, sync_worker: bool = True) -> None:
         effective_keyframes = dict(self._timecode_roi_keyframes)
@@ -10380,13 +10322,10 @@ class MainWindow(QMainWindow):
             format_name = str(info.get("format_name", "")).strip()
             if format_name in {"RP188 LTC", "RP188 VITC1", "RP188 VITC2"}:
                 format_name = "RP188 auto"
-            try:
-                detected_cadence = max(
-                    1,
-                    int(info.get("detected_cadence", self._timecode_phase_tracker.get("detected_cadence", 1))),
-                )
-            except (TypeError, ValueError):
-                detected_cadence = 1
+            detected_cadence = _effective_synthesis_cadence(
+                info,
+                int(self._timecode_phase_tracker.get("detected_cadence", 1)),
+            )
             if detected_cadence > 1:
                 format_name += f", {detected_cadence}x"
             if timecode_text:
@@ -10540,8 +10479,6 @@ class MainWindow(QMainWindow):
             and hasattr(self._controller, "start_roi_microstep_transition")
         )
         self._roi_keyframe_transition["backend_driven"] = backend_driven
-
-        self._prepare_decklink_buffer_for_roi_transition()
 
         # Ensure no background controller interpolation remains active while
         # keyframe transition drives ROI updates directly.
@@ -11025,7 +10962,6 @@ def load_video_processor_module():
 
 
 def main() -> int:
-    enable_windows_gui_keep_active()
     app = QApplication(sys.argv)
     initialize_com_for_decklink()
 
@@ -11033,7 +10969,6 @@ def main() -> int:
         module = load_video_processor_module()
     except Exception as exc:
         print(f"Failed to import video_processor module: {exc}")
-        disable_windows_gui_keep_active()
         return 1
 
     window = MainWindow(module)
@@ -11046,10 +10981,7 @@ def main() -> int:
     else:
         window.resize(1400, 860)
     window.show()
-    try:
-        return app.exec()
-    finally:
-        disable_windows_gui_keep_active()
+    return app.exec()
 
 
 if __name__ == "__main__":

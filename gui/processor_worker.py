@@ -21,11 +21,45 @@ import numpy as np
 
 
 _SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
+_MAX_SOURCE_CADENCE_RUN_LENGTH = max(_SUPPORTED_SOURCE_CADENCES) * 2
 
 
-def _detect_source_cadence(run_length: int, position_step: int = 1) -> int:
-    observed = max(1.0, float(run_length) / float(max(1, position_step)))
+def _detect_source_cadence(
+    run_length: int,
+    position_step: int = 1,
+    delivery_phases: int = 1,
+) -> int:
+    normalized_run_length = float(max(1, run_length))
+    normalized_position_step = float(max(1, position_step))
+    normalized_delivery_phases = max(1, int(delivery_phases))
+    if normalized_delivery_phases == 1:
+        observed = normalized_run_length / normalized_position_step
+    else:
+        observed = (
+            normalized_run_length * float(normalized_delivery_phases)
+        ) / normalized_position_step
+    observed = max(1.0, observed)
     return min(_SUPPORTED_SOURCE_CADENCES, key=lambda cadence: (abs(cadence - observed), cadence))
+
+
+def _detect_source_cadence_stable(
+    run_length: int,
+    position_step: int,
+    delivery_phases: int,
+    previous_cadence: int,
+) -> int:
+    detected = _detect_source_cadence(run_length, position_step, delivery_phases)
+    previous = int(previous_cadence)
+    if previous not in _SUPPORTED_SOURCE_CADENCES:
+        return detected
+    observed = (
+        float(max(1, run_length))
+        * float(max(1, delivery_phases))
+        / float(max(1, position_step))
+    )
+    if abs(observed - float(previous)) <= 1.0:
+        return previous
+    return detected
 
 
 def _normalize_timecode_phase_synthesis_mode(mode_name: str) -> str:
@@ -52,6 +86,7 @@ def _timecode_to_internal_position(
     video_fps: float,
     phase_mode: str,
     phase_tracker: dict[str, object] | None = None,
+    delivery_phases: int = 1,
 ) -> float | None:
     if not bool(info.get("present", False)):
         if isinstance(phase_tracker, dict):
@@ -82,7 +117,7 @@ def _timecode_to_internal_position(
     field_mark = bool(info.get("field_mark", False))
     phase_multiplier = _timecode_phase_multiplier(video_fps, count_fps, phase_mode)
     format_name = str(info.get("format_name", "")).strip()
-    if count_fps == 30 and format_name in {"RP188 VITC1", "RP188 VITC2"}:
+    if count_fps == 30 and format_name in {"RP188 LTC", "RP188 VITC1", "RP188 VITC2"}:
         hardware_position = (base_frame * 2) + (1 if field_mark else 0)
         if _normalize_timecode_phase_synthesis_mode(phase_mode) != "source_cadence":
             if isinstance(phase_tracker, dict):
@@ -95,23 +130,41 @@ def _timecode_to_internal_position(
         current_run_length = max(1, int(phase_tracker.get("current_run_length", 1)))
         estimated_run_length = max(1, int(phase_tracker.get("estimated_run_length", 1)))
         position_step = max(1, int(phase_tracker.get("position_step", 1)))
+        run_frozen = bool(phase_tracker.get("run_frozen", False))
         if not isinstance(last_position, int):
             direction = 1
             run_index = 0
             current_run_length = 1
+            run_frozen = False
         elif hardware_position != last_position:
             direction = 1 if hardware_position > last_position else -1
             observed_step = abs(hardware_position - last_position)
             if observed_step in {1, 2}:
                 position_step = observed_step
-                detected_cadence = _detect_source_cadence(current_run_length, position_step)
+                if run_frozen:
+                    detected_cadence = max(1, int(phase_tracker.get("detected_cadence", 1)))
+                else:
+                    detected_cadence = _detect_source_cadence_stable(
+                        current_run_length,
+                        position_step,
+                        delivery_phases,
+                        int(phase_tracker.get("detected_cadence", 1)),
+                    )
                 estimated_run_length = detected_cadence * position_step
+                estimated_run_length = max(
+                    1,
+                    int(round(float(estimated_run_length) / float(max(1, delivery_phases)))),
+                )
             run_index = 0
             current_run_length = 1
+            run_frozen = False
         else:
             direction = 1 if last_direction >= 0 else -1
             run_index = current_run_length
-            current_run_length += 1
+            if current_run_length >= _MAX_SOURCE_CADENCE_RUN_LENGTH:
+                run_frozen = True
+            else:
+                current_run_length += 1
         phase_step = float(position_step) / float(estimated_run_length)
         max_phase = float(position_step) - phase_step
         phase = min(max_phase, float(run_index) * phase_step)
@@ -122,7 +175,14 @@ def _timecode_to_internal_position(
         phase_tracker["current_run_length"] = current_run_length
         phase_tracker["estimated_run_length"] = estimated_run_length
         phase_tracker["position_step"] = position_step
-        phase_tracker["detected_cadence"] = _detect_source_cadence(estimated_run_length, position_step)
+        phase_tracker["phase_step"] = phase_step
+        phase_tracker["run_frozen"] = run_frozen
+        phase_tracker["delivery_phases"] = max(1, int(delivery_phases))
+        phase_tracker["detected_cadence"] = _detect_source_cadence(
+            estimated_run_length,
+            position_step,
+            delivery_phases,
+        )
         return hardware_position + phase
     if field_mark:
         if isinstance(phase_tracker, dict):
@@ -210,6 +270,38 @@ def _timecode_roi_sample(
     start_roi = tuple(float(value) for value in start_key["roi"])
     end_roi = tuple(float(value) for value in end_key["roi"])
     return tuple(start + ((end - start) * progress) for start, end in zip(start_roi, end_roi))
+
+
+def _timecode_interlaced_phase_state(
+    carrier_roi: tuple[int, int, int, int],
+    field0_shift: tuple[float, float],
+    field1_sample: tuple[float, float, float, float] | None = None,
+    frame_width: int = 1920,
+    frame_height: int = 1080,
+) -> dict[str, object]:
+    field1_shift_x = float(field0_shift[0])
+    field1_shift_y = float(field0_shift[1])
+    if field1_sample is not None:
+        carrier_x, carrier_y, carrier_w, carrier_h = carrier_roi
+        field1_x, field1_y, field1_w, field1_h = field1_sample
+        field1_center_x = field1_x + (field1_w * 0.5)
+        field1_center_y = field1_y + (field1_h * 0.5)
+        carrier_center_x = float(carrier_x) + (float(carrier_w) * 0.5)
+        carrier_center_y = float(carrier_y) + (float(carrier_h) * 0.5)
+        scale_x = float(frame_width) / max(1.0, float(carrier_w))
+        scale_y = float(frame_height) / max(1.0, float(carrier_h))
+        max_shift_x = max(2.0, min(48.0, scale_x * 1.5))
+        max_shift_y = max(2.0, min(48.0, scale_y * 1.5))
+        field1_shift_x = max(-max_shift_x, min(max_shift_x, -((field1_center_x - carrier_center_x) * scale_x)))
+        field1_shift_y = max(-max_shift_y, min(max_shift_y, -((field1_center_y - carrier_center_y) * scale_y)))
+    return {
+        "roi0": carrier_roi,
+        "roi1": carrier_roi,
+        "field0_x": float(field0_shift[0]),
+        "field0_y": float(field0_shift[1]),
+        "field1_x": field1_shift_x,
+        "field1_y": field1_shift_y,
+    }
 
 
 def _bootstrap_project_venv_site() -> None:
@@ -2415,6 +2507,7 @@ def run_processor_worker(
             roi_motion_trace_file = None
     output_nominal_fps = 0.0
     output_frame_period_s = 0.0
+    input_mode_is_interlaced = False
     output_mode_is_interlaced = False
     output_field_dominance_code: int | None = None
     output_mode_name = ""
@@ -3009,10 +3102,7 @@ def run_processor_worker(
             int(roi_phase[2]),
             int(roi_phase[3]),
         )
-        if phase_w == int(current_roi_w) and phase_h == int(current_roi_h):
-            processor.set_roi_position(phase_x, phase_y)
-        else:
-            processor.set_roi(phase_x, phase_y, phase_w, phase_h)
+        processor.set_roi(phase_x, phase_y, phase_w, phase_h)
 
     def _active_interlaced_field_phase_state(consume_manual_snapshot: bool = False) -> dict[str, object] | None:
         nonlocal manual_interlaced_phase_state, manual_interlaced_phase_until_ts, manual_interlaced_phase_pending
@@ -3331,8 +3421,8 @@ def run_processor_worker(
             t = float(frame_progress) / float(total_frames)
             curved_t = _apply_roi_curve(t, interpolation_mode)
             previous_progress = float(frame_progress - 1)
-            field0_t = previous_progress / float(total_frames)
-            field1_t = min(1.0, (previous_progress + phase_fraction) / float(total_frames))
+            field0_t = min(1.0, (previous_progress + phase_fraction) / float(total_frames))
+            field1_t = t
             curved_t_field0 = _apply_roi_curve(field0_t, interpolation_mode)
             curved_t_field1 = _apply_roi_curve(field1_t, interpolation_mode)
 
@@ -3358,12 +3448,12 @@ def run_processor_worker(
                 desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
                 field0_weight = max(0.0, 4.0 * curved_t_field0 * (1.0 - curved_t_field0))
                 field1_weight = max(0.0, 4.0 * curved_t_field1 * (1.0 - curved_t_field1))
-                desired_w_field0 = (ideal_w_field0 + residual_w) * (1.0 + ((overscan_pct / 100.0) * field0_weight))
-                desired_w_field1 = (ideal_w_field1 + residual_w) * (1.0 + ((overscan_pct / 100.0) * field1_weight))
+                desired_w_field0 = ideal_w_field0 * (1.0 + ((overscan_pct / 100.0) * field0_weight))
+                desired_w_field1 = ideal_w_field1 * (1.0 + ((overscan_pct / 100.0) * field1_weight))
             else:
                 desired_w_backend = desired_w
-                desired_w_field0 = ideal_w_field0 + residual_w
-                desired_w_field1 = ideal_w_field1 + residual_w
+                desired_w_field0 = ideal_w_field0
+                desired_w_field1 = ideal_w_field1
 
             quant_w = max(2, quantize_directional(desired_w_backend, d_w, 2) & ~1)
             quant_h = max(2, int(round(quant_w * 9.0 / 16.0)))
@@ -3439,13 +3529,7 @@ def run_processor_worker(
                 field_values[4], field_values[5], field_values[10], field_values[11],
             )
 
-        schedule[-1, 1:19] = (
-            t_x, t_y, t_w, t_h,
-            0.0, 0.0,
-            t_x, t_y, t_w, t_h,
-            t_x, t_y, t_w, t_h,
-            0.0, 0.0, 0.0, 0.0,
-        )
+        schedule[-1, 1:7] = (t_x, t_y, t_w, t_h, 0.0, 0.0)
         return schedule
 
     def _start_roi_microstep_transition(
@@ -4867,16 +4951,20 @@ def run_processor_worker(
 
         def _apply_timecode_roi_for_capture(frame_timecode_info: dict[str, object]) -> None:
             nonlocal current_roi_x, current_roi_y, current_roi_w, current_roi_h, roi_microstep_transition
+            nonlocal manual_interlaced_phase_state, manual_interlaced_phase_until_ts, manual_interlaced_phase_pending
             frame_number = _timecode_to_internal_position(
                 frame_timecode_info,
                 output_nominal_fps,
                 timecode_phase_mode,
                 phase_tracker=timecode_phase_tracker,
+                delivery_phases=2 if input_mode_is_interlaced else 1,
             )
             if frame_number is None:
                 return
             frame_timecode_info["internal_position"] = float(frame_number)
             frame_timecode_info["detected_cadence"] = int(timecode_phase_tracker.get("detected_cadence", 1))
+            frame_timecode_info["cadence_phase_step"] = float(timecode_phase_tracker.get("phase_step", 0.0))
+            frame_timecode_info["cadence_delivery_phases"] = int(timecode_phase_tracker.get("delivery_phases", 1))
             if not timecode_roi_enabled or not timecode_roi_ordered_frames:
                 return
             sample = _timecode_roi_sample(
@@ -4936,6 +5024,30 @@ def run_processor_worker(
             shift_y = max(-max_shift_y, min(max_shift_y, -((desired_center_y - carrier_center_y) * scale_y)))
             _set_roi_shift_immediate(shift_x, shift_y)
             roi_microstep_transition = None
+
+            if input_mode_is_interlaced and output_mode_is_interlaced and _interlaced_phase_controls_active():
+                capture_step = float(timecode_phase_tracker.get("phase_step", 0.0))
+                if capture_step > 0.0:
+                    detected_cadence = int(timecode_phase_tracker.get("detected_cadence", 1))
+                    field1_sample = None
+                    if detected_cadence == 8 and not bool(timecode_phase_tracker.get("run_frozen", False)):
+                        direction = 1 if int(timecode_phase_tracker.get("last_direction", 1)) >= 0 else -1
+                        delivery_phases = max(1, int(timecode_phase_tracker.get("delivery_phases", 1)))
+                        field_step = capture_step / float(delivery_phases)
+                        field1_sample = _timecode_roi_sample(
+                            frame_number + (float(direction) * field_step),
+                            timecode_roi_keyframes,
+                            timecode_roi_ordered_frames,
+                        )
+                    manual_interlaced_phase_state = _timecode_interlaced_phase_state(
+                        (current_roi_x, current_roi_y, current_roi_w, current_roi_h),
+                        (shift_x, shift_y),
+                        field1_sample,
+                        FRAME_W,
+                        FRAME_H,
+                    )
+                    manual_interlaced_phase_until_ts = time.perf_counter() + max(0.05, output_frame_period_s * 2.0)
+                    manual_interlaced_phase_pending = True
 
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
@@ -5922,6 +6034,7 @@ def run_processor_worker(
         resolved_out_mode = getattr(resolved_out_entry, "mode", None)
         if resolved_in_mode is None or resolved_out_mode is None:
             raise RuntimeError("DeckLink display mode resolution failed: missing mode value")
+        input_mode_is_interlaced = _mode_name_is_interlaced(str(getattr(resolved_in_entry, "name", "")))
         output_mode_name = str(getattr(resolved_out_entry, "name", ""))
         output_mode_value = str(getattr(resolved_out_entry, "mode", ""))
         output_field_dominance_name = str(getattr(resolved_out_entry, "field_dominance_name", ""))
@@ -6526,6 +6639,8 @@ def run_processor_worker(
                 continue
 
             if command == "set_roi":
+                if timecode_roi_enabled:
+                    continue
                 _cancel_roi_microstep_transition(reset_shift=True)
                 _apply_manual_roi_with_subpixel_compensation(
                     int(message["x"]),
@@ -6552,6 +6667,7 @@ def run_processor_worker(
                 continue
 
             if command == "set_timecode_roi_keyframes":
+                previous_timecode_phase_mode = timecode_phase_mode
                 raw_keyframes = message.get("keyframes", [])
                 normalized_keyframes: list[dict[str, object]] = []
                 if isinstance(raw_keyframes, list):
@@ -6576,16 +6692,22 @@ def run_processor_worker(
                 timecode_roi_ordered_frames = [int(item["frame_number"]) for item in normalized_keyframes]
                 timecode_roi_enabled = bool(message.get("enabled", False))
                 timecode_phase_mode = _normalize_timecode_phase_synthesis_mode(str(message.get("phase_mode", "strict")))
-                timecode_phase_tracker.clear()
+                if timecode_phase_mode != previous_timecode_phase_mode:
+                    timecode_phase_tracker.clear()
                 roi_microstep_transition = None
                 roi_manual_frame_target = None
                 roi_manual_velocity_x = 0.0
                 roi_manual_velocity_y = 0.0
+                manual_interlaced_phase_state = None
+                manual_interlaced_phase_until_ts = 0.0
+                manual_interlaced_phase_pending = False
                 if not timecode_roi_enabled:
                     _set_roi_shift_immediate(0.0, 0.0)
                 continue
 
             if command == "set_roi_position":
+                if timecode_roi_enabled:
+                    continue
                 _cancel_roi_microstep_transition(reset_shift=True)
                 _apply_manual_roi_with_subpixel_compensation(
                     int(message["x"]),
@@ -6596,6 +6718,8 @@ def run_processor_worker(
                 continue
 
             if command == "start_roi_microstep_transition":
+                if timecode_roi_enabled:
+                    continue
                 start_from_current = bool(message.get("start_from_current", False))
                 if start_from_current:
                     start_roi = (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
@@ -6622,12 +6746,17 @@ def run_processor_worker(
                 continue
 
             if command == "cancel_roi_microstep_transition":
+                if timecode_roi_enabled:
+                    continue
                 _cancel_roi_microstep_transition(reset_shift=bool(message.get("reset_subpixel_shift", True)))
                 continue
 
             if command == "set_roi_with_subpixel":
+                suspend_timecode = bool(message.get("suspend_timecode", False))
+                if timecode_roi_enabled and not suspend_timecode:
+                    continue
                 roi_microstep_transition = None
-                if bool(message.get("suspend_timecode", False)):
+                if suspend_timecode:
                     timecode_roi_enabled = False
                 prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
                 prev_shift_state = (float(roi_shift_applied_x), float(roi_shift_applied_y))
@@ -6702,6 +6831,8 @@ def run_processor_worker(
                 continue
 
             if command == "set_roi_subpixel_shift":
+                if timecode_roi_enabled:
+                    continue
                 _set_roi_shift_target(
                     float(message.get("shift_x", 0.0)),
                     float(message.get("shift_y", 0.0)),
