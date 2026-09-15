@@ -1181,6 +1181,8 @@ class AiSrOnnxEngine:
             trt_cache_dir.mkdir(parents=True, exist_ok=True)
             trt_provider_options["trt_engine_cache_path"] = str(trt_cache_dir)
 
+        provider_fallback_note: str | None = None
+
         if provider_name in {"trt", "tensorrt"} and not trt_available:
             raise RuntimeError(
                 f"TensorrtExecutionProvider is not available in onnxruntime. Available providers: {available_providers_sorted}"
@@ -1209,8 +1211,17 @@ class AiSrOnnxEngine:
             providers = [("TensorrtExecutionProvider", trt_provider_options)]
         elif provider_name == "auto":
             if trt_available:
-                _preflight_tensorrt_runtime()
-                providers = [("TensorrtExecutionProvider", trt_provider_options)]
+                try:
+                    _preflight_tensorrt_runtime()
+                    providers = [("TensorrtExecutionProvider", trt_provider_options)]
+                except Exception as trt_exc:
+                    # "auto" should be robust: a broken/incomplete TensorRT
+                    # install (e.g. stray DLLs from another NVIDIA app) must
+                    # not silently mask AI SR entirely; fall back to CUDA.
+                    if not cuda_available:
+                        raise
+                    provider_fallback_note = f"TensorRT unavailable, fell back to CUDA: {trt_exc}"
+                    providers = [("CUDAExecutionProvider", cuda_provider_options)]
             elif cuda_available:
                 providers = [("CUDAExecutionProvider", cuda_provider_options)]
             else:
@@ -1293,6 +1304,7 @@ class AiSrOnnxEngine:
         self._timing_samples = 0
         self._available_providers = available_providers_sorted
         self._requested_provider = provider_name
+        self._provider_fallback_note = provider_fallback_note
         self._trt_precision = trt_precision_name
         self._trt_engine_cache_path = trt_provider_options.get("trt_engine_cache_path", "")
         self._require_gpu = bool(require_gpu)
@@ -1488,6 +1500,7 @@ class AiSrOnnxEngine:
             "model_path": self._model_path,
             "provider": self._provider,
             "requested_provider": self._requested_provider,
+            "provider_fallback_note": self._provider_fallback_note,
             "trt_precision": self._trt_precision,
             "trt_engine_cache_path": self._trt_engine_cache_path,
             "available_providers": self._available_providers,
@@ -1523,6 +1536,59 @@ class AiSrOnnxEngine:
             "native_gpu_preprocess_enabled": bool(self._native_preprocess_available),
             "onnx_input_gpu_direct_enabled": bool(self._native_gpu_input_available),
         }
+
+    def update_runtime_settings(
+        self,
+        input_align: int,
+        roi_overscan_percent: float,
+        inference_divisor: int,
+        detail_preserve_percent: float,
+        post_denoise_method: str,
+        post_denoise_strength: float,
+        post_artifact_reduction_method: str,
+        post_artifact_reduction_strength: float,
+        post_exaggeration_enabled: bool,
+        post_exaggeration_gain: float,
+        color_space: str,
+        color_range: str,
+    ) -> None:
+        # None of these parameters affect the loaded ONNX Runtime session, so
+        # apply them in place instead of rebuilding the session/TensorRT engine
+        # (that rebuild is the expensive part of AI SR startup/toggling).
+        self._input_align = max(1, int(input_align))
+        self._roi_overscan_percent = max(0.0, min(100.0, float(roi_overscan_percent)))
+        self._inference_divisor = max(0, int(inference_divisor))
+        self._detail_preserve_requested_percent = max(0.0, min(100.0, float(detail_preserve_percent)))
+        self._detail_preserve_percent = 0.0
+        self._color_space = _normalize_color_space_name(color_space)
+        self._color_range = _normalize_color_range_name(color_range)
+        self._post_denoise_method = _normalize_ai_sr_post_denoise_method(post_denoise_method)
+        self._post_denoise_strength = max(0.0, min(1.0, float(post_denoise_strength)))
+        self._post_artifact_reduction_method = _normalize_ai_sr_post_artifact_reduction_method(post_artifact_reduction_method)
+        self._post_artifact_reduction_strength = max(0.0, min(1.0, float(post_artifact_reduction_strength)))
+        self._post_exaggeration_enabled = bool(post_exaggeration_enabled)
+        self._post_exaggeration_gain = max(1.0, min(4.0, float(post_exaggeration_gain)))
+
+        self._cuda_post.set_color_space(self._color_space)
+        self._cuda_post.set_color_range(self._color_range)
+        self._cuda_post.set_post_denoise_method(self._post_denoise_method)
+        self._cuda_post.set_post_denoise_strength(self._post_denoise_strength)
+        self._cuda_post.set_post_artifact_reduction_method(self._post_artifact_reduction_method)
+        self._cuda_post.set_post_artifact_reduction_strength(self._post_artifact_reduction_strength)
+        self._cuda_post.set_post_exaggeration_enabled(self._post_exaggeration_enabled)
+        self._cuda_post.set_post_exaggeration_gain(self._post_exaggeration_gain)
+        if hasattr(self._cuda_post, "get_post_denoise_method"):
+            self._post_denoise_method = str(self._cuda_post.get_post_denoise_method())
+        if hasattr(self._cuda_post, "get_post_denoise_strength"):
+            self._post_denoise_strength = float(self._cuda_post.get_post_denoise_strength())
+        if hasattr(self._cuda_post, "get_post_artifact_reduction_method"):
+            self._post_artifact_reduction_method = str(self._cuda_post.get_post_artifact_reduction_method())
+        if hasattr(self._cuda_post, "get_post_artifact_reduction_strength"):
+            self._post_artifact_reduction_strength = float(self._cuda_post.get_post_artifact_reduction_strength())
+        if hasattr(self._cuda_post, "get_post_exaggeration_enabled"):
+            self._post_exaggeration_enabled = bool(self._cuda_post.get_post_exaggeration_enabled())
+        if hasattr(self._cuda_post, "get_post_exaggeration_gain"):
+            self._post_exaggeration_gain = float(self._cuda_post.get_post_exaggeration_gain())
 
     def _record_timing_sample(self, prep_ms: float, infer_ms: float, post_ms: float, total_ms: float) -> None:
         self._last_stage_ms = {
@@ -2609,6 +2675,16 @@ def run_processor_worker(
     ai_sr_applied_frames = 0
     ai_sr_reused_frames = 0
     ai_sr_passthrough_frames = 0
+    # Cache of the most recently built engine plus the "heavy" config it was
+    # built for (model/provider/precision/gpu requirement). Reused across
+    # enable/disable toggles and cheap settings changes to avoid rebuilding
+    # the ONNX Runtime/TensorRT session, which is the slow part of AI SR load.
+    ai_sr_cached_engine: AiSrOnnxEngine | None = None
+    ai_sr_cached_heavy_key: tuple[str, str, str, bool] | None = None
+    ai_sr_engine_loading = False
+    ai_sr_build_executor: ThreadPoolExecutor | None = None
+    ai_sr_build_future: Future[AiSrOnnxEngine] | None = None
+    ai_sr_build_heavy_key_pending: tuple[str, str, str, bool] | None = None
     zeroed_output_warning_emitted = False
     preprocess_noop_warning_emitted = False
     native_subpixel_warning_emitted = False
@@ -2627,6 +2703,9 @@ def run_processor_worker(
     rtx_roi_rebuild_pending = False
     rtx_roi_rebuild_due_ts = 0.0
     rtx_roi_rebuild_settle_s = 0.25
+    rtx_stage_last_error: str | None = None
+    rtx_stage_cooldown_until_ts = 0.0
+    rtx_stage_consecutive_failures = 0
     current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bilinear_sharp"))
     current_color_space = _normalize_color_space_name(str(startup_config.get("color_space", "rec709")))
     current_color_range = _normalize_color_range_name(str(startup_config.get("color_range", "limited")))
@@ -4642,8 +4721,18 @@ def run_processor_worker(
         frame_bytes: bytes,
         roi: tuple[int, int, int, int] | None = None,
     ) -> tuple[bytes, bool]:
+        nonlocal rtx_stage_last_error, rtx_stage_cooldown_until_ts, rtx_stage_consecutive_failures
         if not (rtx_vsr_enabled and rtx_vsr_engine is not None):
             return frame_bytes, False
+
+        now = time.perf_counter()
+        if rtx_stage_cooldown_until_ts > now:
+            # Recent evaluate failures: back off instead of retrying every
+            # frame, since a persistently failing GPU evaluate call (e.g. an
+            # unsupported ROI input:output scale ratio) can otherwise hammer
+            # the driver every captured frame and stall the whole pipeline.
+            return frame_bytes, False
+
         try:
             active_roi = roi or (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
             rtx_out = _apply_rtx_vsr(
@@ -4652,9 +4741,16 @@ def run_processor_worker(
             )
             if _looks_zeroed_uyvy_frame(rtx_out):
                 return frame_bytes, False
+            rtx_stage_consecutive_failures = 0
             return rtx_out, True
         except Exception as rtx_exc:
-            _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {rtx_exc}"})
+            rtx_stage_consecutive_failures += 1
+            error_text = str(rtx_exc)
+            if error_text != rtx_stage_last_error:
+                _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {error_text}"})
+                rtx_stage_last_error = error_text
+            backoff_s = min(2.0, 0.1 * (2 ** min(6, rtx_stage_consecutive_failures)))
+            rtx_stage_cooldown_until_ts = now + backoff_s
             return frame_bytes, False
 
     def _build_stage_stack() -> list[str]:
@@ -5696,124 +5792,253 @@ def run_processor_worker(
         output_thread.start()
         pipeline_running = True
 
+    def _ai_sr_heavy_key() -> tuple[str, str, str, bool]:
+        # Only these actually affect the loaded ONNX Runtime session/provider;
+        # everything else can be changed on the existing engine in place.
+        return (str(ai_sr_model_path), str(ai_sr_provider), str(ai_sr_trt_precision), bool(ai_sr_require_gpu))
+
+    def _describe_ai_sr_build_error(ai_exc: Exception) -> str:
+        error_text = str(ai_exc)
+        if ort is not None:
+            try:
+                ort_providers = ort.get_available_providers()
+            except Exception:
+                ort_providers = []
+            ort_module = getattr(ort, "__file__", "unknown")
+            error_text = (
+                f"{error_text} | onnxruntime_module={ort_module} | "
+                f"available_providers={ort_providers}"
+            )
+        return error_text
+
+    def _compose_ai_sr_info(engine: AiSrOnnxEngine) -> dict[str, object]:
+        info = engine.info()
+        info["strict_mode"] = bool(ai_sr_strict)
+        info["async_mode"] = not bool(ai_sr_strict)
+        info["frame_interval"] = int(ai_sr_frame_interval)
+        info["inference_fps"] = int(ai_sr_frame_interval)
+        info["discard_while_busy"] = False
+        info["requested_provider"] = str(ai_sr_provider)
+        info["trt_precision"] = str(ai_sr_trt_precision)
+        info["gpu_required"] = bool(ai_sr_require_gpu)
+        info["runtime_profile_note"] = ai_sr_runtime_note
+        info["max_hold_ms"] = float(ai_sr_max_hold_ms)
+        info["hold_last_frame"] = bool(ai_sr_hold_last_frame)
+        info["max_inflight"] = int(ai_sr_max_inflight)
+        info["submit_spacing_ms"] = float(ai_sr_submit_spacing_ms)
+        info["post_denoise_method"] = str(ai_sr_post_denoise_method)
+        info["post_denoise_strength"] = float(ai_sr_post_denoise_strength)
+        info["post_artifact_reduction_method"] = str(ai_sr_post_artifact_reduction_method)
+        info["post_artifact_reduction_strength"] = float(ai_sr_post_artifact_reduction_strength)
+        info["post_exaggeration_enabled"] = bool(ai_sr_post_exaggeration_enabled)
+        info["post_exaggeration_gain"] = float(ai_sr_post_exaggeration_gain)
+        info["post_exaggeration_passes"] = 3 if ai_sr_post_exaggeration_enabled else 1
+        info["postprocess_gpu_chain"] = "resize/sharpen -> post_denoise(xN) -> post_artifact_reduction(xN) -> rgb_to_uyvy"
+        info["basic_cuda_post_scale_enabled"] = False
+        info["basic_cuda_post_scale_active"] = False
+        info["pipeline_order"] = "crop/preprocess -> onnx(cuda) -> cuda_postprocess -> uyvy"
+        if float(ai_sr_detail_preserve_percent) > 0.0:
+            info["detail_preserve_note"] = (
+                "detail_preserve is disabled in zero-copy mode to keep output fully GPU-resident"
+            )
+        return info
+
+    def _clear_ai_sr_runtime_counters() -> None:
+        nonlocal ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_latest_output_ts, ai_sr_completed_frames
+        nonlocal ai_sr_warmup_pending, ai_sr_dropped_frames, ai_sr_applied_frames, ai_sr_reused_frames, ai_sr_passthrough_frames
+        ai_sr_frame_counter = 0
+        ai_sr_latest_output_frame = None
+        ai_sr_latest_output_ts = 0.0
+        ai_sr_completed_frames = 0
+        ai_sr_warmup_pending = False
+        ai_sr_dropped_frames = 0
+        ai_sr_applied_frames = 0
+        ai_sr_reused_frames = 0
+        ai_sr_passthrough_frames = 0
+
+    def _reset_ai_sr_runtime_state() -> None:
+        nonlocal ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_latest_output_ts, ai_sr_completed_frames
+        nonlocal ai_sr_warmup_pending, ai_sr_last_submit_ts, ai_sr_dropped_frames, ai_sr_applied_frames
+        nonlocal ai_sr_reused_frames, ai_sr_passthrough_frames, ai_sr_executor, ai_sr_futures
+        ai_sr_frame_counter = 0
+        ai_sr_latest_output_frame = None
+        ai_sr_latest_output_ts = 0.0
+        ai_sr_completed_frames = 0
+        ai_sr_warmup_pending = True
+        ai_sr_last_submit_ts = 0.0
+        ai_sr_dropped_frames = 0
+        ai_sr_applied_frames = 0
+        ai_sr_reused_frames = 0
+        ai_sr_passthrough_frames = 0
+        ai_sr_executor = ThreadPoolExecutor(max_workers=ai_sr_max_inflight, thread_name_prefix="ai-sr")
+        ai_sr_futures = []
+        if ai_sr_strict:
+            _cleanup_ai_async()
+
     def _refresh_ai_sr_engine() -> str | None:
-        nonlocal ai_sr_engine, ai_sr_info, ai_sr_frame_counter, ai_sr_latest_output_frame, ai_sr_latest_output_ts, ai_sr_completed_frames, ai_sr_warmup_pending, ai_sr_executor, ai_sr_futures, ai_sr_dropped_frames, ai_sr_applied_frames, ai_sr_reused_frames, ai_sr_passthrough_frames, ai_sr_runtime_note, ai_sr_max_inflight
-        nonlocal ai_sr_submit_spacing_ms, ai_sr_last_submit_ts
+        nonlocal ai_sr_engine, ai_sr_info, ai_sr_runtime_note
+        nonlocal ai_sr_cached_engine, ai_sr_cached_heavy_key
+        nonlocal ai_sr_engine_loading, ai_sr_build_executor, ai_sr_build_future, ai_sr_build_heavy_key_pending
         _cleanup_ai_async()
 
         if not ai_sr_enabled:
+            # Keep any cached/in-flight engine build around (untouched) so a
+            # quick re-enable with the same model/provider is instant instead
+            # of reloading the ONNX Runtime/TensorRT session from scratch.
             ai_sr_engine = None
             ai_sr_info = None
-            ai_sr_frame_counter = 0
-            ai_sr_latest_output_frame = None
-            ai_sr_latest_output_ts = 0.0
-            ai_sr_completed_frames = 0
-            ai_sr_warmup_pending = False
-            ai_sr_dropped_frames = 0
-            ai_sr_applied_frames = 0
-            ai_sr_reused_frames = 0
-            ai_sr_passthrough_frames = 0
+            ai_sr_engine_loading = False
+            _clear_ai_sr_runtime_counters()
+            return None
+
+        heavy_key = _ai_sr_heavy_key()
+
+        if ai_sr_cached_engine is not None and ai_sr_cached_heavy_key == heavy_key:
+            # Fast path: model/provider/precision/gpu requirement are unchanged,
+            # so reuse the already-loaded session and just apply cheap settings.
+            try:
+                _apply_ai_sr_performance_profile()
+                ai_sr_cached_engine.update_runtime_settings(
+                    input_align=ai_sr_input_align,
+                    roi_overscan_percent=ai_sr_roi_overscan_percent,
+                    inference_divisor=ai_sr_inference_divisor,
+                    detail_preserve_percent=ai_sr_detail_preserve_percent,
+                    post_denoise_method=ai_sr_post_denoise_method,
+                    post_denoise_strength=ai_sr_post_denoise_strength,
+                    post_artifact_reduction_method=ai_sr_post_artifact_reduction_method,
+                    post_artifact_reduction_strength=ai_sr_post_artifact_reduction_strength,
+                    post_exaggeration_enabled=ai_sr_post_exaggeration_enabled,
+                    post_exaggeration_gain=ai_sr_post_exaggeration_gain,
+                    color_space=current_color_space,
+                    color_range=current_color_range,
+                )
+                ai_sr_engine = ai_sr_cached_engine
+                ai_sr_info = _compose_ai_sr_info(ai_sr_engine)
+                ai_sr_engine_loading = False
+                _reset_ai_sr_runtime_state()
+                if ai_sr_runtime_note is not None:
+                    _safe_put({"type": "warning", "warning": f"AI SR throughput profile applied: {ai_sr_runtime_note}"})
+                return None
+            except Exception as ai_exc:
+                ai_sr_engine = None
+                ai_sr_info = None
+                _clear_ai_sr_runtime_counters()
+                return _describe_ai_sr_build_error(ai_exc)
+
+        # Heavy path: the model/provider/precision/gpu requirement changed (or
+        # this is the first activation). Building the ONNX Runtime session
+        # (and, for TensorRT, compiling the engine) can take a long time, so
+        # run it on a background thread and keep servicing decklink_tick /
+        # frame output in the meantime instead of freezing the pipeline.
+        if (
+            ai_sr_build_future is not None
+            and ai_sr_build_heavy_key_pending == heavy_key
+            and not ai_sr_build_future.done()
+        ):
+            ai_sr_engine_loading = True
             return None
 
         try:
             _apply_ai_sr_performance_profile()
+        except Exception:
+            pass
 
-            ai_sr_engine = AiSrOnnxEngine(
-                ai_sr_model_path,
-                provider=ai_sr_provider,
-                trt_precision=ai_sr_trt_precision,
-                trt_engine_cache_path=str(trt_cache_root),
-                require_gpu=ai_sr_require_gpu,
-                input_align=ai_sr_input_align,
-                roi_overscan_percent=ai_sr_roi_overscan_percent,
-                inference_divisor=ai_sr_inference_divisor,
-                detail_preserve_percent=ai_sr_detail_preserve_percent,
-                post_denoise_method=ai_sr_post_denoise_method,
-                post_denoise_strength=ai_sr_post_denoise_strength,
-                post_artifact_reduction_method=ai_sr_post_artifact_reduction_method,
-                post_artifact_reduction_strength=ai_sr_post_artifact_reduction_strength,
-                post_exaggeration_enabled=ai_sr_post_exaggeration_enabled,
-                post_exaggeration_gain=ai_sr_post_exaggeration_gain,
-                color_space=current_color_space,
-                color_range=current_color_range,
-                native_module=module,
-                native_processor=processor,
-            )
-            ai_sr_info = ai_sr_engine.info()
-            ai_sr_info["strict_mode"] = bool(ai_sr_strict)
-            ai_sr_info["async_mode"] = not bool(ai_sr_strict)
-            ai_sr_info["frame_interval"] = int(ai_sr_frame_interval)
-            ai_sr_info["inference_fps"] = int(ai_sr_frame_interval)
-            ai_sr_info["discard_while_busy"] = False
-            ai_sr_info["requested_provider"] = str(ai_sr_provider)
-            ai_sr_info["trt_precision"] = str(ai_sr_trt_precision)
-            ai_sr_info["gpu_required"] = bool(ai_sr_require_gpu)
-            ai_sr_info["runtime_profile_note"] = ai_sr_runtime_note
-            ai_sr_info["max_hold_ms"] = float(ai_sr_max_hold_ms)
-            ai_sr_info["hold_last_frame"] = bool(ai_sr_hold_last_frame)
-            ai_sr_info["max_inflight"] = int(ai_sr_max_inflight)
-            ai_sr_info["submit_spacing_ms"] = float(ai_sr_submit_spacing_ms)
-            ai_sr_info["post_denoise_method"] = str(ai_sr_post_denoise_method)
-            ai_sr_info["post_denoise_strength"] = float(ai_sr_post_denoise_strength)
-            ai_sr_info["post_artifact_reduction_method"] = str(ai_sr_post_artifact_reduction_method)
-            ai_sr_info["post_artifact_reduction_strength"] = float(ai_sr_post_artifact_reduction_strength)
-            ai_sr_info["post_exaggeration_enabled"] = bool(ai_sr_post_exaggeration_enabled)
-            ai_sr_info["post_exaggeration_gain"] = float(ai_sr_post_exaggeration_gain)
-            ai_sr_info["post_exaggeration_passes"] = 3 if ai_sr_post_exaggeration_enabled else 1
-            ai_sr_info["postprocess_gpu_chain"] = "resize/sharpen -> post_denoise(xN) -> post_artifact_reduction(xN) -> rgb_to_uyvy"
-            ai_sr_info["basic_cuda_post_scale_enabled"] = False
-            ai_sr_info["basic_cuda_post_scale_active"] = False
-            ai_sr_info["pipeline_order"] = "crop/preprocess -> onnx(cuda) -> cuda_postprocess -> uyvy"
-            if float(ai_sr_detail_preserve_percent) > 0.0:
-                ai_sr_info["detail_preserve_note"] = (
-                    "detail_preserve is disabled in zero-copy mode to keep output fully GPU-resident"
-                )
-            ai_sr_frame_counter = 0
-            ai_sr_latest_output_frame = None
-            ai_sr_latest_output_ts = 0.0
-            ai_sr_completed_frames = 0
-            ai_sr_warmup_pending = True
-            ai_sr_last_submit_ts = 0.0
-            ai_sr_dropped_frames = 0
-            ai_sr_applied_frames = 0
-            ai_sr_reused_frames = 0
-            ai_sr_passthrough_frames = 0
-            ai_sr_executor = ThreadPoolExecutor(max_workers=ai_sr_max_inflight, thread_name_prefix="ai-sr")
-            ai_sr_futures = []
-            if ai_sr_strict:
-                _cleanup_ai_async()
-            if ai_sr_runtime_note is not None:
-                _safe_put({"type": "warning", "warning": f"AI SR throughput profile applied: {ai_sr_runtime_note}"})
-            return None
+        build_kwargs = dict(
+            model_path=ai_sr_model_path,
+            provider=ai_sr_provider,
+            trt_precision=ai_sr_trt_precision,
+            trt_engine_cache_path=str(trt_cache_root),
+            require_gpu=ai_sr_require_gpu,
+            input_align=ai_sr_input_align,
+            roi_overscan_percent=ai_sr_roi_overscan_percent,
+            inference_divisor=ai_sr_inference_divisor,
+            detail_preserve_percent=ai_sr_detail_preserve_percent,
+            post_denoise_method=ai_sr_post_denoise_method,
+            post_denoise_strength=ai_sr_post_denoise_strength,
+            post_artifact_reduction_method=ai_sr_post_artifact_reduction_method,
+            post_artifact_reduction_strength=ai_sr_post_artifact_reduction_strength,
+            post_exaggeration_enabled=ai_sr_post_exaggeration_enabled,
+            post_exaggeration_gain=ai_sr_post_exaggeration_gain,
+            color_space=current_color_space,
+            color_range=current_color_range,
+            native_module=module,
+            native_processor=processor,
+        )
+
+        if ai_sr_build_executor is None:
+            ai_sr_build_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-sr-build")
+
+        ai_sr_engine = None
+        ai_sr_info = None
+        ai_sr_engine_loading = True
+        ai_sr_build_heavy_key_pending = heavy_key
+        ai_sr_build_future = ai_sr_build_executor.submit(AiSrOnnxEngine, **build_kwargs)
+        return None
+
+    def _maybe_apply_pending_ai_sr_build() -> None:
+        nonlocal ai_sr_engine, ai_sr_info, ai_sr_engine_loading, ai_sr_build_future, ai_sr_build_heavy_key_pending
+        nonlocal ai_sr_cached_engine, ai_sr_cached_heavy_key, ai_sr_runtime_note
+
+        future = ai_sr_build_future
+        if future is None or not future.done():
+            return
+
+        heavy_key = ai_sr_build_heavy_key_pending
+        ai_sr_build_future = None
+        ai_sr_build_heavy_key_pending = None
+        ai_sr_engine_loading = False
+
+        try:
+            built_engine = future.result()
         except Exception as ai_exc:
-            ai_sr_engine = None
-            ai_sr_info = None
-            ai_sr_frame_counter = 0
-            ai_sr_latest_output_frame = None
-            ai_sr_latest_output_ts = 0.0
-            ai_sr_completed_frames = 0
-            ai_sr_warmup_pending = False
-            ai_sr_dropped_frames = 0
-            ai_sr_applied_frames = 0
-            ai_sr_reused_frames = 0
-            ai_sr_passthrough_frames = 0
-            error_text = str(ai_exc)
-            if ort is not None:
-                try:
-                    ort_providers = ort.get_available_providers()
-                except Exception:
-                    ort_providers = []
-                ort_module = getattr(ort, "__file__", "unknown")
-                error_text = (
-                    f"{error_text} | onnxruntime_module={ort_module} | "
-                    f"available_providers={ort_providers}"
-                )
-            return error_text
+            error_text = _describe_ai_sr_build_error(ai_exc)
+            _safe_put({"type": "warning", "warning": f"AI SR engine build failed: {error_text}"})
+            _safe_put(
+                {
+                    "type": "ai_sr_engine_update",
+                    "ai_sr_enabled": bool(ai_sr_enabled),
+                    "ai_sr_active": False,
+                    "ai_sr_loading": False,
+                    "ai_sr_error": error_text,
+                    "ai_sr_info": None,
+                }
+            )
+            return
+
+        # Cache every successful build so a later re-enable/settings match can
+        # reuse it without paying the load cost again.
+        ai_sr_cached_engine = built_engine
+        ai_sr_cached_heavy_key = heavy_key
+
+        if not ai_sr_enabled or heavy_key != _ai_sr_heavy_key():
+            # Toggled off or reconfigured again while this build was running;
+            # keep the engine cached for reuse but do not activate it now.
+            return
+
+        ai_sr_engine = built_engine
+        ai_sr_info = _compose_ai_sr_info(ai_sr_engine)
+        _reset_ai_sr_runtime_state()
+        if ai_sr_runtime_note is not None:
+            _safe_put({"type": "warning", "warning": f"AI SR throughput profile applied: {ai_sr_runtime_note}"})
+        _safe_put(
+            {
+                "type": "ai_sr_engine_update",
+                "ai_sr_enabled": True,
+                "ai_sr_active": True,
+                "ai_sr_loading": False,
+                "ai_sr_error": None,
+                "ai_sr_info": ai_sr_info,
+            }
+        )
 
     def _refresh_rtx_vsr_engine() -> str | None:
         nonlocal rtx_vsr_engine, rtx_vsr_info, rtx_roi_rebuild_pending
+        nonlocal rtx_stage_last_error, rtx_stage_cooldown_until_ts, rtx_stage_consecutive_failures
 
         rtx_roi_rebuild_pending = False
+        rtx_stage_last_error = None
+        rtx_stage_cooldown_until_ts = 0.0
+        rtx_stage_consecutive_failures = 0
 
         if rtx_vsr_engine is not None:
             try:
@@ -6166,6 +6391,7 @@ def run_processor_worker(
                 "sr_flavor_supported": bool(basic_scaling_method_supported),
                 "ai_sr_enabled": bool(ai_sr_enabled),
                 "ai_sr_active": bool(ai_sr_engine is not None),
+                "ai_sr_loading": bool(ai_sr_engine_loading),
                 "ai_sr_error": ai_sr_error,
                 "ai_sr_info": ai_sr_info,
                 "rtx_vsr_enabled": bool(rtx_vsr_enabled),
@@ -6181,6 +6407,7 @@ def run_processor_worker(
 
         while True:
             _maybe_run_pending_rtx_roi_rebuild()
+            _maybe_apply_pending_ai_sr_build()
 
             message = None
             try:
@@ -6515,6 +6742,7 @@ def run_processor_worker(
                     "ai_sr_timing_ms": ai_sr_timing_ms,
                     "rtx_vsr_applied": current_rtx_applied,
                     "rtx_effect_mean_abs_luma": current_rtx_delta,
+                    "rtx_stage_last_error": rtx_stage_last_error,
                     "stage_enable_flags": {
                         "preprocess": bool(_is_preprocess_stage_enabled()),
                         "basic_scaling": bool(_basic_scaling_enabled()),
@@ -7006,6 +7234,20 @@ def run_processor_worker(
                 processor.set_max_auto_sr_scale(int(current_max_auto_basic_scaling))
                 continue
 
+            if command == "set_basic_scaling_enabled":
+                # Lightweight runtime toggle: no processor/session recreation.
+                # Basic CUDA scaling is the always-available fallback layer
+                # underneath AI SR/RTX VSR, so this can be flipped instantly.
+                basic_scaling_enabled = bool(message.get("enabled", False))
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_basic_scaling_enabled",
+                        "basic_scaling_enabled": bool(basic_scaling_enabled),
+                    }
+                )
+                continue
+
             if command == "set_ai_sr_enabled":
                 ai_sr_enabled = bool(message.get("enabled", False))
                 ai_sr_error = _refresh_ai_sr_engine()
@@ -7015,6 +7257,7 @@ def run_processor_worker(
                         "cmd": "set_ai_sr_enabled",
                         "ai_sr_enabled": bool(ai_sr_enabled),
                         "ai_sr_active": bool(ai_sr_engine is not None),
+                        "ai_sr_loading": bool(ai_sr_engine_loading),
                         "basic_upscale_enabled": not bool(ai_sr_enabled),
                         "ai_sr_error": ai_sr_error,
                         "ai_sr_info": ai_sr_info,
@@ -7035,6 +7278,7 @@ def run_processor_worker(
                         "cmd": "set_ai_sr_model_path",
                         "ai_sr_enabled": bool(ai_sr_enabled),
                         "ai_sr_active": bool(ai_sr_engine is not None),
+                        "ai_sr_loading": bool(ai_sr_engine_loading),
                         "basic_upscale_enabled": not bool(ai_sr_enabled),
                         "ai_sr_error": ai_sr_error,
                         "ai_sr_info": ai_sr_info,
@@ -7087,6 +7331,7 @@ def run_processor_worker(
                         "cmd": "set_ai_sr_settings",
                         "ai_sr_enabled": bool(ai_sr_enabled),
                         "ai_sr_active": bool(ai_sr_engine is not None),
+                        "ai_sr_loading": bool(ai_sr_engine_loading),
                         "basic_upscale_enabled": not bool(ai_sr_enabled),
                         "ai_sr_error": ai_sr_error,
                         "ai_sr_info": ai_sr_info,

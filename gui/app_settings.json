@@ -1,10 +1,10 @@
 {
-  "ai_sr_detail_preserve_percent": 90.0,
-  "ai_sr_enabled": true,
+  "ai_sr_detail_preserve_percent": 100.0,
+  "ai_sr_enabled": false,
   "ai_sr_inference_divisor": 1,
-  "ai_sr_inference_fps": 4,
-  "ai_sr_input_align": "2",
-  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\span_x4_int8.onnx",
+  "ai_sr_inference_fps": 15,
+  "ai_sr_input_align": "1",
+  "ai_sr_model_path": "C:\\Coding Projects\\video_processor\\models\\rt4ksr_x2_fp16.onnx",
   "ai_sr_post_artifact_reduction_method": "Off",
   "ai_sr_post_artifact_reduction_strength": 1.0,
   "ai_sr_post_denoise_method": "Off",
@@ -12,12 +12,12 @@
   "ai_sr_post_exaggeration_enabled": false,
   "ai_sr_post_exaggeration_gain": 3.0,
   "ai_sr_provider": "auto",
-  "ai_sr_require_gpu": false,
+  "ai_sr_require_gpu": true,
   "ai_sr_roi_overscan_percent": 0.0,
   "ai_sr_strict": false,
-  "ai_sr_trt_precision": "int8",
+  "ai_sr_trt_precision": "fp16",
   "basic_scaling_auto_max": "2",
-  "basic_scaling_enabled": false,
+  "basic_scaling_enabled": true,
   "basic_scaling_manual": "2",
   "basic_scaling_method": "Bicubic (Balanced)",
   "basic_scaling_mode": "Auto",
@@ -38,8 +38,8 @@
   "denoise_method": "Off",
   "denoise_strength": 0.35,
   "display_splitter_sizes": [
-    388,
-    388
+    367,
+    366
   ],
   "fps": 30,
   "fullscreen_scale_presets": [
@@ -50,8 +50,8 @@
   "fullscreen_selected_scale_index": 1,
   "interlaced_field2_phase_fraction": 0.5,
   "main_splitter_sizes": [
-    760,
-    759
+    698,
+    698
   ],
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
@@ -115,8 +115,9 @@
   "rtx_thdr_saturation": 50,
   "rtx_vsr_enabled": false,
   "rtx_vsr_post_scale_method": "Bicubic (Balanced)",
-  "rtx_vsr_quality": "high",
+  "rtx_vsr_quality": "ultra",
   "rtx_vsr_scale": "2",
+  "scaling_mode": "Standard CUDA Scaling",
   "source_mode": "Blackmagic DeckLink",
   "version": 1,
   "worker_process_priority": "High"

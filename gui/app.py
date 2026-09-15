@@ -66,6 +66,13 @@ SR_FLAVOR_LABEL_TO_NAME = {
 }
 SR_FLAVOR_NAME_TO_LABEL = {value: key for key, value in SR_FLAVOR_LABEL_TO_NAME.items()}
 
+# Single-select upscaling mode: which stage (if any) sits on top of the
+# always-available basic CUDA scaling/passthrough fallback.
+SCALING_MODE_BASIC = "Standard CUDA Scaling"
+SCALING_MODE_ONNX_SR = "ONNX SR"
+SCALING_MODE_RTX_SR = "Nvidia SR"
+SCALING_MODE_OPTIONS = [SCALING_MODE_BASIC, SCALING_MODE_ONNX_SR, SCALING_MODE_RTX_SR]
+
 DEINTERLACE_METHOD_LABEL_TO_NAME = {
     "Bob (Fast)": "bob",
     "Blend (Stable)": "blend",
@@ -2243,6 +2250,7 @@ class VideoProcessorController:
         self.color_range = _normalize_color_range_name(os.environ.get("VP_COLOR_RANGE", "limited"))
         self.ai_sr_enabled = False
         self.ai_sr_active = False
+        self.ai_sr_loading = False
         self.ai_sr_model_path = ""
         self.ai_sr_error: str | None = None
         self.ai_sr_provider = "auto"
@@ -2456,6 +2464,11 @@ class VideoProcessorController:
 
     def close(self) -> None:
         self.processor = None
+
+    def set_basic_scaling_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
+        # In-process backend: enable_placeholder_sr is constructor-only, so the
+        # caller (MainWindow) recreates the processor via create() as needed.
+        self.enable_basic_scaling = bool(enabled)
 
     def set_ai_sr_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
         self.ai_sr_enabled = bool(enabled)
@@ -2709,6 +2722,7 @@ class ProcessVideoProcessorController:
         self.ai_sr_max_hold_ms = max(0.0, float(os.environ.get("VP_AI_SR_MAX_HOLD_MS", "0")))
         self.ai_sr_max_inflight = max(1, min(4, int(os.environ.get("VP_AI_SR_MAX_INFLIGHT", "1"))))
         self.ai_sr_active = False
+        self.ai_sr_loading = False
         self.ai_sr_error: str | None = None
         self.ai_sr_info: dict[str, object] | None = None
         self.ai_sr_last_warning: str | None = None
@@ -2768,6 +2782,7 @@ class ProcessVideoProcessorController:
         self._decklink_ai_timing_ms: dict[str, object] = {}
         self._decklink_rtx_vsr_applied = False
         self._decklink_rtx_effect_mean_abs_luma = 0.0
+        self._decklink_rtx_last_error: str | None = None
         self._decklink_stage_enable_flags: dict[str, bool] = {
             "preprocess": False,
             "basic_scaling": False,
@@ -3006,6 +3021,7 @@ class ProcessVideoProcessorController:
         self._decklink_rtx_effect_mean_abs_luma = float(
             message.get("rtx_effect_mean_abs_luma", self._decklink_rtx_effect_mean_abs_luma)
         )
+        self._decklink_rtx_last_error = message.get("rtx_stage_last_error", self._decklink_rtx_last_error)
         self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
         self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
         self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
@@ -3139,7 +3155,10 @@ class ProcessVideoProcessorController:
         if run_processor_worker is None:
             raise RuntimeError("Process worker module is unavailable")
 
-        effective_basic_scaling_enabled = bool(self.enable_basic_scaling) and not bool(self.ai_sr_enabled)
+        # Basic CUDA scaling is always kept available as the worker-side
+        # fallback layer beneath AI SR/RTX VSR (toggled at runtime via
+        # set_basic_scaling_enabled), so it is not suppressed here anymore.
+        effective_basic_scaling_enabled = bool(self.enable_basic_scaling)
         sr_scale = 0 if self.basic_scaling_auto_mode else self.basic_scaling_manual
         project_root = str(Path(__file__).resolve().parents[1])
         startup_config = {
@@ -3250,6 +3269,7 @@ class ProcessVideoProcessorController:
                 self.basic_scaling_method_supported = bool(message.get("basic_scaling_method_supported", message.get("sr_flavor_supported", True)))
                 self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                 self.ai_sr_active = bool(message.get("ai_sr_active", False))
+                self.ai_sr_loading = bool(message.get("ai_sr_loading", False))
                 self.ai_sr_error = message.get("ai_sr_error")
                 self.ai_sr_info = message.get("ai_sr_info")
                 self.rtx_vsr_enabled = bool(message.get("rtx_vsr_enabled", self.rtx_vsr_enabled))
@@ -3449,6 +3469,8 @@ class ProcessVideoProcessorController:
                 ack_cmd = str(message.get("cmd", ""))
                 if ack_cmd in {"set_basic_scaling_method", "set_sr_flavor"}:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                elif ack_cmd == "set_basic_scaling_enabled":
+                    self.enable_basic_scaling = bool(message.get("basic_scaling_enabled", self.enable_basic_scaling))
                 elif ack_cmd == "set_deinterlace_enabled":
                     self.deinterlace_enabled = bool(message.get("deinterlace_enabled", self.deinterlace_enabled))
                 elif ack_cmd == "set_reinterlace_enabled":
@@ -3461,6 +3483,7 @@ class ProcessVideoProcessorController:
                 elif ack_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
                     self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                     self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
+                    self.ai_sr_loading = bool(message.get("ai_sr_loading", False))
                     self.ai_sr_error = message.get("ai_sr_error")
                     self.ai_sr_info = message.get("ai_sr_info")
                 elif ack_cmd in {"set_rtx_vsr_enabled", "set_rtx_vsr_settings"}:
@@ -3488,6 +3511,16 @@ class ProcessVideoProcessorController:
                     self.interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
                         float(message.get("interlaced_field2_phase_fraction", self.interlaced_field2_phase_fraction))
                     )
+                continue
+
+            if message_type == "ai_sr_engine_update":
+                # Background AI SR engine build finished (or failed) after an
+                # earlier ack already reported "loading"; refresh final state.
+                self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
+                self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
+                self.ai_sr_loading = bool(message.get("ai_sr_loading", False))
+                self.ai_sr_error = message.get("ai_sr_error")
+                self.ai_sr_info = message.get("ai_sr_info")
                 continue
 
             if message_type == "warning":
@@ -3826,6 +3859,8 @@ class ProcessVideoProcessorController:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
                 if expected_cmd == "set_sr_flavor":
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
+                if expected_cmd == "set_basic_scaling_enabled":
+                    self.enable_basic_scaling = bool(message.get("basic_scaling_enabled", self.enable_basic_scaling))
                 if expected_cmd == "set_deinterlace_method":
                     self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
                 if expected_cmd == "set_deinterlace_enabled":
@@ -3838,6 +3873,7 @@ class ProcessVideoProcessorController:
                 if expected_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
                     self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                     self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
+                    self.ai_sr_loading = bool(message.get("ai_sr_loading", False))
                     self.ai_sr_error = message.get("ai_sr_error")
                     self.ai_sr_info = message.get("ai_sr_info")
                 if expected_cmd in {"set_rtx_vsr_enabled", "set_rtx_vsr_settings"}:
@@ -3874,6 +3910,14 @@ class ProcessVideoProcessorController:
                 self._decklink_tick_pending = False
                 self._decklink_tick_pending_since = 0.0
                 continue
+            if message_type == "ai_sr_engine_update":
+                self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
+                self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
+                self.ai_sr_loading = bool(message.get("ai_sr_loading", False))
+                self.ai_sr_error = message.get("ai_sr_error")
+                self.ai_sr_info = message.get("ai_sr_info")
+                continue
+
             if message_type == "warning":
                 warning_text = str(message.get("warning", ""))
                 if warning_text:
@@ -4093,6 +4137,12 @@ class ProcessVideoProcessorController:
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
 
+    def set_basic_scaling_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
+        self.enable_basic_scaling = bool(enabled)
+        self._send_control({"cmd": "set_basic_scaling_enabled", "enabled": bool(enabled)})
+        if wait_for_ack:
+            self._wait_for_ack("set_basic_scaling_enabled", timeout_seconds=max(0.5, float(timeout_seconds)))
+
     def set_ai_sr_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
         self.ai_sr_enabled = bool(enabled)
         self._send_control({"cmd": "set_ai_sr_enabled", "enabled": bool(enabled)})
@@ -4235,6 +4285,9 @@ class ProcessVideoProcessorController:
 
     def decklink_rtx_stats(self) -> tuple[bool, float]:
         return bool(self._decklink_rtx_vsr_applied), float(self._decklink_rtx_effect_mean_abs_luma)
+
+    def decklink_rtx_last_error(self) -> str | None:
+        return self._decklink_rtx_last_error
 
     def decklink_stage_telemetry(self) -> tuple[dict[str, bool], dict[str, bool], dict[str, int]]:
         return (
@@ -4654,7 +4707,6 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._apply_manual_drag_tuning_to_controller()
         self._apply_interlaced_phase_tuning_to_controller()
-        self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
@@ -4697,7 +4749,7 @@ class MainWindow(QMainWindow):
         if hasattr(self._controller, "worker_process_priority"):
             self._controller.worker_process_priority = _normalize_worker_priority_name(self._worker_process_priority)
         self._controller.create(self._roi)
-        self._sync_ai_sr_basic_scaling_ui(notify=False)
+        self._apply_scaling_mode_visibility(self.scaling_mode_combo.currentText())
         self._apply_startup_ai_sr_settings()
         self._apply_controller_color_settings_from_ui()
         self._apply_worker_process_priority_to_controller(notify=False)
@@ -4746,6 +4798,7 @@ class MainWindow(QMainWindow):
             self.preview_downsample_combo,
             self.color_space_combo,
             self.color_range_combo,
+            self.scaling_mode_combo,
             self.sr_mode_combo,
             self.sr_flavor_combo,
             self.sr_manual_combo,
@@ -4774,9 +4827,6 @@ class MainWindow(QMainWindow):
             combo.currentTextChanged.connect(self._schedule_settings_save)
 
         checkbox_widgets = [
-            self.enable_sr_checkbox,
-            self.enable_ai_sr_checkbox,
-            self.enable_rtx_vsr_checkbox,
             self.deinterlace_checkbox,
             self.reinterlace_checkbox,
             self.perf_guard_checkbox,
@@ -4873,14 +4923,15 @@ class MainWindow(QMainWindow):
             "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
             "basic_scaling_manual": str(self.sr_manual_combo.currentText()),
             "basic_scaling_auto_max": str(self.auto_sr_max_combo.currentText()),
-            "basic_scaling_enabled": bool(self.enable_sr_checkbox.isChecked()) and not bool(self.enable_ai_sr_checkbox.isChecked()),
+            "scaling_mode": str(self.scaling_mode_combo.currentText()),
+            "basic_scaling_enabled": self.scaling_mode_combo.currentText() == SCALING_MODE_BASIC,
             "deinterlace_enabled": bool(self.deinterlace_checkbox.isChecked()),
             "reinterlace_enabled": bool(self.reinterlace_checkbox.isChecked()),
             "deinterlace_method": str(self.deinterlace_method_combo.currentText()),
             "denoise_method": str(self.denoise_method_combo.currentText()),
             "denoise_strength": float(self.denoise_strength_spin.value()),
             "perf_guard_enabled": bool(self.perf_guard_checkbox.isChecked()),
-            "ai_sr_enabled": bool(self.enable_ai_sr_checkbox.isChecked()),
+            "ai_sr_enabled": self.scaling_mode_combo.currentText() == SCALING_MODE_ONNX_SR,
             "ai_sr_model_path": str(self.ai_sr_model_combo.currentText().strip()),
             "ai_sr_provider": str(self.ai_sr_provider_combo.currentText()),
             "ai_sr_trt_precision": str(self.ai_sr_trt_precision_combo.currentText()),
@@ -4897,7 +4948,7 @@ class MainWindow(QMainWindow):
             "ai_sr_post_artifact_reduction_strength": float(self.ai_sr_post_artifact_reduction_strength_spin.value()),
             "ai_sr_post_exaggeration_enabled": bool(self.ai_sr_post_exaggeration_checkbox.isChecked()),
             "ai_sr_post_exaggeration_gain": float(self.ai_sr_post_exaggeration_gain_spin.value()),
-            "rtx_vsr_enabled": bool(self.enable_rtx_vsr_checkbox.isChecked()),
+            "rtx_vsr_enabled": self.scaling_mode_combo.currentText() == SCALING_MODE_RTX_SR,
             "rtx_vsr_quality": str(self.rtx_vsr_quality_combo.currentText()),
             "rtx_vsr_scale": str(self.rtx_vsr_scale_combo.currentText()),
             "rtx_vsr_post_scale_method": str(self.rtx_vsr_post_scale_method_combo.currentText()),
@@ -4986,7 +5037,18 @@ class MainWindow(QMainWindow):
             self.sr_manual_combo.setCurrentText(str(raw.get("basic_scaling_manual", self.sr_manual_combo.currentText())))
             self.auto_sr_max_combo.setCurrentText(str(raw.get("basic_scaling_auto_max", self.auto_sr_max_combo.currentText())))
 
-            self.enable_sr_checkbox.setChecked(bool(raw.get("basic_scaling_enabled", self.enable_sr_checkbox.isChecked())))
+            if "scaling_mode" in raw:
+                restored_scaling_mode = str(raw.get("scaling_mode", SCALING_MODE_BASIC))
+            elif bool(raw.get("ai_sr_enabled", False)):
+                restored_scaling_mode = SCALING_MODE_ONNX_SR
+            elif bool(raw.get("rtx_vsr_enabled", False)):
+                restored_scaling_mode = SCALING_MODE_RTX_SR
+            else:
+                restored_scaling_mode = SCALING_MODE_BASIC
+            if restored_scaling_mode not in SCALING_MODE_OPTIONS:
+                restored_scaling_mode = SCALING_MODE_BASIC
+            self.scaling_mode_combo.setCurrentText(restored_scaling_mode)
+            self._apply_scaling_mode_visibility(restored_scaling_mode)
             self.deinterlace_checkbox.setChecked(bool(raw.get("deinterlace_enabled", self.deinterlace_checkbox.isChecked())))
             self.reinterlace_checkbox.setChecked(bool(raw.get("reinterlace_enabled", self.reinterlace_checkbox.isChecked())))
             self.deinterlace_method_combo.setCurrentText(str(raw.get("deinterlace_method", self.deinterlace_method_combo.currentText())))
@@ -4994,7 +5056,6 @@ class MainWindow(QMainWindow):
             self.denoise_strength_spin.setValue(float(raw.get("denoise_strength", self.denoise_strength_spin.value())))
             self.perf_guard_checkbox.setChecked(bool(raw.get("perf_guard_enabled", self.perf_guard_checkbox.isChecked())))
 
-            self.enable_ai_sr_checkbox.setChecked(bool(raw.get("ai_sr_enabled", self.enable_ai_sr_checkbox.isChecked())))
             self.ai_sr_model_combo.setCurrentText(str(raw.get("ai_sr_model_path", self.ai_sr_model_combo.currentText())))
             persisted_provider = str(raw.get("ai_sr_provider", self.ai_sr_provider_combo.currentText())).strip().lower()
             if persisted_provider == "trt_int8":
@@ -5067,7 +5128,6 @@ class MainWindow(QMainWindow):
                 )
             )
 
-            self.enable_rtx_vsr_checkbox.setChecked(bool(raw.get("rtx_vsr_enabled", self.enable_rtx_vsr_checkbox.isChecked())))
             self.rtx_vsr_quality_combo.setCurrentText(str(raw.get("rtx_vsr_quality", self.rtx_vsr_quality_combo.currentText())))
             self.rtx_vsr_scale_combo.setCurrentText(str(raw.get("rtx_vsr_scale", self.rtx_vsr_scale_combo.currentText())))
             self.rtx_vsr_post_scale_method_combo.setCurrentText(str(raw.get("rtx_vsr_post_scale_method", self.rtx_vsr_post_scale_method_combo.currentText())))
@@ -5304,7 +5364,13 @@ class MainWindow(QMainWindow):
 
     def _apply_startup_ai_sr_settings(self) -> None:
         model_path = self._resolve_startup_ai_sr_model_path()
-        ai_enabled = bool(self.enable_ai_sr_checkbox.isChecked())
+        scaling_mode = self.scaling_mode_combo.currentText()
+        ai_enabled = scaling_mode == SCALING_MODE_ONNX_SR
+        rtx_enabled = scaling_mode == SCALING_MODE_RTX_SR
+
+        # Basic CUDA scaling is always kept enabled at the worker as the live
+        # fallback layer beneath AI SR/RTX VSR.
+        self._set_basic_scaling_enabled_effective(True)
 
         if model_path and model_path != self.ai_sr_model_combo.currentText().strip():
             self.ai_sr_model_combo.blockSignals(True)
@@ -5346,21 +5412,32 @@ class MainWindow(QMainWindow):
             )
 
             if ai_enabled and not bool(getattr(self._controller, "ai_sr_active", False)):
-                ai_err = str(getattr(self._controller, "ai_sr_error", "AI SR did not become active")).strip()
-                if ai_err:
-                    raise RuntimeError(ai_err)
-                raise RuntimeError("AI SR did not become active")
+                if bool(getattr(self._controller, "ai_sr_loading", False)):
+                    # Engine build continues in the background; do not block/fail
+                    # startup on it, the runtime panel updates once it is ready.
+                    self._update_status(f"AI SR engine loading in background | model={model_path}")
+                else:
+                    ai_err = str(getattr(self._controller, "ai_sr_error", "AI SR did not become active")).strip()
+                    if ai_err:
+                        raise RuntimeError(ai_err)
+                    raise RuntimeError("AI SR did not become active")
 
             LOGGER.info(
-                "Applied startup AI SR settings: enabled=%s, model=%s, provider=%s, inference_fps=%s",
+                "Applied startup AI SR settings: enabled=%s, model=%s, provider=%s, inference_fps=%s, loading=%s",
                 ai_enabled,
                 model_path,
                 profile["provider"],
                 profile["inference_fps"],
+                bool(getattr(self._controller, "ai_sr_loading", False)),
             )
         except Exception as exc:
             LOGGER.warning("Failed to apply startup AI SR settings: %s", exc)
             self._update_status(f"Startup AI SR apply failed: {exc}")
+
+        try:
+            self._controller.set_rtx_vsr_enabled(rtx_enabled)
+        except Exception as exc:
+            LOGGER.warning("Failed to apply startup RTX VSR enabled state: %s", exc)
 
     def _discover_ai_sr_model_paths(self) -> list[str]:
         models_root = Path(__file__).resolve().parents[1] / "models"
@@ -5440,17 +5517,18 @@ class MainWindow(QMainWindow):
         self.auto_sr_max_combo.setCurrentText("4")
         self.auto_sr_max_combo.currentIndexChanged.connect(self._on_auto_sr_max_changed)
 
-        self.enable_sr_checkbox = QCheckBox("Enable basic CUDA scaling")
-        self.enable_sr_checkbox.setChecked(True)
-        self.enable_sr_checkbox.toggled.connect(self._on_enable_sr_toggled)
+        if bool(getattr(self._controller, "ai_sr_enabled", False)):
+            initial_scaling_mode = SCALING_MODE_ONNX_SR
+        elif bool(getattr(self._controller, "rtx_vsr_enabled", False)):
+            initial_scaling_mode = SCALING_MODE_RTX_SR
+        else:
+            initial_scaling_mode = SCALING_MODE_BASIC
 
-        self.enable_ai_sr_checkbox = QCheckBox("Enable AI SR (ONNX model)")
-        self.enable_ai_sr_checkbox.setChecked(getattr(self._controller, "ai_sr_enabled", False))
-        self.enable_ai_sr_checkbox.toggled.connect(self._on_enable_ai_sr_toggled)
+        self.scaling_mode_combo = QComboBox()
+        self.scaling_mode_combo.addItems(SCALING_MODE_OPTIONS)
+        self.scaling_mode_combo.setCurrentText(initial_scaling_mode)
+        self.scaling_mode_combo.currentTextChanged.connect(self._on_scaling_mode_changed)
 
-        self.enable_rtx_vsr_checkbox = QCheckBox("Enable RTX VSR (NVIDIA SDK path)")
-        self.enable_rtx_vsr_checkbox.setChecked(bool(getattr(self._controller, "rtx_vsr_enabled", False)))
-        self.enable_rtx_vsr_checkbox.toggled.connect(self._on_enable_rtx_vsr_toggled)
 
         self.ai_sr_model_combo = QComboBox()
         self.ai_sr_model_combo.setEditable(True)
@@ -5599,8 +5677,8 @@ class MainWindow(QMainWindow):
         self.ai_sr_runtime_label.setWordWrap(True)
         ai_sr_runtime_layout.addWidget(self.ai_sr_runtime_label)
 
-        rtx_vsr_box = QGroupBox("RTX Video SDK (VSR)")
-        rtx_vsr_form = QFormLayout(rtx_vsr_box)
+        self.rtx_vsr_box = QGroupBox("RTX Video SDK (VSR)")
+        rtx_vsr_form = QFormLayout(self.rtx_vsr_box)
 
         self.rtx_vsr_quality_combo = QComboBox()
         self.rtx_vsr_quality_combo.addItems(["low", "medium", "high", "ultra"])
@@ -5693,31 +5771,52 @@ class MainWindow(QMainWindow):
         denoise_form.addRow("Method", self.denoise_method_combo)
         denoise_form.addRow("Strength", self.denoise_strength_spin)
 
-        upscaling_box = QGroupBox("Upscaling (Basic or AI)")
-        upscaling_form = QFormLayout(upscaling_box)
-        upscaling_form.addRow(self.enable_sr_checkbox)
-        upscaling_form.addRow("Basic scaling mode", self.sr_mode_combo)
-        upscaling_form.addRow("Basic scaling method", self.sr_flavor_combo)
-        upscaling_form.addRow("Manual basic scaling", self.sr_manual_combo)
-        upscaling_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
-        upscaling_form.addRow(self.enable_ai_sr_checkbox)
-        upscaling_form.addRow(self.enable_rtx_vsr_checkbox)
-        upscaling_form.addRow("AI SR model", self.ai_sr_model_combo)
-        upscaling_form.addRow(ai_sr_model_actions)
-        upscaling_form.addRow("AI SR provider", self.ai_sr_provider_combo)
-        upscaling_form.addRow("TensorRT precision", self.ai_sr_trt_precision_combo)
-        upscaling_form.addRow(self.ai_sr_require_gpu_checkbox)
-        upscaling_form.addRow("AI inference FPS", self.ai_sr_frame_interval_spin)
-        upscaling_form.addRow(self.ai_sr_strict_checkbox)
-        upscaling_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
-        upscaling_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
-        upscaling_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
-        upscaling_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
-        upscaling_form.addRow(ai_sr_tuning_actions)
-        upscaling_form.addRow(ai_sr_runtime_box)
+        upscaling_box = QGroupBox("Upscaling")
+        self.upscaling_form = QFormLayout(upscaling_box)
+        self.upscaling_form.addRow("Scaling mode", self.scaling_mode_combo)
 
-        ai_sr_postprocess_box = QGroupBox("AI SR Post Process Noise Reduction")
-        ai_sr_postprocess_form = QFormLayout(ai_sr_postprocess_box)
+        self._basic_scaling_mode_rows = [
+            self.sr_mode_combo,
+            self.sr_flavor_combo,
+            self.sr_manual_combo,
+            self.auto_sr_max_combo,
+        ]
+        self.upscaling_form.addRow("Basic scaling mode", self.sr_mode_combo)
+        self.upscaling_form.addRow("Basic scaling method", self.sr_flavor_combo)
+        self.upscaling_form.addRow("Manual basic scaling", self.sr_manual_combo)
+        self.upscaling_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
+
+        self._ai_sr_mode_rows = [
+            self.ai_sr_model_combo,
+            ai_sr_model_actions,
+            self.ai_sr_provider_combo,
+            self.ai_sr_trt_precision_combo,
+            self.ai_sr_require_gpu_checkbox,
+            self.ai_sr_frame_interval_spin,
+            self.ai_sr_strict_checkbox,
+            self.ai_sr_input_align_combo,
+            self.ai_sr_overscan_spin,
+            self.ai_sr_inference_divisor_spin,
+            self.ai_sr_detail_preserve_spin,
+            ai_sr_tuning_actions,
+            ai_sr_runtime_box,
+        ]
+        self.upscaling_form.addRow("AI SR model", self.ai_sr_model_combo)
+        self.upscaling_form.addRow(ai_sr_model_actions)
+        self.upscaling_form.addRow("AI SR provider", self.ai_sr_provider_combo)
+        self.upscaling_form.addRow("TensorRT precision", self.ai_sr_trt_precision_combo)
+        self.upscaling_form.addRow(self.ai_sr_require_gpu_checkbox)
+        self.upscaling_form.addRow("AI inference FPS", self.ai_sr_frame_interval_spin)
+        self.upscaling_form.addRow(self.ai_sr_strict_checkbox)
+        self.upscaling_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
+        self.upscaling_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
+        self.upscaling_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
+        self.upscaling_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
+        self.upscaling_form.addRow(ai_sr_tuning_actions)
+        self.upscaling_form.addRow(ai_sr_runtime_box)
+
+        self.ai_sr_postprocess_box = QGroupBox("AI SR Post Process Noise Reduction")
+        ai_sr_postprocess_form = QFormLayout(self.ai_sr_postprocess_box)
         ai_sr_postprocess_form.addRow("Noise Method", self.ai_sr_post_denoise_method_combo)
         ai_sr_postprocess_form.addRow("Noise Level", self.ai_sr_post_denoise_strength_spin)
         ai_sr_postprocess_form.addRow("Artifact Method", self.ai_sr_post_artifact_reduction_method_combo)
@@ -6069,13 +6168,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(deinterlace_box)
         layout.addWidget(denoise_box)
         layout.addWidget(upscaling_box)
-        layout.addWidget(rtx_vsr_box)
+        layout.addWidget(self.rtx_vsr_box)
         layout.addWidget(settings_box)
-        layout.addWidget(ai_sr_postprocess_box)
+        layout.addWidget(self.ai_sr_postprocess_box)
         layout.addWidget(post_vsr_scaling_box)
         layout.addWidget(controls_hint)
         layout.addWidget(self.status_label)
         layout.addStretch(1)
+        self._apply_scaling_mode_visibility(self.scaling_mode_combo.currentText())
         return panel
 
     def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
@@ -6632,7 +6732,12 @@ class MainWindow(QMainWindow):
                     ai_sr_state = "off"
                     ai_sr_detail = ""
                     if getattr(self._controller, "ai_sr_enabled", False):
-                        ai_sr_state = "active" if getattr(self._controller, "ai_sr_active", False) else "requested"
+                        if getattr(self._controller, "ai_sr_active", False):
+                            ai_sr_state = "active"
+                        elif getattr(self._controller, "ai_sr_loading", False):
+                            ai_sr_state = "loading"
+                        else:
+                            ai_sr_state = "requested"
                         ai_sr_info = getattr(self._controller, "ai_sr_info", None)
                         ai_sr_error = getattr(self._controller, "ai_sr_error", None)
                         if ai_sr_info and ai_sr_state == "active":
@@ -6973,7 +7078,12 @@ class MainWindow(QMainWindow):
                 ai_sr_state = "off"
                 ai_sr_detail = ""
                 if getattr(self._controller, "ai_sr_enabled", False):
-                    ai_sr_state = "active" if getattr(self._controller, "ai_sr_active", False) else "requested"
+                    if getattr(self._controller, "ai_sr_active", False):
+                        ai_sr_state = "active"
+                    elif getattr(self._controller, "ai_sr_loading", False):
+                        ai_sr_state = "loading"
+                    else:
+                        ai_sr_state = "requested"
                     ai_sr_info = getattr(self._controller, "ai_sr_info", None)
                     ai_sr_error = getattr(self._controller, "ai_sr_error", None)
                     if ai_sr_info and ai_sr_state == "active":
@@ -8230,38 +8340,76 @@ class MainWindow(QMainWindow):
         if self._timecode_adjustment_paused:
             self._roi_control_adjustment_timer.start()
 
-    def _sync_ai_sr_basic_scaling_ui(self, notify: bool = False, runtime_force_disable: bool = False) -> None:
-        ai_sr_selected = bool(self.enable_ai_sr_checkbox.isChecked())
-        basic_forced_off = False
+    def _apply_scaling_mode_visibility(self, mode_text: str) -> None:
+        is_basic = mode_text == SCALING_MODE_BASIC
+        is_ai = mode_text == SCALING_MODE_ONNX_SR
+        is_rtx = mode_text == SCALING_MODE_RTX_SR
 
-        if ai_sr_selected and self.enable_sr_checkbox.isChecked():
-            if runtime_force_disable:
-                self.enable_sr_checkbox.setChecked(False)
+        for widget in self._basic_scaling_mode_rows:
+            self.upscaling_form.setRowVisible(widget, is_basic)
+        for widget in self._ai_sr_mode_rows:
+            self.upscaling_form.setRowVisible(widget, is_ai)
+        self.ai_sr_postprocess_box.setVisible(is_ai)
+        self.rtx_vsr_box.setVisible(is_rtx)
+
+    def _set_basic_scaling_enabled_effective(self, enabled: bool) -> None:
+        # Worker backend: instant runtime toggle, no processor/session recreation.
+        if self._controller_backend == "worker-process" and hasattr(self._controller, "set_basic_scaling_enabled"):
+            self._controller.enable_basic_scaling = bool(enabled)
+            self._controller.set_basic_scaling_enabled(enabled)
+            return
+
+        # In-process backend: basic scaling is a constructor-only native option.
+        previous_value = self._controller.enable_basic_scaling
+        self._controller.enable_basic_scaling = bool(enabled)
+        try:
+            self._controller.create(self._roi)
+            if self._source_mode == "Blackmagic DeckLink":
+                self._start_decklink_sessions()
+        except Exception as exc:
+            self._controller.enable_basic_scaling = previous_value
+            try:
+                self._controller.create(self._roi)
+                if self._source_mode == "Blackmagic DeckLink":
+                    self._start_decklink_sessions()
+            except Exception:
+                pass
+            self._update_status(f"Processor recreate failed: {exc}")
+
+    def _apply_scaling_mode_runtime(self, mode_text: str) -> None:
+        want_ai = mode_text == SCALING_MODE_ONNX_SR
+        want_rtx = mode_text == SCALING_MODE_RTX_SR
+
+        # Basic CUDA scaling stays enabled at the worker as the live fallback
+        # layer (shown until AI SR/RTX VSR actually becomes active), so
+        # switching modes never blacks out or requires a processor restart.
+        self._set_basic_scaling_enabled_effective(True)
+
+        try:
+            if not want_ai and bool(getattr(self._controller, "ai_sr_enabled", False)):
+                self._controller.set_ai_sr_enabled(False)
+            if not want_rtx and bool(getattr(self._controller, "rtx_vsr_enabled", False)):
+                self._controller.set_rtx_vsr_enabled(False)
+            if want_ai:
+                self._controller.set_ai_sr_enabled(True)
+                model_path = self.ai_sr_model_combo.currentText().strip()
+                self._update_status(f"ONNX SR mode selected | awaiting worker ack | model={model_path}")
+            elif want_rtx:
+                self._controller.set_rtx_vsr_enabled(True)
+                self._update_status("Nvidia SR (RTX VSR) mode selected | awaiting worker ack")
             else:
-                self.enable_sr_checkbox.blockSignals(True)
-                self.enable_sr_checkbox.setChecked(False)
-                self.enable_sr_checkbox.blockSignals(False)
-                self._controller.enable_basic_scaling = False
-            basic_forced_off = True
+                self._update_status("Standard CUDA scaling mode selected")
+        except Exception as exc:
+            self._update_status(f"Scaling mode change failed: {exc}")
 
-        self.enable_sr_checkbox.setEnabled(not ai_sr_selected)
-
-        basic_controls_enabled = bool(self.enable_sr_checkbox.isChecked()) and not ai_sr_selected
-        self.sr_mode_combo.setEnabled(basic_controls_enabled)
-        self.sr_flavor_combo.setEnabled(basic_controls_enabled)
-        self.sr_manual_combo.setEnabled(basic_controls_enabled)
-        self.auto_sr_max_combo.setEnabled(basic_controls_enabled)
-
-        if ai_sr_selected:
-            self.enable_sr_checkbox.setToolTip("Basic CUDA scaling is disabled while AI SR (ONNX) is enabled.")
-        else:
-            self.enable_sr_checkbox.setToolTip("")
-
-        if notify and basic_forced_off:
-            self._update_status("AI SR ONNX selected: basic CUDA scaling has been disabled automatically")
+    def _on_scaling_mode_changed(self, mode_text: str) -> None:
+        self._apply_scaling_mode_visibility(mode_text)
+        if self._updating_controls:
+            return
+        self._apply_scaling_mode_runtime(mode_text)
 
     def _on_sr_mode_changed(self) -> None:
-        if self.enable_ai_sr_checkbox.isChecked():
+        if self.scaling_mode_combo.currentText() != SCALING_MODE_BASIC:
             return
         mode = self.sr_mode_combo.currentText()
         try:
@@ -8310,45 +8458,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._update_status(f"Auto basic scaling max change failed: {exc}")
 
-    def _on_enable_sr_toggled(self, checked: bool) -> None:
-        if self._updating_controls:
-            self._controller.enable_basic_scaling = bool(checked)
-            self._sync_ai_sr_basic_scaling_ui(notify=False)
-            return
-
-        if checked and self.enable_ai_sr_checkbox.isChecked():
-            self.enable_sr_checkbox.blockSignals(True)
-            self.enable_sr_checkbox.setChecked(False)
-            self.enable_sr_checkbox.blockSignals(False)
-            self._controller.enable_basic_scaling = False
-            self._sync_ai_sr_basic_scaling_ui(notify=False)
-            self._update_status("Basic CUDA scaling remains disabled while AI SR ONNX is enabled")
-            return
-
-        previous_value = self._controller.enable_basic_scaling
-        self._controller.enable_basic_scaling = checked
-        try:
-            self._controller.create(self._roi)
-            if self._source_mode == "Blackmagic DeckLink":
-                self._start_decklink_sessions()
-            self._sync_ai_sr_basic_scaling_ui(notify=False)
-            self._update_status("Recreated processor after basic scaling toggle")
-        except Exception as exc:
-            # Roll back to previous SR enable state so the app can recover in-place.
-            self._controller.enable_basic_scaling = previous_value
-            try:
-                self._controller.create(self._roi)
-                if self._source_mode == "Blackmagic DeckLink":
-                    self._start_decklink_sessions()
-            except Exception:
-                pass
-
-            self.enable_sr_checkbox.blockSignals(True)
-            self.enable_sr_checkbox.setChecked(previous_value)
-            self.enable_sr_checkbox.blockSignals(False)
-            self._sync_ai_sr_basic_scaling_ui(notify=False)
-            self._update_status(f"Processor recreate failed: {exc}")
-
     def _on_deinterlace_toggled(self, checked: bool) -> None:
         try:
             self._controller.set_deinterlace_enabled(checked)
@@ -8394,36 +8503,6 @@ class MainWindow(QMainWindow):
         self._perf_guard_enabled = checked
         self._perf_guard_low_fps_seconds = 0
         self._perf_guard_last_action = ""
-
-    def _on_enable_ai_sr_toggled(self, checked: bool) -> None:
-        if self._updating_controls:
-            self._controller.ai_sr_enabled = bool(checked)
-            self._sync_ai_sr_basic_scaling_ui(notify=False)
-            return
-
-        self._sync_ai_sr_basic_scaling_ui(notify=checked, runtime_force_disable=checked)
-        try:
-            self._controller.set_ai_sr_enabled(checked)
-            if checked:
-                model_path = self.ai_sr_model_combo.currentText().strip()
-                self._update_status(f"AI SR ONNX mode requested | basic CUDA scaling disabled | awaiting worker ack | model={model_path}")
-            else:
-                self._update_status("AI SR disable requested | awaiting worker ack")
-        except Exception as exc:
-            self._update_status(f"AI SR toggle failed: {exc}")
-
-    def _on_enable_rtx_vsr_toggled(self, checked: bool) -> None:
-        try:
-            self._controller.set_rtx_vsr_enabled(checked)
-            if checked:
-                if bool(getattr(self._controller, "ai_sr_enabled", False)):
-                    self._update_status("RTX VSR enable requested | awaiting worker ack | note: with AI SR enabled, RTX runs as fallback when AI is unavailable on a frame")
-                else:
-                    self._update_status("RTX VSR enable requested | awaiting worker ack")
-            else:
-                self._update_status("RTX VSR disable requested | awaiting worker ack")
-        except Exception as exc:
-            self._update_status(f"RTX VSR toggle failed: {exc}")
 
     def _on_ai_sr_model_path_changed(self, model_path: str) -> None:
         if self._updating_controls:
@@ -8582,6 +8661,7 @@ class MainWindow(QMainWindow):
         info = getattr(self._controller, "ai_sr_info", None) or {}
         enabled = bool(getattr(self._controller, "ai_sr_enabled", False))
         active = bool(getattr(self._controller, "ai_sr_active", False))
+        loading = bool(getattr(self._controller, "ai_sr_loading", False))
         error_text = getattr(self._controller, "ai_sr_error", None)
         warning_text = getattr(self._controller, "ai_sr_last_warning", None)
 
@@ -8662,9 +8742,10 @@ class MainWindow(QMainWindow):
         post_exaggeration_passes = int(info.get("post_exaggeration_passes", 2 if post_exaggeration_enabled else 1))
         onnx_output_copy_to_cpu = bool(info.get("onnx_output_copy_to_cpu", True))
         detail_preserve_note = str(info.get("detail_preserve_note", "")).strip()
+        provider_fallback_note = str(info.get("provider_fallback_note", "") or "").strip()
 
         lines = [
-            f"Enabled: {enabled} | Active: {active}",
+            f"Enabled: {enabled} | Active: {active} | Loading: {loading}",
             f"GPU active: {gpu_state} | Provider: {provider_upper} | Requested: {requested_provider}",
             f"TensorRT precision: {trt_precision}",
             f"Available providers: {available_text}",
@@ -8696,13 +8777,24 @@ class MainWindow(QMainWindow):
                 "Visibility warning: AI inference FPS is very low (1-2), so output updates can look like passthrough. Increase AI inference FPS."
             )
 
+        if enabled and loading and not active:
+            lines.append(
+                "AI SR engine is loading in the background (ONNX Runtime/TensorRT session build); "
+                "the current mode keeps rendering live until it is ready."
+            )
+
+        if provider_fallback_note:
+            lines.append(f"Provider fallback: {provider_fallback_note}")
+
         if isinstance(timing_warmup_frames, (int, float)) and isinstance(timing_warmup_remaining, (int, float)):
             lines.append(
                 f"Timing warmup: excluded first {int(timing_warmup_frames)} sample(s), remaining={max(0, int(timing_warmup_remaining))}"
             )
 
-        if enabled:
-            lines.append("Mode: ONNX AI SR only (basic CUDA scaling is disabled while AI SR is enabled).")
+        if enabled and not active:
+            lines.append("Mode: basic CUDA scaling remains live as fallback until the AI SR engine becomes active.")
+        elif enabled:
+            lines.append("Mode: ONNX AI SR active (basic CUDA scaling is bypassed while AI SR is producing output).")
 
         lines.append("Scheduler: worker skips frames and submits inference jobs to match the target AI inference FPS.")
         if onnx_output_copy_to_cpu:
@@ -8762,6 +8854,12 @@ class MainWindow(QMainWindow):
             lines.append("Note: RTX VSR path is bypassed while AI SR is enabled.")
         if error_text:
             lines.append(f"Error: {error_text}")
+
+        stage_error = None
+        if hasattr(self._controller, "decklink_rtx_last_error"):
+            stage_error = self._controller.decklink_rtx_last_error()
+        if stage_error:
+            lines.append(f"Last inference error (falling back to passthrough): {stage_error}")
 
         self.rtx_vsr_runtime_label.setText("\n".join(lines))
         self.rtx_vsr_scaling_info_label.setText(
@@ -8953,6 +9051,11 @@ class MainWindow(QMainWindow):
         if self._perf_guard_low_fps_seconds < 2:
             return
 
+        if self.scaling_mode_combo.currentText() != SCALING_MODE_BASIC:
+            # Basic scaling is only the sole active stage in this mode; AI
+            # SR/RTX VSR performance is not affected by these mitigations.
+            return
+
         # First mitigation: clamp basic-scaling cost by switching to manual x2.
         if self._controller.enable_basic_scaling and (
             self._controller.basic_scaling_auto_mode or self._controller.basic_scaling_manual > 2 or self._controller.effective_scale() > 2
@@ -8979,7 +9082,7 @@ class MainWindow(QMainWindow):
             and measured_fps < severe_threshold
             and self._perf_guard_last_action != "disable_sr"
         ):
-            self.enable_sr_checkbox.setChecked(False)
+            self._set_basic_scaling_enabled_effective(False)
             self._perf_guard_last_action = "disable_sr"
             self._perf_guard_low_fps_seconds = 0
             LOGGER.warning(
