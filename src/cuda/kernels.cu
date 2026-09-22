@@ -1356,6 +1356,396 @@ __global__ void TensorToRgbKernel(
     rgb[pixel_index] = make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
 }
 
+__global__ void ScaleRgbaToColorAlphaKernel(
+    const uint8_t* rgba,
+    int src_width,
+    int src_height,
+    uchar3* color,
+    uint8_t* alpha,
+    int out_width,
+    int out_height
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= out_width || y >= out_height) {
+        return;
+    }
+    const float source_x = ((static_cast<float>(x) + 0.5f) * src_width / out_width) - 0.5f;
+    const float source_y = ((static_cast<float>(y) + 0.5f) * src_height / out_height) - 0.5f;
+    const int sx = max(0, min(src_width - 1, static_cast<int>(source_x + 0.5f)));
+    const int sy = max(0, min(src_height - 1, static_cast<int>(source_y + 0.5f)));
+    const int source_index = (sy * src_width + sx) * 4;
+    const int target_index = y * out_width + x;
+    color[target_index] = make_uchar3(rgba[source_index], rgba[source_index + 1], rgba[source_index + 2]);
+    alpha[target_index] = rgba[source_index + 3];
+}
+
+__global__ void ConvertColorAlphaChannelsKernel(
+    uchar3* color,
+    uint8_t* alpha,
+    int width,
+    int height,
+    bool color_from_alpha,
+    bool alpha_from_color
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * width + x;
+    const uchar3 source_color = color[index];
+    const uint8_t source_alpha = alpha[index];
+    if (color_from_alpha) {
+        color[index] = make_uchar3(source_alpha, source_alpha, source_alpha);
+    }
+    if (alpha_from_color) {
+        alpha[index] = ClampToU8(
+            0.2126f * static_cast<float>(source_color.x)
+            + 0.7152f * static_cast<float>(source_color.y)
+            + 0.0722f * static_cast<float>(source_color.z)
+        );
+    }
+}
+
+__global__ void ApplyProceduralAlphaMaskKernel(
+    uint8_t* alpha,
+    int width,
+    int height,
+    int pattern,
+    float softness,
+    float aspect,
+    bool invert,
+    float size
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const float base_radius = 0.5f * static_cast<float>(min(width, height)) * size;
+    const float aspect_scale = sqrtf(aspect);
+    const float normalized_x = fabsf((static_cast<float>(x) + 0.5f - 0.5f * width) / (base_radius * aspect_scale));
+    const float normalized_y = fabsf((static_cast<float>(y) + 0.5f - 0.5f * height) * aspect_scale / base_radius);
+
+    float distance = 0.0f;
+    if (pattern == 1) {
+        distance = fmaxf(normalized_x, normalized_y);
+    } else if (pattern == 2) {
+        distance = sqrtf(normalized_x * normalized_x + normalized_y * normalized_y);
+    } else {
+        distance = normalized_x + normalized_y;
+    }
+
+    float mask_alpha = distance <= 1.0f ? 1.0f : 0.0f;
+    if (softness > 0.0f) {
+        const float feather_position = (1.0f + softness - distance) / (2.0f * softness);
+        const float t = fminf(1.0f, fmaxf(0.0f, feather_position));
+        mask_alpha = t * t * (3.0f - 2.0f * t);
+    }
+    if (invert) {
+        mask_alpha = 1.0f - mask_alpha;
+    }
+    const int index = y * width + x;
+    alpha[index] = ClampToU8(static_cast<float>(alpha[index]) * mask_alpha);
+}
+
+__device__ inline float BlurSampleWeight(int offset, float radius, int method) {
+    const float distance = fabsf(static_cast<float>(offset));
+    const float edge_weight = fminf(1.0f, fmaxf(0.0f, radius + 1.0f - distance));
+    if (method != 1) {
+        return edge_weight;
+    }
+    const float sigma = fmaxf(0.75f, radius * 0.5f);
+    return edge_weight * expf(-static_cast<float>(offset * offset) / (2.0f * sigma * sigma));
+}
+
+__global__ void BlurColorHorizontalKernel(
+    const uchar3* input,
+    uchar3* output,
+    int width,
+    int height,
+    float radius,
+    int method
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    float sum_r = 0.0f;
+    float sum_g = 0.0f;
+    float sum_b = 0.0f;
+    float total = 0.0f;
+    const int sample_radius = static_cast<int>(ceilf(radius));
+    for (int offset = -sample_radius; offset <= sample_radius; ++offset) {
+        const int sx = max(0, min(width - 1, x + offset));
+        const float weight = BlurSampleWeight(offset, radius, method);
+        const uchar3 pixel = input[y * width + sx];
+        sum_r += static_cast<float>(pixel.x) * weight;
+        sum_g += static_cast<float>(pixel.y) * weight;
+        sum_b += static_cast<float>(pixel.z) * weight;
+        total += weight;
+    }
+    output[y * width + x] = make_uchar3(
+        ClampToU8(sum_r / total),
+        ClampToU8(sum_g / total),
+        ClampToU8(sum_b / total)
+    );
+}
+
+__global__ void BlurColorVerticalKernel(
+    const uchar3* input,
+    uchar3* output,
+    int width,
+    int height,
+    float radius,
+    int method
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    float sum_r = 0.0f;
+    float sum_g = 0.0f;
+    float sum_b = 0.0f;
+    float total = 0.0f;
+    const int sample_radius = static_cast<int>(ceilf(radius));
+    for (int offset = -sample_radius; offset <= sample_radius; ++offset) {
+        const int sy = max(0, min(height - 1, y + offset));
+        const float weight = BlurSampleWeight(offset, radius, method);
+        const uchar3 pixel = input[sy * width + x];
+        sum_r += static_cast<float>(pixel.x) * weight;
+        sum_g += static_cast<float>(pixel.y) * weight;
+        sum_b += static_cast<float>(pixel.z) * weight;
+        total += weight;
+    }
+    output[y * width + x] = make_uchar3(
+        ClampToU8(sum_r / total),
+        ClampToU8(sum_g / total),
+        ClampToU8(sum_b / total)
+    );
+}
+
+__global__ void BlurAlphaHorizontalKernel(
+    const uint8_t* input,
+    uint8_t* output,
+    int width,
+    int height,
+    float radius,
+    int method
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    float sum = 0.0f;
+    float total = 0.0f;
+    const int sample_radius = static_cast<int>(ceilf(radius));
+    for (int offset = -sample_radius; offset <= sample_radius; ++offset) {
+        const int sx = max(0, min(width - 1, x + offset));
+        const float weight = BlurSampleWeight(offset, radius, method);
+        sum += static_cast<float>(input[y * width + sx]) * weight;
+        total += weight;
+    }
+    output[y * width + x] = ClampToU8(sum / total);
+}
+
+__global__ void BlurAlphaVerticalKernel(
+    const uint8_t* input,
+    uint8_t* output,
+    int width,
+    int height,
+    float radius,
+    int method
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    float sum = 0.0f;
+    float total = 0.0f;
+    const int sample_radius = static_cast<int>(ceilf(radius));
+    for (int offset = -sample_radius; offset <= sample_radius; ++offset) {
+        const int sy = max(0, min(height - 1, y + offset));
+        const float weight = BlurSampleWeight(offset, radius, method);
+        sum += static_cast<float>(input[sy * width + x]) * weight;
+        total += weight;
+    }
+    output[y * width + x] = ClampToU8(sum / total);
+}
+
+__device__ inline float BlendChannel(float background, float foreground, int mode) {
+    if (mode == 1) return background * foreground;
+    if (mode == 2) return 1.0f - ((1.0f - background) * (1.0f - foreground));
+    if (mode == 3) return background < 0.5f ? 2.0f * background * foreground : 1.0f - 2.0f * (1.0f - background) * (1.0f - foreground);
+    if (mode == 4) return (1.0f - 2.0f * foreground) * background * background + 2.0f * foreground * background;
+    if (mode == 5) return foreground < 0.5f ? 2.0f * background * foreground : 1.0f - 2.0f * (1.0f - background) * (1.0f - foreground);
+    if (mode == 6) return fabsf(background - foreground);
+    if (mode == 7) return fminf(1.0f, background + foreground);
+    return foreground;
+}
+
+__device__ inline float SmoothStep(float edge0, float edge1, float value) {
+    const float width = fmaxf(edge1 - edge0, 1.0e-6f);
+    const float t = fminf(1.0f, fmaxf(0.0f, (value - edge0) / width));
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__global__ void CompositeColorAlphaKernel(
+    const uchar3* background,
+    const uint8_t* background_alpha,
+    const uchar3* foreground,
+    const uint8_t* alpha,
+    uchar3* output,
+    uint8_t* output_alpha,
+    int width,
+    int height,
+    float initial_background_opacity,
+    float opacity,
+    int blend_mode,
+    int key_mode,
+    uchar3 key_color,
+    float key_similarity,
+    float key_softness,
+    float spill_suppression,
+    float luma_low,
+    float luma_high,
+    float luma_softness,
+    bool key_invert
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * width + x;
+    const uchar3 bg = background[index];
+    const uchar3 source_fg = foreground[index];
+    const float stored_br = static_cast<float>(bg.x) / 255.0f;
+    const float stored_bg = static_cast<float>(bg.y) / 255.0f;
+    const float stored_bb = static_cast<float>(bg.z) / 255.0f;
+    const float background_opacity = background_alpha == nullptr
+        ? initial_background_opacity
+        : static_cast<float>(background_alpha[index]) / 255.0f;
+    const float clamped_background_alpha = fminf(1.0f, fmaxf(0.0f, background_opacity));
+    const bool background_is_premultiplied = background_alpha != nullptr;
+    const float inverse_background_alpha = clamped_background_alpha > 1.0e-6f
+        ? 1.0f / clamped_background_alpha
+        : 0.0f;
+    const float br = background_is_premultiplied ? stored_br * inverse_background_alpha : stored_br;
+    const float bgc = background_is_premultiplied ? stored_bg * inverse_background_alpha : stored_bg;
+    const float bb = background_is_premultiplied ? stored_bb * inverse_background_alpha : stored_bb;
+    float fr = static_cast<float>(source_fg.x) / 255.0f;
+    float fgc = static_cast<float>(source_fg.y) / 255.0f;
+    float fb = static_cast<float>(source_fg.z) / 255.0f;
+    float key_alpha = 1.0f;
+    if (key_mode == 1) {
+        const float kr = static_cast<float>(key_color.x) / 255.0f;
+        const float kg = static_cast<float>(key_color.y) / 255.0f;
+        const float kb = static_cast<float>(key_color.z) / 255.0f;
+        const float dr = fr - kr;
+        const float dg = fgc - kg;
+        const float db = fb - kb;
+        const float distance = sqrtf((dr * dr + dg * dg + db * db) / 3.0f);
+        key_alpha = SmoothStep(key_similarity, key_similarity + key_softness, distance);
+        const float spill = (1.0f - key_alpha) * spill_suppression;
+        const float luminance = 0.2126f * fr + 0.7152f * fgc + 0.0722f * fb;
+        fr += (luminance - fr) * spill;
+        fgc += (luminance - fgc) * spill;
+        fb += (luminance - fb) * spill;
+    } else if (key_mode == 2) {
+        const float luminance = 0.2126f * fr + 0.7152f * fgc + 0.0722f * fb;
+        const float low_matte = SmoothStep(luma_low - luma_softness, luma_low, luminance);
+        const float high_matte = 1.0f - SmoothStep(luma_high, luma_high + luma_softness, luminance);
+        key_alpha = low_matte * high_matte;
+    }
+    if (key_invert) {
+        key_alpha = 1.0f - key_alpha;
+    }
+    const float foreground_alpha = fminf(1.0f, fmaxf(0.0f, opacity))
+        * static_cast<float>(alpha[index]) / 255.0f * key_alpha;
+    const float composite_alpha = foreground_alpha + clamped_background_alpha * (1.0f - foreground_alpha);
+    const float background_red = background_is_premultiplied ? stored_br : br * clamped_background_alpha;
+    const float background_green = background_is_premultiplied ? stored_bg : bgc * clamped_background_alpha;
+    const float background_blue = background_is_premultiplied ? stored_bb : bb * clamped_background_alpha;
+    output[index] = make_uchar3(
+        ClampToU8((background_red * (1.0f - foreground_alpha) + BlendChannel(br, fr, blend_mode) * foreground_alpha) * 255.0f),
+        ClampToU8((background_green * (1.0f - foreground_alpha) + BlendChannel(bgc, fgc, blend_mode) * foreground_alpha) * 255.0f),
+        ClampToU8((background_blue * (1.0f - foreground_alpha) + BlendChannel(bb, fb, blend_mode) * foreground_alpha) * 255.0f)
+    );
+    output_alpha[index] = ClampToU8(composite_alpha * 255.0f);
+}
+
+__global__ void ColorAdjustmentKernel(
+    const uchar3* input,
+    uchar3* output,
+    int width,
+    int height,
+    int stage_type,
+    float param0,
+    float param1,
+    float param2,
+    float param3,
+    float param4,
+    float param5,
+    float param6,
+    float param7,
+    float param8,
+    bool invert
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const int index = y * width + x;
+    const uchar3 pixel = input[index];
+    float red = static_cast<float>(pixel.x) / 255.0f;
+    float green = static_cast<float>(pixel.y) / 255.0f;
+    float blue = static_cast<float>(pixel.z) / 255.0f;
+
+    if (stage_type == 0) {
+        const float saturation = param0;
+        const float hue_radians = param1 * 0.01745329251994329577f;
+        const float brightness = param2;
+        const float contrast = param3;
+        const float yiq_y = 0.299f * red + 0.587f * green + 0.114f * blue;
+        const float yiq_i = 0.596f * red - 0.274f * green - 0.322f * blue;
+        const float yiq_q = 0.211f * red - 0.523f * green + 0.312f * blue;
+        const float hue_cos = cosf(hue_radians);
+        const float hue_sin = sinf(hue_radians);
+        const float rotated_i = yiq_i * hue_cos - yiq_q * hue_sin;
+        const float rotated_q = yiq_i * hue_sin + yiq_q * hue_cos;
+        red = yiq_y + 0.956f * rotated_i + 0.621f * rotated_q;
+        green = yiq_y - 0.272f * rotated_i - 0.647f * rotated_q;
+        blue = yiq_y - 1.106f * rotated_i + 1.703f * rotated_q;
+        const float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
+        red = ((luminance + (red - luminance) * saturation - 0.5f) * contrast) + 0.5f + brightness;
+        green = ((luminance + (green - luminance) * saturation - 0.5f) * contrast) + 0.5f + brightness;
+        blue = ((luminance + (blue - luminance) * saturation - 0.5f) * contrast) + 0.5f + brightness;
+        if (invert) {
+            red = 1.0f - red;
+            green = 1.0f - green;
+            blue = 1.0f - blue;
+        }
+    } else {
+        red = powf(fmaxf(0.0f, red + param6), 1.0f / fmaxf(0.01f, param3)) * param0;
+        green = powf(fmaxf(0.0f, green + param7), 1.0f / fmaxf(0.01f, param4)) * param1;
+        blue = powf(fmaxf(0.0f, blue + param8), 1.0f / fmaxf(0.01f, param5)) * param2;
+    }
+
+    output[index] = make_uchar3(
+        ClampToU8(red * 255.0f),
+        ClampToU8(green * 255.0f),
+        ClampToU8(blue * 255.0f)
+    );
+}
 inline dim3 Grid2D(int width, int height, int bx = 16, int by = 16) {
     return dim3((width + bx - 1) / bx, (height + by - 1) / by, 1);
 }
@@ -1864,6 +2254,166 @@ void LaunchDenoiseUyvyLumaBilateral5x5(
         height,
         fminf(1.0f, fmaxf(0.0f, strength))
     );
+}
+
+void LaunchScaleRgbaToColorAlpha(
+    const uint8_t* d_rgba,
+    int src_width,
+    int src_height,
+    uchar3* d_color,
+    uint8_t* d_alpha,
+    int out_width,
+    int out_height,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    ScaleRgbaToColorAlphaKernel<<<Grid2D(out_width, out_height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgba, src_width, src_height, d_color, d_alpha, out_width, out_height
+    );
+    CheckKernelLaunch("ScaleRgbaToColorAlphaKernel launch");
+}
+
+void LaunchConvertColorAlphaChannels(
+    uchar3* d_color,
+    uint8_t* d_alpha,
+    int width,
+    int height,
+    bool color_from_alpha,
+    bool alpha_from_color,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    ConvertColorAlphaChannelsKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_color, d_alpha, width, height, color_from_alpha, alpha_from_color
+    );
+    CheckKernelLaunch("ConvertColorAlphaChannelsKernel launch");
+}
+
+void LaunchApplyProceduralAlphaMask(
+    uint8_t* d_alpha,
+    int width,
+    int height,
+    int pattern,
+    float softness,
+    float aspect,
+    bool invert,
+    float size,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    ApplyProceduralAlphaMaskKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_alpha, width, height, pattern, softness, aspect, invert, fmaxf(0.1f, fminf(4.0f, size))
+    );
+    CheckKernelLaunch("ApplyProceduralAlphaMaskKernel launch");
+}
+
+void LaunchBlurColor(
+    const uchar3* d_input,
+    uchar3* d_temp,
+    uchar3* d_output,
+    int width,
+    int height,
+    float radius,
+    int method,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const float clamped_radius = fmaxf(0.01f, fminf(16.0f, radius));
+    BlurColorHorizontalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_input, d_temp, width, height, clamped_radius, method
+    );
+    CheckKernelLaunch("BlurColorHorizontalKernel launch");
+    BlurColorVerticalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_temp, d_output, width, height, clamped_radius, method
+    );
+    CheckKernelLaunch("BlurColorVerticalKernel launch");
+}
+
+void LaunchBlurAlpha(
+    const uint8_t* d_input,
+    uint8_t* d_temp,
+    uint8_t* d_output,
+    int width,
+    int height,
+    float radius,
+    int method,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const float clamped_radius = fmaxf(0.01f, fminf(16.0f, radius));
+    BlurAlphaHorizontalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_input, d_temp, width, height, clamped_radius, method
+    );
+    CheckKernelLaunch("BlurAlphaHorizontalKernel launch");
+    BlurAlphaVerticalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_temp, d_output, width, height, clamped_radius, method
+    );
+    CheckKernelLaunch("BlurAlphaVerticalKernel launch");
+}
+
+void LaunchCompositeColorAlpha(
+    const uchar3* d_background,
+    const uint8_t* d_background_alpha,
+    const uchar3* d_foreground,
+    const uint8_t* d_alpha,
+    uchar3* d_output,
+    uint8_t* d_output_alpha,
+    int width,
+    int height,
+    float initial_background_opacity,
+    float opacity,
+    int blend_mode,
+    int key_mode,
+    uchar3 key_color,
+    float key_similarity,
+    float key_softness,
+    float spill_suppression,
+    float luma_low,
+    float luma_high,
+    float luma_softness,
+    bool key_invert,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    CompositeColorAlphaKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_background, d_background_alpha, d_foreground, d_alpha, d_output, d_output_alpha, width, height,
+        initial_background_opacity, opacity, blend_mode, key_mode, key_color, key_similarity, key_softness,
+        spill_suppression, luma_low, luma_high, luma_softness, key_invert
+    );
+    CheckKernelLaunch("CompositeColorAlphaKernel launch");
+}
+
+void LaunchColorAdjustment(
+    const uchar3* d_rgb_in,
+    uchar3* d_rgb_out,
+    int width,
+    int height,
+    int stage_type,
+    float param0,
+    float param1,
+    float param2,
+    float param3,
+    float param4,
+    float param5,
+    float param6,
+    float param7,
+    float param8,
+    bool invert,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    ColorAdjustmentKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_rgb_in, d_rgb_out, width, height, stage_type,
+        param0, param1, param2, param3, param4, param5, param6, param7, param8, invert
+    );
+    CheckKernelLaunch("ColorAdjustmentKernel launch");
 }
 
 void LaunchDenoiseFieldTemporalLuma(

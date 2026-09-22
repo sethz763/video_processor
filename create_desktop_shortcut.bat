@@ -36,15 +36,21 @@ if not defined DESKTOP_DIR (
 )
 
 set "SHORTCUT_PATH=%DESKTOP_DIR%\%SHORTCUT_NAME%"
+set "LAUNCHER=%REPO_DIR%\launch_gui.bat"
+
+if not exist "%LAUNCHER%" (
+  echo ERROR: Could not find "%LAUNCHER%"
+  exit /b 1
+)
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ws=New-Object -ComObject WScript.Shell;" ^
   "$s=$ws.CreateShortcut('%SHORTCUT_PATH%');" ^
-  "$s.TargetPath='%TARGET%';" ^
-  "$s.Arguments='-m %APP_MODULE%';" ^
+  "$s.TargetPath='%LAUNCHER%';" ^
   "$s.WorkingDirectory='%REPO_DIR%';" ^
+  "$s.WindowStyle=7;" ^
   "$s.IconLocation='%TARGET%,0';" ^
-  "$s.Description='Launch Video Processor GUI';" ^
+  "$s.Description='Launch Video Processor GUI (AI SR max_inflight=2)';" ^
   "$s.Save();"
 
 if errorlevel 1 (
@@ -53,5 +59,5 @@ if errorlevel 1 (
 )
 
 echo Created: "%SHORTCUT_PATH%"
-echo Target : "%TARGET%" -m %APP_MODULE%
+echo Target : "%LAUNCHER%" (VP_AI_SR_MAX_INFLIGHT=2, runs "%TARGET%" -m %APP_MODULE%)
 exit /b 0

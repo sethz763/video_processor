@@ -13,6 +13,7 @@ PySide6 GUI for testing `video_processor` ROI and SR behavior without DeckLink h
 - Optional AI SR via ONNX Runtime in worker backend
 - Runtime settings panel (FPS, SR mode, ROI values, scale)
 - Blackmagic format settings (device indices, mode queries, format detection)
+- GPU effects graph with live-input blur, media compositing, and capture-device source nodes
 
 ## Run
 
@@ -34,6 +35,10 @@ The app auto-discovers the built extension from:
 - `Enable placeholder SR` recreates `VideoProcessor` because it is a constructor-time setting.
 - In `Synthetic` mode, input/output preview is generated locally.
 - In `Blackmagic DeckLink` mode, click `Apply DeckLink Settings` after selecting device indices and mode queries.
+- In the effects graph, use the mouse wheel to zoom, right-click a port to disconnect it, and edit blur radius directly on the Blur node.
+- Gaussian and box blur use separable CUDA passes so large radii remain practical at full HD.
+- Video/Image nodes accept files from the browse button or drag-and-drop. Play/Pause controls frame advancement; Loop either rewinds at end-of-stream or holds the final frame.
+- A Video Capture Device node lists every input-capable DeckLink device currently reported by the system. Its selection updates the DeckLink input control; click `Apply DeckLink Settings` to start or restart capture explicitly.
 - The GUI now attempts an experimental worker-process backend first; in Blackmagic mode this worker owns capture + processing + output, and the GUI only renders previews.
 - If worker startup fails, the app automatically falls back to the legacy in-process backend.
 

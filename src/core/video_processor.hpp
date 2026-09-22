@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -42,10 +43,19 @@ enum class ColorRange {
     Full,
 };
 
+struct ColorStageConfig {
+    int type = 0;
+    bool after_composite = false;
+    std::array<float, 9> params{};
+    bool invert = false;
+};
+
 class CudaTensorBuffer {
 public:
     CudaTensorBuffer();
-    CudaTensorBuffer(void* data, std::size_t bytes, int width, int height, int channels, const std::string& dtype, const std::string& layout, bool normalized_01);
+    // owning_stream is used for a stream-ordered cudaFreeAsync release; pass nullptr
+    // to fall back to a plain (device-synchronizing) cudaFree.
+    CudaTensorBuffer(void* data, std::size_t bytes, int width, int height, int channels, const std::string& dtype, const std::string& layout, bool normalized_01, cudaStream_t owning_stream = nullptr);
     ~CudaTensorBuffer();
 
     CudaTensorBuffer(const CudaTensorBuffer&) = delete;
@@ -71,6 +81,7 @@ private:
     std::string dtype_;
     std::string layout_;
     bool normalized_01_;
+    cudaStream_t owning_stream_;
 };
 
 class VideoProcessor {
@@ -178,12 +189,106 @@ public:
     void SetColorRangeByName(const std::string& color_range_name);
     ColorRange GetColorRange() const;
     std::string GetColorRangeName() const;
+    void SetEffectsConfig(
+        bool enabled,
+        float opacity,
+        const std::string& blend_mode,
+        const std::string& blur_method,
+        float blur_radius,
+        const std::string& blur_target,
+        float layer1_opacity = 1.0f,
+        const std::string& key_mode = "off",
+        int key_color_r = 0,
+        int key_color_g = 255,
+        int key_color_b = 0,
+        float key_similarity = 0.25f,
+        float key_softness = 0.10f,
+        float spill_suppression = 0.25f,
+        float luma_low = 0.0f,
+        float luma_high = 1.0f,
+        float luma_softness = 0.10f,
+        bool key_invert = false,
+        bool output_connected = true,
+        bool effect_color_from_alpha = false,
+        bool effect_alpha_from_color = false
+    );
+    void UploadEffectMediaRgba(const uint8_t* rgba, size_t bytes, int width, int height);
+    void SetEffectLayerConfig(
+        int layer_index,
+        bool enabled,
+        float opacity,
+        const std::string& blend_mode,
+        const std::string& blur_method,
+        float blur_radius,
+        const std::string& blur_target,
+        const std::string& key_mode = "off",
+        int key_color_r = 0,
+        int key_color_g = 255,
+        int key_color_b = 0,
+        float key_similarity = 0.25f,
+        float key_softness = 0.10f,
+        float spill_suppression = 0.25f,
+        float luma_low = 0.0f,
+        float luma_high = 1.0f,
+        float luma_softness = 0.10f,
+        bool key_invert = false,
+        bool effect_color_from_alpha = false,
+        bool effect_alpha_from_color = false,
+        const std::string& mask_pattern = "off",
+        float mask_softness = 0.0f,
+        float mask_aspect = 1.0f,
+        bool mask_invert = false,
+        float mask_size = 1.0f
+    );
+    void UploadEffectLayerMediaRgba(
+        int layer_index,
+        const uint8_t* rgba,
+        size_t bytes,
+        int width,
+        int height
+    );
+    void SetColorStages(const std::vector<ColorStageConfig>& stages);
+    void ClearEffectMedia();
 
     int width() const { return width_; }
     int height() const { return height_; }
     int sr_scale() const;
 
 private:
+    static constexpr int kFirstEffectLayer = 2;
+    static constexpr int kLastEffectLayer = 8;
+    static constexpr size_t kEffectLayerCount = kLastEffectLayer - kFirstEffectLayer + 1;
+
+    struct EffectLayerState {
+        bool enabled = false;
+        float opacity = 1.0f;
+        int blend_mode = 0;
+        int key_mode = 0;
+        uchar3 key_color = make_uchar3(0, 255, 0);
+        float key_similarity = 0.25f;
+        float key_softness = 0.10f;
+        float spill_suppression = 0.25f;
+        float luma_low = 0.0f;
+        float luma_high = 1.0f;
+        float luma_softness = 0.10f;
+        bool key_invert = false;
+        bool color_from_alpha = false;
+        bool alpha_from_color = false;
+        int blur_method = 0;
+        float blur_radius = 0.0f;
+        int blur_target = 0;
+        std::string mask_pattern = "off";
+        int mask_pattern_code = 0;
+        float mask_softness = 0.0f;
+        float mask_aspect = 1.0f;
+        bool mask_invert = false;
+        float mask_size = 1.0f;
+        int media_width = 0;
+        int media_height = 0;
+        size_t media_capacity_bytes = 0;
+        uint8_t* d_media_rgba = nullptr;
+    };
+
     std::string ProcessFrameInternal(
         const uint8_t* input_frame,
         size_t input_size,
@@ -197,6 +302,8 @@ private:
     void ClampRoi();
     void ConfigureSrScaleLocked(int requested_scale, bool auto_mode);
     bool EnsureSrBufferCapacityLocked(int target_scale, cudaError_t& last_error);
+    bool EffectsActiveLocked() const;
+    const uchar3* ApplyColorStages(const uchar3* input, bool after_composite);
     void Cleanup();
 
     int width_;
@@ -229,6 +336,10 @@ private:
     float subpixel_shift_y_;
     ColorSpace color_space_;
     ColorRange color_range_;
+    float effects_layer1_opacity_;
+    bool effects_output_connected_;
+    std::array<EffectLayerState, kEffectLayerCount> effect_layers_;
+    std::vector<ColorStageConfig> color_stages_;
 
     size_t uyvy_bytes_;
     size_t rgb_pixels_;
@@ -243,6 +354,16 @@ private:
     uchar3* d_rgb_prev_full_;
     uchar3* d_rgb_sr_;
     uchar3* d_rgb_zoom_;
+    uchar3* d_effect_color_a_;
+    uchar3* d_effect_color_b_;
+    uint8_t* d_effect_alpha_a_;
+    uint8_t* d_effect_alpha_b_;
+    uchar3* d_effect_composite_;
+    uchar3* d_effect_composite_b_;
+    uint8_t* d_effect_composite_alpha_a_;
+    uint8_t* d_effect_composite_alpha_b_;
+    uchar3* d_color_stage_a_;
+    uchar3* d_color_stage_b_;
     bool has_prev_rgb_full_;
     uint8_t* h_output_pinned_;
     uint8_t* h_rgb_output_pinned_;

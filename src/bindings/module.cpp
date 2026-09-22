@@ -485,6 +485,118 @@ PYBIND11_MODULE(video_processor, m) {
             "Get denoise strength in [0.0, 1.0]."
         )
         .def(
+            "set_effects_config",
+            &vp::VideoProcessor::SetEffectsConfig,
+            py::arg("enabled"),
+            py::arg("opacity") = 1.0f,
+            py::arg("blend_mode") = "normal",
+            py::arg("blur_method") = "off",
+            py::arg("blur_radius") = 0.0f,
+            py::arg("blur_target") = "both",
+            py::arg("layer1_opacity") = 1.0f,
+            py::arg("key_mode") = "off",
+            py::arg("key_color_r") = 0,
+            py::arg("key_color_g") = 255,
+            py::arg("key_color_b") = 0,
+            py::arg("key_similarity") = 0.25f,
+            py::arg("key_softness") = 0.10f,
+            py::arg("spill_suppression") = 0.25f,
+            py::arg("luma_low") = 0.0f,
+            py::arg("luma_high") = 1.0f,
+            py::arg("luma_softness") = 0.10f,
+            py::arg("key_invert") = false,
+            py::arg("output_connected") = true,
+            py::arg("effect_color_from_alpha") = false,
+            py::arg("effect_alpha_from_color") = false,
+            "Configure the native CUDA two-layer compositor, keying, and color/alpha blur."
+        )
+        .def(
+            "upload_effect_media_rgba",
+            [](vp::VideoProcessor& self, const py::buffer& rgba, int width, int height) {
+                const auto [rgba_ptr, rgba_size] = GetContiguousByteBuffer(rgba);
+                py::gil_scoped_release release;
+                self.UploadEffectMediaRgba(rgba_ptr, rgba_size, width, height);
+            },
+            py::arg("rgba"),
+            py::arg("width"),
+            py::arg("height"),
+            "Upload one tightly packed RGBA media frame to persistent CUDA memory."
+        )
+        .def(
+            "set_effect_layer_config",
+            &vp::VideoProcessor::SetEffectLayerConfig,
+            py::arg("layer_index"),
+            py::arg("enabled"),
+            py::arg("opacity") = 1.0f,
+            py::arg("blend_mode") = "normal",
+            py::arg("blur_method") = "off",
+            py::arg("blur_radius") = 0.0f,
+            py::arg("blur_target") = "both",
+            py::arg("key_mode") = "off",
+            py::arg("key_color_r") = 0,
+            py::arg("key_color_g") = 255,
+            py::arg("key_color_b") = 0,
+            py::arg("key_similarity") = 0.25f,
+            py::arg("key_softness") = 0.10f,
+            py::arg("spill_suppression") = 0.25f,
+            py::arg("luma_low") = 0.0f,
+            py::arg("luma_high") = 1.0f,
+            py::arg("luma_softness") = 0.10f,
+            py::arg("key_invert") = false,
+            py::arg("effect_color_from_alpha") = false,
+            py::arg("effect_alpha_from_color") = false,
+            py::arg("mask_pattern") = "off",
+            py::arg("mask_softness") = 0.0f,
+            py::arg("mask_aspect") = 1.0f,
+            py::arg("mask_invert") = false,
+            py::arg("mask_size") = 1.0f,
+            "Configure one native CUDA compositor overlay layer in [2, 8]."
+        )
+        .def(
+            "set_color_stages",
+            [](vp::VideoProcessor& self, const py::list& stage_payloads) {
+                std::vector<vp::ColorStageConfig> stages;
+                stages.reserve(stage_payloads.size());
+                for (const py::handle payload : stage_payloads) {
+                    const py::dict stage_payload = py::cast<py::dict>(payload);
+                    vp::ColorStageConfig stage;
+                    const std::string type = py::cast<std::string>(stage_payload["type"]);
+                    stage.type = type == "proc_amp" ? 0 : (type == "color_corrector" ? 1 : -1);
+                    stage.after_composite = py::cast<bool>(stage_payload["after_composite"]);
+                    stage.invert = py::cast<bool>(stage_payload["invert"]);
+                    const py::list params = py::cast<py::list>(stage_payload["params"]);
+                    if (params.size() != stage.params.size()) {
+                        throw py::value_error("Color stage params must contain exactly 9 values.");
+                    }
+                    for (size_t index = 0; index < stage.params.size(); ++index) {
+                        stage.params[index] = py::cast<float>(params[index]);
+                    }
+                    stages.push_back(stage);
+                }
+                self.SetColorStages(stages);
+            },
+            py::arg("stages"),
+            "Replace the ordered live Proc Amp and Color Corrector stage list."
+        )
+        .def(
+            "upload_effect_layer_media_rgba",
+            [](vp::VideoProcessor& self, int layer_index, const py::buffer& rgba, int width, int height) {
+                const auto [rgba_ptr, rgba_size] = GetContiguousByteBuffer(rgba);
+                py::gil_scoped_release release;
+                self.UploadEffectLayerMediaRgba(layer_index, rgba_ptr, rgba_size, width, height);
+            },
+            py::arg("layer_index"),
+            py::arg("rgba"),
+            py::arg("width"),
+            py::arg("height"),
+            "Upload tightly packed RGBA media for one compositor overlay layer in [2, 8]."
+        )
+        .def(
+            "clear_effect_media",
+            &vp::VideoProcessor::ClearEffectMedia,
+            "Disable all native effect layers and clear all active media dimensions."
+        )
+        .def(
             "set_subpixel_shift",
             &vp::VideoProcessor::SetSubpixelShift,
             py::arg("shift_x"),
