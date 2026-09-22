@@ -505,9 +505,11 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("luma_high") = 1.0f,
             py::arg("luma_softness") = 0.10f,
             py::arg("key_invert") = false,
+            py::arg("key_edge_feather") = 0.0f,
             py::arg("output_connected") = true,
             py::arg("effect_color_from_alpha") = false,
             py::arg("effect_alpha_from_color") = false,
+            py::arg("explicit_compositor_layers") = false,
             "Configure the native CUDA two-layer compositor, keying, and color/alpha blur."
         )
         .def(
@@ -521,6 +523,17 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("width"),
             py::arg("height"),
             "Upload one tightly packed RGBA media frame to persistent CUDA memory."
+        )
+        .def(
+            "set_effects_input_transform",
+            &vp::VideoProcessor::SetEffectsInputTransform,
+            py::arg("transform_x") = 0.0f,
+            py::arg("transform_y") = 0.0f,
+            py::arg("transform_z") = 0.0f,
+            py::arg("rotate_x") = 0.0f,
+            py::arg("rotate_y") = 0.0f,
+            py::arg("rotate_z") = 0.0f,
+            "Configure the native CUDA transform for the base Effects Input layer."
         )
         .def(
             "set_effect_layer_config",
@@ -543,14 +556,90 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("luma_high") = 1.0f,
             py::arg("luma_softness") = 0.10f,
             py::arg("key_invert") = false,
+            py::arg("key_edge_feather") = 0.0f,
             py::arg("effect_color_from_alpha") = false,
             py::arg("effect_alpha_from_color") = false,
+            py::arg("preserve_color_from_alpha_opacity") = false,
+            py::arg("source_from_effects_input") = false,
+            py::arg("key_alpha_from_effects_input") = false,
             py::arg("mask_pattern") = "off",
             py::arg("mask_softness") = 0.0f,
             py::arg("mask_aspect") = 1.0f,
             py::arg("mask_invert") = false,
             py::arg("mask_size") = 1.0f,
+            py::arg("mask_x") = 0.0f,
+            py::arg("mask_y") = 0.0f,
+            py::arg("transform_x") = 0.0f,
+            py::arg("transform_y") = 0.0f,
+            py::arg("transform_z") = 0.0f,
+            py::arg("rotate_x") = 0.0f,
+            py::arg("rotate_y") = 0.0f,
+            py::arg("rotate_z") = 0.0f,
+            py::arg("materialize_key_alpha") = false,
             "Configure one native CUDA compositor overlay layer in [2, 8]."
+        )
+        .def(
+            "clear_effect_layer_channel_routes",
+            &vp::VideoProcessor::ClearEffectLayerChannelRoutes,
+            py::arg("layer_index"),
+            "Disable and clear per-channel routing for one compositor layer."
+        )
+        .def(
+            "set_effect_layer_channel_route",
+            &vp::VideoProcessor::SetEffectLayerChannelRoute,
+            py::arg("layer_index"),
+            py::arg("target_channel"),
+            py::arg("source_channel"),
+            py::arg("blur_method") = "off",
+            py::arg("blur_radius") = 0.0f,
+            py::arg("transform_x") = 0.0f,
+            py::arg("transform_y") = 0.0f,
+            py::arg("transform_z") = 0.0f,
+            py::arg("rotate_x") = 0.0f,
+            py::arg("rotate_y") = 0.0f,
+            py::arg("rotate_z") = 0.0f,
+            py::arg("generator_type") = "off",
+            py::arg("key_color_r") = 0,
+            py::arg("key_color_g") = 255,
+            py::arg("key_color_b") = 0,
+            py::arg("key_similarity") = 0.25f,
+            py::arg("key_softness") = 0.10f,
+            py::arg("key_invert") = false,
+            py::arg("mask_pattern") = "off",
+            py::arg("mask_softness") = 0.0f,
+            py::arg("mask_aspect") = 1.0f,
+            py::arg("mask_invert") = false,
+            py::arg("mask_size") = 1.0f,
+            py::arg("mask_x") = 0.0f,
+            py::arg("mask_y") = 0.0f,
+            "Configure one scalar source-to-target channel route for a compositor layer."
+        )
+        .def(
+            "set_effect_layer_color_stages",
+            [](vp::VideoProcessor& self, int layer_index, const py::list& stage_payloads) {
+                std::vector<vp::ColorStageConfig> stages;
+                stages.reserve(stage_payloads.size());
+                for (const py::handle payload : stage_payloads) {
+                    const py::dict stage_payload = py::cast<py::dict>(payload);
+                    vp::ColorStageConfig stage;
+                    const std::string type = py::cast<std::string>(stage_payload["type"]);
+                    stage.type = type == "proc_amp" ? 0 : (type == "color_corrector" ? 1 : -1);
+                    stage.after_composite = false;
+                    stage.invert = py::cast<bool>(stage_payload["invert"]);
+                    const py::list params = py::cast<py::list>(stage_payload["params"]);
+                    if (params.size() != stage.params.size()) {
+                        throw py::value_error("Color stage params must contain exactly 9 values.");
+                    }
+                    for (size_t index = 0; index < stage.params.size(); ++index) {
+                        stage.params[index] = py::cast<float>(params[index]);
+                    }
+                    stages.push_back(stage);
+                }
+                self.SetEffectLayerColorStages(layer_index, stages);
+            },
+            py::arg("layer_index"),
+            py::arg("stages"),
+            "Replace the ordered live Proc Amp and Color Corrector stage list for one compositor layer."
         )
         .def(
             "set_color_stages",

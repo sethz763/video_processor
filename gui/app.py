@@ -39,7 +39,9 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QScrollArea,
     QSlider,
     QSizePolicy,
@@ -458,7 +460,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
         layers = [
             dict(layer)
             for layer in raw_layers
-            if isinstance(layer, dict) and 2 <= int(layer.get("layer_index", 0)) <= 8
+            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
         ]
         if layers:
             return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
@@ -491,6 +493,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
                 "luma_low": float(payload.get("luma_low", 0.0)),
                 "luma_high": float(payload.get("luma_high", 1.0)),
                 "luma_softness": float(payload.get("luma_softness", 0.10)),
+                "edge_feather": float(payload.get("key_edge_feather", 0.0)),
                 "invert": bool(payload.get("key_invert", False)),
             },
             "effect_color_from_alpha": bool(payload.get("effect_color_from_alpha", False)),
@@ -500,6 +503,14 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "mask_aspect": float(payload.get("mask_aspect", 1.0)),
             "mask_invert": bool(payload.get("mask_invert", False)),
             "mask_size": float(payload.get("mask_size", 1.0)),
+            "mask_x": float(payload.get("mask_x", 0.0)),
+            "mask_y": float(payload.get("mask_y", 0.0)),
+            "transform_x": float(payload.get("transform_x", 0.0)),
+            "transform_y": float(payload.get("transform_y", 0.0)),
+            "transform_z": float(payload.get("transform_z", 0.0)),
+            "rotate_x": float(payload.get("rotate_x", 0.0)),
+            "rotate_y": float(payload.get("rotate_y", 0.0)),
+            "rotate_z": float(payload.get("rotate_z", 0.0)),
         }
     ]
 
@@ -530,14 +541,71 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
         luma_high=float(key.get("luma_high", 1.0)),
         luma_softness=float(key.get("luma_softness", 0.10)),
         key_invert=bool(key.get("invert", False)),
+        key_edge_feather=float(key.get("edge_feather", 0.0)),
         effect_color_from_alpha=bool(layer.get("effect_color_from_alpha", False)),
         effect_alpha_from_color=bool(layer.get("effect_alpha_from_color", False)),
+        preserve_color_from_alpha_opacity=bool(layer.get("preserve_color_from_alpha_opacity", False)),
+        source_from_effects_input=bool(layer.get("source_kind") == "effects_input"),
+        key_alpha_from_effects_input=bool(layer.get("key_alpha_from_effects_input", False)),
         mask_pattern=str(layer.get("mask_pattern", "off")),
         mask_softness=float(layer.get("mask_softness", 0.0)),
         mask_aspect=float(layer.get("mask_aspect", 1.0)),
         mask_invert=bool(layer.get("mask_invert", False)),
         mask_size=float(layer.get("mask_size", 1.0)),
+        mask_x=float(layer.get("mask_x", 0.0)),
+        mask_y=float(layer.get("mask_y", 0.0)),
+        transform_x=float(layer.get("transform_x", 0.0)),
+        transform_y=float(layer.get("transform_y", 0.0)),
+        transform_z=float(layer.get("transform_z", 0.0)),
+        rotate_x=float(layer.get("rotate_x", 0.0)),
+        rotate_y=float(layer.get("rotate_y", 0.0)),
+        rotate_z=float(layer.get("rotate_z", 0.0)),
+        materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
     )
+    layer_index = int(layer.get("layer_index", 2))
+    processor.clear_effect_layer_channel_routes(layer_index)
+    channel_routes = layer.get("channel_routes", [])
+    if isinstance(channel_routes, list):
+        for target_channel, route in enumerate(channel_routes[:4]):
+            if not isinstance(route, dict):
+                continue
+            generator_settings = route.get("generator_settings", {})
+            if not isinstance(generator_settings, dict):
+                generator_settings = {}
+            processor.set_effect_layer_channel_route(
+                layer_index,
+                target_channel,
+                int(route.get("source_channel", -1)),
+                blur_method=str(route.get("blur_method", "off")),
+                blur_radius=float(route.get("blur_radius", 0.0)),
+                transform_x=float(route.get("transform_x", 0.0)),
+                transform_y=float(route.get("transform_y", 0.0)),
+                transform_z=float(route.get("transform_z", 0.0)),
+                rotate_x=float(route.get("rotate_x", 0.0)),
+                rotate_y=float(route.get("rotate_y", 0.0)),
+                rotate_z=float(route.get("rotate_z", 0.0)),
+                generator_type=str(route.get("generator_type", "off")),
+                key_color_r=int(generator_settings.get("key_color_r", 0)),
+                key_color_g=int(generator_settings.get("key_color_g", 255)),
+                key_color_b=int(generator_settings.get("key_color_b", 0)),
+                key_similarity=float(generator_settings.get("key_similarity", 0.25)),
+                key_softness=float(generator_settings.get("key_softness", 0.10)),
+                key_invert=bool(generator_settings.get("key_invert", False)),
+                mask_pattern=str(generator_settings.get("pattern", "off")),
+                mask_softness=float(generator_settings.get("softness", 0.0)),
+                mask_aspect=float(generator_settings.get("aspect", 1.0)),
+                mask_invert=bool(generator_settings.get("invert", False)),
+                mask_size=float(generator_settings.get("size", 1.0)),
+                mask_x=float(generator_settings.get("x", 0.0)),
+                mask_y=float(generator_settings.get("y", 0.0)),
+            )
+    raw_color_stages = layer.get("color_stages", []) if bool(layer.get("enabled", False)) else []
+    color_stages = [dict(stage) for stage in raw_color_stages if isinstance(stage, dict)] if isinstance(raw_color_stages, list) else []
+    setter = getattr(processor, "set_effect_layer_color_stages", None)
+    if callable(setter):
+        setter(layer_index, color_stages)
+    elif color_stages:
+        raise RuntimeError("Loaded video_processor build does not support per-layer color stages; rebuild the native module")
 
 
 def _set_native_color_stages(processor: object, payload: dict[str, object]) -> None:
@@ -546,6 +614,23 @@ def _set_native_color_stages(processor: object, payload: dict[str, object]) -> N
     raw_stages = payload.get("color_stages", []) if bool(payload.get("enabled", False)) else []
     stages = [dict(stage) for stage in raw_stages if isinstance(stage, dict)] if isinstance(raw_stages, list) else []
     processor.set_color_stages(stages)
+
+
+def _set_native_effects_input_transform(processor: object, payload: dict[str, object]) -> None:
+    values = (
+        float(payload.get("input_transform_x", 0.0)),
+        float(payload.get("input_transform_y", 0.0)),
+        float(payload.get("input_transform_z", 0.0)),
+        float(payload.get("input_rotate_x", 0.0)),
+        float(payload.get("input_rotate_y", 0.0)),
+        float(payload.get("input_rotate_z", 0.0)),
+    )
+    setter = getattr(processor, "set_effects_input_transform", None)
+    if not callable(setter):
+        if any(abs(value) > 1e-6 for value in values):
+            raise RuntimeError("Loaded video_processor build does not support Effects Input transforms; rebuild the native module")
+        return
+    setter(*values)
 
 
 def _legacy_effect_source_signature(payload: dict[str, object]) -> tuple[object, ...]:
@@ -2460,7 +2545,13 @@ class EffectsNodeWidget(QWidget):
         self.node_type = node_type
         self._drag_offset: QPointF | None = None
         self._selected = False
-        node_sizes = {"keying": (380, 520), "media": (300, 154)}
+        node_sizes = {
+            "keying": (380, 520),
+            "media": (300, 154),
+            "transform_3d": (250, 154),
+            "color_splitter": (250, 154),
+            "color_recombiner": (280, 184),
+        }
         self.setFixedSize(*node_sizes.get(node_type, (250, 124)))
         self.setCursor(Qt.OpenHandCursor)
         self.setToolTip("Drag nodes to position. Drag output ports to inputs. Right-click a port to disconnect.")
@@ -2477,11 +2568,27 @@ class EffectsNodeWidget(QWidget):
         self._ports: dict[str, QPushButton] = {}
         self._port_labels: dict[str, QLabel] = {}
         output_x = self.width() - 20
-        if node_type == "chroma_key":
+        if node_type == "color_recombiner":
+            self._add_port("red_input", 0, 68, "Red channel input")
+            self._add_port("green_input", 0, 98, "Green channel input")
+            self._add_port("blue_input", 0, 128, "Blue channel input")
+            self._add_port("alpha_input", 0, 158, "Optional alpha channel input")
+        elif node_type == "chroma_key":
             self._add_port("color_input", 0, 98, "Color input")
         elif node_type not in {"effects_input", "keying", "capture", "media", "matte", "mask"}:
             self._add_port("input", 0, 98, "Input")
-        if node_type in {"mask", "chroma_key"}:
+        if node_type == "color_splitter":
+            self._add_port("red_output", output_x, 68, "Red channel")
+            self._add_port("green_output", output_x, 98, "Green channel")
+            self._add_port("blue_output", output_x, 128, "Blue channel")
+        elif node_type == "color_recombiner":
+            self._add_port("output", output_x, 98, "Recombined color")
+            self._add_port("alpha_output", output_x, 128, "Recombined alpha")
+        elif node_type == "transform_3d":
+            self._add_port("alpha_input", 0, 128, "Alpha input")
+            self._add_port("output", output_x, 98, "Transformed color")
+            self._add_port("alpha_output", output_x, 128, "Generated alpha")
+        elif node_type in {"mask", "chroma_key"}:
             self._add_port("alpha_output", output_x, 98, "Key alpha" if node_type == "chroma_key" else "Mask alpha")
         elif node_type not in {"effects_output", "keying"}:
             self._add_port("output", output_x, 128 if node_type == "media" else 98, "Color output")
@@ -2550,7 +2657,7 @@ class EffectsNodeWidget(QWidget):
             self.capture_device.setGeometry(14, 70, 176, 25)
             self.capture_device.setToolTip("Video capture device")
             self.capture_device.currentIndexChanged.connect(self._emit_capture_device)
-        elif node_type in {"proc_amp", "color_corrector", "chroma_key"}:
+        elif node_type in {"proc_amp", "color_corrector", "chroma_key", "transform_3d"}:
             self.adjust_settings = QPushButton("Adjust...", self)
             self.adjust_settings.setGeometry(76, 72, 98, 26)
             self.adjust_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
@@ -2782,6 +2889,12 @@ class EffectsNodeWidget(QWidget):
         label_names = {
             **{f"layer{index}_color": f"L{index} Color" for index in range(1, 9)},
             **{f"layer{index}_alpha": f"L{index} Alpha" for index in range(1, 9)},
+            "red_input": "Red",
+            "green_input": "Green",
+            "blue_input": "Blue",
+            "red_output": "Red",
+            "green_output": "Green",
+            "blue_output": "Blue",
         }
         label = QLabel(label_names.get(name, "Alpha" if "alpha" in name else "Color"), self)
         label.setGeometry(x + 24 if x == 0 else x - 80, y - 1, 76, 22)
@@ -2869,6 +2982,9 @@ class EffectsGraphCanvas(QWidget):
         "proc_amp": "Basic Proc Amp",
         "color_corrector": "Color Corrector",
         "chroma_key": "Chroma Key",
+        "transform_3d": "3D Transform",
+        "color_splitter": "Color Splitter",
+        "color_recombiner": "Color Recombiner",
     }
 
     def __init__(self) -> None:
@@ -2923,7 +3039,15 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "matte":
             settings = {"red": 255, "green": 255, "blue": 255, "alpha": 1.0}
         elif node_type == "mask":
-            settings = {"pattern": "circle", "softness": 0.0, "aspect": 1.0, "size": 1.0, "invert": False}
+            settings = {
+                "pattern": "circle", "softness": 0.0, "aspect": 1.0,
+                "size": 1.0, "x": 0.0, "y": 0.0, "invert": False,
+            }
+        elif node_type == "transform_3d":
+            settings = {
+                "x": 0.0, "y": 0.0, "z": 0.0,
+                "rotate_x": 0.0, "rotate_y": 0.0, "rotate_z": 0.0,
+            }
         elif node_type == "proc_amp":
             settings = {"saturation": 1.0, "hue": 0.0, "brightness": 0.0, "contrast": 1.0, "invert": False}
         elif node_type == "color_corrector":
@@ -2936,7 +3060,7 @@ class EffectsGraphCanvas(QWidget):
             settings = {
                 "key_color_r": 0, "key_color_g": 255, "key_color_b": 0,
                 "key_similarity": 0.25, "key_softness": 0.10,
-                "spill_suppression": 0.25, "key_invert": False,
+                "key_edge_feather": 0.0, "spill_suppression": 0.25, "key_invert": False,
             }
         self._nodes[node_id] = {"id": node_id, "type": node_type, "x": int(x), "y": int(y), "settings": settings}
         widget = EffectsNodeWidget(node_id, node_type, self.NODE_TITLES[node_type], self)
@@ -2981,7 +3105,11 @@ class EffectsGraphCanvas(QWidget):
         return node_id
 
     def add_node(self, node_type: str) -> str | None:
-        if node_type not in {"denoise", "media", "capture", "keying", "blur", "matte", "mask", "proc_amp", "color_corrector", "chroma_key"}:
+        if node_type not in {
+            "denoise", "media", "capture", "keying", "blur", "matte", "mask",
+            "proc_amp", "color_corrector", "chroma_key", "transform_3d",
+            "color_splitter", "color_recombiner",
+        }:
             return None
         if node_type == "capture":
             existing_capture = next(
@@ -2997,7 +3125,16 @@ class EffectsGraphCanvas(QWidget):
         return node_id
 
     def _next_free_node_position(self, node_type: str) -> tuple[int, int]:
-        node_width, node_height = (380, 520) if node_type == "keying" else (250, 124)
+        if node_type == "keying":
+            node_width, node_height = 380, 520
+        elif node_type == "media":
+            node_width, node_height = 300, 154
+        elif node_type in {"transform_3d", "color_splitter"}:
+            node_width, node_height = 250, 154
+        elif node_type == "color_recombiner":
+            node_width, node_height = 280, 184
+        else:
+            node_width, node_height = 250, 124
         candidate_x = 300
         candidate_y = 70
         while True:
@@ -3005,7 +3142,14 @@ class EffectsGraphCanvas(QWidget):
             occupied = False
             for node in self._nodes.values():
                 existing_type = str(node.get("type", ""))
-                existing_width, existing_height = (380, 520) if existing_type == "keying" else (250, 124)
+                if existing_type == "keying":
+                    existing_width, existing_height = 380, 520
+                elif existing_type == "media":
+                    existing_width, existing_height = 300, 154
+                elif existing_type == "transform_3d":
+                    existing_width, existing_height = 250, 154
+                else:
+                    existing_width, existing_height = 250, 124
                 existing = QRect(
                     int(node.get("x", 0)), int(node.get("y", 0)), existing_width, existing_height
                 )
@@ -3147,7 +3291,7 @@ class EffectsGraphCanvas(QWidget):
                 self._refresh_node_status(node_id)
 
     def _on_port_clicked(self, node_id: str, port_name: str) -> None:
-        is_output = port_name in {"output", "alpha_output"}
+        is_output = self._is_output_port(port_name)
         if self._pending_port is None:
             if is_output:
                 self._pending_port = (node_id, port_name)
@@ -3161,29 +3305,17 @@ class EffectsGraphCanvas(QWidget):
         self._connect_ports(source_id, source_port, node_id, port_name)
 
     def _connect_ports(self, source_id: str, source_port: str, node_id: str, port_name: str) -> None:
-        output_ports = {"output", "alpha_output"}
-        input_ports = {"input", "color_input", "alpha_input"} | {
+        input_ports = {
+            "input", "color_input", "alpha_input", "red_input", "green_input", "blue_input",
+        } | {
             f"layer{layer_index}_{channel}"
             for layer_index in range(1, 9)
             for channel in ("color", "alpha")
         }
-        if source_id == node_id or source_port not in output_ports or port_name not in input_ports:
-            return
-        if self._nodes.get(node_id, {}).get("type") == "chroma_key" and source_port != "output":
+        if source_id == node_id or not self._is_output_port(source_port) or port_name not in input_ports:
             return
         candidate = (source_id, source_port, node_id, port_name)
         retained = [connection for connection in self._connections if connection[2:4] != candidate[2:4]]
-        if source_port == "output":
-            target_is_chroma_input = self._nodes.get(node_id, {}).get("type") == "chroma_key" and port_name == "color_input"
-            if not target_is_chroma_input:
-                retained = [
-                    connection for connection in retained
-                    if connection[0:2] != candidate[0:2]
-                    or (
-                        self._nodes.get(connection[2], {}).get("type") == "chroma_key"
-                        and connection[3] == "color_input"
-                    )
-                ]
         retained.append(candidate)
         if self._main_connections_have_cycle(retained):
             return
@@ -3192,7 +3324,7 @@ class EffectsGraphCanvas(QWidget):
         self.graphChanged.emit()
 
     def _on_port_drag_started(self, node_id: str, port_name: str, global_position: QPointF) -> None:
-        if port_name not in {"output", "alpha_output"}:
+        if not self._is_output_port(port_name):
             return
         if self._pending_port is not None:
             pending_node_id, _pending_port_name = self._pending_port
@@ -3226,12 +3358,16 @@ class EffectsGraphCanvas(QWidget):
             return
         for target_id, widget in reversed(list(self._widgets.items())):
             for target_port, port in widget._ports.items():
-                if target_port in {"output", "alpha_output"}:
+                if self._is_output_port(target_port):
                     continue
                 if port.rect().contains(port.mapFromGlobal(global_position.toPoint())):
                     self._connect_ports(node_id, port_name, target_id, target_port)
                     return
         self.update()
+
+    @staticmethod
+    def _is_output_port(port_name: str) -> bool:
+        return port_name == "output" or port_name.endswith("_output")
 
     def _disconnect_port(self, node_id: str, port_name: str) -> None:
         retained = [
@@ -3459,6 +3595,9 @@ class EffectsGraphCanvas(QWidget):
         elif node_type in {"proc_amp", "color_corrector"}:
             self._show_color_settings(node_id)
             return
+        elif node_type == "transform_3d":
+            self._show_transform_settings(node_id)
+            return
         elif node_type == "chroma_key":
             self._show_chroma_key_settings(node_id)
             return
@@ -3533,9 +3672,12 @@ class EffectsGraphCanvas(QWidget):
         row_layout.setContentsMargins(0, 0, 0, 0)
         slider = QSlider(Qt.Horizontal, row)
         slider.setRange(round(minimum * scale), round(maximum * scale))
+        slider.setProperty("setting_name", name)
+        slider.setProperty("setting_scale", scale)
         slider.setValue(round(float(settings.get(name, minimum)) * scale))
         value_control = QDoubleSpinBox(row)
         value_control.setRange(minimum, maximum)
+        value_control.setProperty("setting_name", name)
         value_control.setDecimals(decimals)
         value_control.setSingleStep(1.0 / float(scale))
         value_control.setSuffix(suffix)
@@ -3572,6 +3714,13 @@ class EffectsGraphCanvas(QWidget):
         dialog = QDialog(self, Qt.Tool)
         dialog.setWindowTitle(title)
         dialog.setMinimumWidth(430)
+        dialog.setStyleSheet(
+            "QDialog { background: #20242a; color: #f4f4f4; }"
+            "QLabel { color: #d9dde2; }"
+            "QCheckBox { background: #555555; color: #f4f4f4; border-radius: 4px; padding: 4px 6px; }"
+            "QCheckBox::indicator { width: 14px; height: 14px; background: #606870; border: 1px solid #d9dde2; }"
+            "QCheckBox::indicator:checked { background: #efb73e; border-color: #efb73e; }"
+        )
         form = QFormLayout(dialog)
         dialog.destroyed.connect(lambda: self._key_dialogs.pop(node_id, None))
         self._key_dialogs[node_id] = dialog
@@ -3628,6 +3777,7 @@ class EffectsGraphCanvas(QWidget):
             self._add_live_slider(form, dialog, node_id, label, name, 0.0, 255.0, 1, 0)
         self._add_live_slider(form, dialog, node_id, "Similarity", "key_similarity", 0.0, 1.0, 1000, 3)
         self._add_live_slider(form, dialog, node_id, "Softness", "key_softness", 0.0, 1.0, 1000, 3)
+        self._add_live_slider(form, dialog, node_id, "Edge feather", "key_edge_feather", 0.0, 16.0, 10, 1, " px")
         self._add_live_slider(form, dialog, node_id, "Spill suppression", "spill_suppression", 0.0, 1.0, 1000, 3)
         settings = self._nodes[node_id]["settings"]
         invert = QCheckBox("Invert alpha", dialog)
@@ -3635,6 +3785,22 @@ class EffectsGraphCanvas(QWidget):
         invert.setChecked(bool(settings.get("key_invert", False)) if isinstance(settings, dict) else False)
         invert.toggled.connect(lambda value: self._on_color_setting_changed(node_id, "key_invert", bool(value)))
         form.addRow(invert)
+        self._finish_settings_dialog(dialog, form)
+
+    def _show_transform_settings(self, node_id: str) -> None:
+        opened = self._open_settings_dialog(node_id, "3D Transform")
+        if opened is None:
+            return
+        dialog, form = opened
+        for spec in (
+            ("X", "x", -100.0, 100.0, 10, 1, "%"),
+            ("Y", "y", -100.0, 100.0, 10, 1, "%"),
+            ("Z", "z", -90.0, 90.0, 10, 1, "%"),
+            ("Rotate X", "rotate_x", -180.0, 180.0, 10, 1, " deg"),
+            ("Rotate Y", "rotate_y", -180.0, 180.0, 10, 1, " deg"),
+            ("Rotate Z", "rotate_z", -180.0, 180.0, 10, 1, " deg"),
+        ):
+            self._add_live_slider(form, dialog, node_id, *spec)
         self._finish_settings_dialog(dialog, form)
 
     def _mask_icon(self, pattern: str) -> QIcon:
@@ -3679,18 +3845,36 @@ class EffectsGraphCanvas(QWidget):
         softness = QSlider(Qt.Horizontal, dialog)
         softness.setRange(0, 100)
         softness.setValue(round(float(settings.get("softness", 0.0)) * 100.0))
+        softness.setProperty("setting_name", "softness")
+        softness.setProperty("setting_scale", 100)
         aspect = QSlider(Qt.Horizontal, dialog)
         aspect.setRange(25, 400)
         aspect.setValue(round(float(settings.get("aspect", 1.0)) * 100.0))
+        aspect.setProperty("setting_name", "aspect")
+        aspect.setProperty("setting_scale", 100)
         size = QSlider(Qt.Horizontal, dialog)
         size.setRange(10, 400)
         size.setValue(round(float(settings.get("size", 1.0)) * 100.0))
+        size.setProperty("setting_name", "size")
+        size.setProperty("setting_scale", 100)
+        position_x = QSlider(Qt.Horizontal, dialog)
+        position_x.setRange(-100, 100)
+        position_x.setValue(round(float(settings.get("x", 0.0))))
+        position_x.setProperty("setting_name", "x")
+        position_x.setProperty("setting_scale", 1)
+        position_y = QSlider(Qt.Horizontal, dialog)
+        position_y.setRange(-100, 100)
+        position_y.setValue(round(float(settings.get("y", 0.0))))
+        position_y.setProperty("setting_name", "y")
+        position_y.setProperty("setting_scale", 1)
         invert = QCheckBox("Invert mask", dialog)
         invert.setProperty("setting_name", "invert")
         invert.setChecked(bool(settings.get("invert", False)))
         form.addRow("Softness", softness)
         form.addRow("Aspect", aspect)
         form.addRow("Size", size)
+        form.addRow("X position (%)", position_x)
+        form.addRow("Y position (%)", position_y)
         form.addRow(invert)
         layout.addLayout(form)
         close_button = QPushButton("Close", dialog)
@@ -3711,6 +3895,12 @@ class EffectsGraphCanvas(QWidget):
         )
         size.valueChanged.connect(
             lambda value: self._on_compositor_setting_changed(node_id, "size", value / 100.0)
+        )
+        position_x.valueChanged.connect(
+            lambda value: self._on_compositor_setting_changed(node_id, "x", float(value))
+        )
+        position_y.valueChanged.connect(
+            lambda value: self._on_compositor_setting_changed(node_id, "y", float(value))
         )
         invert.toggled.connect(
             lambda value: self._on_compositor_setting_changed(node_id, "invert", value)
@@ -3741,11 +3931,17 @@ class EffectsGraphCanvas(QWidget):
                 int(settings.get("blue", 255)), float(settings.get("alpha", 1.0)),
             )
         elif node_type == "mask":
-            status = "{}{}  size {:.2f}  soft {:.2f}  aspect {:.2f}".format(
+            status = "{}{}  size {:.2f}\nX {:.0f}%  Y {:.0f}%".format(
                 str(settings.get("pattern", "circle")).title(),
                 " inverted" if bool(settings.get("invert", False)) else "",
-                float(settings.get("size", 1.0)), float(settings.get("softness", 0.0)),
-                float(settings.get("aspect", 1.0)),
+                float(settings.get("size", 1.0)),
+                float(settings.get("x", 0.0)), float(settings.get("y", 0.0)),
+            )
+        elif node_type == "transform_3d":
+            status = "XYZ {:.0f}, {:.0f}, {:.0f}%\nRot {:.0f}, {:.0f}, {:.0f} deg".format(
+                float(settings.get("x", 0.0)), float(settings.get("y", 0.0)), float(settings.get("z", 0.0)),
+                float(settings.get("rotate_x", 0.0)), float(settings.get("rotate_y", 0.0)),
+                float(settings.get("rotate_z", 0.0)),
             )
         elif node_type == "proc_amp":
             status = "Sat {:.2f}  Hue {:.1f}\nBright {:.2f}  Contrast {:.2f}{}".format(
@@ -3756,10 +3952,10 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "color_corrector":
             status = "RGB lift / gamma / gain"
         elif node_type == "chroma_key":
-            status = "#{:02X}{:02X}{:02X}  sim {:.3f}\nSoft {:.3f}  Spill {:.3f}{}".format(
+            status = "#{:02X}{:02X}{:02X}  sim {:.3f}\nSoft {:.3f}  Feather {:.1f}px{}".format(
                 int(settings.get("key_color_r", 0)), int(settings.get("key_color_g", 255)),
                 int(settings.get("key_color_b", 0)), float(settings.get("key_similarity", 0.25)),
-                float(settings.get("key_softness", 0.10)), float(settings.get("spill_suppression", 0.25)),
+                float(settings.get("key_softness", 0.10)), float(settings.get("key_edge_feather", 0.0)),
                 "  Invert" if bool(settings.get("key_invert", False)) else "",
             )
         else:
@@ -3782,6 +3978,19 @@ class EffectsGraphCanvas(QWidget):
                     checkbox.blockSignals(True)
                     checkbox.setChecked(bool(settings[setting_name]))
                     checkbox.blockSignals(False)
+            for value_control in dialog.findChildren(QDoubleSpinBox):
+                setting_name = value_control.property("setting_name")
+                if isinstance(setting_name, str) and setting_name in settings:
+                    value_control.blockSignals(True)
+                    value_control.setValue(float(settings[setting_name]))
+                    value_control.blockSignals(False)
+            for slider in dialog.findChildren(QSlider):
+                setting_name = slider.property("setting_name")
+                setting_scale = slider.property("setting_scale")
+                if isinstance(setting_name, str) and setting_name in settings and isinstance(setting_scale, int):
+                    slider.blockSignals(True)
+                    slider.setValue(round(float(settings[setting_name]) * setting_scale))
+                    slider.blockSignals(False)
         if node_type == "capture":
             self._widgets[node_id].set_capture_devices(self._capture_devices, settings.get("device_index"))
 
@@ -3836,13 +4045,297 @@ class EffectsGraphCanvas(QWidget):
         return capture_sources[-1] if capture_sources else "effects_input"
 
     def native_effects_payload(self) -> dict[str, object]:
+        def resolve_generated_alpha(
+            source_id: str | None,
+            source_port: str,
+        ) -> tuple[str | None, str, dict[str, object]]:
+            if source_id is None or source_port != "alpha_output":
+                return source_id, source_port, {}
+            source_node = self._nodes.get(source_id, {})
+            source_type = source_node.get("type")
+            settings = source_node.get("settings", {})
+            if not isinstance(settings, dict):
+                settings = {}
+            if source_type == "mask":
+                return source_id, "alpha_output", {"type": "mask", "settings": dict(settings)}
+            if source_type != "chroma_key":
+                return source_id, source_port, {}
+            incoming = next(
+                (candidate for candidate in self._connections if candidate[2:4] == (source_id, "color_input")),
+                None,
+            )
+            if incoming is None:
+                return None, "", {}
+            return incoming[0], "alpha_output", {"type": "chroma_key", "settings": dict(settings)}
+
+        def resolve_transform_source(
+            connection: tuple[str, str, str, str] | None,
+        ) -> tuple[str | None, str, dict[str, object]]:
+            if connection is None:
+                return None, "", {}
+            source_id, source_port = connection[0], connection[1]
+            transform_settings: dict[str, object] = {}
+            visited: set[str] = set()
+
+            while source_id is not None and source_id not in visited:
+                visited.add(source_id)
+                source_node = self._nodes.get(source_id, {})
+                source_type = source_node.get("type")
+
+                if source_type == "transform_3d":
+                    candidate_settings = source_node.get("settings", {})
+                    if isinstance(candidate_settings, dict):
+                        transform_settings = dict(candidate_settings)
+                    preferred_inputs = (
+                        ("alpha_input", "input")
+                        if source_port == "alpha_output"
+                        else ("input", "alpha_input")
+                    )
+                    incoming = next(
+                        (
+                            candidate
+                            for input_port in preferred_inputs
+                            for candidate in self._connections
+                            if candidate[2:4] == (source_id, input_port)
+                        ),
+                        None,
+                    )
+                    if incoming is None:
+                        return None, "", transform_settings
+                    source_id = incoming[0]
+                    source_port = (
+                        "alpha_output"
+                        if source_port == "alpha_output"
+                        or incoming[1] == "alpha_output"
+                        or incoming[3] == "alpha_input"
+                        else "output"
+                    )
+                    continue
+
+                if source_type in {"proc_amp", "color_corrector"}:
+                    incoming = next(
+                        (candidate for candidate in self._connections if candidate[2:4] == (source_id, "input")),
+                        None,
+                    )
+                    if incoming is None:
+                        return None, "", transform_settings
+                    source_id, source_port = incoming[0], incoming[1]
+                    continue
+
+                return source_id, source_port, transform_settings
+
+            return None, "", transform_settings
+
+        def build_color_stage_payload(
+            node_type: str,
+            settings: dict[str, object],
+        ) -> dict[str, object] | None:
+            if node_type == "proc_amp":
+                return {
+                    "type": node_type,
+                    "params": [
+                        float(settings.get("saturation", 1.0)),
+                        float(settings.get("hue", 0.0)),
+                        float(settings.get("brightness", 0.0)),
+                        float(settings.get("contrast", 1.0)),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    "invert": bool(settings.get("invert", False)),
+                }
+            if node_type == "color_corrector":
+                return {
+                    "type": node_type,
+                    "params": [
+                        float(settings.get("gain_r", 1.0)),
+                        float(settings.get("gain_g", 1.0)),
+                        float(settings.get("gain_b", 1.0)),
+                        float(settings.get("mid_r", 1.0)),
+                        float(settings.get("mid_g", 1.0)),
+                        float(settings.get("mid_b", 1.0)),
+                        float(settings.get("blacks_r", 0.0)),
+                        float(settings.get("blacks_g", 0.0)),
+                        float(settings.get("blacks_b", 0.0)),
+                    ],
+                    "invert": False,
+                }
+            return None
+
+        def resolve_effect_chain(
+            connection: tuple[str, str, str, str] | None,
+        ) -> tuple[str | None, str, dict[str, object], dict[str, object], list[dict[str, object]]]:
+            if connection is None:
+                return None, "", {}, {}, []
+
+            source_id, source_port = connection[0], connection[1]
+            transform_settings: dict[str, object] = {}
+            blur_settings: dict[str, object] = {}
+            color_stage_payloads: list[dict[str, object]] = []
+            visited: set[str] = set()
+
+            while source_id is not None and source_id not in visited:
+                visited.add(source_id)
+                source_node = self._nodes.get(source_id, {})
+                source_type = source_node.get("type")
+                settings = source_node.get("settings", {})
+                if not isinstance(settings, dict):
+                    settings = {}
+
+                if source_type == "transform_3d":
+                    if not transform_settings:
+                        transform_settings = dict(settings)
+                    preferred_inputs = (
+                        ("alpha_input", "input")
+                        if source_port == "alpha_output"
+                        else ("input", "alpha_input")
+                    )
+                    incoming = next(
+                        (
+                            candidate
+                            for input_port in preferred_inputs
+                            for candidate in self._connections
+                            if candidate[2:4] == (source_id, input_port)
+                        ),
+                        None,
+                    )
+                    if incoming is None:
+                        return None, "", transform_settings, blur_settings, color_stage_payloads
+                    source_id = incoming[0]
+                    source_port = (
+                        "alpha_output"
+                        if source_port == "alpha_output"
+                        or incoming[1] == "alpha_output"
+                        or incoming[3] == "alpha_input"
+                        else "output"
+                    )
+                    continue
+
+                if source_type == "blur":
+                    if not blur_settings:
+                        blur_settings = dict(settings)
+                    preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
+                    incoming = next(
+                        (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
+                        None,
+                    )
+                    if incoming is None:
+                        return None, "", transform_settings, blur_settings, color_stage_payloads
+                    source_id, source_port = incoming[0], incoming[1]
+                    continue
+
+                if source_type in {"proc_amp", "color_corrector"}:
+                    stage_payload = build_color_stage_payload(str(source_type), settings)
+                    if stage_payload is not None:
+                        color_stage_payloads.insert(0, stage_payload)
+                    incoming = next(
+                        (candidate for candidate in self._connections if candidate[2:4] == (source_id, "input")),
+                        None,
+                    )
+                    if incoming is None:
+                        return None, "", transform_settings, blur_settings, color_stage_payloads
+                    source_id, source_port = incoming[0], incoming[1]
+                    continue
+
+                return source_id, source_port, transform_settings, blur_settings, color_stage_payloads
+
+            return None, "", transform_settings, blur_settings, color_stage_payloads
+
+        def resolve_channel_recombiner(
+            connection: tuple[str, str, str, str] | None,
+        ) -> tuple[str | None, list[dict[str, object]], list[dict[str, object]]]:
+            if connection is None or self._nodes.get(connection[0], {}).get("type") != "color_recombiner":
+                return None, [], []
+            recombiner_id = connection[0]
+            source_ids: set[str] = set()
+            routes: list[dict[str, object]] = []
+            alpha_generators: list[dict[str, object]] = []
+            component_ports = ("red_input", "green_input", "blue_input", "alpha_input")
+            splitter_channels = {"red_output": 0, "green_output": 1, "blue_output": 2}
+            for component_index, component_port in enumerate(component_ports):
+                current = next(
+                    (candidate for candidate in self._connections if candidate[2:4] == (recombiner_id, component_port)),
+                    None,
+                )
+                route: dict[str, object] = {
+                    "source_channel": -1,
+                    "generator_type": "off",
+                    "blur_method": "off",
+                    "blur_radius": 0.0,
+                    "transform_x": 0.0,
+                    "transform_y": 0.0,
+                    "transform_z": 0.0,
+                    "rotate_x": 0.0,
+                    "rotate_y": 0.0,
+                    "rotate_z": 0.0,
+                }
+                visited: set[str] = set()
+                while current is not None and current[0] not in visited:
+                    source_id, source_port = current[0], current[1]
+                    visited.add(source_id)
+                    source_type = self._nodes.get(source_id, {}).get("type")
+                    settings = self._nodes.get(source_id, {}).get("settings", {})
+                    if not isinstance(settings, dict):
+                        settings = {}
+                    if source_type == "transform_3d":
+                        for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z"):
+                            route["transform_" + name if name in {"x", "y", "z"} else name] = float(settings.get(name, 0.0))
+                        preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
+                        current = next(
+                            (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
+                            None,
+                        )
+                        continue
+                    if source_type == "blur":
+                        route["blur_method"] = str(settings.get("method", "off"))
+                        route["blur_radius"] = float(settings.get("radius", 0.0))
+                        preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
+                        current = next(
+                            (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
+                            None,
+                        )
+                        continue
+                    if source_type == "color_splitter":
+                        current = next(
+                            (candidate for candidate in self._connections if candidate[2:4] == (source_id, "input")),
+                            None,
+                        )
+                        if current is not None:
+                            route["source_channel"] = (
+                                3 if current[1] == "alpha_output"
+                                else splitter_channels.get(source_port, component_index)
+                            )
+                            source_ids.add(current[0])
+                        break
+                    resolved_id, resolved_port, alpha_generator = resolve_generated_alpha(source_id, source_port)
+                    if alpha_generator:
+                        route["source_channel"] = 3
+                        route["generator_type"] = str(alpha_generator.get("type", "off"))
+                        generator_settings = alpha_generator.get("settings", {})
+                        if isinstance(generator_settings, dict):
+                            route["generator_settings"] = dict(generator_settings)
+                        alpha_generators.append(alpha_generator)
+                        if resolved_id is not None and self._nodes.get(resolved_id, {}).get("type") != "mask":
+                            source_ids.add(resolved_id)
+                        break
+                    route["source_channel"] = 3 if source_port == "alpha_output" else component_index
+                    source_ids.add(source_id)
+                    break
+                routes.append(route)
+            if not source_ids and alpha_generators and all(generator.get("type") == "mask" for generator in alpha_generators):
+                source_ids.add(recombiner_id)
+            return (next(iter(source_ids)) if len(source_ids) == 1 else None), routes, alpha_generators
+
         edges = {
             source: target
             for source, source_port, target, target_port in self._connections
             if source_port == "output" and target_port in {"input", "layer1_color"}
         }
         active_nodes: list[str] = []
-        current = self._active_main_source()
+        main_source_id = self._active_main_source()
+        current = main_source_id
         main_capture_id = current if self._nodes.get(current, {}).get("type") == "capture" else None
         visited: set[str] = set()
         while current in edges and current not in visited:
@@ -3851,20 +4344,54 @@ class EffectsGraphCanvas(QWidget):
             active_nodes.append(current)
             if current == "effects_output":
                 break
-        direct_source_connection = next(
+        output_source_connection = next(
             (
                 connection for connection in self._connections
                 if connection[2] == "effects_output" and connection[3] == "input"
-                and self._nodes.get(connection[0], {}).get("type") in {"media", "matte"}
             ),
             None,
         )
-        direct_source_id = direct_source_connection[0] if direct_source_connection is not None else None
+        explicit_compositor_id = (
+            output_source_connection[0]
+            if output_source_connection is not None
+            and self._nodes.get(output_source_connection[0], {}).get("type") == "keying"
+            else None
+        )
+        if explicit_compositor_id is not None:
+            if explicit_compositor_id in active_nodes:
+                compositor_position = active_nodes.index(explicit_compositor_id)
+                active_nodes = active_nodes[: compositor_position + 1]
+                if not active_nodes or active_nodes[-1] != "effects_output":
+                    active_nodes.append("effects_output")
+            else:
+                active_nodes = [explicit_compositor_id, "effects_output"]
+        direct_source_id, direct_source_port, direct_transform_settings = resolve_transform_source(
+            output_source_connection
+        )
+        if self._nodes.get(direct_source_id, {}).get("type") not in {"media", "matte"}:
+            direct_source_id = None
         if direct_source_id is not None:
             active_nodes = [direct_source_id, "effects_output"]
         compositor_ids = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "keying"]
         compositor_id = compositor_ids[-1] if compositor_ids else None
         compositor_position = active_nodes.index(compositor_id) if compositor_id is not None else -1
+        base_transform_ids = [
+            node_id for position, node_id in enumerate(active_nodes)
+            if compositor_position < 0
+            and main_source_id == "effects_input"
+            and self._nodes.get(node_id, {}).get("type") == "transform_3d"
+        ]
+        base_transform_settings = (
+            self._nodes[base_transform_ids[-1]].get("settings", {})
+            if base_transform_ids
+            else {}
+        )
+        if not isinstance(base_transform_settings, dict):
+            base_transform_settings = {}
+        base_transform_active = any(
+            abs(float(base_transform_settings.get(name, 0.0))) > 1e-6
+            for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z")
+        )
         color_stages: list[dict[str, object]] = []
         for position, node_id in enumerate(active_nodes):
             node = self._nodes.get(node_id, {})
@@ -3872,24 +4399,13 @@ class EffectsGraphCanvas(QWidget):
             settings = node.get("settings", {})
             if node_type not in {"proc_amp", "color_corrector"} or not isinstance(settings, dict):
                 continue
-            if node_type == "proc_amp":
-                params = [
-                    float(settings.get("saturation", 1.0)), float(settings.get("hue", 0.0)),
-                    float(settings.get("brightness", 0.0)), float(settings.get("contrast", 1.0)),
-                    0.0, 0.0, 0.0, 0.0, 0.0,
-                ]
-            else:
-                params = [
-                    float(settings.get("gain_r", 1.0)), float(settings.get("gain_g", 1.0)), float(settings.get("gain_b", 1.0)),
-                    float(settings.get("mid_r", 1.0)), float(settings.get("mid_g", 1.0)), float(settings.get("mid_b", 1.0)),
-                    float(settings.get("blacks_r", 0.0)), float(settings.get("blacks_g", 0.0)), float(settings.get("blacks_b", 0.0)),
-                ]
-            color_stages.append({
-                "type": node_type,
-                "after_composite": compositor_position >= 0 and position > compositor_position,
-                "params": params,
-                "invert": bool(settings.get("invert", False)) if node_type == "proc_amp" else False,
-            })
+            if compositor_position >= 0 and position <= compositor_position:
+                continue
+            stage_payload = build_color_stage_payload(node_type, settings)
+            if stage_payload is None:
+                continue
+            stage_payload["after_composite"] = compositor_position >= 0 and position > compositor_position
+            color_stages.append(stage_payload)
         layer2_media_id = next(
             (
                 source for source, source_port, target, target_port in self._connections
@@ -3932,7 +4448,7 @@ class EffectsGraphCanvas(QWidget):
         media_nodes = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "media"]
         if layer2_media_id is not None and layer2_media_id not in media_nodes:
             media_nodes.append(layer2_media_id)
-        blur_ids = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "blur"]
+        blur_ids = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "blur"] if compositor_id is None else []
         if not active_nodes or active_nodes[-1] != "effects_output":
             return {"enabled": False, "output_connected": False}
         media_id = media_nodes[0] if media_nodes else None
@@ -3968,6 +4484,8 @@ class EffectsGraphCanvas(QWidget):
                  or (target == compositor_id and target_port == "layer2_color"))
             for source, source_port, target, target_port in self._connections
         )
+        if direct_source_id is not None:
+            effect_color_from_alpha = direct_source_port == "alpha_output"
         effect_alpha_from_color = any(
             source == uploaded_source_id and source_port == "output"
             and target == compositor_id and target_port == "layer2_alpha"
@@ -3978,13 +4496,13 @@ class EffectsGraphCanvas(QWidget):
         layer2_opacity = max(0.0, min(1.0, source_opacity * key_opacity))
         key_config = {
             "mode": "off", "color": [0, 255, 0], "similarity": 0.25,
-            "softness": 0.10, "spill_suppression": 0.25,
+            "softness": 0.10, "edge_feather": 0.0, "spill_suppression": 0.25,
             "luma_low": 0.0, "luma_high": 1.0, "luma_softness": 0.10, "invert": False,
         }
         layer_payloads: list[dict[str, object]] = []
         layer_count = max(2, min(8, int(compositor_settings.get("layer_count", 2))))
         if compositor_id is not None:
-            for layer_index in range(2, layer_count + 1):
+            for layer_index in range(1, layer_count + 1):
                 color_connection = next(
                     (
                         connection for connection in self._connections
@@ -3999,10 +4517,52 @@ class EffectsGraphCanvas(QWidget):
                     ),
                     None,
                 )
-                source_id = color_connection[0] if color_connection is not None else None
-                source_port = color_connection[1] if color_connection is not None else ""
+                recombiner_source_id, channel_routes, channel_alpha_generators = resolve_channel_recombiner(color_connection)
+                (
+                    color_source_id,
+                    color_source_port,
+                    color_transform_settings,
+                    color_blur_settings,
+                    layer_color_stages,
+                ) = resolve_effect_chain(color_connection)
+                (
+                    alpha_source_id,
+                    alpha_source_port,
+                    alpha_transform_settings,
+                    alpha_blur_settings,
+                    _alpha_color_stages,
+                ) = resolve_effect_chain(alpha_connection)
+                color_source_id, color_source_port, direct_alpha_generator = resolve_generated_alpha(
+                    color_source_id, color_source_port
+                )
+                resolved_alpha_source_id, resolved_alpha_source_port, opacity_alpha_generator = resolve_generated_alpha(
+                    alpha_source_id, alpha_source_port
+                )
+                source_id = recombiner_source_id or color_source_id or alpha_source_id
+                source_port = color_source_port if color_source_id is not None else alpha_source_port
+                transform_settings = (
+                    color_transform_settings
+                    if color_transform_settings
+                    else alpha_transform_settings
+                )
+                layer_blur_settings = (
+                    color_blur_settings
+                    if color_blur_settings
+                    else alpha_blur_settings
+                )
                 source_node = self._nodes.get(source_id, {})
                 source_type = str(source_node.get("type", "")) if isinstance(source_node, dict) else ""
+                mask_generator = next(
+                    (generator for generator in (direct_alpha_generator,) if generator.get("type") == "mask"),
+                    None,
+                )
+                chroma_generator = next(
+                    (
+                        generator for generator in (direct_alpha_generator, opacity_alpha_generator)
+                        if generator.get("type") == "chroma_key"
+                    ),
+                    None,
+                )
                 source_settings = source_node.get("settings", {}) if isinstance(source_node, dict) else {}
                 if not isinstance(source_settings, dict):
                     source_settings = {}
@@ -4029,27 +4589,24 @@ class EffectsGraphCanvas(QWidget):
                 if alpha_connection is not None and self._nodes.get(alpha_connection[0], {}).get("type") == "mask":
                     mask_id = alpha_connection[0]
                 layer_mask_settings = self._nodes.get(mask_id, {}).get("settings", {})
+                if mask_generator is not None:
+                    layer_mask_settings = mask_generator.get("settings", {})
                 if not isinstance(layer_mask_settings, dict):
                     layer_mask_settings = {}
                 prefix = f"layer{layer_index}_"
-                chroma_key_id = None
-                if alpha_connection is not None and self._nodes.get(alpha_connection[0], {}).get("type") == "chroma_key":
-                    candidate_key_id = alpha_connection[0]
-                    key_color_connection = next(
-                        (connection for connection in self._connections if connection[2:4] == (candidate_key_id, "color_input")),
-                        None,
-                    )
-                    if (
-                        color_connection is not None
-                        and key_color_connection is not None
-                        and key_color_connection[0:2] == color_connection[0:2]
-                    ):
-                        chroma_key_id = candidate_key_id
+                chroma_key_id = (
+                    alpha_connection[0]
+                    if alpha_connection is not None
+                    and self._nodes.get(alpha_connection[0], {}).get("type") == "chroma_key"
+                    else None
+                )
                 chroma_key_settings = self._nodes.get(chroma_key_id, {}).get("settings", {})
+                if chroma_generator is not None:
+                    chroma_key_settings = chroma_generator.get("settings", {})
                 if not isinstance(chroma_key_settings, dict):
                     chroma_key_settings = {}
                 layer_key = dict(key_config)
-                if chroma_key_id is not None:
+                if chroma_key_id is not None or chroma_generator is not None:
                     layer_key.update({
                         "mode": "chroma",
                         "color": [
@@ -4059,39 +4616,75 @@ class EffectsGraphCanvas(QWidget):
                         ],
                         "similarity": float(chroma_key_settings.get("key_similarity", 0.25)),
                         "softness": float(chroma_key_settings.get("key_softness", 0.10)),
+                        "edge_feather": float(chroma_key_settings.get("key_edge_feather", 0.0)),
                         "spill_suppression": float(chroma_key_settings.get("spill_suppression", 0.25)),
                         "invert": bool(chroma_key_settings.get("key_invert", False)),
                     })
-                layer_enabled = source_type == "matte" or bool(layer_media_path) or layer_capture_kind == "webcam"
+                generated_mask_source = source_type in {"mask", "color_recombiner"} and (
+                    mask_generator is not None
+                    or any(generator.get("type") == "mask" for generator in channel_alpha_generators)
+                )
+                effects_input_source = source_type == "effects_input"
+                layer_enabled = (
+                    source_type == "matte" or generated_mask_source or effects_input_source
+                    or bool(layer_media_path) or layer_capture_kind == "webcam"
+                )
+                preserve_color_from_alpha_opacity = bool(
+                    color_connection is not None
+                    and alpha_connection is not None
+                    and color_connection[0:2] == alpha_connection[0:2]
+                    and color_source_port == "alpha_output"
+                )
                 layer_payloads.append(
                     {
                         "layer_index": layer_index,
                         "enabled": layer_enabled,
                         "source_node_id": source_id,
-                        "source_kind": "matte" if source_type == "matte" else ("webcam" if layer_capture_kind else "media"),
+                        "source_kind": (
+                            "effects_input" if effects_input_source
+                            else "matte" if source_type == "matte" or generated_mask_source
+                            else "webcam" if layer_capture_kind
+                            else "media"
+                        ),
                         "media_path": layer_media_path,
                         "media_playing": layer_capture_kind == "webcam" or bool(source_settings.get("playing", False)),
                         "media_loop": bool(source_settings.get("loop", True)),
                         "capture_kind": layer_capture_kind,
                         "capture_device_index": layer_capture_index,
-                        "matte_rgba": layer_matte_rgba,
+                        "matte_rgba": [255, 255, 255, 255] if generated_mask_source else layer_matte_rgba,
                         "opacity": max(0.0, min(1.0, layer_source_opacity * float(compositor_settings.get(prefix + "opacity", 1.0)))),
                         "blend_mode": str(compositor_settings.get(prefix + "blend_mode", "normal")),
-                        "blur_method": str(blur_settings.get("method", "off")) if layer_index == 2 else "off",
-                        "blur_radius": float(blur_settings.get("radius", 0.0)) if layer_index == 2 else 0.0,
-                        "blur_target": str(blur_settings.get("target", "both")) if layer_index == 2 else "both",
+                        "blur_method": str(layer_blur_settings.get("method", "off")),
+                        "blur_radius": float(layer_blur_settings.get("radius", 0.0)),
+                        "blur_target": str(layer_blur_settings.get("target", "both")),
+                        "color_stages": list(layer_color_stages),
                         "key": layer_key,
-                        "effect_color_from_alpha": source_port == "alpha_output",
-                        "effect_alpha_from_color": bool(
-                            alpha_connection is not None
-                            and alpha_connection[0] == source_id
-                            and alpha_connection[1] == "output"
+                        "materialize_key_alpha": chroma_generator is not None,
+                        "key_alpha_from_effects_input": bool(
+                            opacity_alpha_generator.get("type") == "chroma_key"
+                            and resolved_alpha_source_id == "effects_input"
+                            and resolved_alpha_source_port == "alpha_output"
                         ),
-                        "mask_pattern": str(layer_mask_settings.get("pattern", "off")) if mask_id is not None else "off",
+                        "effect_color_from_alpha": color_source_port == "alpha_output",
+                        "effect_alpha_from_color": bool(
+                            alpha_source_id == source_id
+                            and alpha_source_port == "output"
+                        ),
+                        "preserve_color_from_alpha_opacity": preserve_color_from_alpha_opacity,
+                        "mask_pattern": str(layer_mask_settings.get("pattern", "off")) if mask_id is not None or mask_generator is not None else "off",
                         "mask_softness": float(layer_mask_settings.get("softness", 0.0)),
                         "mask_aspect": float(layer_mask_settings.get("aspect", 1.0)),
                         "mask_invert": bool(layer_mask_settings.get("invert", False)),
                         "mask_size": float(layer_mask_settings.get("size", 1.0)),
+                        "mask_x": float(layer_mask_settings.get("x", 0.0)),
+                        "mask_y": float(layer_mask_settings.get("y", 0.0)),
+                        "transform_x": float(transform_settings.get("x", 0.0)),
+                        "transform_y": float(transform_settings.get("y", 0.0)),
+                        "transform_z": float(transform_settings.get("z", 0.0)),
+                        "rotate_x": float(transform_settings.get("rotate_x", 0.0)),
+                        "rotate_y": float(transform_settings.get("rotate_y", 0.0)),
+                        "rotate_z": float(transform_settings.get("rotate_z", 0.0)),
+                        "channel_routes": channel_routes,
                     }
                 )
         if not layer_payloads:
@@ -4122,6 +4715,14 @@ class EffectsGraphCanvas(QWidget):
                     "mask_aspect": float(mask_settings.get("aspect", 1.0)),
                     "mask_invert": bool(mask_settings.get("invert", False)),
                     "mask_size": float(mask_settings.get("size", 1.0)),
+                    "mask_x": float(mask_settings.get("x", 0.0)),
+                    "mask_y": float(mask_settings.get("y", 0.0)),
+                    "transform_x": float(direct_transform_settings.get("x", 0.0)),
+                    "transform_y": float(direct_transform_settings.get("y", 0.0)),
+                    "transform_z": float(direct_transform_settings.get("z", 0.0)),
+                    "rotate_x": float(direct_transform_settings.get("rotate_x", 0.0)),
+                    "rotate_y": float(direct_transform_settings.get("rotate_y", 0.0)),
+                    "rotate_z": float(direct_transform_settings.get("rotate_z", 0.0)),
                 }
             )
         legacy_layer = layer_payloads[0]
@@ -4133,8 +4734,11 @@ class EffectsGraphCanvas(QWidget):
                 any(bool(layer.get("enabled", False)) for layer in layer_payloads)
                 or bool(selected_blur)
                 or bool(color_stages)
+                or base_transform_active
+                or compositor_id is not None
             ),
             "output_connected": True,
+            "explicit_compositor_layers": self._effects_enabled and compositor_id is not None,
             "media_path": str(legacy_layer.get("media_path", "")),
             "media_playing": bool(legacy_layer.get("media_playing", False)),
             "media_loop": bool(legacy_layer.get("media_loop", True)),
@@ -4149,6 +4753,12 @@ class EffectsGraphCanvas(QWidget):
             "blur_target": str(legacy_layer.get("blur_target", "both")),
             "layer1_opacity": layer1_opacity,
             "layer1_blend_mode": str(compositor_settings.get("layer1_blend_mode", "normal")),
+            "input_transform_x": float(base_transform_settings.get("x", 0.0)),
+            "input_transform_y": float(base_transform_settings.get("y", 0.0)),
+            "input_transform_z": float(base_transform_settings.get("z", 0.0)),
+            "input_rotate_x": float(base_transform_settings.get("rotate_x", 0.0)),
+            "input_rotate_y": float(base_transform_settings.get("rotate_y", 0.0)),
+            "input_rotate_z": float(base_transform_settings.get("rotate_z", 0.0)),
             "layers": layer_payloads,
             "color_stages": color_stages,
             "key_mode": str(legacy_key.get("mode", "off")),
@@ -4157,6 +4767,7 @@ class EffectsGraphCanvas(QWidget):
             "key_color_b": int(legacy_key.get("color", [0, 255, 0])[2]),
             "key_similarity": float(legacy_key.get("similarity", 0.25)),
             "key_softness": float(legacy_key.get("softness", 0.10)),
+            "key_edge_feather": float(legacy_key.get("edge_feather", 0.0)),
             "spill_suppression": float(legacy_key.get("spill_suppression", 0.25)),
             "luma_low": float(legacy_key.get("luma_low", 0.0)),
             "luma_high": float(legacy_key.get("luma_high", 1.0)),
@@ -4169,6 +4780,14 @@ class EffectsGraphCanvas(QWidget):
             "mask_aspect": float(legacy_layer.get("mask_aspect", 1.0)),
             "mask_invert": bool(legacy_layer.get("mask_invert", False)),
             "mask_size": float(legacy_layer.get("mask_size", 1.0)),
+            "mask_x": float(legacy_layer.get("mask_x", 0.0)),
+            "mask_y": float(legacy_layer.get("mask_y", 0.0)),
+            "transform_x": float(legacy_layer.get("transform_x", 0.0)),
+            "transform_y": float(legacy_layer.get("transform_y", 0.0)),
+            "transform_z": float(legacy_layer.get("transform_z", 0.0)),
+            "rotate_x": float(legacy_layer.get("rotate_x", 0.0)),
+            "rotate_y": float(legacy_layer.get("rotate_y", 0.0)),
+            "rotate_z": float(legacy_layer.get("rotate_z", 0.0)),
         }
 
     def set_effects_enabled(self, enabled: bool) -> None:
@@ -4248,7 +4867,7 @@ class EffectsGraphCanvas(QWidget):
     def _migrate_compositor_chroma_keys(self) -> None:
         key_setting_names = (
             "key_mode", "key_color_r", "key_color_g", "key_color_b",
-            "key_similarity", "key_softness", "spill_suppression",
+            "key_similarity", "key_softness", "key_edge_feather", "spill_suppression",
             "luma_low", "luma_high", "luma_softness", "key_invert",
         )
         compositor_ids = [node_id for node_id, node in self._nodes.items() if node["type"] == "keying"]
@@ -4276,7 +4895,7 @@ class EffectsGraphCanvas(QWidget):
                 if isinstance(chroma_settings, dict):
                     for name in (
                         "key_color_r", "key_color_g", "key_color_b", "key_similarity",
-                        "key_softness", "spill_suppression", "key_invert",
+                        "key_softness", "key_edge_feather", "spill_suppression", "key_invert",
                     ):
                         default = chroma_settings[name]
                         chroma_settings[name] = settings.get(prefix + name, settings.get(name, default))
@@ -4524,12 +5143,16 @@ class EffectsGraphEditor(QGroupBox):
         "Basic Proc Amp": "proc_amp",
         "Color Corrector": "color_corrector",
         "Chroma Key": "chroma_key",
+        "3D Transform": "transform_3d",
+        "Color Splitter": "color_splitter",
+        "Color Recombiner": "color_recombiner",
     }
 
     def __init__(self) -> None:
         super().__init__("Effects")
         self._node_keyframes: dict[str, dict[int, dict[str, object]]] = {}
         self._palette_entries: list[dict[str, object]] = []
+        self._current_palette_index: int | None = None
         self._current_frame = 0
         self._duration = 1
         self._playing = False
@@ -4547,9 +5170,6 @@ class EffectsGraphEditor(QGroupBox):
 
         layout = QVBoxLayout(self)
         top_bar = QHBoxLayout()
-        self.save_effect_button = QPushButton("Save Effect")
-        self.save_effect_button.clicked.connect(self._save_effect_to_palette)
-        top_bar.addWidget(self.save_effect_button)
         self.bypass_toggle = QCheckBox("Bypass effects")
         self.bypass_toggle.setChecked(False)
         self.bypass_toggle.setToolTip("Pass video through without processing the effects graph")
@@ -4611,6 +5231,17 @@ class EffectsGraphEditor(QGroupBox):
         self.node_combo.addItems(list(self.NODE_MENU))
         self.node_combo.currentIndexChanged.connect(self._add_selected_node)
         toolbar.addWidget(self.node_combo, 1)
+        self.current_effect_label = QLabel("Current effect: Unsaved")
+        self.current_effect_label.setMinimumWidth(220)
+        toolbar.addWidget(self.current_effect_label)
+        self.update_effect_button = QPushButton("Update Current")
+        self.update_effect_button.setToolTip("Overwrite the currently loaded palette effect")
+        self.update_effect_button.clicked.connect(self._update_current_palette_item)
+        toolbar.addWidget(self.update_effect_button)
+        self.save_effect_button = QPushButton("Save New")
+        self.save_effect_button.setToolTip("Save the current graph as a new palette effect")
+        self.save_effect_button.clicked.connect(self._save_effect_to_palette)
+        toolbar.addWidget(self.save_effect_button)
         node_layout.addLayout(toolbar)
 
         self.canvas = EffectsGraphCanvas()
@@ -4625,11 +5256,17 @@ class EffectsGraphEditor(QGroupBox):
         palette_layout = QVBoxLayout(palette_page)
         self.palette_list = QListWidget()
         self.palette_list.setIconSize(QPixmap(160, 90).size())
+        self.palette_list.currentItemChanged.connect(self._on_palette_selection_changed)
         self.palette_list.itemDoubleClicked.connect(self._recall_palette_item)
         palette_layout.addWidget(self.palette_list)
-        rename_button = QPushButton("Rename Effect")
-        rename_button.clicked.connect(self._rename_palette_item)
-        palette_layout.addWidget(rename_button)
+        palette_actions = QHBoxLayout()
+        self.rename_effect_button = QPushButton("Rename Effect")
+        self.rename_effect_button.clicked.connect(self._rename_palette_item)
+        palette_actions.addWidget(self.rename_effect_button)
+        self.delete_effect_button = QPushButton("Delete Effect")
+        self.delete_effect_button.clicked.connect(self._delete_palette_item)
+        palette_actions.addWidget(self.delete_effect_button)
+        palette_layout.addLayout(palette_actions)
         self.tabs.addTab(palette_page, "Effects Palette")
         layout.addWidget(self.tabs)
 
@@ -4638,6 +5275,7 @@ class EffectsGraphEditor(QGroupBox):
         layout.addWidget(self.timeline)
         self.canvas.graphChanged.connect(self._on_canvas_changed)
         self.bypass_toggle.toggled.connect(self._set_effects_bypassed)
+        self._refresh_palette_controls()
         self._refresh_timeline()
 
     def _on_canvas_changed(self) -> None:
@@ -4857,10 +5495,37 @@ class EffectsGraphEditor(QGroupBox):
         if candidates:
             self.set_current_frame(candidates[0] if direction > 0 else candidates[-1])
 
-    def _save_effect_to_palette(self) -> None:
-        name, accepted = QInputDialog.getText(self, "Save Effect", "Effect name")
-        if not accepted or not name.strip():
-            return
+    def _palette_index_from_item(self, item: QListWidgetItem | None) -> int | None:
+        if item is None:
+            return None
+        try:
+            index = int(item.data(Qt.UserRole))
+        except (TypeError, ValueError):
+            return None
+        return index if 0 <= index < len(self._palette_entries) else None
+
+    def _selected_palette_index(self) -> int | None:
+        return self._palette_index_from_item(self.palette_list.currentItem())
+
+    def _on_palette_selection_changed(self, _current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        self._refresh_palette_controls()
+
+    def _refresh_palette_controls(self) -> None:
+        selected_index = self._selected_palette_index()
+        current_index = self._current_palette_index if self._current_palette_index is not None else None
+        if current_index is not None and not 0 <= current_index < len(self._palette_entries):
+            current_index = None
+            self._current_palette_index = None
+        self.rename_effect_button.setEnabled(selected_index is not None)
+        self.delete_effect_button.setEnabled(selected_index is not None)
+        self.update_effect_button.setEnabled(current_index is not None)
+        if current_index is None:
+            self.current_effect_label.setText("Current effect: Unsaved")
+        else:
+            current_name = str(self._palette_entries[current_index].get("name", f"Effect {current_index + 1}"))
+            self.current_effect_label.setText(f"Current effect: {current_name}")
+
+    def _build_palette_entry(self, name: str) -> dict[str, object]:
         entry = {
             "name": name.strip(),
             "graph": self.canvas.serialize(),
@@ -4871,31 +5536,92 @@ class EffectsGraphEditor(QGroupBox):
         thumbnail_buffer = QBuffer(thumbnail_bytes)
         if thumbnail_buffer.open(QIODevice.WriteOnly) and thumbnail.save(thumbnail_buffer, "PNG"):
             entry["thumbnail"] = bytes(thumbnail_bytes.toBase64()).decode("ascii")
+        return entry
+
+    def _palette_item(self, index: int, entry: dict[str, object]) -> QListWidgetItem:
+        icon = QIcon()
+        thumbnail_text = entry.get("thumbnail", "")
+        if isinstance(thumbnail_text, str) and thumbnail_text:
+            thumbnail = QPixmap()
+            thumbnail.loadFromData(QByteArray.fromBase64(thumbnail_text.encode("ascii")), "PNG")
+            icon = QIcon(thumbnail)
+        item = QListWidgetItem(icon, str(entry.get("name", f"Effect {index + 1}")))
+        item.setData(Qt.UserRole, index)
+        return item
+
+    def _rebuild_palette_list(self, selected_index: int | None = None) -> None:
+        self.palette_list.clear()
+        for index, entry in enumerate(self._palette_entries):
+            self.palette_list.addItem(self._palette_item(index, entry))
+        if selected_index is not None and 0 <= selected_index < self.palette_list.count():
+            self.palette_list.setCurrentRow(selected_index)
+        self._refresh_palette_controls()
+
+    def _save_effect_to_palette(self) -> None:
+        default_name = ""
+        if self._current_palette_index is not None and 0 <= self._current_palette_index < len(self._palette_entries):
+            default_name = str(self._palette_entries[self._current_palette_index].get("name", ""))
+        name, accepted = QInputDialog.getText(self, "Save New Effect", "Effect name", text=default_name)
+        if not accepted or not name.strip():
+            return
+        entry = self._build_palette_entry(name)
         self._palette_entries.append(entry)
-        item = QListWidgetItem(QIcon(thumbnail), str(entry["name"]))
-        item.setData(Qt.UserRole, len(self._palette_entries) - 1)
-        self.palette_list.addItem(item)
-        self.tabs.setCurrentIndex(1)
+        self._current_palette_index = len(self._palette_entries) - 1
+        self._rebuild_palette_list(self._current_palette_index)
+        self.graphChanged.emit()
+
+    def _update_current_palette_item(self) -> None:
+        if self._current_palette_index is None or not 0 <= self._current_palette_index < len(self._palette_entries):
+            return
+        current_name = str(self._palette_entries[self._current_palette_index].get("name", "Effect"))
+        self._palette_entries[self._current_palette_index] = self._build_palette_entry(current_name)
+        self._rebuild_palette_list(self._current_palette_index)
         self.graphChanged.emit()
 
     def _rename_palette_item(self) -> None:
         item = self.palette_list.currentItem()
-        if item is None:
+        index = self._palette_index_from_item(item)
+        if index is None:
             return
-        index = int(item.data(Qt.UserRole))
         name, accepted = QInputDialog.getText(self, "Rename Effect", "Effect name", text=item.text())
         if accepted and name.strip():
             self._palette_entries[index]["name"] = name.strip()
             item.setText(name.strip())
+            self._refresh_palette_controls()
             self.graphChanged.emit()
 
+    def _delete_palette_item(self) -> None:
+        index = self._selected_palette_index()
+        if index is None:
+            return
+        entry_name = str(self._palette_entries[index].get("name", f"Effect {index + 1}"))
+        response = QMessageBox.question(
+            self,
+            "Delete Effect",
+            f'Delete "{entry_name}" from the effects palette?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if response != QMessageBox.Yes:
+            return
+        self._palette_entries.pop(index)
+        if self._current_palette_index == index:
+            self._current_palette_index = None
+        elif self._current_palette_index is not None and index < self._current_palette_index:
+            self._current_palette_index -= 1
+        next_index = min(index, len(self._palette_entries) - 1) if self._palette_entries else None
+        self._rebuild_palette_list(next_index)
+        self.graphChanged.emit()
+
     def _recall_palette_item(self, item: QListWidgetItem, _column: int = 0) -> None:
-        index = int(item.data(Qt.UserRole))
-        if not 0 <= index < len(self._palette_entries):
+        index = self._palette_index_from_item(item)
+        if index is None:
             return
         entry = self._palette_entries[index]
         if self.canvas.restore(entry.get("graph")):
             self._restore_keyframes(entry.get("keyframes"))
+            self._current_palette_index = index
+            self._rebuild_palette_list(index)
             self.set_current_frame(0)
             self.tabs.setCurrentIndex(0)
 
@@ -4963,20 +5689,12 @@ class EffectsGraphEditor(QGroupBox):
                     dict(entry) for entry in raw_palette
                     if isinstance(entry, dict) and isinstance(entry.get("graph"), dict)
                 ] if isinstance(raw_palette, list) else []
+                self._current_palette_index = None
             else:
                 self._restore_keyframes(None)
                 self._palette_entries = []
-            self.palette_list.clear()
-            for index, entry in enumerate(self._palette_entries):
-                icon = QIcon()
-                thumbnail_text = entry.get("thumbnail", "")
-                if isinstance(thumbnail_text, str) and thumbnail_text:
-                    thumbnail = QPixmap()
-                    thumbnail.loadFromData(QByteArray.fromBase64(thumbnail_text.encode("ascii")), "PNG")
-                    icon = QIcon(thumbnail)
-                item = QListWidgetItem(icon, str(entry.get("name", f"Effect {index + 1}")))
-                item.setData(Qt.UserRole, index)
-                self.palette_list.addItem(item)
+                self._current_palette_index = None
+            self._rebuild_palette_list()
             self.bypass_toggle.blockSignals(True)
             self.bypass_toggle.setChecked(not self.canvas.effects_enabled())
             self.bypass_toggle.blockSignals(False)
@@ -5247,13 +5965,20 @@ class VideoProcessorController:
             float(payload.get("luma_high", 1.0)),
             float(payload.get("luma_softness", 0.10)),
             bool(payload.get("key_invert", False)),
+            float(payload.get("key_edge_feather", 0.0)),
             bool(payload.get("output_connected", True)),
             bool(payload.get("effect_color_from_alpha", False)),
             bool(payload.get("effect_alpha_from_color", False)),
+            bool(payload.get("explicit_compositor_layers", False)),
         )
+        _set_native_effects_input_transform(self.processor, payload)
         layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
-        for layer_index in range(2, 9):
-            layer = layers_by_index.get(layer_index, {"layer_index": layer_index, "enabled": False})
+        for layer_index in range(1, 9):
+            layer = (
+                layers_by_index.get(layer_index, {"layer_index": layer_index, "enabled": False})
+                if enabled
+                else {"layer_index": layer_index, "enabled": False}
+            )
             _set_native_effect_layer_config(self.processor, layer)
         _set_native_color_stages(self.processor, payload)
         self._loaded_effect_source_signature = source_signature
@@ -7683,7 +8408,7 @@ class MainWindow(QMainWindow):
             self._update_status("Ready | Processing backend: worker process")
         else:
             self._update_status("Ready | Processing backend: in-process")
-            self.decklink_status_label.setText("Worker backend not active; running in GUI process")
+            self._set_decklink_status("Worker backend not active; running in GUI process")
         LOGGER.info("GUI initialized; default source mode=%s", self._source_mode)
         QTimer.singleShot(0, self._apply_initial_viewer_layout)
 
@@ -8193,6 +8918,7 @@ class MainWindow(QMainWindow):
         self._update_roi_key_buttons()
 
         self._update_timer_interval()
+        self._on_effects_graph_changed()
 
     def _current_ai_sr_profile(self) -> dict[str, object]:
         return {
@@ -8918,9 +9644,19 @@ class MainWindow(QMainWindow):
         self.decklink_refresh_btn.clicked.connect(self._refresh_decklink_catalog)
         decklink_form.addRow(self.decklink_refresh_btn)
 
-        self.decklink_status_label = QLabel()
-        self.decklink_status_label.setWordWrap(True)
-        decklink_form.addRow(self.decklink_status_label)
+        self.status_dialog = QDialog(self, Qt.Tool)
+        self.status_dialog.setWindowTitle("Runtime Status")
+        self.status_dialog.resize(760, 360)
+        status_dialog_layout = QVBoxLayout(self.status_dialog)
+        self.status_text = QPlainTextEdit(self.status_dialog)
+        self.status_text.setReadOnly(True)
+        self.status_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        status_dialog_layout.addWidget(self.status_text)
+
+        self.status_button = QPushButton("Open Status Window")
+        self.status_button.setToolTip("Open detailed runtime and DeckLink status")
+        self.status_button.clicked.connect(self._show_status_dialog)
+        decklink_form.addRow(self.status_button)
 
         roi_box = QGroupBox("ROI")
         roi_form = QFormLayout(roi_box)
@@ -9133,9 +9869,6 @@ class MainWindow(QMainWindow):
         post_vsr_scaling_form.addRow(self.rtx_vsr_scaling_apply_btn)
         post_vsr_scaling_form.addRow(self.rtx_vsr_scaling_info_label)
 
-        self.status_label = QLabel()
-        self.status_label.setWordWrap(True)
-
         controls_hint = QLabel(
             "Controls:\n"
             "- Input view only: Mouse drag to move ROI\n"
@@ -9158,10 +9891,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.ai_sr_postprocess_box)
         layout.addWidget(post_vsr_scaling_box)
         layout.addWidget(controls_hint)
-        layout.addWidget(self.status_label)
         layout.addStretch(1)
         self._apply_scaling_mode_visibility(self.scaling_mode_combo.currentText())
         return panel
+
+    def _show_status_dialog(self) -> None:
+        self.status_dialog.show()
+        self.status_dialog.raise_()
+        self.status_dialog.activateWindow()
+
+    def _set_decklink_status(self, text: str) -> None:
+        self._update_status(str(text))
 
     def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
         toolbar = QWidget()
@@ -9843,7 +10583,7 @@ class MainWindow(QMainWindow):
                         perf["tick"][0],
                         perf["tick"][1],
                     )
-                    self.decklink_status_label.setText(
+                    self._set_decklink_status(
                         (
                             f"DeckLink streaming via worker process | preview_fps={fps:.1f} | "
                             f"output_fps={worker_fps:.1f} | {health_summary} | "
@@ -10121,7 +10861,7 @@ class MainWindow(QMainWindow):
                     perf["tick"][1],
                 )
                 if self._source_mode == "Blackmagic DeckLink":
-                    self.decklink_status_label.setText("DeckLink streaming")
+                    self._set_decklink_status("DeckLink streaming")
 
                 self._refresh_ai_sr_runtime_panel()
                 self._refresh_rtx_vsr_runtime_panel()
@@ -12105,7 +12845,7 @@ class MainWindow(QMainWindow):
         if self._source_mode == "Synthetic":
             self._stop_decklink_sessions()
             self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
-            self.decklink_status_label.setText("Synthetic mode active")
+            self._set_decklink_status("Synthetic mode active")
             self._update_fps_control_lock()
             return
 
@@ -12163,7 +12903,7 @@ class MainWindow(QMainWindow):
         if self._source_mode != "Blackmagic DeckLink":
             self._stop_decklink_sessions()
             self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
-            self.decklink_status_label.setText("Synthetic mode active")
+            self._set_decklink_status("Synthetic mode active")
             self._update_status("Applied source mode: Synthetic")
             return
 
@@ -12174,7 +12914,7 @@ class MainWindow(QMainWindow):
             return
 
         if d is None:
-            self.decklink_status_label.setText("decklink_wrapper is not available in this environment")
+            self._set_decklink_status("decklink_wrapper is not available in this environment")
             self._update_status("DeckLink unavailable: install or activate decklink_wrapper environment")
             return
 
@@ -12185,7 +12925,7 @@ class MainWindow(QMainWindow):
             self._start_decklink_sessions()
         except Exception as exc:
             LOGGER.exception("DeckLink setup failed")
-            self.decklink_status_label.setText(f"DeckLink setup failed: {exc}")
+            self._set_decklink_status(f"DeckLink setup failed: {exc}")
             self._update_status(f"DeckLink setup failed: {exc}")
 
     def _start_decklink_sessions(self) -> None:
@@ -12300,7 +13040,7 @@ class MainWindow(QMainWindow):
         timecode_format_name = self.decklink_timecode_format_combo.currentText()
         hfrtc_supported = getattr(self, "_decklink_hfrtc_support_by_index", {}).get(int(in_device))
         hfrtc_text = "unknown" if hfrtc_supported is None else ("supported" if hfrtc_supported else "unsupported")
-        self.decklink_status_label.setText(
+        self._set_decklink_status(
             "DeckLink configured: "
             f"in={input_name} mode='{in_mode_name}' ({in_mode}); "
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
@@ -12347,7 +13087,7 @@ class MainWindow(QMainWindow):
         windows_cameras = _windows_video_capture_devices()
         self.effects_graph.set_capture_devices(windows_cameras)
         if d is None:
-            self.decklink_status_label.setText("decklink_wrapper is not available in this environment")
+            self._set_decklink_status("decklink_wrapper is not available in this environment")
             LOGGER.error("DeckLink catalog refresh failed: wrapper unavailable")
             return
 
@@ -12355,7 +13095,7 @@ class MainWindow(QMainWindow):
             devices = _call_decklink_api("list_devices")
         except Exception as exc:
             LOGGER.exception("DeckLink catalog refresh failed while listing devices")
-            self.decklink_status_label.setText(f"DeckLink refresh failed: {exc}")
+            self._set_decklink_status(f"DeckLink refresh failed: {exc}")
             self._update_status(f"DeckLink refresh failed: {exc}")
             self.decklink_input_device_combo.clear()
             self.decklink_output_device_combo.clear()
@@ -14048,7 +14788,7 @@ class MainWindow(QMainWindow):
         if unchanged and within_window:
             return
 
-        self.status_label.setText(text)
+        self.status_text.setPlainText(text)
         LOGGER.info("STATUS: %s", text)
         self._last_status_text = text
         self._last_status_log_ts = now

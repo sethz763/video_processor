@@ -208,11 +208,21 @@ public:
         float luma_high = 1.0f,
         float luma_softness = 0.10f,
         bool key_invert = false,
+        float key_edge_feather = 0.0f,
         bool output_connected = true,
         bool effect_color_from_alpha = false,
-        bool effect_alpha_from_color = false
+        bool effect_alpha_from_color = false,
+        bool explicit_compositor_layers = false
     );
     void UploadEffectMediaRgba(const uint8_t* rgba, size_t bytes, int width, int height);
+    void SetEffectsInputTransform(
+        float transform_x,
+        float transform_y,
+        float transform_z,
+        float rotate_x,
+        float rotate_y,
+        float rotate_z
+    );
     void SetEffectLayerConfig(
         int layer_index,
         bool enabled,
@@ -232,13 +242,26 @@ public:
         float luma_high = 1.0f,
         float luma_softness = 0.10f,
         bool key_invert = false,
+        float key_edge_feather = 0.0f,
         bool effect_color_from_alpha = false,
         bool effect_alpha_from_color = false,
+        bool preserve_color_from_alpha_opacity = false,
+        bool source_from_effects_input = false,
+        bool key_alpha_from_effects_input = false,
         const std::string& mask_pattern = "off",
         float mask_softness = 0.0f,
         float mask_aspect = 1.0f,
         bool mask_invert = false,
-        float mask_size = 1.0f
+        float mask_size = 1.0f,
+        float mask_x = 0.0f,
+        float mask_y = 0.0f,
+        float transform_x = 0.0f,
+        float transform_y = 0.0f,
+        float transform_z = 0.0f,
+        float rotate_x = 0.0f,
+        float rotate_y = 0.0f,
+        float rotate_z = 0.0f,
+        bool materialize_key_alpha = false
     );
     void UploadEffectLayerMediaRgba(
         int layer_index,
@@ -247,6 +270,35 @@ public:
         int width,
         int height
     );
+    void ClearEffectLayerChannelRoutes(int layer_index);
+    void SetEffectLayerChannelRoute(
+        int layer_index,
+        int target_channel,
+        int source_channel,
+        const std::string& blur_method,
+        float blur_radius,
+        float transform_x,
+        float transform_y,
+        float transform_z,
+        float rotate_x,
+        float rotate_y,
+        float rotate_z,
+        const std::string& generator_type = "off",
+        int key_color_r = 0,
+        int key_color_g = 255,
+        int key_color_b = 0,
+        float key_similarity = 0.25f,
+        float key_softness = 0.10f,
+        bool key_invert = false,
+        const std::string& mask_pattern = "off",
+        float mask_softness = 0.0f,
+        float mask_aspect = 1.0f,
+        bool mask_invert = false,
+        float mask_size = 1.0f,
+        float mask_x = 0.0f,
+        float mask_y = 0.0f
+    );
+    void SetEffectLayerColorStages(int layer_index, const std::vector<ColorStageConfig>& stages);
     void SetColorStages(const std::vector<ColorStageConfig>& stages);
     void ClearEffectMedia();
 
@@ -255,11 +307,35 @@ public:
     int sr_scale() const;
 
 private:
-    static constexpr int kFirstEffectLayer = 2;
+    static constexpr int kFirstEffectLayer = 1;
     static constexpr int kLastEffectLayer = 8;
     static constexpr size_t kEffectLayerCount = kLastEffectLayer - kFirstEffectLayer + 1;
 
     struct EffectLayerState {
+        struct ChannelRouteState {
+            int source_channel = -1;
+            int blur_method = 0;
+            float blur_radius = 0.0f;
+            float transform_x = 0.0f;
+            float transform_y = 0.0f;
+            float transform_z = 0.0f;
+            float rotate_x = 0.0f;
+            float rotate_y = 0.0f;
+            float rotate_z = 0.0f;
+            int generator_type = 0;
+            uchar3 key_color = make_uchar3(0, 255, 0);
+            float key_similarity = 0.25f;
+            float key_softness = 0.10f;
+            bool key_invert = false;
+            int mask_pattern_code = 0;
+            float mask_softness = 0.0f;
+            float mask_aspect = 1.0f;
+            bool mask_invert = false;
+            float mask_size = 1.0f;
+            float mask_x = 0.0f;
+            float mask_y = 0.0f;
+        };
+
         bool enabled = false;
         float opacity = 1.0f;
         int blend_mode = 0;
@@ -272,8 +348,13 @@ private:
         float luma_high = 1.0f;
         float luma_softness = 0.10f;
         bool key_invert = false;
+        float key_edge_feather = 0.0f;
+        bool materialize_key_alpha = false;
         bool color_from_alpha = false;
         bool alpha_from_color = false;
+        bool preserve_color_from_alpha_opacity = false;
+        bool source_from_effects_input = false;
+        bool key_alpha_from_effects_input = false;
         int blur_method = 0;
         float blur_radius = 0.0f;
         int blur_target = 0;
@@ -283,6 +364,17 @@ private:
         float mask_aspect = 1.0f;
         bool mask_invert = false;
         float mask_size = 1.0f;
+        float mask_x = 0.0f;
+        float mask_y = 0.0f;
+        float transform_x = 0.0f;
+        float transform_y = 0.0f;
+        float transform_z = 0.0f;
+        float rotate_x = 0.0f;
+        float rotate_y = 0.0f;
+        float rotate_z = 0.0f;
+        bool channel_routing_enabled = false;
+        std::array<ChannelRouteState, 4> channel_routes{};
+        std::vector<ColorStageConfig> color_stages{};
         int media_width = 0;
         int media_height = 0;
         size_t media_capacity_bytes = 0;
@@ -304,6 +396,7 @@ private:
     bool EnsureSrBufferCapacityLocked(int target_scale, cudaError_t& last_error);
     bool EffectsActiveLocked() const;
     const uchar3* ApplyColorStages(const uchar3* input, bool after_composite);
+    const uchar3* ApplyColorStages(const uchar3* input, const std::vector<ColorStageConfig>& stages);
     void Cleanup();
 
     int width_;
@@ -338,6 +431,13 @@ private:
     ColorRange color_range_;
     float effects_layer1_opacity_;
     bool effects_output_connected_;
+    bool effects_explicit_compositor_layers_;
+    float effects_input_transform_x_;
+    float effects_input_transform_y_;
+    float effects_input_transform_z_;
+    float effects_input_rotate_x_;
+    float effects_input_rotate_y_;
+    float effects_input_rotate_z_;
     std::array<EffectLayerState, kEffectLayerCount> effect_layers_;
     std::vector<ColorStageConfig> color_stages_;
 
@@ -358,6 +458,8 @@ private:
     uchar3* d_effect_color_b_;
     uint8_t* d_effect_alpha_a_;
     uint8_t* d_effect_alpha_b_;
+    uint8_t* d_effect_channel_a_;
+    uint8_t* d_effect_channel_b_;
     uchar3* d_effect_composite_;
     uchar3* d_effect_composite_b_;
     uint8_t* d_effect_composite_alpha_a_;

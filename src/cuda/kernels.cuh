@@ -283,6 +283,56 @@ void LaunchConvertColorAlphaChannels(
     cudaStream_t stream
 );
 
+void LaunchExtractColorAlphaChannel(
+    const uchar3* d_color,
+    const uint8_t* d_alpha,
+    uint8_t* d_output,
+    int width,
+    int height,
+    int source_channel,
+    cudaStream_t stream
+);
+
+void LaunchWriteColorAlphaChannel(
+    const uint8_t* d_input,
+    uchar3* d_color,
+    uint8_t* d_alpha,
+    int width,
+    int height,
+    int target_channel,
+    cudaStream_t stream
+);
+
+void LaunchTransformAlpha3D(
+    const uint8_t* d_input,
+    uint8_t* d_output,
+    int width,
+    int height,
+    float translate_x,
+    float translate_y,
+    float translate_z,
+    float rotate_x,
+    float rotate_y,
+    float rotate_z,
+    cudaStream_t stream
+);
+
+void LaunchTransformColorAlpha3D(
+    const uchar3* d_input_color,
+    const uint8_t* d_input_alpha,
+    uchar3* d_output_color,
+    uint8_t* d_output_alpha,
+    int width,
+    int height,
+    float translate_x,
+    float translate_y,
+    float translate_z,
+    float rotate_x,
+    float rotate_y,
+    float rotate_z,
+    cudaStream_t stream
+);
+
 void LaunchApplyProceduralAlphaMask(
     uint8_t* d_alpha,
     int width,
@@ -292,6 +342,24 @@ void LaunchApplyProceduralAlphaMask(
     float aspect,
     bool invert,
     float size,
+    float position_x,
+    float position_y,
+    cudaStream_t stream
+);
+
+void LaunchGenerateKeyAlpha(
+    const uchar3* d_color,
+    uint8_t* d_alpha,
+    int width,
+    int height,
+    int key_mode,
+    uchar3 key_color,
+    float key_similarity,
+    float key_softness,
+    float luma_low,
+    float luma_high,
+    float luma_softness,
+    bool key_invert,
     cudaStream_t stream
 );
 

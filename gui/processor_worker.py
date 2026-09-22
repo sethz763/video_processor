@@ -33,7 +33,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
         layers = [
             dict(layer)
             for layer in raw_layers
-            if isinstance(layer, dict) and 2 <= int(layer.get("layer_index", 0)) <= 8
+            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
         ]
         if layers:
             return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
@@ -74,6 +74,14 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "mask_aspect": float(payload.get("mask_aspect", 1.0)),
             "mask_invert": bool(payload.get("mask_invert", False)),
             "mask_size": float(payload.get("mask_size", 1.0)),
+            "mask_x": float(payload.get("mask_x", 0.0)),
+            "mask_y": float(payload.get("mask_y", 0.0)),
+            "transform_x": float(payload.get("transform_x", 0.0)),
+            "transform_y": float(payload.get("transform_y", 0.0)),
+            "transform_z": float(payload.get("transform_z", 0.0)),
+            "rotate_x": float(payload.get("rotate_x", 0.0)),
+            "rotate_y": float(payload.get("rotate_y", 0.0)),
+            "rotate_z": float(payload.get("rotate_z", 0.0)),
         }
     ]
 
@@ -104,14 +112,71 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
         luma_high=float(key.get("luma_high", 1.0)),
         luma_softness=float(key.get("luma_softness", 0.10)),
         key_invert=bool(key.get("invert", False)),
+        key_edge_feather=float(key.get("edge_feather", 0.0)),
         effect_color_from_alpha=bool(layer.get("effect_color_from_alpha", False)),
         effect_alpha_from_color=bool(layer.get("effect_alpha_from_color", False)),
+        preserve_color_from_alpha_opacity=bool(layer.get("preserve_color_from_alpha_opacity", False)),
+        source_from_effects_input=bool(layer.get("source_kind") == "effects_input"),
+        key_alpha_from_effects_input=bool(layer.get("key_alpha_from_effects_input", False)),
         mask_pattern=str(layer.get("mask_pattern", "off")),
         mask_softness=float(layer.get("mask_softness", 0.0)),
         mask_aspect=float(layer.get("mask_aspect", 1.0)),
         mask_invert=bool(layer.get("mask_invert", False)),
         mask_size=float(layer.get("mask_size", 1.0)),
+        mask_x=float(layer.get("mask_x", 0.0)),
+        mask_y=float(layer.get("mask_y", 0.0)),
+        transform_x=float(layer.get("transform_x", 0.0)),
+        transform_y=float(layer.get("transform_y", 0.0)),
+        transform_z=float(layer.get("transform_z", 0.0)),
+        rotate_x=float(layer.get("rotate_x", 0.0)),
+        rotate_y=float(layer.get("rotate_y", 0.0)),
+        rotate_z=float(layer.get("rotate_z", 0.0)),
+        materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
     )
+    layer_index = int(layer.get("layer_index", 2))
+    processor.clear_effect_layer_channel_routes(layer_index)
+    channel_routes = layer.get("channel_routes", [])
+    if isinstance(channel_routes, list):
+        for target_channel, route in enumerate(channel_routes[:4]):
+            if not isinstance(route, dict):
+                continue
+            generator_settings = route.get("generator_settings", {})
+            if not isinstance(generator_settings, dict):
+                generator_settings = {}
+            processor.set_effect_layer_channel_route(
+                layer_index,
+                target_channel,
+                int(route.get("source_channel", -1)),
+                blur_method=str(route.get("blur_method", "off")),
+                blur_radius=float(route.get("blur_radius", 0.0)),
+                transform_x=float(route.get("transform_x", 0.0)),
+                transform_y=float(route.get("transform_y", 0.0)),
+                transform_z=float(route.get("transform_z", 0.0)),
+                rotate_x=float(route.get("rotate_x", 0.0)),
+                rotate_y=float(route.get("rotate_y", 0.0)),
+                rotate_z=float(route.get("rotate_z", 0.0)),
+                generator_type=str(route.get("generator_type", "off")),
+                key_color_r=int(generator_settings.get("key_color_r", 0)),
+                key_color_g=int(generator_settings.get("key_color_g", 255)),
+                key_color_b=int(generator_settings.get("key_color_b", 0)),
+                key_similarity=float(generator_settings.get("key_similarity", 0.25)),
+                key_softness=float(generator_settings.get("key_softness", 0.10)),
+                key_invert=bool(generator_settings.get("key_invert", False)),
+                mask_pattern=str(generator_settings.get("pattern", "off")),
+                mask_softness=float(generator_settings.get("softness", 0.0)),
+                mask_aspect=float(generator_settings.get("aspect", 1.0)),
+                mask_invert=bool(generator_settings.get("invert", False)),
+                mask_size=float(generator_settings.get("size", 1.0)),
+                mask_x=float(generator_settings.get("x", 0.0)),
+                mask_y=float(generator_settings.get("y", 0.0)),
+            )
+    raw_color_stages = layer.get("color_stages", []) if bool(layer.get("enabled", False)) else []
+    color_stages = [dict(stage) for stage in raw_color_stages if isinstance(stage, dict)] if isinstance(raw_color_stages, list) else []
+    setter = getattr(processor, "set_effect_layer_color_stages", None)
+    if callable(setter):
+        setter(layer_index, color_stages)
+    elif color_stages:
+        raise RuntimeError("Loaded video_processor build does not support per-layer color stages; rebuild the native module")
 
 
 def _set_native_color_stages(processor: object, payload: dict[str, object]) -> None:
@@ -120,6 +185,23 @@ def _set_native_color_stages(processor: object, payload: dict[str, object]) -> N
     raw_stages = payload.get("color_stages", []) if bool(payload.get("enabled", False)) else []
     stages = [dict(stage) for stage in raw_stages if isinstance(stage, dict)] if isinstance(raw_stages, list) else []
     processor.set_color_stages(stages)
+
+
+def _set_native_effects_input_transform(processor: object, payload: dict[str, object]) -> None:
+    values = (
+        float(payload.get("input_transform_x", 0.0)),
+        float(payload.get("input_transform_y", 0.0)),
+        float(payload.get("input_transform_z", 0.0)),
+        float(payload.get("input_rotate_x", 0.0)),
+        float(payload.get("input_rotate_y", 0.0)),
+        float(payload.get("input_rotate_z", 0.0)),
+    )
+    setter = getattr(processor, "set_effects_input_transform", None)
+    if not callable(setter):
+        if any(abs(value) > 1e-6 for value in values):
+            raise RuntimeError("Loaded video_processor build does not support Effects Input transforms; rebuild the native module")
+        return
+    setter(*values)
 
 
 class EffectMediaDecoder:
@@ -7854,14 +7936,21 @@ def run_processor_worker(
                         float(message.get("luma_high", 1.0)),
                         float(message.get("luma_softness", 0.10)),
                         bool(message.get("key_invert", False)),
+                        float(message.get("key_edge_feather", 0.0)),
                         bool(message.get("output_connected", True)),
                         bool(message.get("effect_color_from_alpha", False)),
                         bool(message.get("effect_alpha_from_color", False)),
+                        bool(message.get("explicit_compositor_layers", False)),
                     )
+                    _set_native_effects_input_transform(processor, message)
                     layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
-                    for layer_index in range(2, 9):
-                        layer = layers_by_index.get(
-                            layer_index, {"layer_index": layer_index, "enabled": False}
+                    for layer_index in range(1, 9):
+                        layer = (
+                            layers_by_index.get(
+                                layer_index, {"layer_index": layer_index, "enabled": False}
+                            )
+                            if requested_enabled
+                            else {"layer_index": layer_index, "enabled": False}
                         )
                         _set_native_effect_layer_config(processor, layer)
                     _set_native_color_stages(processor, message)
@@ -7874,7 +7963,7 @@ def run_processor_worker(
                     _set_native_color_stages(processor, {"enabled": False})
                     processor.set_effects_config(
                         False, 1.0, "normal", "off", 0, "both", 0.0, "off",
-                        0, 255, 0, 0.25, 0.10, 0.25, 0.0, 1.0, 0.10, False, False,
+                        0, 255, 0, 0.25, 0.10, 0.25, 0.0, 1.0, 0.10, False, 0.0, False,
                     )
                     _stop_effect_media_decoder()
                 if reload_source and pipeline_was_running:

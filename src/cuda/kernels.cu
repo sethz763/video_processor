@@ -1408,6 +1408,192 @@ __global__ void ConvertColorAlphaChannelsKernel(
     }
 }
 
+__global__ void ExtractColorAlphaChannelKernel(
+    const uchar3* color,
+    const uint8_t* alpha,
+    uint8_t* output,
+    int width,
+    int height,
+    int source_channel
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * width + x;
+    const uchar3 source = color[index];
+    output[index] = source_channel == 0 ? source.x
+        : (source_channel == 1 ? source.y
+        : (source_channel == 2 ? source.z : alpha[index]));
+}
+
+__global__ void WriteColorAlphaChannelKernel(
+    const uint8_t* input,
+    uchar3* color,
+    uint8_t* alpha,
+    int width,
+    int height,
+    int target_channel
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * width + x;
+    if (target_channel == 0) {
+        color[index].x = input[index];
+    } else if (target_channel == 1) {
+        color[index].y = input[index];
+    } else if (target_channel == 2) {
+        color[index].z = input[index];
+    } else {
+        alpha[index] = input[index];
+    }
+}
+
+__global__ void TransformAlpha3DKernel(
+    const uint8_t* input,
+    uint8_t* output,
+    int width,
+    int height,
+    float translate_x,
+    float translate_y,
+    float translate_z,
+    float rotate_x,
+    float rotate_y,
+    float rotate_z
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int output_index = y * width + x;
+    const float radians = 0.01745329251994329577f;
+    const float sx = sinf(rotate_x * radians);
+    const float cx = cosf(rotate_x * radians);
+    const float sy = sinf(rotate_y * radians);
+    const float cy = cosf(rotate_y * radians);
+    const float sz = sinf(rotate_z * radians);
+    const float cz = cosf(rotate_z * radians);
+    const float r00 = cz * cy;
+    const float r01 = cz * sy * sx - sz * cx;
+    const float r02 = cz * sy * cx + sz * sx;
+    const float r10 = sz * cy;
+    const float r11 = sz * sy * sx + cz * cx;
+    const float r12 = sz * sy * cx - cz * sx;
+    const float r20 = -sy;
+    const float r21 = cy * sx;
+    const float r22 = cy * cx;
+    const float tx = translate_x / 50.0f;
+    const float ty = translate_y / 50.0f;
+    const float tz = translate_z / 100.0f;
+    constexpr float camera_distance = 3.0f;
+    const float screen_x = ((static_cast<float>(x) + 0.5f) / (0.5f * width)) - 1.0f;
+    const float screen_y = ((static_cast<float>(y) + 0.5f) / (0.5f * height)) - 1.0f;
+    const float denominator = r02 * screen_x + r12 * screen_y - r22 * camera_distance;
+    if (fabsf(denominator) < 1.0e-5f) {
+        output[output_index] = 0;
+        return;
+    }
+    const float ray_t = (r02 * tx + r12 * ty + r22 * (tz - camera_distance)) / denominator;
+    if (ray_t <= 0.0f) {
+        output[output_index] = 0;
+        return;
+    }
+    const float point_x = ray_t * screen_x - tx;
+    const float point_y = ray_t * screen_y - ty;
+    const float point_z = camera_distance * (1.0f - ray_t) - tz;
+    const float source_u = r00 * point_x + r10 * point_y + r20 * point_z;
+    const float source_v = r01 * point_x + r11 * point_y + r21 * point_z;
+    const float source_x = (source_u + 1.0f) * 0.5f * width - 0.5f;
+    const float source_y = (source_v + 1.0f) * 0.5f * height - 0.5f;
+    if (source_x < -0.5f || source_x > static_cast<float>(width) - 0.5f ||
+        source_y < -0.5f || source_y > static_cast<float>(height) - 0.5f) {
+        output[output_index] = 0;
+        return;
+    }
+    const int sample_x = max(0, min(width - 1, static_cast<int>(source_x + 0.5f)));
+    const int sample_y = max(0, min(height - 1, static_cast<int>(source_y + 0.5f)));
+    output[output_index] = input[sample_y * width + sample_x];
+}
+
+__global__ void TransformColorAlpha3DKernel(
+    const uchar3* input_color,
+    const uint8_t* input_alpha,
+    uchar3* output_color,
+    uint8_t* output_alpha,
+    int width,
+    int height,
+    float translate_x,
+    float translate_y,
+    float translate_z,
+    float rotate_x,
+    float rotate_y,
+    float rotate_z
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int output_index = y * width + x;
+    const float degrees_to_radians = 0.01745329251994329577f;
+    const float sx = sinf(rotate_x * degrees_to_radians);
+    const float cx = cosf(rotate_x * degrees_to_radians);
+    const float sy = sinf(rotate_y * degrees_to_radians);
+    const float cy = cosf(rotate_y * degrees_to_radians);
+    const float sz = sinf(rotate_z * degrees_to_radians);
+    const float cz = cosf(rotate_z * degrees_to_radians);
+    const float r00 = cz * cy;
+    const float r01 = cz * sy * sx - sz * cx;
+    const float r02 = cz * sy * cx + sz * sx;
+    const float r10 = sz * cy;
+    const float r11 = sz * sy * sx + cz * cx;
+    const float r12 = sz * sy * cx - cz * sx;
+    const float r20 = -sy;
+    const float r21 = cy * sx;
+    const float r22 = cy * cx;
+    const float tx = translate_x / 50.0f;
+    const float ty = translate_y / 50.0f;
+    const float tz = translate_z / 100.0f;
+    constexpr float camera_distance = 3.0f;
+    const float screen_x = ((static_cast<float>(x) + 0.5f) / (0.5f * width)) - 1.0f;
+    const float screen_y = ((static_cast<float>(y) + 0.5f) / (0.5f * height)) - 1.0f;
+    const float denominator = r02 * screen_x + r12 * screen_y - r22 * camera_distance;
+    if (fabsf(denominator) < 1.0e-5f) {
+        output_color[output_index] = make_uchar3(0, 0, 0);
+        output_alpha[output_index] = 0;
+        return;
+    }
+    const float ray_t = (r02 * tx + r12 * ty + r22 * (tz - camera_distance)) / denominator;
+    if (ray_t <= 0.0f) {
+        output_color[output_index] = make_uchar3(0, 0, 0);
+        output_alpha[output_index] = 0;
+        return;
+    }
+    const float point_x = ray_t * screen_x - tx;
+    const float point_y = ray_t * screen_y - ty;
+    const float point_z = camera_distance * (1.0f - ray_t) - tz;
+    const float source_u = r00 * point_x + r10 * point_y + r20 * point_z;
+    const float source_v = r01 * point_x + r11 * point_y + r21 * point_z;
+    const float source_x = (source_u + 1.0f) * 0.5f * width - 0.5f;
+    const float source_y = (source_v + 1.0f) * 0.5f * height - 0.5f;
+    if (source_x < -0.5f || source_x > static_cast<float>(width) - 0.5f ||
+        source_y < -0.5f || source_y > static_cast<float>(height) - 0.5f) {
+        output_color[output_index] = make_uchar3(0, 0, 0);
+        output_alpha[output_index] = 0;
+        return;
+    }
+    const int sample_x = max(0, min(width - 1, static_cast<int>(source_x + 0.5f)));
+    const int sample_y = max(0, min(height - 1, static_cast<int>(source_y + 0.5f)));
+    const int source_index = sample_y * width + sample_x;
+    output_color[output_index] = input_color[source_index];
+    output_alpha[output_index] = input_alpha[source_index];
+}
+
 __global__ void ApplyProceduralAlphaMaskKernel(
     uint8_t* alpha,
     int width,
@@ -1416,7 +1602,9 @@ __global__ void ApplyProceduralAlphaMaskKernel(
     float softness,
     float aspect,
     bool invert,
-    float size
+    float size,
+    float position_x,
+    float position_y
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1426,8 +1614,10 @@ __global__ void ApplyProceduralAlphaMaskKernel(
 
     const float base_radius = 0.5f * static_cast<float>(min(width, height)) * size;
     const float aspect_scale = sqrtf(aspect);
-    const float normalized_x = fabsf((static_cast<float>(x) + 0.5f - 0.5f * width) / (base_radius * aspect_scale));
-    const float normalized_y = fabsf((static_cast<float>(y) + 0.5f - 0.5f * height) * aspect_scale / base_radius);
+    const float center_x = (0.5f + position_x / 100.0f) * width;
+    const float center_y = (0.5f + position_y / 100.0f) * height;
+    const float normalized_x = fabsf((static_cast<float>(x) + 0.5f - center_x) / (base_radius * aspect_scale));
+    const float normalized_y = fabsf((static_cast<float>(y) + 0.5f - center_y) * aspect_scale / base_radius);
 
     float distance = 0.0f;
     if (pattern == 1) {
@@ -1449,6 +1639,56 @@ __global__ void ApplyProceduralAlphaMaskKernel(
     }
     const int index = y * width + x;
     alpha[index] = ClampToU8(static_cast<float>(alpha[index]) * mask_alpha);
+}
+
+__global__ void GenerateKeyAlphaKernel(
+    const uchar3* color,
+    uint8_t* alpha,
+    int width,
+    int height,
+    int key_mode,
+    uchar3 key_color,
+    float key_similarity,
+    float key_softness,
+    float luma_low,
+    float luma_high,
+    float luma_softness,
+    bool key_invert
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const int index = y * width + x;
+    const uchar3 source = color[index];
+    const float red = static_cast<float>(source.x) / 255.0f;
+    const float green = static_cast<float>(source.y) / 255.0f;
+    const float blue = static_cast<float>(source.z) / 255.0f;
+    float key_alpha = 1.0f;
+    if (key_mode == 1) {
+        const float delta_red = red - static_cast<float>(key_color.x) / 255.0f;
+        const float delta_green = green - static_cast<float>(key_color.y) / 255.0f;
+        const float delta_blue = blue - static_cast<float>(key_color.z) / 255.0f;
+        const float distance = sqrtf(
+            (delta_red * delta_red + delta_green * delta_green + delta_blue * delta_blue) / 3.0f
+        );
+        const float edge_width = fmaxf(key_softness, 1.0e-6f);
+        const float t = fminf(1.0f, fmaxf(0.0f, (distance - key_similarity) / edge_width));
+        key_alpha = t * t * (3.0f - 2.0f * t);
+    } else if (key_mode == 2) {
+        const float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
+        const float low_width = fmaxf(luma_softness, 1.0e-6f);
+        const float low_t = fminf(1.0f, fmaxf(0.0f, (luminance - (luma_low - luma_softness)) / low_width));
+        const float high_t = fminf(1.0f, fmaxf(0.0f, (luminance - luma_high) / low_width));
+        const float low_matte = low_t * low_t * (3.0f - 2.0f * low_t);
+        const float high_curve = high_t * high_t * (3.0f - 2.0f * high_t);
+        key_alpha = low_matte * (1.0f - high_curve);
+    }
+    if (key_mode != 0 && key_invert) {
+        key_alpha = 1.0f - key_alpha;
+    }
+    alpha[index] = ClampToU8(static_cast<float>(alpha[index]) * key_alpha);
 }
 
 __device__ inline float BlurSampleWeight(int offset, float radius, int method) {
@@ -1664,7 +1904,7 @@ __global__ void CompositeColorAlphaKernel(
         const float high_matte = 1.0f - SmoothStep(luma_high, luma_high + luma_softness, luminance);
         key_alpha = low_matte * high_matte;
     }
-    if (key_invert) {
+    if (key_mode != 0 && key_invert) {
         key_alpha = 1.0f - key_alpha;
     }
     const float foreground_alpha = fminf(1.0f, fmaxf(0.0f, opacity))
@@ -2291,6 +2531,86 @@ void LaunchConvertColorAlphaChannels(
     CheckKernelLaunch("ConvertColorAlphaChannelsKernel launch");
 }
 
+void LaunchExtractColorAlphaChannel(
+    const uchar3* d_color,
+    const uint8_t* d_alpha,
+    uint8_t* d_output,
+    int width,
+    int height,
+    int source_channel,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    ExtractColorAlphaChannelKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_color, d_alpha, d_output, width, height, source_channel
+    );
+    CheckKernelLaunch("ExtractColorAlphaChannelKernel launch");
+}
+
+void LaunchWriteColorAlphaChannel(
+    const uint8_t* d_input,
+    uchar3* d_color,
+    uint8_t* d_alpha,
+    int width,
+    int height,
+    int target_channel,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    WriteColorAlphaChannelKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_input, d_color, d_alpha, width, height, target_channel
+    );
+    CheckKernelLaunch("WriteColorAlphaChannelKernel launch");
+}
+
+void LaunchTransformAlpha3D(
+    const uint8_t* d_input,
+    uint8_t* d_output,
+    int width,
+    int height,
+    float translate_x,
+    float translate_y,
+    float translate_z,
+    float rotate_x,
+    float rotate_y,
+    float rotate_z,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    TransformAlpha3DKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_input, d_output, width, height, translate_x, translate_y, translate_z,
+        rotate_x, rotate_y, rotate_z
+    );
+    CheckKernelLaunch("TransformAlpha3DKernel launch");
+}
+
+void LaunchTransformColorAlpha3D(
+    const uchar3* d_input_color,
+    const uint8_t* d_input_alpha,
+    uchar3* d_output_color,
+    uint8_t* d_output_alpha,
+    int width,
+    int height,
+    float translate_x,
+    float translate_y,
+    float translate_z,
+    float rotate_x,
+    float rotate_y,
+    float rotate_z,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    TransformColorAlpha3DKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_input_color, d_input_alpha, d_output_color, d_output_alpha, width, height,
+        translate_x, translate_y, translate_z, rotate_x, rotate_y, rotate_z
+    );
+    CheckKernelLaunch("TransformColorAlpha3DKernel launch");
+}
+
 void LaunchApplyProceduralAlphaMask(
     uint8_t* d_alpha,
     int width,
@@ -2300,14 +2620,43 @@ void LaunchApplyProceduralAlphaMask(
     float aspect,
     bool invert,
     float size,
+    float position_x,
+    float position_y,
     cudaStream_t stream
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     ApplyProceduralAlphaMaskKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-        d_alpha, width, height, pattern, softness, aspect, invert, fmaxf(0.1f, fminf(4.0f, size))
+        d_alpha, width, height, pattern, softness, aspect, invert,
+        fmaxf(0.1f, fminf(4.0f, size)),
+        fmaxf(-100.0f, fminf(100.0f, position_x)),
+        fmaxf(-100.0f, fminf(100.0f, position_y))
     );
     CheckKernelLaunch("ApplyProceduralAlphaMaskKernel launch");
+}
+
+void LaunchGenerateKeyAlpha(
+    const uchar3* d_color,
+    uint8_t* d_alpha,
+    int width,
+    int height,
+    int key_mode,
+    uchar3 key_color,
+    float key_similarity,
+    float key_softness,
+    float luma_low,
+    float luma_high,
+    float luma_softness,
+    bool key_invert,
+    cudaStream_t stream
+) {
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    GenerateKeyAlphaKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+        d_color, d_alpha, width, height, key_mode, key_color, key_similarity,
+        key_softness, luma_low, luma_high, luma_softness, key_invert
+    );
+    CheckKernelLaunch("GenerateKeyAlphaKernel launch");
 }
 
 void LaunchBlurColor(
