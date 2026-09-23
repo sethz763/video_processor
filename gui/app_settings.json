@@ -29,7 +29,7 @@
   "decklink_fps_priority_guard": true,
   "decklink_input_device": 1,
   "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
-  "decklink_output_buffer_frames": 3,
+  "decklink_output_buffer_frames": 2,
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_timecode_format": "RP188 LTC",
@@ -39,8 +39,8 @@
   "denoise_method": "Off",
   "denoise_strength": 0.0,
   "display_splitter_sizes": [
-    388,
-    388
+    367,
+    366
   ],
   "effects_graph": {
     "clock_source": "Internal",
@@ -74,6 +74,12 @@
           "input"
         ],
         [
+          "proc_amp_1",
+          "output",
+          "keying_1",
+          "layer1_color"
+        ],
+        [
           "effects_input",
           "output",
           "transform_3d_1",
@@ -82,23 +88,23 @@
         [
           "media_1",
           "output",
+          "color_splitter_3",
+          "input"
+        ],
+        [
+          "color_splitter_3",
+          "green_output",
           "keying_1",
           "layer4_alpha"
         ],
         [
-          "effects_input",
-          "output",
-          "keying_1",
-          "layer1_color"
-        ],
-        [
-          "proc_amp_1",
+          "transform_3d_1",
           "output",
           "keying_1",
           "layer4_color"
         ],
         [
-          "transform_3d_1",
+          "effects_input",
           "output",
           "proc_amp_1",
           "input"
@@ -110,7 +116,7 @@
           "id": "effects_input",
           "settings": {},
           "type": "effects_input",
-          "x": 14,
+          "x": 13,
           "y": 0
         },
         {
@@ -124,19 +130,19 @@
           "id": "keying_1",
           "settings": {
             "layer1_blend_mode": "normal",
-            "layer1_opacity": 1.0,
+            "layer1_opacity": 1,
             "layer2_blend_mode": "screen",
             "layer2_opacity": 0.7,
             "layer3_blend_mode": "normal",
-            "layer3_opacity": 0.0,
+            "layer3_opacity": 0,
             "layer4_blend_mode": "normal",
-            "layer4_opacity": 0.46,
+            "layer4_opacity": 1,
             "layer5_blend_mode": "normal",
-            "layer5_opacity": 0.0,
+            "layer5_opacity": 0,
             "layer6_blend_mode": "normal",
-            "layer6_opacity": 0.0,
+            "layer6_opacity": 0,
             "layer7_blend_mode": "normal",
-            "layer7_opacity": 0.0,
+            "layer7_opacity": 0,
             "layer8_blend_mode": "normal",
             "layer8_opacity": 0.72,
             "layer_count": 8,
@@ -144,7 +150,7 @@
           },
           "type": "keying",
           "x": 1136,
-          "y": 159
+          "y": 160
         },
         {
           "id": "mask_1",
@@ -154,8 +160,8 @@
             "pattern": "circle",
             "size": 1.37,
             "softness": 0.4,
-            "x": 0.0,
-            "y": 0.0
+            "x": 0,
+            "y": 0
           },
           "type": "mask",
           "x": 0,
@@ -164,7 +170,7 @@
         {
           "id": "matte_1",
           "settings": {
-            "alpha": 1.0,
+            "alpha": 1,
             "blue": 0,
             "green": 0,
             "red": 0
@@ -176,11 +182,11 @@
         {
           "id": "proc_amp_1",
           "settings": {
-            "brightness": 0.19,
-            "contrast": 4.0,
-            "hue": 99.0,
+            "brightness": 0.72,
+            "contrast": 2.79,
+            "hue": 0,
             "invert": false,
-            "saturation": 1.4
+            "saturation": 0
           },
           "type": "proc_amp",
           "x": 476,
@@ -190,14 +196,14 @@
           "id": "media_1",
           "settings": {
             "loop": true,
-            "opacity": 1.0,
-            "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 9.mov",
+            "opacity": 1,
+            "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
             "playing": true,
             "runtime_supported": true
           },
           "type": "media",
           "x": 0,
-          "y": 243
+          "y": 221
         },
         {
           "id": "mask_2",
@@ -207,8 +213,8 @@
             "pattern": "circle",
             "size": 0.98,
             "softness": 0.57,
-            "x": 0.0,
-            "y": 0.0
+            "x": 0,
+            "y": 0
           },
           "type": "mask",
           "x": 718,
@@ -217,40 +223,62 @@
         {
           "id": "transform_3d_1",
           "settings": {
-            "rotate_x": 0.0,
-            "rotate_y": 0.0,
-            "rotate_z": 0.0,
+            "rotate_x": 0,
+            "rotate_y": 0,
+            "rotate_z": 0,
             "x": -0.4,
-            "y": 0.0,
-            "z": 27.0
+            "y": 0,
+            "z": 27
           },
           "type": "transform_3d",
           "x": 298,
           "y": 135
+        },
+        {
+          "id": "matte_2",
+          "settings": {
+            "alpha": 1,
+            "blue": 255,
+            "green": 255,
+            "red": 255
+          },
+          "type": "matte",
+          "x": 78,
+          "y": 173
+        },
+        {
+          "id": "color_splitter_3",
+          "settings": {},
+          "type": "color_splitter",
+          "x": 407,
+          "y": 279
         }
       ],
       "version": 6
     },
     "keyframes": {
+      "color_splitter_3": {
+        "0": {}
+      },
       "effects_input": {
         "0": {}
       },
       "keying_1": {
         "0": {
           "layer1_blend_mode": "normal",
-          "layer1_opacity": 1.0,
+          "layer1_opacity": 1,
           "layer2_blend_mode": "screen",
           "layer2_opacity": 0.7,
           "layer3_blend_mode": "normal",
-          "layer3_opacity": 0.0,
+          "layer3_opacity": 0,
           "layer4_blend_mode": "normal",
-          "layer4_opacity": 0.46,
+          "layer4_opacity": 1,
           "layer5_blend_mode": "normal",
-          "layer5_opacity": 0.0,
+          "layer5_opacity": 0,
           "layer6_blend_mode": "normal",
-          "layer6_opacity": 0.0,
+          "layer6_opacity": 0,
           "layer7_blend_mode": "normal",
-          "layer7_opacity": 0.0,
+          "layer7_opacity": 0,
           "layer8_blend_mode": "normal",
           "layer8_opacity": 0.72,
           "layer_count": 8,
@@ -264,23 +292,31 @@
           "pattern": "circle",
           "size": 0.98,
           "softness": 0.57,
-          "x": 0.0,
-          "y": 0.0
+          "x": 0,
+          "y": 0
         }
       },
       "matte_1": {
         "0": {
-          "alpha": 1.0,
+          "alpha": 1,
           "blue": 0,
           "green": 0,
           "red": 0
         }
       },
+      "matte_2": {
+        "0": {
+          "alpha": 1,
+          "blue": 255,
+          "green": 255,
+          "red": 255
+        }
+      },
       "media_1": {
         "0": {
           "loop": true,
-          "opacity": 1.0,
-          "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 9.mov",
+          "opacity": 1,
+          "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
           "playing": true,
           "runtime_supported": true
         }
@@ -289,19 +325,19 @@
         "0": {
           "brightness": 0.72,
           "contrast": 2.79,
-          "hue": 0.0,
+          "hue": 0,
           "invert": false,
-          "saturation": 0.0
+          "saturation": 0
         }
       },
       "transform_3d_1": {
         "0": {
-          "rotate_x": 0.0,
-          "rotate_y": 0.0,
-          "rotate_z": 0.0,
+          "rotate_x": 0,
+          "rotate_y": 0,
+          "rotate_z": 0,
           "x": -0.4,
-          "y": 0.0,
-          "z": 27.0
+          "y": 0,
+          "z": 27
         }
       }
     },
@@ -372,19 +408,19 @@
               "id": "keying_1",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "screen",
                 "layer2_opacity": 0.7,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 0.0,
+                "layer3_opacity": 0,
                 "layer4_blend_mode": "normal",
-                "layer4_opacity": 0.0,
+                "layer4_opacity": 0,
                 "layer5_blend_mode": "normal",
-                "layer5_opacity": 0.0,
+                "layer5_opacity": 0,
                 "layer6_blend_mode": "normal",
-                "layer6_opacity": 0.0,
+                "layer6_opacity": 0,
                 "layer7_blend_mode": "normal",
-                "layer7_opacity": 0.0,
+                "layer7_opacity": 0,
                 "layer8_blend_mode": "normal",
                 "layer8_opacity": 0.72,
                 "layer_count": 8,
@@ -402,8 +438,8 @@
                 "pattern": "circle",
                 "size": 1.37,
                 "softness": 0.4,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -412,7 +448,7 @@
             {
               "id": "matte_1",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -426,7 +462,7 @@
               "settings": {
                 "brightness": 0.4,
                 "contrast": 1.97,
-                "hue": 0.0,
+                "hue": 0,
                 "invert": false,
                 "saturation": 1.17
               },
@@ -438,7 +474,7 @@
               "id": "media_1",
               "settings": {
                 "loop": true,
-                "opacity": 1.0,
+                "opacity": 1,
                 "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
                 "playing": true,
                 "runtime_supported": true
@@ -455,8 +491,8 @@
                 "pattern": "circle",
                 "size": 0.98,
                 "softness": 0.57,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 392,
@@ -470,7 +506,7 @@
             "0": {
               "brightness": 0.4,
               "contrast": 1.97,
-              "hue": 0.0,
+              "hue": 0,
               "invert": false,
               "saturation": 1.17
             }
@@ -539,21 +575,21 @@
               "id": "keying_1",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "screen",
                 "layer2_opacity": 0.4,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 1.0,
+                "layer3_opacity": 1,
                 "layer4_blend_mode": "normal",
-                "layer4_opacity": 0.0,
+                "layer4_opacity": 0,
                 "layer5_blend_mode": "normal",
                 "layer5_opacity": 0.79,
                 "layer6_blend_mode": "normal",
-                "layer6_opacity": 1.0,
+                "layer6_opacity": 1,
                 "layer7_blend_mode": "normal",
-                "layer7_opacity": 0.0,
+                "layer7_opacity": 0,
                 "layer8_blend_mode": "normal",
-                "layer8_opacity": 1.0,
+                "layer8_opacity": 1,
                 "layer_count": 8,
                 "runtime_supported": true
               },
@@ -569,8 +605,8 @@
                 "pattern": "circle",
                 "size": 1.37,
                 "softness": 0.4,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 35,
@@ -579,7 +615,7 @@
             {
               "id": "matte_1",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -592,7 +628,7 @@
               "id": "media_1",
               "settings": {
                 "loop": true,
-                "opacity": 1.0,
+                "opacity": 1,
                 "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
                 "playing": true,
                 "runtime_supported": true
@@ -609,8 +645,8 @@
                 "pattern": "circle",
                 "size": 0.98,
                 "softness": 0.57,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 331,
@@ -629,61 +665,61 @@
           "keying_1": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.4,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 1.0,
+              "layer3_opacity": 1,
               "layer4_blend_mode": "normal",
-              "layer4_opacity": 0.0,
+              "layer4_opacity": 0,
               "layer5_blend_mode": "normal",
               "layer5_opacity": 0.79,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 1.0,
+              "layer6_opacity": 1,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
-              "layer8_opacity": 1.0,
+              "layer8_opacity": 1,
               "layer_count": 8,
               "runtime_supported": true
             },
             "130": {
               "layer1_blend_mode": "soft_light",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.4,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 1.0,
+              "layer3_opacity": 1,
               "layer4_blend_mode": "normal",
-              "layer4_opacity": 0.0,
+              "layer4_opacity": 0,
               "layer5_blend_mode": "normal",
               "layer5_opacity": 0.79,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 1.0,
+              "layer6_opacity": 1,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
-              "layer8_opacity": 0.0,
+              "layer8_opacity": 0,
               "layer_count": 8,
               "runtime_supported": true
             },
             "44": {
               "layer1_blend_mode": "soft_light",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.4,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 1.0,
+              "layer3_opacity": 1,
               "layer4_blend_mode": "normal",
-              "layer4_opacity": 0.0,
+              "layer4_opacity": 0,
               "layer5_blend_mode": "normal",
               "layer5_opacity": 0.79,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 1.0,
+              "layer6_opacity": 1,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
-              "layer8_opacity": 1.0,
+              "layer8_opacity": 1,
               "layer_count": 8,
               "runtime_supported": true
             }
@@ -695,8 +731,8 @@
               "pattern": "circle",
               "size": 1.37,
               "softness": 0.4,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "mask_2": {
@@ -706,43 +742,43 @@
               "pattern": "circle",
               "size": 0.98,
               "softness": 0.57,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_1": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "1": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "10": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "188": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "233": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "9": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -751,80 +787,80 @@
           "media_1": {
             "0": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": true,
               "runtime_supported": true
             },
             "1": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "runtime_supported": true
             },
             "10": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "runtime_supported": true
             },
             "16": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": true,
               "runtime_supported": true
             },
             "18": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": true,
               "runtime_supported": true
             },
             "188": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": false,
               "runtime_supported": true
             },
             "20": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": true,
               "runtime_supported": true
             },
             "22": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "runtime_supported": true
             },
             "233": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "runtime_supported": true
             },
             "27": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": false,
               "runtime_supported": true
             },
             "32": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": true,
               "runtime_supported": true
             },
             "9": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
               "playing": true,
               "runtime_supported": true
@@ -914,13 +950,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 1.24,
                 "softness": 0.52,
-                "x": -5.0,
-                "y": -3.0
+                "x": -5,
+                "y": -3
               },
               "type": "mask",
               "x": 161,
@@ -930,9 +966,9 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "screen",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
-                "layer2_opacity": 1.0,
+                "layer2_opacity": 1,
                 "layer_count": 2,
                 "runtime_supported": true
               },
@@ -943,7 +979,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -962,27 +998,27 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 1.0,
+              "layer2_opacity": 1,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "mask_1": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": false,
               "pattern": "circle",
               "size": 1.11,
-              "softness": 0.0,
-              "x": 0.0,
-              "y": 0.0
+              "softness": 0,
+              "x": 0,
+              "y": 0
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 255,
               "green": 255,
               "red": 255
@@ -1039,13 +1075,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 0.6,
-                "softness": 0.0,
-                "x": -31.0,
-                "y": -7.0
+                "softness": 0,
+                "x": -31,
+                "y": -7
               },
               "type": "mask",
               "x": 0,
@@ -1055,7 +1091,7 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
                 "layer2_opacity": 0.55,
                 "layer_count": 2,
@@ -1068,7 +1104,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -1087,7 +1123,7 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
               "layer2_opacity": 0.55,
               "layer_count": 2,
@@ -1095,42 +1131,42 @@
             },
             "30": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 0.0,
+              "layer2_opacity": 0,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "mask_1": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 0.6,
-              "softness": 0.0,
-              "x": -31.0,
-              "y": -7.0
+              "softness": 0,
+              "x": -31,
+              "y": -7
             },
             "30": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 0.6,
-              "softness": 0.0,
-              "x": -31.0,
-              "y": -7.0
+              "softness": 0,
+              "x": -31,
+              "y": -7
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "30": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -1187,13 +1223,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 1.11,
                 "softness": 0.8,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 160,
@@ -1203,9 +1239,9 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
-                "layer2_opacity": 1.0,
+                "layer2_opacity": 1,
                 "layer_count": 2,
                 "runtime_supported": true
               },
@@ -1216,7 +1252,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -1235,27 +1271,27 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 1.0,
+              "layer2_opacity": 1,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "mask_1": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 1.11,
               "softness": 0.8,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 255,
               "green": 255,
               "red": 255
@@ -1312,13 +1348,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 1.11,
                 "softness": 0.8,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 160,
@@ -1328,9 +1364,9 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
-                "layer2_opacity": 1.0,
+                "layer2_opacity": 1,
                 "layer_count": 2,
                 "runtime_supported": true
               },
@@ -1341,7 +1377,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -1360,27 +1396,27 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 1.0,
+              "layer2_opacity": 1,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "mask_1": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 1.11,
               "softness": 0.8,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -1437,13 +1473,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 1.11,
                 "softness": 0.8,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 160,
@@ -1453,9 +1489,9 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
-                "layer2_opacity": 1.0,
+                "layer2_opacity": 1,
                 "layer_count": 2,
                 "runtime_supported": true
               },
@@ -1466,7 +1502,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -1485,27 +1521,27 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 1.0,
+              "layer2_opacity": 1,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "mask_1": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 1.11,
               "softness": 0.8,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -1569,11 +1605,11 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "difference",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
-                "layer2_opacity": 1.0,
+                "layer2_opacity": 1,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 1.0,
+                "layer3_opacity": 1,
                 "layer_count": 3,
                 "runtime_supported": true
               },
@@ -1584,7 +1620,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 239,
                 "green": 18,
                 "red": 7
@@ -1596,13 +1632,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 0.87,
-                "softness": 0.0,
-                "x": 0.0,
-                "y": 0.0
+                "softness": 0,
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -1611,13 +1647,13 @@
             {
               "id": "chroma_key_1",
               "settings": {
-                "key_color_b": 0.0,
-                "key_color_g": 255.0,
-                "key_color_r": 0.0,
+                "key_color_b": 0,
+                "key_color_g": 255,
+                "key_color_r": 0,
                 "key_invert": false,
                 "key_similarity": 0.477,
-                "key_softness": 0.0,
-                "spill_suppression": 0.0
+                "key_softness": 0,
+                "spill_suppression": 0
               },
               "type": "chroma_key",
               "x": 418,
@@ -1633,16 +1669,16 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 1.0,
+              "layer2_opacity": 1,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -1712,11 +1748,11 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
-                "layer2_opacity": 1.0,
+                "layer2_opacity": 1,
                 "layer3_blend_mode": "multiply",
-                "layer3_opacity": 0.0,
+                "layer3_opacity": 0,
                 "layer_count": 2,
                 "runtime_supported": true
               },
@@ -1727,13 +1763,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 0.87,
-                "softness": 0.0,
-                "x": 0.0,
-                "y": 0.0
+                "softness": 0,
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -1742,14 +1778,14 @@
             {
               "id": "chroma_key_1",
               "settings": {
-                "key_color_b": 29.0,
-                "key_color_g": 28.0,
-                "key_color_r": 0.0,
-                "key_edge_feather": 0.0,
+                "key_color_b": 29,
+                "key_color_g": 28,
+                "key_color_r": 0,
+                "key_edge_feather": 0,
                 "key_invert": true,
                 "key_similarity": 0.171,
-                "key_softness": 0.0,
-                "spill_suppression": 0.0
+                "key_softness": 0,
+                "spill_suppression": 0
               },
               "type": "chroma_key",
               "x": 350,
@@ -1760,9 +1796,9 @@
               "settings": {
                 "brightness": 0.29,
                 "contrast": 2.05,
-                "hue": 5.0,
+                "hue": 5,
                 "invert": false,
-                "saturation": 0.0
+                "saturation": 0
               },
               "type": "proc_amp",
               "x": 471,
@@ -1774,14 +1810,14 @@
         "keyframes": {
           "chroma_key_1": {
             "0": {
-              "key_color_b": 29.0,
-              "key_color_g": 28.0,
-              "key_color_r": 0.0,
-              "key_edge_feather": 0.0,
+              "key_color_b": 29,
+              "key_color_g": 28,
+              "key_color_r": 0,
+              "key_edge_feather": 0,
               "key_invert": true,
               "key_similarity": 0.171,
-              "key_softness": 0.0,
-              "spill_suppression": 0.0
+              "key_softness": 0,
+              "spill_suppression": 0
             }
           },
           "effects_input": {
@@ -1790,11 +1826,11 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 1.0,
+              "layer2_opacity": 1,
               "layer3_blend_mode": "multiply",
-              "layer3_opacity": 0.0,
+              "layer3_opacity": 0,
               "layer_count": 2,
               "runtime_supported": true
             }
@@ -1803,9 +1839,9 @@
             "0": {
               "brightness": 0.29,
               "contrast": 2.05,
-              "hue": 5.0,
+              "hue": 5,
               "invert": false,
-              "saturation": 0.0
+              "saturation": 0
             }
           }
         },
@@ -1871,13 +1907,13 @@
             {
               "id": "mask_1",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 0.6,
-                "softness": 0.0,
-                "x": -31.0,
-                "y": -7.0
+                "softness": 0,
+                "x": -31,
+                "y": -7
               },
               "type": "mask",
               "x": 0,
@@ -1887,7 +1923,7 @@
               "id": "keying_2",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "normal",
                 "layer2_opacity": 0.55,
                 "layer_count": 2,
@@ -1900,7 +1936,7 @@
             {
               "id": "matte_3",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -1912,13 +1948,13 @@
             {
               "id": "mask_2",
               "settings": {
-                "aspect": 1.0,
+                "aspect": 1,
                 "invert": true,
                 "pattern": "circle",
                 "size": 0.46,
-                "softness": 0.0,
-                "x": 22.0,
-                "y": 0.0
+                "softness": 0,
+                "x": 22,
+                "y": 0
               },
               "type": "mask",
               "x": 56,
@@ -1927,7 +1963,7 @@
             {
               "id": "mix_3",
               "settings": {
-                "factor": 1.0,
+                "factor": 1,
                 "mode": "multiply"
               },
               "type": "mix",
@@ -1944,7 +1980,7 @@
           "keying_2": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
               "layer2_opacity": 0.55,
               "layer_count": 2,
@@ -1952,62 +1988,62 @@
             },
             "30": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "normal",
-              "layer2_opacity": 0.0,
+              "layer2_opacity": 0,
               "layer_count": 2,
               "runtime_supported": true
             }
           },
           "mask_1": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 0.6,
-              "softness": 0.0,
-              "x": -31.0,
-              "y": -7.0
+              "softness": 0,
+              "x": -31,
+              "y": -7
             },
             "3": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 0.22,
-              "softness": 0.0,
-              "x": -31.0,
-              "y": -7.0
+              "softness": 0,
+              "x": -31,
+              "y": -7
             },
             "30": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 0.1,
-              "softness": 0.0,
-              "x": -31.0,
-              "y": -7.0
+              "softness": 0,
+              "x": -31,
+              "y": -7
             }
           },
           "mask_2": {
             "0": {
-              "aspect": 1.0,
+              "aspect": 1,
               "invert": true,
               "pattern": "circle",
               "size": 0.46,
-              "softness": 0.0,
-              "x": 22.0,
-              "y": 0.0
+              "softness": 0,
+              "x": 22,
+              "y": 0
             }
           },
           "matte_3": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
             },
             "30": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -2015,7 +2051,7 @@
           },
           "mix_3": {
             "0": {
-              "factor": 1.0,
+              "factor": 1,
               "mode": "multiply"
             }
           }
@@ -2089,19 +2125,19 @@
               "id": "keying_1",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "screen",
                 "layer2_opacity": 0.7,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 0.0,
+                "layer3_opacity": 0,
                 "layer4_blend_mode": "normal",
-                "layer4_opacity": 0.0,
+                "layer4_opacity": 0,
                 "layer5_blend_mode": "normal",
-                "layer5_opacity": 0.0,
+                "layer5_opacity": 0,
                 "layer6_blend_mode": "normal",
-                "layer6_opacity": 0.0,
+                "layer6_opacity": 0,
                 "layer7_blend_mode": "normal",
-                "layer7_opacity": 0.0,
+                "layer7_opacity": 0,
                 "layer8_blend_mode": "normal",
                 "layer8_opacity": 0.72,
                 "layer_count": 8,
@@ -2119,8 +2155,8 @@
                 "pattern": "circle",
                 "size": 1.37,
                 "softness": 0.4,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -2129,7 +2165,7 @@
             {
               "id": "matte_1",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -2143,9 +2179,9 @@
               "settings": {
                 "brightness": 0.72,
                 "contrast": 2.79,
-                "hue": 0.0,
+                "hue": 0,
                 "invert": false,
-                "saturation": 0.0
+                "saturation": 0
               },
               "type": "proc_amp",
               "x": 491,
@@ -2155,7 +2191,7 @@
               "id": "media_1",
               "settings": {
                 "loop": true,
-                "opacity": 1.0,
+                "opacity": 1,
                 "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
                 "playing": true,
                 "runtime_supported": true
@@ -2172,8 +2208,8 @@
                 "pattern": "circle",
                 "size": 0.98,
                 "softness": 0.57,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 393,
@@ -2189,19 +2225,19 @@
           "keying_1": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.7,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 0.0,
+              "layer3_opacity": 0,
               "layer4_blend_mode": "normal",
-              "layer4_opacity": 0.0,
+              "layer4_opacity": 0,
               "layer5_blend_mode": "normal",
-              "layer5_opacity": 0.0,
+              "layer5_opacity": 0,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 0.0,
+              "layer6_opacity": 0,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
               "layer8_opacity": 0.72,
               "layer_count": 8,
@@ -2215,13 +2251,13 @@
               "pattern": "circle",
               "size": 0.98,
               "softness": 0.57,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_1": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -2230,7 +2266,7 @@
           "media_1": {
             "0": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
               "playing": true,
               "runtime_supported": true
@@ -2240,9 +2276,9 @@
             "0": {
               "brightness": 0.72,
               "contrast": 2.79,
-              "hue": 0.0,
+              "hue": 0,
               "invert": false,
-              "saturation": 0.0
+              "saturation": 0
             }
           }
         },
@@ -2333,19 +2369,19 @@
               "id": "keying_1",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "screen",
                 "layer2_opacity": 0.7,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 0.0,
+                "layer3_opacity": 0,
                 "layer4_blend_mode": "normal",
-                "layer4_opacity": 1.0,
+                "layer4_opacity": 1,
                 "layer5_blend_mode": "normal",
-                "layer5_opacity": 0.0,
+                "layer5_opacity": 0,
                 "layer6_blend_mode": "normal",
-                "layer6_opacity": 0.0,
+                "layer6_opacity": 0,
                 "layer7_blend_mode": "normal",
-                "layer7_opacity": 0.0,
+                "layer7_opacity": 0,
                 "layer8_blend_mode": "normal",
                 "layer8_opacity": 0.72,
                 "layer_count": 8,
@@ -2363,8 +2399,8 @@
                 "pattern": "circle",
                 "size": 1.37,
                 "softness": 0.4,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -2373,7 +2409,7 @@
             {
               "id": "matte_1",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -2387,9 +2423,9 @@
               "settings": {
                 "brightness": 0.72,
                 "contrast": 2.79,
-                "hue": 0.0,
+                "hue": 0,
                 "invert": false,
-                "saturation": 0.0
+                "saturation": 0
               },
               "type": "proc_amp",
               "x": 476,
@@ -2399,7 +2435,7 @@
               "id": "media_1",
               "settings": {
                 "loop": true,
-                "opacity": 1.0,
+                "opacity": 1,
                 "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
                 "playing": true,
                 "runtime_supported": true
@@ -2416,8 +2452,8 @@
                 "pattern": "circle",
                 "size": 0.98,
                 "softness": 0.57,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 718,
@@ -2426,12 +2462,12 @@
             {
               "id": "transform_3d_1",
               "settings": {
-                "rotate_x": 0.0,
-                "rotate_y": 0.0,
-                "rotate_z": 0.0,
+                "rotate_x": 0,
+                "rotate_y": 0,
+                "rotate_z": 0,
                 "x": -0.4,
-                "y": 0.0,
-                "z": 27.0
+                "y": 0,
+                "z": 27
               },
               "type": "transform_3d",
               "x": 298,
@@ -2440,7 +2476,7 @@
             {
               "id": "matte_2",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 255,
                 "green": 255,
                 "red": 255
@@ -2469,19 +2505,19 @@
           "keying_1": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.7,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 0.0,
+              "layer3_opacity": 0,
               "layer4_blend_mode": "normal",
-              "layer4_opacity": 1.0,
+              "layer4_opacity": 1,
               "layer5_blend_mode": "normal",
-              "layer5_opacity": 0.0,
+              "layer5_opacity": 0,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 0.0,
+              "layer6_opacity": 0,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
               "layer8_opacity": 0.72,
               "layer_count": 8,
@@ -2495,13 +2531,13 @@
               "pattern": "circle",
               "size": 0.98,
               "softness": 0.57,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_1": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -2509,7 +2545,7 @@
           },
           "matte_2": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 255,
               "green": 255,
               "red": 255
@@ -2518,7 +2554,7 @@
           "media_1": {
             "0": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
               "playing": true,
               "runtime_supported": true
@@ -2528,19 +2564,19 @@
             "0": {
               "brightness": 0.72,
               "contrast": 2.79,
-              "hue": 0.0,
+              "hue": 0,
               "invert": false,
-              "saturation": 0.0
+              "saturation": 0
             }
           },
           "transform_3d_1": {
             "0": {
-              "rotate_x": 0.0,
-              "rotate_y": 0.0,
-              "rotate_z": 0.0,
+              "rotate_x": 0,
+              "rotate_y": 0,
+              "rotate_z": 0,
               "x": -0.4,
-              "y": 0.0,
-              "z": 27.0
+              "y": 0,
+              "z": 27
             }
           }
         },
@@ -2625,19 +2661,19 @@
               "id": "keying_1",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "screen",
                 "layer2_opacity": 0.7,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 0.0,
+                "layer3_opacity": 0,
                 "layer4_blend_mode": "normal",
                 "layer4_opacity": 0.46,
                 "layer5_blend_mode": "normal",
-                "layer5_opacity": 0.0,
+                "layer5_opacity": 0,
                 "layer6_blend_mode": "normal",
-                "layer6_opacity": 0.0,
+                "layer6_opacity": 0,
                 "layer7_blend_mode": "normal",
-                "layer7_opacity": 0.0,
+                "layer7_opacity": 0,
                 "layer8_blend_mode": "normal",
                 "layer8_opacity": 0.72,
                 "layer_count": 8,
@@ -2655,8 +2691,8 @@
                 "pattern": "circle",
                 "size": 1.37,
                 "softness": 0.4,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -2665,7 +2701,7 @@
             {
               "id": "matte_1",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -2679,9 +2715,9 @@
               "settings": {
                 "brightness": 0.72,
                 "contrast": 2.79,
-                "hue": 0.0,
+                "hue": 0,
                 "invert": false,
-                "saturation": 0.0
+                "saturation": 0
               },
               "type": "proc_amp",
               "x": 476,
@@ -2691,7 +2727,7 @@
               "id": "media_1",
               "settings": {
                 "loop": true,
-                "opacity": 1.0,
+                "opacity": 1,
                 "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 6.mov",
                 "playing": true,
                 "runtime_supported": true
@@ -2708,8 +2744,8 @@
                 "pattern": "circle",
                 "size": 0.98,
                 "softness": 0.57,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 718,
@@ -2718,12 +2754,12 @@
             {
               "id": "transform_3d_1",
               "settings": {
-                "rotate_x": 0.0,
-                "rotate_y": 0.0,
-                "rotate_z": 0.0,
+                "rotate_x": 0,
+                "rotate_y": 0,
+                "rotate_z": 0,
                 "x": -0.4,
-                "y": 0.0,
-                "z": 27.0
+                "y": 0,
+                "z": 27
               },
               "type": "transform_3d",
               "x": 298,
@@ -2739,19 +2775,19 @@
           "keying_1": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.7,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 0.0,
+              "layer3_opacity": 0,
               "layer4_blend_mode": "normal",
               "layer4_opacity": 0.46,
               "layer5_blend_mode": "normal",
-              "layer5_opacity": 0.0,
+              "layer5_opacity": 0,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 0.0,
+              "layer6_opacity": 0,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
               "layer8_opacity": 0.72,
               "layer_count": 8,
@@ -2765,13 +2801,13 @@
               "pattern": "circle",
               "size": 0.98,
               "softness": 0.57,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_1": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -2780,7 +2816,7 @@
           "media_1": {
             "0": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 6.mov",
               "playing": true,
               "runtime_supported": true
@@ -2790,19 +2826,19 @@
             "0": {
               "brightness": 0.72,
               "contrast": 2.79,
-              "hue": 0.0,
+              "hue": 0,
               "invert": false,
-              "saturation": 0.0
+              "saturation": 0
             }
           },
           "transform_3d_1": {
             "0": {
-              "rotate_x": 0.0,
-              "rotate_y": 0.0,
-              "rotate_z": 0.0,
+              "rotate_x": 0,
+              "rotate_y": 0,
+              "rotate_z": 0,
               "x": -0.4,
-              "y": 0.0,
-              "z": 27.0
+              "y": 0,
+              "z": 27
             }
           }
         },
@@ -2887,19 +2923,19 @@
               "id": "keying_1",
               "settings": {
                 "layer1_blend_mode": "normal",
-                "layer1_opacity": 1.0,
+                "layer1_opacity": 1,
                 "layer2_blend_mode": "screen",
                 "layer2_opacity": 0.7,
                 "layer3_blend_mode": "normal",
-                "layer3_opacity": 0.0,
+                "layer3_opacity": 0,
                 "layer4_blend_mode": "normal",
                 "layer4_opacity": 0.46,
                 "layer5_blend_mode": "normal",
-                "layer5_opacity": 0.0,
+                "layer5_opacity": 0,
                 "layer6_blend_mode": "normal",
-                "layer6_opacity": 0.0,
+                "layer6_opacity": 0,
                 "layer7_blend_mode": "normal",
-                "layer7_opacity": 0.0,
+                "layer7_opacity": 0,
                 "layer8_blend_mode": "normal",
                 "layer8_opacity": 0.72,
                 "layer_count": 8,
@@ -2917,8 +2953,8 @@
                 "pattern": "circle",
                 "size": 1.37,
                 "softness": 0.4,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 0,
@@ -2927,7 +2963,7 @@
             {
               "id": "matte_1",
               "settings": {
-                "alpha": 1.0,
+                "alpha": 1,
                 "blue": 0,
                 "green": 0,
                 "red": 0
@@ -2940,8 +2976,8 @@
               "id": "proc_amp_1",
               "settings": {
                 "brightness": 0.19,
-                "contrast": 4.0,
-                "hue": 99.0,
+                "contrast": 4,
+                "hue": 99,
                 "invert": false,
                 "saturation": 1.4
               },
@@ -2953,7 +2989,7 @@
               "id": "media_1",
               "settings": {
                 "loop": true,
-                "opacity": 1.0,
+                "opacity": 1,
                 "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 9.mov",
                 "playing": true,
                 "runtime_supported": true
@@ -2970,8 +3006,8 @@
                 "pattern": "circle",
                 "size": 0.98,
                 "softness": 0.57,
-                "x": 0.0,
-                "y": 0.0
+                "x": 0,
+                "y": 0
               },
               "type": "mask",
               "x": 718,
@@ -2980,12 +3016,12 @@
             {
               "id": "transform_3d_1",
               "settings": {
-                "rotate_x": 0.0,
-                "rotate_y": 0.0,
-                "rotate_z": 0.0,
+                "rotate_x": 0,
+                "rotate_y": 0,
+                "rotate_z": 0,
                 "x": -0.4,
-                "y": 0.0,
-                "z": 27.0
+                "y": 0,
+                "z": 27
               },
               "type": "transform_3d",
               "x": 298,
@@ -3001,19 +3037,19 @@
           "keying_1": {
             "0": {
               "layer1_blend_mode": "normal",
-              "layer1_opacity": 1.0,
+              "layer1_opacity": 1,
               "layer2_blend_mode": "screen",
               "layer2_opacity": 0.7,
               "layer3_blend_mode": "normal",
-              "layer3_opacity": 0.0,
+              "layer3_opacity": 0,
               "layer4_blend_mode": "normal",
               "layer4_opacity": 0.46,
               "layer5_blend_mode": "normal",
-              "layer5_opacity": 0.0,
+              "layer5_opacity": 0,
               "layer6_blend_mode": "normal",
-              "layer6_opacity": 0.0,
+              "layer6_opacity": 0,
               "layer7_blend_mode": "normal",
-              "layer7_opacity": 0.0,
+              "layer7_opacity": 0,
               "layer8_blend_mode": "normal",
               "layer8_opacity": 0.72,
               "layer_count": 8,
@@ -3027,13 +3063,13 @@
               "pattern": "circle",
               "size": 0.98,
               "softness": 0.57,
-              "x": 0.0,
-              "y": 0.0
+              "x": 0,
+              "y": 0
             }
           },
           "matte_1": {
             "0": {
-              "alpha": 1.0,
+              "alpha": 1,
               "blue": 0,
               "green": 0,
               "red": 0
@@ -3042,7 +3078,7 @@
           "media_1": {
             "0": {
               "loop": true,
-              "opacity": 1.0,
+              "opacity": 1,
               "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 9.mov",
               "playing": true,
               "runtime_supported": true
@@ -3052,19 +3088,19 @@
             "0": {
               "brightness": 0.72,
               "contrast": 2.79,
-              "hue": 0.0,
+              "hue": 0,
               "invert": false,
-              "saturation": 0.0
+              "saturation": 0
             }
           },
           "transform_3d_1": {
             "0": {
-              "rotate_x": 0.0,
-              "rotate_y": 0.0,
-              "rotate_z": 0.0,
+              "rotate_x": 0,
+              "rotate_y": 0,
+              "rotate_z": 0,
               "x": -0.4,
-              "y": 0.0,
-              "z": 27.0
+              "y": 0,
+              "z": 27
             }
           }
         },
@@ -3082,36 +3118,36 @@
   "fullscreen_selected_scale_index": 2,
   "interlaced_field2_phase_fraction": 0.5,
   "main_splitter_sizes": [
-    447,
-    1072
+    698,
+    698
   ],
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
   "preview_poll_fps": 30,
   "preview_request_fps": 30,
   "reinterlace_enabled": false,
-  "roi_drag_x_hysteresis_px": 0.15,
+  "roi_drag_x_hysteresis_px": 0.1,
   "roi_interpolation_mode": "Ease In/Out",
   "roi_keyframe_duration_override": true,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 36,
+      "duration_frames": 60,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1204,
-        216,
+        532,
+        19,
         480,
         270
       ]
     },
     "2": {
-      "duration_frames": 22,
+      "duration_frames": 60,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1222,
-        134,
-        656,
-        369
+        1322,
+        792,
+        480,
+        270
       ]
     },
     "3": {
@@ -3139,7 +3175,7 @@
   "roi_manual_drag_hold_s": 0.4,
   "roi_timecode_keyframes": [],
   "roi_timecode_playback_enabled": false,
-  "roi_transition_duration_frames": 36,
+  "roi_transition_duration_frames": 60,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,

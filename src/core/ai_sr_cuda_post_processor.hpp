@@ -40,6 +40,20 @@ public:
         BicubicSharpen,
     };
 
+    enum class PostDenoiseMethod {
+        Off,
+        LumaGaussian3x3,
+        LumaMedian3x3,
+        LumaBilateral3x3,
+        LumaBilateral5x5,
+    };
+
+    enum class PostArtifactReductionMethod {
+        Off,
+        LumaBilateral3x3,
+        LumaBilateral5x5,
+    };
+
     AiSrCudaPostProcessor(
         int output_width = 1920,
         int output_height = 1080,
@@ -68,6 +82,19 @@ public:
     std::string GetColorSpaceName() const;
     std::string GetColorRangeName() const;
 
+    void SetPostDenoiseMethodByName(const std::string& method_name);
+    std::string GetPostDenoiseMethodName() const;
+    void SetPostDenoiseStrength(float strength);
+    float GetPostDenoiseStrength() const;
+    void SetPostArtifactReductionMethodByName(const std::string& method_name);
+    std::string GetPostArtifactReductionMethodName() const;
+    void SetPostArtifactReductionStrength(float strength);
+    float GetPostArtifactReductionStrength() const;
+    void SetPostExaggerationEnabled(bool enabled);
+    bool GetPostExaggerationEnabled() const;
+    void SetPostExaggerationGain(float gain);
+    float GetPostExaggerationGain() const;
+
     int output_width() const { return output_width_; }
     int output_height() const { return output_height_; }
 
@@ -82,6 +109,12 @@ private:
 
     ColorSpace color_space_;
     ColorRange color_range_;
+    PostDenoiseMethod post_denoise_method_;
+    float post_denoise_strength_;
+    PostArtifactReductionMethod post_artifact_reduction_method_;
+    float post_artifact_reduction_strength_;
+    bool post_exaggeration_enabled_;
+    float post_exaggeration_gain_;
 
     cudaStream_t stream_;
 

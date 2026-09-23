@@ -12,12 +12,394 @@ import importlib
 import math
 import ctypes
 import shutil
+import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_EFFECT_IMAGE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
+    ".exr", ".hdr", ".ppm", ".pgm", ".pbm",
+}
+_EFFECT_MEDIA_RING_FRAMES = 4
+
+
+def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
+    raw_layers = payload.get("layers")
+    if isinstance(raw_layers, list):
+        layers = [
+            dict(layer)
+            for layer in raw_layers
+            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
+        ]
+        if layers:
+            return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
+    return [
+        {
+            "layer_index": 2,
+            "enabled": bool(payload.get("enabled", False)),
+            "source_kind": str(payload.get("source_kind", "media")),
+            "media_path": str(payload.get("media_path", "")),
+            "media_playing": bool(payload.get("media_playing", False)),
+            "media_loop": bool(payload.get("media_loop", True)),
+            "capture_kind": str(payload.get("capture_kind", "")),
+            "capture_device_index": int(payload.get("capture_device_index", -1)),
+            "matte_rgba": payload.get("matte_rgba", [255, 255, 255, 255]),
+            "opacity": float(payload.get("opacity", 1.0)),
+            "blend_mode": str(payload.get("blend_mode", "normal")),
+            "blur_method": str(payload.get("blur_method", "off")),
+            "blur_radius": float(payload.get("blur_radius", 0.0)),
+            "blur_target": str(payload.get("blur_target", "both")),
+            "key": {
+                "mode": str(payload.get("key_mode", "off")),
+                "color": [
+                    int(payload.get("key_color_r", 0)), int(payload.get("key_color_g", 255)),
+                    int(payload.get("key_color_b", 0)),
+                ],
+                "similarity": float(payload.get("key_similarity", 0.25)),
+                "softness": float(payload.get("key_softness", 0.10)),
+                "spill_suppression": float(payload.get("spill_suppression", 0.25)),
+                "luma_low": float(payload.get("luma_low", 0.0)),
+                "luma_high": float(payload.get("luma_high", 1.0)),
+                "luma_softness": float(payload.get("luma_softness", 0.10)),
+                "invert": bool(payload.get("key_invert", False)),
+            },
+            "effect_color_from_alpha": bool(payload.get("effect_color_from_alpha", False)),
+            "effect_alpha_from_color": bool(payload.get("effect_alpha_from_color", False)),
+            "mask_pattern": str(payload.get("mask_pattern", "off")),
+            "mask_softness": float(payload.get("mask_softness", 0.0)),
+            "mask_aspect": float(payload.get("mask_aspect", 1.0)),
+            "mask_invert": bool(payload.get("mask_invert", False)),
+            "mask_size": float(payload.get("mask_size", 1.0)),
+            "mask_x": float(payload.get("mask_x", 0.0)),
+            "mask_y": float(payload.get("mask_y", 0.0)),
+            "transform_x": float(payload.get("transform_x", 0.0)),
+            "transform_y": float(payload.get("transform_y", 0.0)),
+            "transform_z": float(payload.get("transform_z", 0.0)),
+            "rotate_x": float(payload.get("rotate_x", 0.0)),
+            "rotate_y": float(payload.get("rotate_y", 0.0)),
+            "rotate_z": float(payload.get("rotate_z", 0.0)),
+        }
+    ]
+
+
+def _set_native_effect_layer_config(processor: object, layer: dict[str, object]) -> None:
+    key = layer.get("key", {})
+    if not isinstance(key, dict):
+        key = {}
+    color = key.get("color", [0, 255, 0])
+    if not isinstance(color, (list, tuple)) or len(color) < 3:
+        color = [0, 255, 0]
+    processor.set_effect_layer_config(
+        int(layer.get("layer_index", 2)),
+        bool(layer.get("enabled", False)),
+        opacity=float(layer.get("opacity", 1.0)),
+        blend_mode=str(layer.get("blend_mode", "normal")),
+        blur_method=str(layer.get("blur_method", "off")),
+        blur_radius=float(layer.get("blur_radius", 0.0)),
+        blur_target=str(layer.get("blur_target", "both")),
+        key_mode=str(key.get("mode", "off")),
+        key_color_r=int(color[0]),
+        key_color_g=int(color[1]),
+        key_color_b=int(color[2]),
+        key_similarity=float(key.get("similarity", 0.25)),
+        key_softness=float(key.get("softness", 0.10)),
+        spill_suppression=float(key.get("spill_suppression", 0.25)),
+        luma_low=float(key.get("luma_low", 0.0)),
+        luma_high=float(key.get("luma_high", 1.0)),
+        luma_softness=float(key.get("luma_softness", 0.10)),
+        key_invert=bool(key.get("invert", False)),
+        key_edge_feather=float(key.get("edge_feather", 0.0)),
+        effect_color_from_alpha=bool(layer.get("effect_color_from_alpha", False)),
+        effect_alpha_from_color=bool(layer.get("effect_alpha_from_color", False)),
+        preserve_color_from_alpha_opacity=bool(layer.get("preserve_color_from_alpha_opacity", False)),
+        source_from_effects_input=bool(layer.get("source_kind") == "effects_input"),
+        key_alpha_from_effects_input=bool(layer.get("key_alpha_from_effects_input", False)),
+        mask_pattern=str(layer.get("mask_pattern", "off")),
+        mask_softness=float(layer.get("mask_softness", 0.0)),
+        mask_aspect=float(layer.get("mask_aspect", 1.0)),
+        mask_invert=bool(layer.get("mask_invert", False)),
+        mask_size=float(layer.get("mask_size", 1.0)),
+        mask_x=float(layer.get("mask_x", 0.0)),
+        mask_y=float(layer.get("mask_y", 0.0)),
+        transform_x=float(layer.get("transform_x", 0.0)),
+        transform_y=float(layer.get("transform_y", 0.0)),
+        transform_z=float(layer.get("transform_z", 0.0)),
+        rotate_x=float(layer.get("rotate_x", 0.0)),
+        rotate_y=float(layer.get("rotate_y", 0.0)),
+        rotate_z=float(layer.get("rotate_z", 0.0)),
+        materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
+    )
+    layer_index = int(layer.get("layer_index", 2))
+    alpha_mix_setter = getattr(processor, "set_effect_layer_alpha_mix", None)
+    alpha_mix_base = layer.get("alpha_mix_base")
+    raw_alpha_mix_ops = layer.get("alpha_mix_ops", []) if bool(layer.get("enabled", False)) else []
+    alpha_mix_ops = [dict(op) for op in raw_alpha_mix_ops if isinstance(op, dict)] if isinstance(raw_alpha_mix_ops, list) else []
+    if callable(alpha_mix_setter):
+        alpha_mix_setter(
+            layer_index,
+            dict(alpha_mix_base) if isinstance(alpha_mix_base, dict) and bool(layer.get("enabled", False)) else None,
+            alpha_mix_ops,
+        )
+    elif (isinstance(alpha_mix_base, dict) and bool(layer.get("enabled", False))) or alpha_mix_ops:
+        raise RuntimeError("Loaded video_processor build does not support alpha mix nodes; rebuild the native module")
+    processor.clear_effect_layer_channel_routes(layer_index)
+    channel_routes = layer.get("channel_routes", [])
+    if isinstance(channel_routes, list):
+        for target_channel, route in enumerate(channel_routes[:4]):
+            if not isinstance(route, dict):
+                continue
+            generator_settings = route.get("generator_settings", {})
+            if not isinstance(generator_settings, dict):
+                generator_settings = {}
+            processor.set_effect_layer_channel_route(
+                layer_index,
+                target_channel,
+                int(route.get("source_channel", -1)),
+                blur_method=str(route.get("blur_method", "off")),
+                blur_radius=float(route.get("blur_radius", 0.0)),
+                transform_x=float(route.get("transform_x", 0.0)),
+                transform_y=float(route.get("transform_y", 0.0)),
+                transform_z=float(route.get("transform_z", 0.0)),
+                rotate_x=float(route.get("rotate_x", 0.0)),
+                rotate_y=float(route.get("rotate_y", 0.0)),
+                rotate_z=float(route.get("rotate_z", 0.0)),
+                generator_type=str(route.get("generator_type", "off")),
+                key_color_r=int(generator_settings.get("key_color_r", 0)),
+                key_color_g=int(generator_settings.get("key_color_g", 255)),
+                key_color_b=int(generator_settings.get("key_color_b", 0)),
+                key_similarity=float(generator_settings.get("key_similarity", 0.25)),
+                key_softness=float(generator_settings.get("key_softness", 0.10)),
+                key_invert=bool(generator_settings.get("key_invert", False)),
+                mask_pattern=str(generator_settings.get("pattern", "off")),
+                mask_softness=float(generator_settings.get("softness", 0.0)),
+                mask_aspect=float(generator_settings.get("aspect", 1.0)),
+                mask_invert=bool(generator_settings.get("invert", False)),
+                mask_size=float(generator_settings.get("size", 1.0)),
+                mask_x=float(generator_settings.get("x", 0.0)),
+                mask_y=float(generator_settings.get("y", 0.0)),
+            )
+            route_alpha_mix_setter = getattr(processor, "set_effect_layer_channel_alpha_mix", None)
+            route_alpha_mix_base = route.get("alpha_mix_base")
+            raw_route_alpha_mix_ops = route.get("alpha_mix_ops", [])
+            route_alpha_mix_ops = [
+                dict(op) for op in raw_route_alpha_mix_ops if isinstance(op, dict)
+            ] if isinstance(raw_route_alpha_mix_ops, list) else []
+            if callable(route_alpha_mix_setter):
+                route_alpha_mix_setter(
+                    layer_index,
+                    target_channel,
+                    dict(route_alpha_mix_base) if isinstance(route_alpha_mix_base, dict) else None,
+                    route_alpha_mix_ops,
+                )
+            elif isinstance(route_alpha_mix_base, dict) or route_alpha_mix_ops:
+                raise RuntimeError(
+                    "Loaded video_processor build does not support channel alpha mix routes; rebuild the native module"
+                )
+    raw_color_stages = layer.get("color_stages", []) if bool(layer.get("enabled", False)) else []
+    color_stages = [dict(stage) for stage in raw_color_stages if isinstance(stage, dict)] if isinstance(raw_color_stages, list) else []
+    setter = getattr(processor, "set_effect_layer_color_stages", None)
+    if callable(setter):
+        setter(layer_index, color_stages)
+    elif color_stages:
+        raise RuntimeError("Loaded video_processor build does not support per-layer color stages; rebuild the native module")
+
+
+def _set_native_color_stages(processor: object, payload: dict[str, object]) -> None:
+    if not hasattr(processor, "set_color_stages"):
+        return
+    raw_stages = payload.get("color_stages", []) if bool(payload.get("enabled", False)) else []
+    stages = [dict(stage) for stage in raw_stages if isinstance(stage, dict)] if isinstance(raw_stages, list) else []
+    processor.set_color_stages(stages)
+
+
+def _set_native_effects_input_transform(processor: object, payload: dict[str, object]) -> None:
+    values = (
+        float(payload.get("input_transform_x", 0.0)),
+        float(payload.get("input_transform_y", 0.0)),
+        float(payload.get("input_transform_z", 0.0)),
+        float(payload.get("input_rotate_x", 0.0)),
+        float(payload.get("input_rotate_y", 0.0)),
+        float(payload.get("input_rotate_z", 0.0)),
+    )
+    setter = getattr(processor, "set_effects_input_transform", None)
+    if not callable(setter):
+        if any(abs(value) > 1e-6 for value in values):
+            raise RuntimeError("Loaded video_processor build does not support Effects Input transforms; rebuild the native module")
+        return
+    setter(*values)
+
+
+class EffectMediaDecoder:
+    def __init__(self, media_path: str) -> None:
+        self.path = Path(media_path)
+        if not self.path.is_file():
+            raise RuntimeError(f"Effects media file not found: {self.path}")
+        self._sequence_paths: list[Path] = []
+        self._sequence_index = 0
+        self._container = None
+        self._video_stream = None
+        self._video_frames = None
+        self._opencv_capture = None
+        self._last_rgba: np.ndarray | None = None
+        self._ended = False
+        self.frame_interval_s = 1.0 / 30.0
+        if self.path.suffix.lower() in _EFFECT_IMAGE_SUFFIXES:
+            self._sequence_paths = self._discover_image_sequence(self.path)
+        else:
+            self._open_video()
+
+    @staticmethod
+    def _discover_image_sequence(path: Path) -> list[Path]:
+        match = re.match(r"^(.*?)(\d+)$", path.stem)
+        if match is None:
+            return [path]
+        prefix, digits = match.groups()
+        candidates = [
+            candidate
+            for candidate in path.parent.glob(f"{prefix}*{path.suffix}")
+            if re.match(rf"^{re.escape(prefix)}\d{{{len(digits)}}}$", candidate.stem)
+        ]
+        return sorted(candidates) or [path]
+
+    def _open_video(self) -> None:
+        self.close()
+        av_error: Exception | None = None
+        if av is not None:
+            try:
+                self._container = av.open(str(self.path))
+                self._video_stream = next((stream for stream in self._container.streams if stream.type == "video"), None)
+                if self._video_stream is None:
+                    raise RuntimeError(f"Effects media has no video stream: {self.path}")
+                average_rate = self._video_stream.average_rate
+                if average_rate is not None and float(average_rate) > 0.0:
+                    self.frame_interval_s = 1.0 / float(average_rate)
+                self._video_frames = self._container.decode(self._video_stream)
+                return
+            except Exception as exc:
+                av_error = exc
+                self.close()
+        if cv2 is not None:
+            capture = cv2.VideoCapture(str(self.path), cv2.CAP_FFMPEG)
+            if capture.isOpened():
+                self._opencv_capture = capture
+                source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+                if math.isfinite(source_fps) and source_fps > 0.0:
+                    self.frame_interval_s = 1.0 / source_fps
+                return
+            capture.release()
+        backend_error = f"PyAV: {av_error}" if av_error is not None else "PyAV unavailable"
+        raise RuntimeError(f"Unable to decode effects media with PyAV or OpenCV ({backend_error}): {self.path}")
+
+    @staticmethod
+    def _load_image_rgba(path: Path) -> np.ndarray:
+        pillow_error: Exception | None = None
+        if Image is not None:
+            try:
+                with Image.open(path) as image:
+                    return np.ascontiguousarray(np.asarray(image.convert("RGBA"), dtype=np.uint8))
+            except Exception as exc:
+                pillow_error = exc
+        if cv2 is not None:
+            image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if image is not None:
+                if image.dtype != np.uint8:
+                    finite_max = float(np.nanmax(image)) if image.size else 1.0
+                    scale = 255.0 if finite_max <= 1.0 else 255.0 / max(1.0, finite_max)
+                    image = np.clip(image.astype(np.float32) * scale, 0.0, 255.0).astype(np.uint8)
+                if image.ndim == 2:
+                    return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_GRAY2RGBA))
+                if image.shape[2] == 4:
+                    return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA))
+                return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGBA))
+        backend_error = f"Pillow: {pillow_error}" if pillow_error is not None else "Pillow unavailable"
+        raise RuntimeError(f"Unable to decode effects image with Pillow or OpenCV ({backend_error}): {path}")
+
+    def next_rgba(self, loop: bool = True) -> np.ndarray:
+        if self._ended and not loop and self._last_rgba is not None:
+            return self._last_rgba
+        if self._sequence_paths:
+            frame_path = self._sequence_paths[self._sequence_index]
+            frame = self._load_image_rgba(frame_path)
+            if self._sequence_index + 1 >= len(self._sequence_paths):
+                if loop:
+                    self._sequence_index = 0
+                else:
+                    self._ended = True
+            else:
+                self._sequence_index += 1
+            self._last_rgba = frame
+            return frame
+        if self._opencv_capture is not None:
+            ok, frame = self._opencv_capture.read()
+            if not ok and loop:
+                self._opencv_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self._opencv_capture.read()
+            if not ok:
+                if self._last_rgba is not None:
+                    self._ended = True
+                    return self._last_rgba
+                raise RuntimeError(f"Effects media contains no decodable video frames: {self.path}")
+            self._last_rgba = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA), dtype=np.uint8)
+            return self._last_rgba
+        try:
+            frame = next(self._video_frames)
+        except StopIteration:
+            if not loop and self._last_rgba is not None:
+                self._ended = True
+                return self._last_rgba
+            self._open_video()
+            frame = next(self._video_frames)
+        self._last_rgba = np.ascontiguousarray(frame.to_ndarray(format="rgba"), dtype=np.uint8)
+        return self._last_rgba
+
+    def close(self) -> None:
+        if self._container is not None:
+            self._container.close()
+        if self._opencv_capture is not None:
+            self._opencv_capture.release()
+        self._container = None
+        self._video_stream = None
+        self._video_frames = None
+        self._opencv_capture = None
+
+
+class EffectCaptureDecoder:
+    def __init__(self, device_index: int) -> None:
+        if cv2 is None:
+            raise RuntimeError("OpenCV is required for Windows camera capture")
+        self.device_index = int(device_index)
+        self._capture = None
+        self.frame_interval_s = 0.0
+        attempted_backends: list[tuple[int, str]] = []
+        for backend_name in ("CAP_DSHOW", "CAP_MSMF", "CAP_ANY"):
+            backend = int(getattr(cv2, backend_name, cv2.CAP_ANY))
+            if any(attempted_backend == backend for attempted_backend, _name in attempted_backends):
+                continue
+            capture = cv2.VideoCapture(self.device_index, backend)
+            if capture.isOpened():
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._capture = capture
+                return
+            capture.release()
+            attempted_backends.append((backend, backend_name))
+        attempted = ", ".join(name for _backend, name in attempted_backends)
+        raise RuntimeError(f"Unable to open Windows camera {self.device_index} using {attempted}")
+
+    def next_rgba(self, loop: bool = True) -> np.ndarray:
+        del loop
+        ok, frame = self._capture.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Windows camera {self.device_index} did not return a video frame")
+        return np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA), dtype=np.uint8)
+
+    def close(self) -> None:
+        if self._capture is not None:
+            self._capture.release()
+            self._capture = None
 
 
 _SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
@@ -318,6 +700,16 @@ def _bootstrap_project_venv_site() -> None:
 
 
 _bootstrap_project_venv_site()
+
+try:
+    av = importlib.import_module("av")
+except Exception:
+    av = None
+
+try:
+    Image = importlib.import_module("PIL.Image")
+except Exception:
+    Image = None
 
 
 _CUDA_DLL_DIR_HANDLES: list[Any] = []
@@ -798,6 +1190,11 @@ def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
 
 
 def _freeze_frame_bytes(frame_bytes: bytes | bytearray | memoryview) -> bytes:
+    """Own pixels before retaining them or handing them to another consumer.
+
+    Even a read-only memoryview can refer to a reusable, mutable native buffer.
+    Already-owned immutable bytes can cross boundaries without another copy.
+    """
     if isinstance(frame_bytes, bytes):
         return frame_bytes
     return bytes(frame_bytes)
@@ -2287,13 +2684,13 @@ def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int
 class _StageFrame:
     frame_id: int
     captured_ts: float
-    input_bytes: bytes
+    input_bytes: bytes | bytearray | memoryview
     process_start_ts: float = 0.0
     process_end_ts: float = 0.0
     output_queue_put_ts: float = 0.0
     output_dequeue_ts: float = 0.0
-    preprocess_bytes: bytes | None = None
-    output_bytes: bytes | None = None
+    preprocess_bytes: bytes | bytearray | memoryview | None = None
+    output_bytes: bytes | bytearray | memoryview | None = None
     shift_x: float = 0.0
     shift_y: float = 0.0
     roi_x: int = 0
@@ -2309,6 +2706,23 @@ class _StageFrame:
     interlaced_field_phase: dict[str, object] | None = None
     interlaced_phase_rendered: bool = False
     roi_motion_trace: dict[str, object] | None = None
+
+
+class _StageFrameQueue(queue.Queue):
+    """Transfer stage frames with owned, immutable pixel payloads.
+
+    A producer may reuse native buffers after put() returns, but must relinquish
+    the frame envelope itself. Freeze in _put so both blocking and nonblocking
+    insertion are safe, and frames rejected by a full queue are not copied.
+    """
+
+    def _put(self, item: _StageFrame) -> None:
+        item.input_bytes = _freeze_frame_bytes(item.input_bytes)
+        if item.preprocess_bytes is not None:
+            item.preprocess_bytes = _freeze_frame_bytes(item.preprocess_bytes)
+        if item.output_bytes is not None:
+            item.output_bytes = _freeze_frame_bytes(item.output_bytes)
+        super()._put(item)
 
 
 def run_processor_worker(
@@ -2735,12 +3149,138 @@ def run_processor_worker(
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
     current_denoise_method = str(startup_config.get("denoise_method", "off"))
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
-    current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 2))))
+    current_effects_enabled = False
+    effect_media_states: dict[tuple[int, int], dict[str, object]] = {}
+    current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 0))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
     current_basic_scaling_auto_mode = bool(startup_config.get("basic_scaling_auto_mode", True))
     current_basic_scaling_manual_scale = int(startup_config.get("basic_scaling_manual", startup_config.get("sr_scale", 4)))
     current_max_auto_basic_scaling = int(startup_config.get("max_auto_basic_scaling", startup_config.get("max_auto_sr_scale", 4)))
     state_lock = threading.Lock()
+
+    def _stop_effect_media_decoder() -> None:
+        for source_key in list(effect_media_states):
+            _stop_effect_media_layer(source_key)
+
+    def _stop_effect_media_layer(source_key: tuple[int, int]) -> None:
+        state = effect_media_states.pop(source_key, None)
+        if state is None:
+            return
+        decoder = state.get("decoder")
+        stop_event = state.get("stop")
+        decode_thread = state.get("thread")
+        if isinstance(stop_event, threading.Event):
+            stop_event.set()
+        if isinstance(decode_thread, threading.Thread) and decode_thread is not threading.current_thread():
+            decode_thread.join(timeout=0.25)
+            if decode_thread.is_alive() and decoder is not None:
+                decoder.close()
+                decode_thread.join(timeout=1.0)
+        if decoder is not None:
+            decoder.close()
+
+    def _start_effect_media_decoder() -> None:
+        for source_key, state in effect_media_states.items():
+            decoder = state.get("decoder")
+            if decoder is None or not bool(state.get("playing", False)):
+                continue
+            stop_event = state["stop"]
+            frame_ring = state["ring"]
+            frame_lock = state["lock"]
+            stop_event.clear()
+            while not frame_ring.empty():
+                try:
+                    frame_ring.get_nowait()
+                except queue.Empty:
+                    break
+            with frame_lock:
+                state["error"] = None
+            state["next_present_ts"] = time.perf_counter() + max(0.0, float(decoder.frame_interval_s))
+
+            def _decode_worker(
+                worker_state: dict[str, object] = state,
+                worker_decoder: EffectMediaDecoder | EffectCaptureDecoder = decoder,
+            ) -> None:
+                worker_stop = worker_state["stop"]
+                worker_ring = worker_state["ring"]
+                worker_lock = worker_state["lock"]
+                while not worker_stop.is_set():
+                    try:
+                        rgba = worker_decoder.next_rgba(loop=bool(worker_state.get("loop", True)))
+                    except Exception as exc:
+                        with worker_lock:
+                            worker_state["error"] = exc
+                        return
+                    frame_interval_s = max(0.0, float(worker_decoder.frame_interval_s))
+                    if frame_interval_s <= 0.0:
+                        if worker_ring.full():
+                            try:
+                                worker_ring.get_nowait()
+                            except queue.Empty:
+                                pass
+                        try:
+                            worker_ring.put_nowait(rgba)
+                        except queue.Full:
+                            pass
+                        continue
+                    while not worker_stop.is_set():
+                        try:
+                            worker_ring.put(rgba, timeout=0.05)
+                            break
+                        except queue.Full:
+                            continue
+
+            decode_thread = threading.Thread(
+                target=_decode_worker,
+                name=f"vp-effect-media-decode-{source_key[0]}-{source_key[1]}",
+                daemon=True,
+            )
+            state["thread"] = decode_thread
+            decode_thread.start()
+
+    def _upload_next_effect_media() -> None:
+        if not current_effects_enabled:
+            return
+        for source_key, state in list(effect_media_states.items()):
+            layer_index, source_slot = source_key
+            decoder = state.get("decoder")
+            if decoder is None or not bool(state.get("playing", False)):
+                continue
+            with state["lock"]:
+                decode_error = state.get("error")
+            if decode_error is not None:
+                _stop_effect_media_layer(source_key)
+                processor.set_effect_layer_config(layer_index, False)
+                _safe_put({"type": "warning", "warning": f"Effects layer {layer_index} source stopped: {decode_error}"})
+                continue
+            frame_interval_s = max(0.0, float(decoder.frame_interval_s))
+            now = time.perf_counter()
+            if frame_interval_s > 0.0 and now < float(state.get("next_present_ts", 0.0)):
+                continue
+            frame_ring = state["ring"]
+            try:
+                rgba = frame_ring.get_nowait()
+                if frame_interval_s <= 0.0:
+                    while True:
+                        try:
+                            rgba = frame_ring.get_nowait()
+                        except queue.Empty:
+                            break
+                height, width = int(rgba.shape[0]), int(rgba.shape[1])
+                if source_slot == 0:
+                    processor.upload_effect_layer_media_rgba(layer_index, rgba, width, height)
+                else:
+                    processor.upload_effect_layer_source_rgba(layer_index, source_slot, rgba, width, height)
+                if frame_interval_s > 0.0:
+                    state["next_present_ts"] = max(
+                        float(state.get("next_present_ts", 0.0)) + frame_interval_s, now
+                    )
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                _stop_effect_media_layer(source_key)
+                processor.set_effect_layer_config(layer_index, False)
+                _safe_put({"type": "warning", "warning": f"Effects layer {layer_index} source stopped: {exc}"})
 
     def _is_live_passthrough_mode() -> bool:
         # Passthrough mode is valid only when no stage is expected to modify pixels.
@@ -2748,6 +3288,8 @@ def run_processor_worker(
         ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
         rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
         return (
+            (not current_effects_enabled)
+            and
             (not current_deinterlace_enabled)
             and (not denoise_enabled)
             and (not basic_scaling_enabled)
@@ -2756,13 +3298,12 @@ def run_processor_worker(
         )
 
     def _is_live_basic_scaling_fast_mode() -> bool:
-        # Basic scaling fast mode keeps processing in capture thread when the
-        # pipeline is native-only (no Python AI/RTX stages). Native process_frame
-        # already fuses preprocess, so deinterlace/denoise can remain enabled.
+        # Keep native processing in the capture thread when no Python AI/RTX
+        # stage is active. process_frame fuses scaling, preprocess, and effects.
         ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
         rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
         return (
-            basic_scaling_enabled
+            (basic_scaling_enabled or current_effects_enabled)
             and (not ai_stage_active)
             and (not rtx_stage_active)
         )
@@ -4571,7 +5112,9 @@ def run_processor_worker(
     def _reinterlace_enabled_for_output() -> bool:
         return bool(output_mode_is_interlaced and current_reinterlace_enabled)
 
-    def _apply_reinterlace_from_previous_frame_if_needed(frame_bytes: bytes) -> bytes:
+    def _apply_reinterlace_from_previous_frame_if_needed(
+        frame_bytes: bytes | bytearray,
+    ) -> bytes | bytearray:
         nonlocal prev_reinterlace_frame_bytes
 
         if not _reinterlace_enabled_for_output():
@@ -4581,6 +5124,8 @@ def run_processor_worker(
         if len(frame_bytes) != (UYVY_ROW_BYTES * FRAME_H):
             return frame_bytes
 
+        # History outlives this native call and must not alias its next output.
+        frame_bytes = _freeze_frame_bytes(frame_bytes)
         prev_frame = prev_reinterlace_frame_bytes
         prev_reinterlace_frame_bytes = frame_bytes
         if prev_frame is None or len(prev_frame) != (UYVY_ROW_BYTES * FRAME_H):
@@ -4652,7 +5197,8 @@ def run_processor_worker(
         shift_y: float,
     ) -> tuple[bytes, bool, bool, float]:
         nonlocal zeroed_output_warning_emitted
-        if not _basic_scaling_enabled():
+        basic_scaling_active = _basic_scaling_enabled()
+        if not basic_scaling_active and not current_effects_enabled:
             return frame_bytes, False, False, 0.0
 
         native_shift_applied = False
@@ -4688,7 +5234,7 @@ def run_processor_worker(
                 zeroed_output_warning_emitted = True
             return frame_bytes, False, False, basic_stage_ms
 
-        return scaled, True, native_shift_applied, basic_stage_ms
+        return scaled, basic_scaling_active, native_shift_applied, basic_stage_ms
 
     def _record_basic_scaling_timing(frame_ms: float) -> None:
         nonlocal basic_scaling_last_frame_ms, basic_scaling_avg_frame_ms, basic_scaling_max_frame_ms, basic_scaling_timing_samples
@@ -4737,6 +5283,8 @@ def run_processor_worker(
         # AI so final output sizing is handled by native CUDA path.
         if basic_stage_active:
             stack.append("basic_scaling")
+        elif current_effects_enabled:
+            stack.append("effects")
         return stack
 
     def _process_pipeline_frame(
@@ -4789,6 +5337,15 @@ def run_processor_worker(
                 )
                 if basic_applied:
                     _record_basic_scaling_timing(basic_stage_ms)
+                continue
+
+            if stage_name == "effects":
+                working = _run_native_uyvy_process(
+                    working,
+                    "process_frame_no_deinterlace",
+                    "process_frame_no_deinterlace_into",
+                    reusable_process_frame_no_deinterlace_out,
+                )
                 continue
 
         return working, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied
@@ -4850,7 +5407,8 @@ def run_processor_worker(
         pipeline_stop_event.clear()
         parallel_basic_processors = []
         parallel_basic_worker_count = 1
-        if parallel_basic_max_inflight > 1 and _is_live_basic_scaling_fast_mode():
+        # Effect media/config belongs to the shared processor, not pool clones.
+        if parallel_basic_max_inflight > 1 and _is_live_basic_scaling_fast_mode() and not current_effects_enabled:
             for _ in range(parallel_basic_max_inflight):
                 try:
                     parallel_proc, _ = _create_processor(module, startup_config)
@@ -4868,9 +5426,9 @@ def run_processor_worker(
             if parallel_basic_processors:
                 parallel_basic_worker_count = len(parallel_basic_processors)
 
-        q_capture_to_preprocess = queue.Queue(maxsize=max(2, parallel_basic_worker_count * 2))
+        q_capture_to_preprocess = _StageFrameQueue(maxsize=max(2, parallel_basic_worker_count * 2))
         q_preprocess_to_upscale = None
-        q_upscale_to_output = queue.Queue(maxsize=max(1, parallel_basic_worker_count))
+        q_upscale_to_output = _StageFrameQueue(maxsize=max(1, parallel_basic_worker_count))
         frame_id_counter = 0
         capture_drop_count = 0
         preprocess_drop_count = 0
@@ -5207,9 +5765,10 @@ def run_processor_worker(
                         emitted=bool(emitted),
                     )
 
+                    preview_output = _freeze_frame_bytes(output_bytes)
                     with state_lock:
                         latest_input_frame = input_bytes
-                        latest_output_frame = output_bytes
+                        latest_output_frame = preview_output
                         latest_effective_sr_scale = 1
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
@@ -5265,6 +5824,7 @@ def run_processor_worker(
                     roi_motion_trace = _snapshot_roi_motion_trace(shift_x, shift_y)
                     interlaced_phase = interlaced_phase_snapshot
                     try:
+                        _upload_next_effect_media()
                         if _reinterlace_enabled_for_output():
                             reinterlace_phase = interlaced_phase
                             if reinterlace_phase is None:
@@ -5349,9 +5909,10 @@ def run_processor_worker(
                     last_stage_rtx_applied = False
                     last_stage_stack = ["basic_scaling"] if basic_applied else []
 
+                    preview_output = _freeze_frame_bytes(output_bytes)
                     with state_lock:
                         latest_input_frame = input_bytes
-                        latest_output_frame = output_bytes
+                        latest_output_frame = preview_output
                         latest_effective_sr_scale = int(processor.get_effective_sr_scale())
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
@@ -5542,6 +6103,7 @@ def run_processor_worker(
 
                 preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
                 try:
+                    _upload_next_effect_media()
                     item.process_start_ts = time.perf_counter()
                     item_roi = (int(item.roi_x), int(item.roi_y), int(item.roi_w), int(item.roi_h))
                     _apply_processor_roi_for_phase(item_roi)
@@ -5689,9 +6251,10 @@ def run_processor_worker(
                     emitted=bool(emitted),
                 )
 
+                preview_output = _freeze_frame_bytes(output_bytes)
                 with state_lock:
                     latest_input_frame = item.input_bytes
-                    latest_output_frame = output_bytes
+                    latest_output_frame = preview_output
                     latest_effective_sr_scale = int(item.effective_sr_scale)
                     latest_rtx_vsr_applied = bool(item.rtx_applied)
                     latest_rtx_effect_mean_abs_luma = sampled_delta
@@ -6467,6 +7030,7 @@ def run_processor_worker(
                 _stop_sessions()
                 _cleanup_ai_async()
                 _close_rtx_vsr_engine()
+                _stop_effect_media_decoder()
                 return
 
             if command == "start_decklink":
@@ -6764,6 +7328,7 @@ def run_processor_worker(
             if command == "process_frame":
                 frame_id = int(message["frame_id"])
                 frame_bytes = message["frame_bytes"]
+                _upload_next_effect_media()
                 _advance_roi_microstep_transition_for_output_frame()
                 shift_x, shift_y = _step_smoothed_roi_shift()
                 interlaced_phase = _active_interlaced_field_phase_state(consume_manual_snapshot=True)
@@ -6805,6 +7370,9 @@ def run_processor_worker(
                 if ai_sr_engine is not None and not ai_applied and _ai_inference_busy():
                     ai_sr_dropped_frames += 1
 
+                # The IPC feeder may serialize after the next native call has
+                # reused its output. Share this snapshot with preview as well.
+                output_bytes = _freeze_frame_bytes(output_bytes)
                 latest_output_frame = output_bytes
                 last_stage_basic_applied = bool(basic_applied)
                 last_stage_ai_applied = bool(ai_applied)
@@ -7143,6 +7711,163 @@ def run_processor_worker(
                 )
                 continue
 
+            if command == "set_effects_config":
+                requested_enabled = bool(message.get("enabled", False))
+                reload_source = bool(message.get("reload_source", True))
+                effects_error: str | None = None
+                pipeline_was_running = bool(pipeline_running)
+                if reload_source and pipeline_was_running:
+                    _stop_live_pipeline()
+                if reload_source:
+                    _stop_effect_media_decoder()
+                    current_effects_enabled = False
+                try:
+                    if reload_source:
+                        processor.clear_effect_media()
+                    layers = _effect_layers_from_payload(message)
+                    if requested_enabled:
+                        for layer in layers:
+                            if not bool(layer.get("enabled", False)):
+                                continue
+                            layer_index = int(layer.get("layer_index", 2))
+                            media_path = str(layer.get("media_path", "")).strip()
+                            capture_kind = str(layer.get("capture_kind", "")).strip().lower()
+                            source_kind = str(layer.get("source_kind", "media")).strip().lower()
+                            decoder = None
+                            if source_kind == "matte":
+                                matte_rgba = np.asarray(
+                                    layer.get("matte_rgba", [255, 255, 255, 255]), dtype=np.uint8
+                                ).reshape(1, 1, 4)
+                                processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
+                            elif reload_source and capture_kind == "webcam":
+                                decoder = EffectCaptureDecoder(int(layer.get("capture_device_index", 0)))
+                            elif reload_source and media_path:
+                                decoder = EffectMediaDecoder(media_path)
+                            if decoder is not None:
+                                rgba = decoder.next_rgba(loop=bool(layer.get("media_loop", True)))
+                                height, width = int(rgba.shape[0]), int(rgba.shape[1])
+                                processor.upload_effect_layer_media_rgba(layer_index, rgba, width, height)
+                                effect_media_states[(layer_index, 0)] = {
+                                    "decoder": decoder,
+                                    "playing": capture_kind == "webcam" or bool(layer.get("media_playing", False)),
+                                    "loop": bool(layer.get("media_loop", True)),
+                                    "thread": None,
+                                    "stop": threading.Event(),
+                                    "lock": threading.Lock(),
+                                    "ring": queue.Queue(maxsize=_EFFECT_MEDIA_RING_FRAMES),
+                                    "error": None,
+                                    "next_present_ts": 0.0,
+                                }
+                            raw_image_sources = layer.get("image_sources", [])
+                            image_sources = raw_image_sources if isinstance(raw_image_sources, list) else []
+                            for image_source in image_sources:
+                                if not isinstance(image_source, dict):
+                                    continue
+                                source_slot = int(image_source.get("slot", 0))
+                                if source_slot < 1 or source_slot > 7:
+                                    continue
+                                auxiliary_kind = str(image_source.get("source_kind", "media")).strip().lower()
+                                auxiliary_path = str(image_source.get("media_path", "")).strip()
+                                auxiliary_capture_kind = str(image_source.get("capture_kind", "")).strip().lower()
+                                auxiliary_decoder = None
+                                if auxiliary_kind == "matte":
+                                    auxiliary_rgba = np.asarray(
+                                        image_source.get("matte_rgba", [255, 255, 255, 255]), dtype=np.uint8
+                                    ).reshape(1, 1, 4)
+                                    processor.upload_effect_layer_source_rgba(
+                                        layer_index, source_slot, auxiliary_rgba, 1, 1
+                                    )
+                                elif reload_source and auxiliary_capture_kind == "webcam":
+                                    auxiliary_decoder = EffectCaptureDecoder(
+                                        int(image_source.get("capture_device_index", 0))
+                                    )
+                                elif reload_source and auxiliary_path:
+                                    auxiliary_decoder = EffectMediaDecoder(auxiliary_path)
+                                if auxiliary_decoder is not None:
+                                    auxiliary_rgba = auxiliary_decoder.next_rgba(
+                                        loop=bool(image_source.get("media_loop", True))
+                                    )
+                                    auxiliary_height = int(auxiliary_rgba.shape[0])
+                                    auxiliary_width = int(auxiliary_rgba.shape[1])
+                                    processor.upload_effect_layer_source_rgba(
+                                        layer_index,
+                                        source_slot,
+                                        auxiliary_rgba,
+                                        auxiliary_width,
+                                        auxiliary_height,
+                                    )
+                                    effect_media_states[(layer_index, source_slot)] = {
+                                        "decoder": auxiliary_decoder,
+                                        "playing": auxiliary_capture_kind == "webcam" or bool(image_source.get("media_playing", False)),
+                                        "loop": bool(image_source.get("media_loop", True)),
+                                        "thread": None,
+                                        "stop": threading.Event(),
+                                        "lock": threading.Lock(),
+                                        "ring": queue.Queue(maxsize=_EFFECT_MEDIA_RING_FRAMES),
+                                        "error": None,
+                                        "next_present_ts": 0.0,
+                                    }
+                    processor.set_effects_config(
+                        requested_enabled,
+                        float(message.get("opacity", 1.0)),
+                        str(message.get("blend_mode", "normal")),
+                        str(message.get("blur_method", "off")),
+                        float(message.get("blur_radius", 0.0)),
+                        str(message.get("blur_target", "both")),
+                        float(message.get("layer1_opacity", 1.0)),
+                        str(message.get("key_mode", "off")),
+                        int(message.get("key_color_r", 0)),
+                        int(message.get("key_color_g", 255)),
+                        int(message.get("key_color_b", 0)),
+                        float(message.get("key_similarity", 0.25)),
+                        float(message.get("key_softness", 0.10)),
+                        float(message.get("spill_suppression", 0.25)),
+                        float(message.get("luma_low", 0.0)),
+                        float(message.get("luma_high", 1.0)),
+                        float(message.get("luma_softness", 0.10)),
+                        bool(message.get("key_invert", False)),
+                        float(message.get("key_edge_feather", 0.0)),
+                        bool(message.get("output_connected", True)),
+                        bool(message.get("effect_color_from_alpha", False)),
+                        bool(message.get("effect_alpha_from_color", False)),
+                        bool(message.get("explicit_compositor_layers", False)),
+                    )
+                    _set_native_effects_input_transform(processor, message)
+                    layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
+                    for layer_index in range(1, 9):
+                        layer = (
+                            layers_by_index.get(
+                                layer_index, {"layer_index": layer_index, "enabled": False}
+                            )
+                            if requested_enabled
+                            else {"layer_index": layer_index, "enabled": False}
+                        )
+                        _set_native_effect_layer_config(processor, layer)
+                    _set_native_color_stages(processor, message)
+                    current_effects_enabled = requested_enabled
+                    if reload_source:
+                        _start_effect_media_decoder()
+                except Exception as exc:
+                    effects_error = str(exc)
+                    processor.clear_effect_media()
+                    _set_native_color_stages(processor, {"enabled": False})
+                    processor.set_effects_config(
+                        False, 1.0, "normal", "off", 0, "both", 0.0, "off",
+                        0, 255, 0, 0.25, 0.10, 0.25, 0.0, 1.0, 0.10, False, 0.0, False,
+                    )
+                    _stop_effect_media_decoder()
+                if reload_source and pipeline_was_running:
+                    _start_live_pipeline()
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "set_effects_config",
+                        "effects_enabled": bool(current_effects_enabled),
+                        "effects_error": effects_error,
+                    }
+                )
+                continue
+
             if command == "set_color_space":
                 current_color_space = _normalize_color_space_name(str(message.get("color_space", current_color_space)))
                 if hasattr(processor, "set_color_space"):
@@ -7332,6 +8057,7 @@ def run_processor_worker(
         _stop_sessions()
         _cleanup_ai_async()
         _close_rtx_vsr_engine()
+        _stop_effect_media_decoder()
         try:
             _safe_put(
                 {

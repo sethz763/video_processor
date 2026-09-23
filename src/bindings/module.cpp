@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cctype>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -40,10 +41,150 @@ std::pair<const std::uint8_t*, std::size_t> GetContiguousByteBuffer(const py::bu
     };
 }
 
+std::pair<std::uint8_t*, std::size_t> GetWritableContiguousByteBuffer(
+    const py::buffer& buffer,
+    const char* buffer_name
+) {
+    const py::buffer_info info = buffer.request();
+    if (info.readonly) {
+        throw py::value_error(std::string(buffer_name) + " must be writable");
+    }
+    if (info.itemsize != 1) {
+        throw py::value_error(std::string(buffer_name) + " must have byte-sized elements");
+    }
+    if (info.ndim < 1) {
+        throw py::value_error(std::string(buffer_name) + " must have at least one dimension");
+    }
+
+    std::size_t total_bytes = static_cast<std::size_t>(info.itemsize);
+    for (py::ssize_t dim = info.ndim - 1; dim >= 0; --dim) {
+        const py::ssize_t shape = info.shape[dim];
+        const py::ssize_t stride = info.strides[dim];
+        if (shape < 0) {
+            throw py::value_error(std::string(buffer_name) + " has invalid shape");
+        }
+        if (shape > 1 && stride != static_cast<py::ssize_t>(total_bytes)) {
+            throw py::value_error(std::string(buffer_name) + " must be C-contiguous");
+        }
+        total_bytes *= static_cast<std::size_t>(shape);
+    }
+
+    return {
+        reinterpret_cast<std::uint8_t*>(info.ptr),
+        total_bytes,
+    };
+}
+
+int ParseAlphaMixModeName(const std::string& mode_name) {
+    if (mode_name == "add") return 1;
+    if (mode_name == "multiply") return 2;
+    if (mode_name == "subtract") return 3;
+    if (mode_name == "overlay") return 4;
+    if (mode_name == "difference") return 5;
+    throw py::value_error("Alpha mix mode must be one of [add, multiply, subtract, overlay, difference].");
+}
+
+vp::AlphaMixOperandConfig ParseAlphaMixOperandPayload(const py::dict& operand_payload) {
+    vp::AlphaMixOperandConfig operand;
+    const std::string type = operand_payload.contains("type")
+        ? py::cast<std::string>(operand_payload["type"])
+        : std::string("off");
+    operand.type = type == "source_alpha" ? 1 : (
+        type == "chroma_key" ? 2 : (type == "mask" ? 3 : (type == "source_luma" ? 4 : 0))
+    );
+    operand.source_from_effects_input = operand_payload.contains("source_from_effects_input")
+        ? py::cast<bool>(operand_payload["source_from_effects_input"])
+        : false;
+    operand.source_slot = operand_payload.contains("source_slot")
+        ? py::cast<int>(operand_payload["source_slot"])
+        : 0;
+    operand.source_channel = operand_payload.contains("source_channel")
+        ? py::cast<int>(operand_payload["source_channel"])
+        : 3;
+    if (operand_payload.contains("color_stages")) {
+        for (const py::handle payload : py::cast<py::list>(operand_payload["color_stages"])) {
+            const py::dict stage_payload = py::cast<py::dict>(payload);
+            vp::ColorStageConfig stage;
+            const std::string stage_type = py::cast<std::string>(stage_payload["type"]);
+            stage.type = stage_type == "proc_amp" ? 0 : (stage_type == "color_corrector" ? 1 : -1);
+            stage.invert = py::cast<bool>(stage_payload["invert"]);
+            const py::list params = py::cast<py::list>(stage_payload["params"]);
+            if (params.size() != stage.params.size()) {
+                throw py::value_error("Alpha source color stage params must contain exactly 9 values.");
+            }
+            for (size_t index = 0; index < stage.params.size(); ++index) {
+                stage.params[index] = py::cast<float>(params[index]);
+            }
+            operand.color_stages.push_back(stage);
+        }
+    }
+    if (operand_payload.contains("blur_method")) {
+        const std::string blur_method = py::cast<std::string>(operand_payload["blur_method"]);
+        operand.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
+    }
+    operand.blur_radius = operand_payload.contains("blur_radius") ? py::cast<float>(operand_payload["blur_radius"]) : 0.0f;
+    operand.transform_x = operand_payload.contains("transform_x") ? py::cast<float>(operand_payload["transform_x"]) : 0.0f;
+    operand.transform_y = operand_payload.contains("transform_y") ? py::cast<float>(operand_payload["transform_y"]) : 0.0f;
+    operand.transform_z = operand_payload.contains("transform_z") ? py::cast<float>(operand_payload["transform_z"]) : 0.0f;
+    operand.rotate_x = operand_payload.contains("rotate_x") ? py::cast<float>(operand_payload["rotate_x"]) : 0.0f;
+    operand.rotate_y = operand_payload.contains("rotate_y") ? py::cast<float>(operand_payload["rotate_y"]) : 0.0f;
+    operand.rotate_z = operand_payload.contains("rotate_z") ? py::cast<float>(operand_payload["rotate_z"]) : 0.0f;
+    operand.key_color = make_uchar3(
+        static_cast<unsigned char>(operand_payload.contains("key_color_r") ? py::cast<int>(operand_payload["key_color_r"]) : 0),
+        static_cast<unsigned char>(operand_payload.contains("key_color_g") ? py::cast<int>(operand_payload["key_color_g"]) : 255),
+        static_cast<unsigned char>(operand_payload.contains("key_color_b") ? py::cast<int>(operand_payload["key_color_b"]) : 0)
+    );
+    operand.key_similarity = operand_payload.contains("key_similarity") ? py::cast<float>(operand_payload["key_similarity"]) : 0.25f;
+    operand.key_softness = operand_payload.contains("key_softness") ? py::cast<float>(operand_payload["key_softness"]) : 0.10f;
+    operand.key_edge_feather = operand_payload.contains("key_edge_feather") ? py::cast<float>(operand_payload["key_edge_feather"]) : 0.0f;
+    operand.key_invert = operand_payload.contains("key_invert") ? py::cast<bool>(operand_payload["key_invert"]) : false;
+    if (operand_payload.contains("pattern")) {
+        const std::string pattern_name = py::cast<std::string>(operand_payload["pattern"]);
+        operand.mask_pattern_code = pattern_name == "square" || pattern_name == "rect"
+            ? 1
+            : (pattern_name == "circle" ? 2 : (pattern_name == "diamond" ? 3 : 0));
+    }
+    operand.mask_softness = operand_payload.contains("softness") ? py::cast<float>(operand_payload["softness"]) : 0.0f;
+    operand.mask_aspect = operand_payload.contains("aspect") ? py::cast<float>(operand_payload["aspect"]) : 1.0f;
+    operand.mask_invert = operand_payload.contains("invert") ? py::cast<bool>(operand_payload["invert"]) : false;
+    operand.mask_size = operand_payload.contains("size") ? py::cast<float>(operand_payload["size"]) : 1.0f;
+    operand.mask_x = operand_payload.contains("x") ? py::cast<float>(operand_payload["x"]) : 0.0f;
+    operand.mask_y = operand_payload.contains("y") ? py::cast<float>(operand_payload["y"]) : 0.0f;
+    return operand;
+}
+
+py::ssize_t CopyOutputToWritableBuffer(
+    const std::string& output,
+    std::uint8_t* out_ptr,
+    std::size_t out_size,
+    const char* output_arg_name
+) {
+    if (output.size() != out_size) {
+        throw py::value_error(
+            std::string(output_arg_name) +
+            " has incorrect size; expected " +
+            std::to_string(output.size()) +
+            " bytes"
+        );
+    }
+    std::memcpy(out_ptr, output.data(), output.size());
+    return static_cast<py::ssize_t>(output.size());
+}
+
 }  // namespace
 
 PYBIND11_MODULE(video_processor, m) {
     m.doc() = "CUDA video processor module for UYVY deinterlace/crop/zoom basic scaling";
+
+    py::class_<vp::CudaTensorBuffer>(m, "CudaTensorBuffer")
+        .def_property_readonly("data_ptr", &vp::CudaTensorBuffer::DataPtr)
+        .def_property_readonly("bytes", &vp::CudaTensorBuffer::Bytes)
+        .def_property_readonly("width", &vp::CudaTensorBuffer::Width)
+        .def_property_readonly("height", &vp::CudaTensorBuffer::Height)
+        .def_property_readonly("channels", &vp::CudaTensorBuffer::Channels)
+        .def_property_readonly("dtype", &vp::CudaTensorBuffer::DType)
+        .def_property_readonly("layout", &vp::CudaTensorBuffer::Layout)
+        .def_property_readonly("normalized_01", &vp::CudaTensorBuffer::Normalized01);
 
     py::class_<vp::VideoProcessor>(m, "VideoProcessor")
         .def(
@@ -72,6 +213,41 @@ PYBIND11_MODULE(video_processor, m) {
             "Process one 1920x1080 interlaced UYVY frame and return UYVY bytes."
         )
         .def(
+            "process_frame_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Process one frame and write UYVY bytes into a caller-provided writable output buffer."
+        )
+        .def(
+            "process_frame_field_phase_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output, int field_phase) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameFieldPhaseBuffer(frame_ptr, frame_size, field_phase);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            py::arg("field_phase"),
+            "Process one interlaced field phase directly from the original UYVY frame."
+        )
+        .def(
             "process_frame_no_deinterlace",
             [](vp::VideoProcessor& self, const py::buffer& frame) {
                 const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
@@ -84,6 +260,23 @@ PYBIND11_MODULE(video_processor, m) {
             },
             py::arg("frame"),
             "Process one UYVY frame while skipping Bob deinterlacing in this pass."
+        )
+        .def(
+            "process_frame_no_deinterlace_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameNoDeinterlaceBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Process one frame with deinterlace disabled and write UYVY bytes into a writable output buffer."
         )
         .def(
             "process_frame_deinterlace_only",
@@ -100,6 +293,23 @@ PYBIND11_MODULE(video_processor, m) {
             "Apply Bob deinterlacing and return deinterlaced UYVY bytes without ROI scaling."
         )
         .def(
+            "process_frame_deinterlace_only_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFrameDeinterlaceOnlyBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Apply Bob deinterlacing and write UYVY bytes into a writable output buffer."
+        )
+        .def(
             "process_frame_preprocess_only",
             [](vp::VideoProcessor& self, const py::buffer& frame) {
                 const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
@@ -112,6 +322,98 @@ PYBIND11_MODULE(video_processor, m) {
             },
             py::arg("frame"),
             "Apply enabled preprocess stages (deinterlace/denoise) and return UYVY bytes without ROI scaling."
+        )
+        .def(
+            "process_frame_preprocess_only_into",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+
+                std::string processed;
+                {
+                    py::gil_scoped_release release;
+                    processed = self.ProcessFramePreprocessOnlyBuffer(frame_ptr, frame_size);
+                }
+                return CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+            },
+            py::arg("frame"),
+            py::arg("output"),
+            "Apply enabled preprocess stages and write UYVY bytes into a writable output buffer."
+        )
+        .def(
+            "process_frame_preprocess_roi_rgb",
+            [](vp::VideoProcessor& self,
+               const py::buffer& frame,
+               int roi_x,
+               int roi_y,
+               int roi_w,
+               int roi_h,
+               int out_w,
+               int out_h) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                std::string output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFramePreprocessRoiRgbBuffer(
+                        frame_ptr,
+                        frame_size,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        out_w,
+                        out_h
+                    );
+                }
+                return py::bytes(output);
+            },
+            py::arg("frame"),
+            py::arg("roi_x"),
+            py::arg("roi_y"),
+            py::arg("roi_w"),
+            py::arg("roi_h"),
+            py::arg("out_w"),
+            py::arg("out_h"),
+            "Apply native preprocess on GPU for the ROI and return RGB bytes sized to out_w/out_h."
+        )
+        .def(
+            "process_frame_preprocess_roi_tensor_cuda",
+            [](vp::VideoProcessor& self,
+               const py::buffer& frame,
+               int roi_x,
+               int roi_y,
+               int roi_w,
+               int roi_h,
+               int out_w,
+               int out_h,
+               const std::string& dtype) {
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                vp::CudaTensorBuffer output;
+                {
+                    py::gil_scoped_release release;
+                    output = self.ProcessFramePreprocessRoiTensorCudaBuffer(
+                        frame_ptr,
+                        frame_size,
+                        roi_x,
+                        roi_y,
+                        roi_w,
+                        roi_h,
+                        out_w,
+                        out_h,
+                        dtype
+                    );
+                }
+                return output;
+            },
+            py::arg("frame"),
+            py::arg("roi_x"),
+            py::arg("roi_y"),
+            py::arg("roi_w"),
+            py::arg("roi_h"),
+            py::arg("out_w"),
+            py::arg("out_h"),
+            py::arg("dtype") = "float16",
+            "Apply native preprocess on GPU for the ROI and return a CUDA NCHW tensor buffer for direct ONNX input binding."
         )
         .def(
             "set_roi",
@@ -259,6 +561,278 @@ PYBIND11_MODULE(video_processor, m) {
             "get_denoise_strength",
             &vp::VideoProcessor::GetDenoiseStrength,
             "Get denoise strength in [0.0, 1.0]."
+        )
+        .def(
+            "set_effects_config",
+            &vp::VideoProcessor::SetEffectsConfig,
+            py::arg("enabled"),
+            py::arg("opacity") = 1.0f,
+            py::arg("blend_mode") = "normal",
+            py::arg("blur_method") = "off",
+            py::arg("blur_radius") = 0.0f,
+            py::arg("blur_target") = "both",
+            py::arg("layer1_opacity") = 1.0f,
+            py::arg("key_mode") = "off",
+            py::arg("key_color_r") = 0,
+            py::arg("key_color_g") = 255,
+            py::arg("key_color_b") = 0,
+            py::arg("key_similarity") = 0.25f,
+            py::arg("key_softness") = 0.10f,
+            py::arg("spill_suppression") = 0.25f,
+            py::arg("luma_low") = 0.0f,
+            py::arg("luma_high") = 1.0f,
+            py::arg("luma_softness") = 0.10f,
+            py::arg("key_invert") = false,
+            py::arg("key_edge_feather") = 0.0f,
+            py::arg("output_connected") = true,
+            py::arg("effect_color_from_alpha") = false,
+            py::arg("effect_alpha_from_color") = false,
+            py::arg("explicit_compositor_layers") = false,
+            "Configure the native CUDA two-layer compositor, keying, and color/alpha blur."
+        )
+        .def(
+            "upload_effect_media_rgba",
+            [](vp::VideoProcessor& self, const py::buffer& rgba, int width, int height) {
+                const auto [rgba_ptr, rgba_size] = GetContiguousByteBuffer(rgba);
+                py::gil_scoped_release release;
+                self.UploadEffectMediaRgba(rgba_ptr, rgba_size, width, height);
+            },
+            py::arg("rgba"),
+            py::arg("width"),
+            py::arg("height"),
+            "Upload one tightly packed RGBA media frame to persistent CUDA memory."
+        )
+        .def(
+            "set_effects_input_transform",
+            &vp::VideoProcessor::SetEffectsInputTransform,
+            py::arg("transform_x") = 0.0f,
+            py::arg("transform_y") = 0.0f,
+            py::arg("transform_z") = 0.0f,
+            py::arg("rotate_x") = 0.0f,
+            py::arg("rotate_y") = 0.0f,
+            py::arg("rotate_z") = 0.0f,
+            "Configure the native CUDA transform for the base Effects Input layer."
+        )
+        .def(
+            "set_effect_layer_config",
+            &vp::VideoProcessor::SetEffectLayerConfig,
+            py::arg("layer_index"),
+            py::arg("enabled"),
+            py::arg("opacity") = 1.0f,
+            py::arg("blend_mode") = "normal",
+            py::arg("blur_method") = "off",
+            py::arg("blur_radius") = 0.0f,
+            py::arg("blur_target") = "both",
+            py::arg("key_mode") = "off",
+            py::arg("key_color_r") = 0,
+            py::arg("key_color_g") = 255,
+            py::arg("key_color_b") = 0,
+            py::arg("key_similarity") = 0.25f,
+            py::arg("key_softness") = 0.10f,
+            py::arg("spill_suppression") = 0.25f,
+            py::arg("luma_low") = 0.0f,
+            py::arg("luma_high") = 1.0f,
+            py::arg("luma_softness") = 0.10f,
+            py::arg("key_invert") = false,
+            py::arg("key_edge_feather") = 0.0f,
+            py::arg("effect_color_from_alpha") = false,
+            py::arg("effect_alpha_from_color") = false,
+            py::arg("preserve_color_from_alpha_opacity") = false,
+            py::arg("source_from_effects_input") = false,
+            py::arg("key_alpha_from_effects_input") = false,
+            py::arg("mask_pattern") = "off",
+            py::arg("mask_softness") = 0.0f,
+            py::arg("mask_aspect") = 1.0f,
+            py::arg("mask_invert") = false,
+            py::arg("mask_size") = 1.0f,
+            py::arg("mask_x") = 0.0f,
+            py::arg("mask_y") = 0.0f,
+            py::arg("transform_x") = 0.0f,
+            py::arg("transform_y") = 0.0f,
+            py::arg("transform_z") = 0.0f,
+            py::arg("rotate_x") = 0.0f,
+            py::arg("rotate_y") = 0.0f,
+            py::arg("rotate_z") = 0.0f,
+            py::arg("materialize_key_alpha") = false,
+            "Configure one native CUDA compositor overlay layer in [2, 8]."
+        )
+        .def(
+            "clear_effect_layer_channel_routes",
+            &vp::VideoProcessor::ClearEffectLayerChannelRoutes,
+            py::arg("layer_index"),
+            "Disable and clear per-channel routing for one compositor layer."
+        )
+        .def(
+            "set_effect_layer_channel_route",
+            &vp::VideoProcessor::SetEffectLayerChannelRoute,
+            py::arg("layer_index"),
+            py::arg("target_channel"),
+            py::arg("source_channel"),
+            py::arg("blur_method") = "off",
+            py::arg("blur_radius") = 0.0f,
+            py::arg("transform_x") = 0.0f,
+            py::arg("transform_y") = 0.0f,
+            py::arg("transform_z") = 0.0f,
+            py::arg("rotate_x") = 0.0f,
+            py::arg("rotate_y") = 0.0f,
+            py::arg("rotate_z") = 0.0f,
+            py::arg("generator_type") = "off",
+            py::arg("key_color_r") = 0,
+            py::arg("key_color_g") = 255,
+            py::arg("key_color_b") = 0,
+            py::arg("key_similarity") = 0.25f,
+            py::arg("key_softness") = 0.10f,
+            py::arg("key_invert") = false,
+            py::arg("mask_pattern") = "off",
+            py::arg("mask_softness") = 0.0f,
+            py::arg("mask_aspect") = 1.0f,
+            py::arg("mask_invert") = false,
+            py::arg("mask_size") = 1.0f,
+            py::arg("mask_x") = 0.0f,
+            py::arg("mask_y") = 0.0f,
+            "Configure one scalar source-to-target channel route for a compositor layer."
+        )
+        .def(
+            "set_effect_layer_color_stages",
+            [](vp::VideoProcessor& self, int layer_index, const py::list& stage_payloads) {
+                std::vector<vp::ColorStageConfig> stages;
+                stages.reserve(stage_payloads.size());
+                for (const py::handle payload : stage_payloads) {
+                    const py::dict stage_payload = py::cast<py::dict>(payload);
+                    vp::ColorStageConfig stage;
+                    const std::string type = py::cast<std::string>(stage_payload["type"]);
+                    stage.type = type == "proc_amp" ? 0 : (type == "color_corrector" ? 1 : -1);
+                    stage.after_composite = false;
+                    stage.invert = py::cast<bool>(stage_payload["invert"]);
+                    const py::list params = py::cast<py::list>(stage_payload["params"]);
+                    if (params.size() != stage.params.size()) {
+                        throw py::value_error("Color stage params must contain exactly 9 values.");
+                    }
+                    for (size_t index = 0; index < stage.params.size(); ++index) {
+                        stage.params[index] = py::cast<float>(params[index]);
+                    }
+                    stages.push_back(stage);
+                }
+                self.SetEffectLayerColorStages(layer_index, stages);
+            },
+            py::arg("layer_index"),
+            py::arg("stages"),
+            "Replace the ordered live Proc Amp and Color Corrector stage list for one compositor layer."
+        )
+        .def(
+            "set_effect_layer_alpha_mix",
+            [](vp::VideoProcessor& self, int layer_index, py::object base_payload, const py::list& op_payloads) {
+                vp::AlphaMixOperandConfig base_operand;
+                const bool enabled = !base_payload.is_none();
+                if (enabled) {
+                    base_operand = ParseAlphaMixOperandPayload(py::cast<py::dict>(base_payload));
+                }
+                std::vector<vp::AlphaMixOpConfig> ops;
+                ops.reserve(op_payloads.size());
+                for (const py::handle payload : op_payloads) {
+                    const py::dict op_payload = py::cast<py::dict>(payload);
+                    if (!op_payload.contains("mode") || !op_payload.contains("operand")) {
+                        throw py::value_error("Alpha mix ops must contain mode and operand fields.");
+                    }
+                    vp::AlphaMixOpConfig op;
+                    op.mode = ParseAlphaMixModeName(py::cast<std::string>(op_payload["mode"]));
+                    op.factor = op_payload.contains("factor") ? py::cast<float>(op_payload["factor"]) : 1.0f;
+                    op.operand = ParseAlphaMixOperandPayload(py::cast<py::dict>(op_payload["operand"]));
+                    ops.push_back(op);
+                }
+                self.SetEffectLayerAlphaMix(layer_index, enabled, base_operand, ops);
+            },
+            py::arg("layer_index"),
+            py::arg("base_operand"),
+            py::arg("ops"),
+            "Replace the ordered alpha-mix chain for one compositor layer."
+        )
+        .def(
+            "upload_effect_layer_source_rgba",
+            [](vp::VideoProcessor& self, int layer_index, int source_slot, const py::buffer& rgba, int width, int height) {
+                const auto [rgba_ptr, rgba_size] = GetContiguousByteBuffer(rgba);
+                py::gil_scoped_release release;
+                self.UploadEffectLayerSourceRgba(layer_index, source_slot, rgba_ptr, rgba_size, width, height);
+            },
+            py::arg("layer_index"),
+            py::arg("source_slot"),
+            py::arg("rgba"),
+            py::arg("width"),
+            py::arg("height"),
+            "Upload one RGBA image into a compositor layer source slot."
+        )
+        .def(
+            "set_effect_layer_channel_alpha_mix",
+            [](vp::VideoProcessor& self, int layer_index, int target_channel, py::object base_payload, const py::list& op_payloads) {
+                vp::AlphaMixOperandConfig base_operand;
+                const bool enabled = !base_payload.is_none();
+                if (enabled) {
+                    base_operand = ParseAlphaMixOperandPayload(py::cast<py::dict>(base_payload));
+                }
+                std::vector<vp::AlphaMixOpConfig> ops;
+                ops.reserve(op_payloads.size());
+                for (const py::handle payload : op_payloads) {
+                    const py::dict op_payload = py::cast<py::dict>(payload);
+                    if (!op_payload.contains("mode") || !op_payload.contains("operand")) {
+                        throw py::value_error("Alpha mix ops must contain mode and operand fields.");
+                    }
+                    vp::AlphaMixOpConfig op;
+                    op.mode = ParseAlphaMixModeName(py::cast<std::string>(op_payload["mode"]));
+                    op.factor = op_payload.contains("factor") ? py::cast<float>(op_payload["factor"]) : 1.0f;
+                    op.operand = ParseAlphaMixOperandPayload(py::cast<py::dict>(op_payload["operand"]));
+                    ops.push_back(op);
+                }
+                self.SetEffectLayerChannelAlphaMix(layer_index, target_channel, enabled, base_operand, ops);
+            },
+            py::arg("layer_index"),
+            py::arg("target_channel"),
+            py::arg("base_operand"),
+            py::arg("ops"),
+            "Replace the ordered alpha-mix chain for one recombined channel route."
+        )
+        .def(
+            "set_color_stages",
+            [](vp::VideoProcessor& self, const py::list& stage_payloads) {
+                std::vector<vp::ColorStageConfig> stages;
+                stages.reserve(stage_payloads.size());
+                for (const py::handle payload : stage_payloads) {
+                    const py::dict stage_payload = py::cast<py::dict>(payload);
+                    vp::ColorStageConfig stage;
+                    const std::string type = py::cast<std::string>(stage_payload["type"]);
+                    stage.type = type == "proc_amp" ? 0 : (type == "color_corrector" ? 1 : -1);
+                    stage.after_composite = py::cast<bool>(stage_payload["after_composite"]);
+                    stage.invert = py::cast<bool>(stage_payload["invert"]);
+                    const py::list params = py::cast<py::list>(stage_payload["params"]);
+                    if (params.size() != stage.params.size()) {
+                        throw py::value_error("Color stage params must contain exactly 9 values.");
+                    }
+                    for (size_t index = 0; index < stage.params.size(); ++index) {
+                        stage.params[index] = py::cast<float>(params[index]);
+                    }
+                    stages.push_back(stage);
+                }
+                self.SetColorStages(stages);
+            },
+            py::arg("stages"),
+            "Replace the ordered live Proc Amp and Color Corrector stage list."
+        )
+        .def(
+            "upload_effect_layer_media_rgba",
+            [](vp::VideoProcessor& self, int layer_index, const py::buffer& rgba, int width, int height) {
+                const auto [rgba_ptr, rgba_size] = GetContiguousByteBuffer(rgba);
+                py::gil_scoped_release release;
+                self.UploadEffectLayerMediaRgba(layer_index, rgba_ptr, rgba_size, width, height);
+            },
+            py::arg("layer_index"),
+            py::arg("rgba"),
+            py::arg("width"),
+            py::arg("height"),
+            "Upload tightly packed RGBA media for one compositor overlay layer in [2, 8]."
+        )
+        .def(
+            "clear_effect_media",
+            &vp::VideoProcessor::ClearEffectMedia,
+            "Disable all native effect layers and clear all active media dimensions."
         )
         .def(
             "set_subpixel_shift",
@@ -413,6 +987,72 @@ PYBIND11_MODULE(video_processor, m) {
         .def("set_color_range", &vp::AiSrCudaPostProcessor::SetColorRangeByName, py::arg("color_range"))
         .def("get_color_space", &vp::AiSrCudaPostProcessor::GetColorSpaceName)
         .def("get_color_range", &vp::AiSrCudaPostProcessor::GetColorRangeName)
+        .def(
+            "set_post_denoise_method",
+            &vp::AiSrCudaPostProcessor::SetPostDenoiseMethodByName,
+            py::arg("method"),
+            "Set AI SR postprocess denoise method to one of [off, luma_gaussian3x3, luma_median3x3, luma_bilateral3x3, luma_bilateral5x5]."
+        )
+        .def(
+            "get_post_denoise_method",
+            &vp::AiSrCudaPostProcessor::GetPostDenoiseMethodName,
+            "Get AI SR postprocess denoise method name."
+        )
+        .def(
+            "set_post_denoise_strength",
+            &vp::AiSrCudaPostProcessor::SetPostDenoiseStrength,
+            py::arg("strength"),
+            "Set AI SR postprocess denoise strength in [0.0, 1.0]."
+        )
+        .def(
+            "get_post_denoise_strength",
+            &vp::AiSrCudaPostProcessor::GetPostDenoiseStrength,
+            "Get AI SR postprocess denoise strength in [0.0, 1.0]."
+        )
+        .def(
+            "set_post_artifact_reduction_method",
+            &vp::AiSrCudaPostProcessor::SetPostArtifactReductionMethodByName,
+            py::arg("method"),
+            "Set AI SR postprocess artifact reduction method to one of [off, luma_bilateral3x3, luma_bilateral5x5]."
+        )
+        .def(
+            "get_post_artifact_reduction_method",
+            &vp::AiSrCudaPostProcessor::GetPostArtifactReductionMethodName,
+            "Get AI SR postprocess artifact reduction method name."
+        )
+        .def(
+            "set_post_artifact_reduction_strength",
+            &vp::AiSrCudaPostProcessor::SetPostArtifactReductionStrength,
+            py::arg("strength"),
+            "Set AI SR postprocess artifact reduction strength in [0.0, 1.0]."
+        )
+        .def(
+            "get_post_artifact_reduction_strength",
+            &vp::AiSrCudaPostProcessor::GetPostArtifactReductionStrength,
+            "Get AI SR postprocess artifact reduction strength in [0.0, 1.0]."
+        )
+        .def(
+            "set_post_exaggeration_enabled",
+            &vp::AiSrCudaPostProcessor::SetPostExaggerationEnabled,
+            py::arg("enabled"),
+            "Enable or disable exaggerated AI SR postprocess debug mode."
+        )
+        .def(
+            "get_post_exaggeration_enabled",
+            &vp::AiSrCudaPostProcessor::GetPostExaggerationEnabled,
+            "Return whether exaggerated AI SR postprocess debug mode is enabled."
+        )
+        .def(
+            "set_post_exaggeration_gain",
+            &vp::AiSrCudaPostProcessor::SetPostExaggerationGain,
+            py::arg("gain"),
+            "Set exaggerated AI SR postprocess gain in [1.0, 4.0]."
+        )
+        .def(
+            "get_post_exaggeration_gain",
+            &vp::AiSrCudaPostProcessor::GetPostExaggerationGain,
+            "Get exaggerated AI SR postprocess gain in [1.0, 4.0]."
+        )
         .def_property_readonly("output_width", &vp::AiSrCudaPostProcessor::output_width)
         .def_property_readonly("output_height", &vp::AiSrCudaPostProcessor::output_height);
 }

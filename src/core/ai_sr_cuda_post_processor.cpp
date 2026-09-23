@@ -97,6 +97,72 @@ inline AiSrCudaPostProcessor::ResizeMethod ParseResizeMethod(const std::string& 
     return AiSrCudaPostProcessor::ResizeMethod::Bicubic;
 }
 
+inline AiSrCudaPostProcessor::PostDenoiseMethod ParsePostDenoiseMethodName(const std::string& method_name) {
+    const std::string normalized = NormalizeName(method_name);
+    if (normalized == "off" || normalized == "none") {
+        return AiSrCudaPostProcessor::PostDenoiseMethod::Off;
+    }
+    if (normalized == "luma_gaussian3x3") {
+        return AiSrCudaPostProcessor::PostDenoiseMethod::LumaGaussian3x3;
+    }
+    if (normalized == "luma_median3x3") {
+        return AiSrCudaPostProcessor::PostDenoiseMethod::LumaMedian3x3;
+    }
+    if (normalized == "luma_bilateral3x3") {
+        return AiSrCudaPostProcessor::PostDenoiseMethod::LumaBilateral3x3;
+    }
+    if (normalized == "luma_bilateral5x5") {
+        return AiSrCudaPostProcessor::PostDenoiseMethod::LumaBilateral5x5;
+    }
+    throw std::invalid_argument(
+        "AI SR post denoise method must be one of [off, luma_gaussian3x3, luma_median3x3, luma_bilateral3x3, luma_bilateral5x5]."
+    );
+}
+
+inline const char* ToPostDenoiseMethodName(AiSrCudaPostProcessor::PostDenoiseMethod method) {
+    switch (method) {
+        case AiSrCudaPostProcessor::PostDenoiseMethod::LumaGaussian3x3:
+            return "luma_gaussian3x3";
+        case AiSrCudaPostProcessor::PostDenoiseMethod::LumaMedian3x3:
+            return "luma_median3x3";
+        case AiSrCudaPostProcessor::PostDenoiseMethod::LumaBilateral3x3:
+            return "luma_bilateral3x3";
+        case AiSrCudaPostProcessor::PostDenoiseMethod::LumaBilateral5x5:
+            return "luma_bilateral5x5";
+        case AiSrCudaPostProcessor::PostDenoiseMethod::Off:
+        default:
+            return "off";
+    }
+}
+
+inline AiSrCudaPostProcessor::PostArtifactReductionMethod ParsePostArtifactReductionMethodName(const std::string& method_name) {
+    const std::string normalized = NormalizeName(method_name);
+    if (normalized == "off" || normalized == "none") {
+        return AiSrCudaPostProcessor::PostArtifactReductionMethod::Off;
+    }
+    if (normalized == "luma_bilateral3x3") {
+        return AiSrCudaPostProcessor::PostArtifactReductionMethod::LumaBilateral3x3;
+    }
+    if (normalized == "luma_bilateral5x5") {
+        return AiSrCudaPostProcessor::PostArtifactReductionMethod::LumaBilateral5x5;
+    }
+    throw std::invalid_argument(
+        "AI SR post artifact reduction method must be one of [off, luma_bilateral3x3, luma_bilateral5x5]."
+    );
+}
+
+inline const char* ToPostArtifactReductionMethodName(AiSrCudaPostProcessor::PostArtifactReductionMethod method) {
+    switch (method) {
+        case AiSrCudaPostProcessor::PostArtifactReductionMethod::LumaBilateral3x3:
+            return "luma_bilateral3x3";
+        case AiSrCudaPostProcessor::PostArtifactReductionMethod::LumaBilateral5x5:
+            return "luma_bilateral5x5";
+        case AiSrCudaPostProcessor::PostArtifactReductionMethod::Off:
+        default:
+            return "off";
+    }
+}
+
 }  // namespace
 
 AiSrCudaPostProcessor::AiSrCudaPostProcessor(
@@ -110,6 +176,12 @@ AiSrCudaPostProcessor::AiSrCudaPostProcessor(
       output_uyvy_bytes_(0),
       color_space_(ParseColorSpaceName(color_space)),
       color_range_(ParseColorRangeName(color_range)),
+            post_denoise_method_(PostDenoiseMethod::Off),
+            post_denoise_strength_(0.35f),
+            post_artifact_reduction_method_(PostArtifactReductionMethod::Off),
+            post_artifact_reduction_strength_(0.35f),
+            post_exaggeration_enabled_(false),
+            post_exaggeration_gain_(2.0f),
       stream_(nullptr),
       d_tensor_rgb_(nullptr),
       d_tensor_rgb_capacity_pixels_(0),
@@ -276,6 +348,91 @@ std::string AiSrCudaPostProcessor::ProcessOnnxOutputCudaPtr(
             break;
     }
 
+    const PostDenoiseMethod post_denoise_method = post_denoise_method_;
+    float post_denoise_strength = std::clamp(post_denoise_strength_, 0.0f, 1.0f);
+    const bool post_exaggeration_enabled = post_exaggeration_enabled_;
+    const float post_exaggeration_gain = std::clamp(post_exaggeration_gain_, 1.0f, 4.0f);
+    const int post_exaggeration_passes = post_exaggeration_enabled ? 3 : 1;
+    bool any_post_stage_applied = false;
+    if (post_exaggeration_enabled) {
+        post_denoise_strength = std::clamp(post_denoise_strength * post_exaggeration_gain, 0.0f, 1.0f);
+    }
+    if (post_denoise_method != PostDenoiseMethod::Off && post_denoise_strength > 0.001f) {
+        const uchar3* denoise_input = final_rgb;
+        uchar3* denoise_output = final_rgb == d_output_tmp_ ? d_output_rgb_ : d_output_tmp_;
+        for (int pass = 0; pass < post_exaggeration_passes; ++pass) {
+            switch (post_denoise_method) {
+                case PostDenoiseMethod::LumaMedian3x3:
+                    cuda_kernels::LaunchDenoiseLumaMedian3x3(denoise_input, denoise_output, output_width_, output_height_, post_denoise_strength, stream_);
+                    break;
+                case PostDenoiseMethod::LumaBilateral3x3:
+                    cuda_kernels::LaunchDenoiseLumaBilateral3x3(denoise_input, denoise_output, output_width_, output_height_, post_denoise_strength, stream_);
+                    break;
+                case PostDenoiseMethod::LumaBilateral5x5:
+                    cuda_kernels::LaunchDenoiseLumaBilateral5x5(denoise_input, denoise_output, output_width_, output_height_, post_denoise_strength, stream_);
+                    break;
+                case PostDenoiseMethod::LumaGaussian3x3:
+                    cuda_kernels::LaunchDenoiseLumaGaussian3x3(denoise_input, denoise_output, output_width_, output_height_, post_denoise_strength, stream_);
+                    break;
+                case PostDenoiseMethod::Off:
+                default:
+                    break;
+            }
+            denoise_input = denoise_output;
+            denoise_output = denoise_input == d_output_tmp_ ? d_output_rgb_ : d_output_tmp_;
+        }
+        final_rgb = denoise_input;
+        any_post_stage_applied = true;
+    }
+
+    const PostArtifactReductionMethod artifact_method = post_artifact_reduction_method_;
+    float artifact_strength = std::clamp(post_artifact_reduction_strength_, 0.0f, 1.0f);
+    if (post_exaggeration_enabled) {
+        artifact_strength = std::clamp(artifact_strength * post_exaggeration_gain, 0.0f, 1.0f);
+    }
+    if (artifact_method != PostArtifactReductionMethod::Off && artifact_strength > 0.001f) {
+        const uchar3* artifact_input = final_rgb;
+        uchar3* artifact_output = final_rgb == d_output_tmp_ ? d_output_rgb_ : d_output_tmp_;
+        for (int pass = 0; pass < post_exaggeration_passes; ++pass) {
+            switch (artifact_method) {
+                case PostArtifactReductionMethod::LumaBilateral3x3:
+                    cuda_kernels::LaunchDenoiseLumaBilateral3x3(artifact_input, artifact_output, output_width_, output_height_, artifact_strength, stream_);
+                    break;
+                case PostArtifactReductionMethod::LumaBilateral5x5:
+                    cuda_kernels::LaunchDenoiseLumaBilateral5x5(artifact_input, artifact_output, output_width_, output_height_, artifact_strength, stream_);
+                    break;
+                case PostArtifactReductionMethod::Off:
+                default:
+                    break;
+            }
+            artifact_input = artifact_output;
+            artifact_output = artifact_input == d_output_tmp_ ? d_output_rgb_ : d_output_tmp_;
+        }
+        final_rgb = artifact_input;
+        any_post_stage_applied = true;
+    }
+
+    if (post_exaggeration_enabled && !any_post_stage_applied) {
+        // Exaggerated mode is explicit user intent: force a visible post stage
+        // even when individual methods are set to Off.
+        const float forced_strength = std::clamp(0.35f + (0.20f * post_exaggeration_gain), 0.0f, 1.0f);
+        const uchar3* forced_input = final_rgb;
+        uchar3* forced_output = final_rgb == d_output_tmp_ ? d_output_rgb_ : d_output_tmp_;
+        for (int pass = 0; pass < post_exaggeration_passes; ++pass) {
+            cuda_kernels::LaunchDenoiseLumaBilateral5x5(
+                forced_input,
+                forced_output,
+                output_width_,
+                output_height_,
+                forced_strength,
+                stream_
+            );
+            forced_input = forced_output;
+            forced_output = forced_input == d_output_tmp_ ? d_output_rgb_ : d_output_tmp_;
+        }
+        final_rgb = forced_input;
+    }
+
     const int color_matrix = ToColorMatrixId(color_space_);
     const int color_range = ToColorRangeId(color_range_);
     cuda_kernels::LaunchRgbToUyvy(final_rgb, d_output_uyvy_, output_width_, output_height_, color_matrix, color_range, stream_);
@@ -308,6 +465,66 @@ std::string AiSrCudaPostProcessor::GetColorSpaceName() const {
 std::string AiSrCudaPostProcessor::GetColorRangeName() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return ToColorRangeName(color_range_);
+}
+
+void AiSrCudaPostProcessor::SetPostDenoiseMethodByName(const std::string& method_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    post_denoise_method_ = ParsePostDenoiseMethodName(method_name);
+}
+
+std::string AiSrCudaPostProcessor::GetPostDenoiseMethodName() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ToPostDenoiseMethodName(post_denoise_method_);
+}
+
+void AiSrCudaPostProcessor::SetPostDenoiseStrength(float strength) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    post_denoise_strength_ = std::clamp(strength, 0.0f, 1.0f);
+}
+
+float AiSrCudaPostProcessor::GetPostDenoiseStrength() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return post_denoise_strength_;
+}
+
+void AiSrCudaPostProcessor::SetPostArtifactReductionMethodByName(const std::string& method_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    post_artifact_reduction_method_ = ParsePostArtifactReductionMethodName(method_name);
+}
+
+std::string AiSrCudaPostProcessor::GetPostArtifactReductionMethodName() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ToPostArtifactReductionMethodName(post_artifact_reduction_method_);
+}
+
+void AiSrCudaPostProcessor::SetPostArtifactReductionStrength(float strength) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    post_artifact_reduction_strength_ = std::clamp(strength, 0.0f, 1.0f);
+}
+
+float AiSrCudaPostProcessor::GetPostArtifactReductionStrength() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return post_artifact_reduction_strength_;
+}
+
+void AiSrCudaPostProcessor::SetPostExaggerationEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    post_exaggeration_enabled_ = enabled;
+}
+
+bool AiSrCudaPostProcessor::GetPostExaggerationEnabled() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return post_exaggeration_enabled_;
+}
+
+void AiSrCudaPostProcessor::SetPostExaggerationGain(float gain) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    post_exaggeration_gain_ = std::clamp(gain, 1.0f, 4.0f);
+}
+
+float AiSrCudaPostProcessor::GetPostExaggerationGain() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return post_exaggeration_gain_;
 }
 
 void AiSrCudaPostProcessor::Cleanup() {
