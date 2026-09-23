@@ -12,365 +12,12 @@ import importlib
 import math
 import ctypes
 import shutil
-import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-_EFFECT_IMAGE_SUFFIXES = {
-    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
-    ".exr", ".hdr", ".ppm", ".pgm", ".pbm",
-}
-_EFFECT_MEDIA_RING_FRAMES = 4
-
-
-def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
-    raw_layers = payload.get("layers")
-    if isinstance(raw_layers, list):
-        layers = [
-            dict(layer)
-            for layer in raw_layers
-            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
-        ]
-        if layers:
-            return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
-    return [
-        {
-            "layer_index": 2,
-            "enabled": bool(payload.get("enabled", False)),
-            "source_kind": str(payload.get("source_kind", "media")),
-            "media_path": str(payload.get("media_path", "")),
-            "media_playing": bool(payload.get("media_playing", False)),
-            "media_loop": bool(payload.get("media_loop", True)),
-            "capture_kind": str(payload.get("capture_kind", "")),
-            "capture_device_index": int(payload.get("capture_device_index", -1)),
-            "matte_rgba": payload.get("matte_rgba", [255, 255, 255, 255]),
-            "opacity": float(payload.get("opacity", 1.0)),
-            "blend_mode": str(payload.get("blend_mode", "normal")),
-            "blur_method": str(payload.get("blur_method", "off")),
-            "blur_radius": float(payload.get("blur_radius", 0.0)),
-            "blur_target": str(payload.get("blur_target", "both")),
-            "key": {
-                "mode": str(payload.get("key_mode", "off")),
-                "color": [
-                    int(payload.get("key_color_r", 0)), int(payload.get("key_color_g", 255)),
-                    int(payload.get("key_color_b", 0)),
-                ],
-                "similarity": float(payload.get("key_similarity", 0.25)),
-                "softness": float(payload.get("key_softness", 0.10)),
-                "spill_suppression": float(payload.get("spill_suppression", 0.25)),
-                "luma_low": float(payload.get("luma_low", 0.0)),
-                "luma_high": float(payload.get("luma_high", 1.0)),
-                "luma_softness": float(payload.get("luma_softness", 0.10)),
-                "invert": bool(payload.get("key_invert", False)),
-            },
-            "effect_color_from_alpha": bool(payload.get("effect_color_from_alpha", False)),
-            "effect_alpha_from_color": bool(payload.get("effect_alpha_from_color", False)),
-            "mask_pattern": str(payload.get("mask_pattern", "off")),
-            "mask_softness": float(payload.get("mask_softness", 0.0)),
-            "mask_aspect": float(payload.get("mask_aspect", 1.0)),
-            "mask_invert": bool(payload.get("mask_invert", False)),
-            "mask_size": float(payload.get("mask_size", 1.0)),
-            "mask_x": float(payload.get("mask_x", 0.0)),
-            "mask_y": float(payload.get("mask_y", 0.0)),
-            "transform_x": float(payload.get("transform_x", 0.0)),
-            "transform_y": float(payload.get("transform_y", 0.0)),
-            "transform_z": float(payload.get("transform_z", 0.0)),
-            "rotate_x": float(payload.get("rotate_x", 0.0)),
-            "rotate_y": float(payload.get("rotate_y", 0.0)),
-            "rotate_z": float(payload.get("rotate_z", 0.0)),
-        }
-    ]
-
-
-def _set_native_effect_layer_config(processor: object, layer: dict[str, object]) -> None:
-    key = layer.get("key", {})
-    if not isinstance(key, dict):
-        key = {}
-    color = key.get("color", [0, 255, 0])
-    if not isinstance(color, (list, tuple)) or len(color) < 3:
-        color = [0, 255, 0]
-    processor.set_effect_layer_config(
-        int(layer.get("layer_index", 2)),
-        bool(layer.get("enabled", False)),
-        opacity=float(layer.get("opacity", 1.0)),
-        blend_mode=str(layer.get("blend_mode", "normal")),
-        blur_method=str(layer.get("blur_method", "off")),
-        blur_radius=float(layer.get("blur_radius", 0.0)),
-        blur_target=str(layer.get("blur_target", "both")),
-        key_mode=str(key.get("mode", "off")),
-        key_color_r=int(color[0]),
-        key_color_g=int(color[1]),
-        key_color_b=int(color[2]),
-        key_similarity=float(key.get("similarity", 0.25)),
-        key_softness=float(key.get("softness", 0.10)),
-        spill_suppression=float(key.get("spill_suppression", 0.25)),
-        luma_low=float(key.get("luma_low", 0.0)),
-        luma_high=float(key.get("luma_high", 1.0)),
-        luma_softness=float(key.get("luma_softness", 0.10)),
-        key_invert=bool(key.get("invert", False)),
-        key_edge_feather=float(key.get("edge_feather", 0.0)),
-        effect_color_from_alpha=bool(layer.get("effect_color_from_alpha", False)),
-        effect_alpha_from_color=bool(layer.get("effect_alpha_from_color", False)),
-        preserve_color_from_alpha_opacity=bool(layer.get("preserve_color_from_alpha_opacity", False)),
-        source_from_effects_input=bool(layer.get("source_kind") == "effects_input"),
-        key_alpha_from_effects_input=bool(layer.get("key_alpha_from_effects_input", False)),
-        mask_pattern=str(layer.get("mask_pattern", "off")),
-        mask_softness=float(layer.get("mask_softness", 0.0)),
-        mask_aspect=float(layer.get("mask_aspect", 1.0)),
-        mask_invert=bool(layer.get("mask_invert", False)),
-        mask_size=float(layer.get("mask_size", 1.0)),
-        mask_x=float(layer.get("mask_x", 0.0)),
-        mask_y=float(layer.get("mask_y", 0.0)),
-        transform_x=float(layer.get("transform_x", 0.0)),
-        transform_y=float(layer.get("transform_y", 0.0)),
-        transform_z=float(layer.get("transform_z", 0.0)),
-        rotate_x=float(layer.get("rotate_x", 0.0)),
-        rotate_y=float(layer.get("rotate_y", 0.0)),
-        rotate_z=float(layer.get("rotate_z", 0.0)),
-        materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
-    )
-    layer_index = int(layer.get("layer_index", 2))
-    processor.clear_effect_layer_channel_routes(layer_index)
-    channel_routes = layer.get("channel_routes", [])
-    if isinstance(channel_routes, list):
-        for target_channel, route in enumerate(channel_routes[:4]):
-            if not isinstance(route, dict):
-                continue
-            generator_settings = route.get("generator_settings", {})
-            if not isinstance(generator_settings, dict):
-                generator_settings = {}
-            processor.set_effect_layer_channel_route(
-                layer_index,
-                target_channel,
-                int(route.get("source_channel", -1)),
-                blur_method=str(route.get("blur_method", "off")),
-                blur_radius=float(route.get("blur_radius", 0.0)),
-                transform_x=float(route.get("transform_x", 0.0)),
-                transform_y=float(route.get("transform_y", 0.0)),
-                transform_z=float(route.get("transform_z", 0.0)),
-                rotate_x=float(route.get("rotate_x", 0.0)),
-                rotate_y=float(route.get("rotate_y", 0.0)),
-                rotate_z=float(route.get("rotate_z", 0.0)),
-                generator_type=str(route.get("generator_type", "off")),
-                key_color_r=int(generator_settings.get("key_color_r", 0)),
-                key_color_g=int(generator_settings.get("key_color_g", 255)),
-                key_color_b=int(generator_settings.get("key_color_b", 0)),
-                key_similarity=float(generator_settings.get("key_similarity", 0.25)),
-                key_softness=float(generator_settings.get("key_softness", 0.10)),
-                key_invert=bool(generator_settings.get("key_invert", False)),
-                mask_pattern=str(generator_settings.get("pattern", "off")),
-                mask_softness=float(generator_settings.get("softness", 0.0)),
-                mask_aspect=float(generator_settings.get("aspect", 1.0)),
-                mask_invert=bool(generator_settings.get("invert", False)),
-                mask_size=float(generator_settings.get("size", 1.0)),
-                mask_x=float(generator_settings.get("x", 0.0)),
-                mask_y=float(generator_settings.get("y", 0.0)),
-            )
-    raw_color_stages = layer.get("color_stages", []) if bool(layer.get("enabled", False)) else []
-    color_stages = [dict(stage) for stage in raw_color_stages if isinstance(stage, dict)] if isinstance(raw_color_stages, list) else []
-    setter = getattr(processor, "set_effect_layer_color_stages", None)
-    if callable(setter):
-        setter(layer_index, color_stages)
-    elif color_stages:
-        raise RuntimeError("Loaded video_processor build does not support per-layer color stages; rebuild the native module")
-
-
-def _set_native_color_stages(processor: object, payload: dict[str, object]) -> None:
-    if not hasattr(processor, "set_color_stages"):
-        return
-    raw_stages = payload.get("color_stages", []) if bool(payload.get("enabled", False)) else []
-    stages = [dict(stage) for stage in raw_stages if isinstance(stage, dict)] if isinstance(raw_stages, list) else []
-    processor.set_color_stages(stages)
-
-
-def _set_native_effects_input_transform(processor: object, payload: dict[str, object]) -> None:
-    values = (
-        float(payload.get("input_transform_x", 0.0)),
-        float(payload.get("input_transform_y", 0.0)),
-        float(payload.get("input_transform_z", 0.0)),
-        float(payload.get("input_rotate_x", 0.0)),
-        float(payload.get("input_rotate_y", 0.0)),
-        float(payload.get("input_rotate_z", 0.0)),
-    )
-    setter = getattr(processor, "set_effects_input_transform", None)
-    if not callable(setter):
-        if any(abs(value) > 1e-6 for value in values):
-            raise RuntimeError("Loaded video_processor build does not support Effects Input transforms; rebuild the native module")
-        return
-    setter(*values)
-
-
-class EffectMediaDecoder:
-    def __init__(self, media_path: str) -> None:
-        self.path = Path(media_path)
-        if not self.path.is_file():
-            raise RuntimeError(f"Effects media file not found: {self.path}")
-        self._sequence_paths: list[Path] = []
-        self._sequence_index = 0
-        self._container = None
-        self._video_stream = None
-        self._video_frames = None
-        self._opencv_capture = None
-        self._last_rgba: np.ndarray | None = None
-        self._ended = False
-        self.frame_interval_s = 1.0 / 30.0
-        if self.path.suffix.lower() in _EFFECT_IMAGE_SUFFIXES:
-            self._sequence_paths = self._discover_image_sequence(self.path)
-        else:
-            self._open_video()
-
-    @staticmethod
-    def _discover_image_sequence(path: Path) -> list[Path]:
-        match = re.match(r"^(.*?)(\d+)$", path.stem)
-        if match is None:
-            return [path]
-        prefix, digits = match.groups()
-        candidates = [
-            candidate
-            for candidate in path.parent.glob(f"{prefix}*{path.suffix}")
-            if re.match(rf"^{re.escape(prefix)}\d{{{len(digits)}}}$", candidate.stem)
-        ]
-        return sorted(candidates) or [path]
-
-    def _open_video(self) -> None:
-        self.close()
-        av_error: Exception | None = None
-        if av is not None:
-            try:
-                self._container = av.open(str(self.path))
-                self._video_stream = next((stream for stream in self._container.streams if stream.type == "video"), None)
-                if self._video_stream is None:
-                    raise RuntimeError(f"Effects media has no video stream: {self.path}")
-                average_rate = self._video_stream.average_rate
-                if average_rate is not None and float(average_rate) > 0.0:
-                    self.frame_interval_s = 1.0 / float(average_rate)
-                self._video_frames = self._container.decode(self._video_stream)
-                return
-            except Exception as exc:
-                av_error = exc
-                self.close()
-        if cv2 is not None:
-            capture = cv2.VideoCapture(str(self.path), cv2.CAP_FFMPEG)
-            if capture.isOpened():
-                self._opencv_capture = capture
-                source_fps = float(capture.get(cv2.CAP_PROP_FPS))
-                if math.isfinite(source_fps) and source_fps > 0.0:
-                    self.frame_interval_s = 1.0 / source_fps
-                return
-            capture.release()
-        backend_error = f"PyAV: {av_error}" if av_error is not None else "PyAV unavailable"
-        raise RuntimeError(f"Unable to decode effects media with PyAV or OpenCV ({backend_error}): {self.path}")
-
-    @staticmethod
-    def _load_image_rgba(path: Path) -> np.ndarray:
-        pillow_error: Exception | None = None
-        if Image is not None:
-            try:
-                with Image.open(path) as image:
-                    return np.ascontiguousarray(np.asarray(image.convert("RGBA"), dtype=np.uint8))
-            except Exception as exc:
-                pillow_error = exc
-        if cv2 is not None:
-            image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-            if image is not None:
-                if image.dtype != np.uint8:
-                    finite_max = float(np.nanmax(image)) if image.size else 1.0
-                    scale = 255.0 if finite_max <= 1.0 else 255.0 / max(1.0, finite_max)
-                    image = np.clip(image.astype(np.float32) * scale, 0.0, 255.0).astype(np.uint8)
-                if image.ndim == 2:
-                    return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_GRAY2RGBA))
-                if image.shape[2] == 4:
-                    return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA))
-                return np.ascontiguousarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGBA))
-        backend_error = f"Pillow: {pillow_error}" if pillow_error is not None else "Pillow unavailable"
-        raise RuntimeError(f"Unable to decode effects image with Pillow or OpenCV ({backend_error}): {path}")
-
-    def next_rgba(self, loop: bool = True) -> np.ndarray:
-        if self._ended and not loop and self._last_rgba is not None:
-            return self._last_rgba
-        if self._sequence_paths:
-            frame_path = self._sequence_paths[self._sequence_index]
-            frame = self._load_image_rgba(frame_path)
-            if self._sequence_index + 1 >= len(self._sequence_paths):
-                if loop:
-                    self._sequence_index = 0
-                else:
-                    self._ended = True
-            else:
-                self._sequence_index += 1
-            self._last_rgba = frame
-            return frame
-        if self._opencv_capture is not None:
-            ok, frame = self._opencv_capture.read()
-            if not ok and loop:
-                self._opencv_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok, frame = self._opencv_capture.read()
-            if not ok:
-                if self._last_rgba is not None:
-                    self._ended = True
-                    return self._last_rgba
-                raise RuntimeError(f"Effects media contains no decodable video frames: {self.path}")
-            self._last_rgba = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA), dtype=np.uint8)
-            return self._last_rgba
-        try:
-            frame = next(self._video_frames)
-        except StopIteration:
-            if not loop and self._last_rgba is not None:
-                self._ended = True
-                return self._last_rgba
-            self._open_video()
-            frame = next(self._video_frames)
-        self._last_rgba = np.ascontiguousarray(frame.to_ndarray(format="rgba"), dtype=np.uint8)
-        return self._last_rgba
-
-    def close(self) -> None:
-        if self._container is not None:
-            self._container.close()
-        if self._opencv_capture is not None:
-            self._opencv_capture.release()
-        self._container = None
-        self._video_stream = None
-        self._video_frames = None
-        self._opencv_capture = None
-
-
-class EffectCaptureDecoder:
-    def __init__(self, device_index: int) -> None:
-        if cv2 is None:
-            raise RuntimeError("OpenCV is required for Windows camera capture")
-        self.device_index = int(device_index)
-        self._capture = None
-        self.frame_interval_s = 0.0
-        attempted_backends: list[tuple[int, str]] = []
-        for backend_name in ("CAP_DSHOW", "CAP_MSMF", "CAP_ANY"):
-            backend = int(getattr(cv2, backend_name, cv2.CAP_ANY))
-            if any(attempted_backend == backend for attempted_backend, _name in attempted_backends):
-                continue
-            capture = cv2.VideoCapture(self.device_index, backend)
-            if capture.isOpened():
-                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                self._capture = capture
-                return
-            capture.release()
-            attempted_backends.append((backend, backend_name))
-        attempted = ", ".join(name for _backend, name in attempted_backends)
-        raise RuntimeError(f"Unable to open Windows camera {self.device_index} using {attempted}")
-
-    def next_rgba(self, loop: bool = True) -> np.ndarray:
-        del loop
-        ok, frame = self._capture.read()
-        if not ok or frame is None:
-            raise RuntimeError(f"Windows camera {self.device_index} did not return a video frame")
-        return np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA), dtype=np.uint8)
-
-    def close(self) -> None:
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
 
 
 _SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
@@ -672,16 +319,6 @@ def _bootstrap_project_venv_site() -> None:
 
 _bootstrap_project_venv_site()
 
-try:
-    av = importlib.import_module("av")
-except Exception:
-    av = None
-
-try:
-    Image = importlib.import_module("PIL.Image")
-except Exception:
-    Image = None
-
 
 _CUDA_DLL_DIR_HANDLES: list[Any] = []
 _CUDA_DLL_DIR_KEYS: set[str] = set()
@@ -729,98 +366,6 @@ def _apply_current_process_priority(priority_name: str) -> tuple[str, str | None
         return normalized, None
     except Exception as exc:
         return normalized, str(exc)
-
-
-class _WindowsWorkerKeepAlive:
-    def __init__(self, refresh_interval_s: float = 30.0) -> None:
-        self.enabled = False
-        self.error: str | None = None
-        self._refresh_interval_s = max(5.0, float(refresh_interval_s))
-        self._next_refresh_ts = 0.0
-        self._kernel32 = None
-        self._winmm = None
-        self._timer_period_active = False
-
-        if os.name != "nt" or os.environ.get("VP_KEEP_WORKER_ACTIVE", "1") == "0":
-            return
-
-        errors: list[str] = []
-        try:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            self._kernel32 = kernel32
-
-            class ProcessPowerThrottlingState(ctypes.Structure):
-                _fields_ = [
-                    ("Version", ctypes.c_uint32),
-                    ("ControlMask", ctypes.c_uint32),
-                    ("StateMask", ctypes.c_uint32),
-                ]
-
-            set_process_information = kernel32.SetProcessInformation
-            set_process_information.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-            ]
-            set_process_information.restype = ctypes.c_int
-            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-
-            power_state = ProcessPowerThrottlingState(1, 1, 0)
-            if not set_process_information(
-                kernel32.GetCurrentProcess(),
-                4,
-                ctypes.byref(power_state),
-                ctypes.sizeof(power_state),
-            ):
-                errors.append(f"SetProcessInformation: {ctypes.WinError(ctypes.get_last_error())}")
-
-            set_execution_state = kernel32.SetThreadExecutionState
-            set_execution_state.argtypes = [ctypes.c_uint32]
-            set_execution_state.restype = ctypes.c_uint32
-            if not set_execution_state(0x80000001):
-                errors.append(f"SetThreadExecutionState: {ctypes.WinError(ctypes.get_last_error())}")
-
-            winmm = ctypes.WinDLL("winmm", use_last_error=True)
-            self._winmm = winmm
-            winmm.timeBeginPeriod.argtypes = [ctypes.c_uint]
-            winmm.timeBeginPeriod.restype = ctypes.c_uint
-            timer_result = int(winmm.timeBeginPeriod(1))
-            if timer_result == 0:
-                self._timer_period_active = True
-            else:
-                errors.append(f"timeBeginPeriod: result={timer_result}")
-
-            self.enabled = not errors
-            self.error = "; ".join(errors) or None
-            self._next_refresh_ts = time.perf_counter() + self._refresh_interval_s
-        except Exception as exc:
-            self.error = str(exc)
-
-    def refresh(self) -> None:
-        if self._kernel32 is None or time.perf_counter() < self._next_refresh_ts:
-            return
-        self._next_refresh_ts = time.perf_counter() + self._refresh_interval_s
-        try:
-            if not self._kernel32.SetThreadExecutionState(0x80000001):
-                self.error = f"SetThreadExecutionState refresh: {ctypes.WinError(ctypes.get_last_error())}"
-                self.enabled = False
-        except Exception as exc:
-            self.error = str(exc)
-            self.enabled = False
-
-    def close(self) -> None:
-        if self._kernel32 is not None:
-            try:
-                self._kernel32.SetThreadExecutionState(0x80000000)
-            except Exception:
-                pass
-        if self._timer_period_active and self._winmm is not None:
-            try:
-                self._winmm.timeEndPeriod(1)
-            except Exception:
-                pass
-        self._timer_period_active = False
 
 
 def _clamp_interlaced_field2_phase_fraction(value: float) -> float:
@@ -1262,19 +807,6 @@ def _has_effective_subpixel_shift(shift_x: float, shift_y: float) -> bool:
     eps = float(_SUBPIXEL_SHIFT_APPLY_EPS)
     return abs(float(shift_x)) >= eps or abs(float(shift_y)) >= eps
 
-
-def _should_apply_roi_transition_overscan(
-    start_width: float,
-    target_width: float,
-    target_scale: float,
-    overscan_percent: float,
-) -> bool:
-    return (
-        abs(float(target_width) - float(start_width)) > 1e-6
-        and float(target_scale) >= 4.0
-        and float(overscan_percent) > 0.0
-    )
-
 RTX_POST_SCALE_METHOD_TO_CV2_INTERP = {
     "nearest": cv2.INTER_NEAREST if cv2 is not None else 0,
     "bilinear": cv2.INTER_LINEAR if cv2 is not None else 1,
@@ -1649,8 +1181,6 @@ class AiSrOnnxEngine:
             trt_cache_dir.mkdir(parents=True, exist_ok=True)
             trt_provider_options["trt_engine_cache_path"] = str(trt_cache_dir)
 
-        provider_fallback_note: str | None = None
-
         if provider_name in {"trt", "tensorrt"} and not trt_available:
             raise RuntimeError(
                 f"TensorrtExecutionProvider is not available in onnxruntime. Available providers: {available_providers_sorted}"
@@ -1679,17 +1209,8 @@ class AiSrOnnxEngine:
             providers = [("TensorrtExecutionProvider", trt_provider_options)]
         elif provider_name == "auto":
             if trt_available:
-                try:
-                    _preflight_tensorrt_runtime()
-                    providers = [("TensorrtExecutionProvider", trt_provider_options)]
-                except Exception as trt_exc:
-                    # "auto" should be robust: a broken/incomplete TensorRT
-                    # install (e.g. stray DLLs from another NVIDIA app) must
-                    # not silently mask AI SR entirely; fall back to CUDA.
-                    if not cuda_available:
-                        raise
-                    provider_fallback_note = f"TensorRT unavailable, fell back to CUDA: {trt_exc}"
-                    providers = [("CUDAExecutionProvider", cuda_provider_options)]
+                _preflight_tensorrt_runtime()
+                providers = [("TensorrtExecutionProvider", trt_provider_options)]
             elif cuda_available:
                 providers = [("CUDAExecutionProvider", cuda_provider_options)]
             else:
@@ -1772,7 +1293,6 @@ class AiSrOnnxEngine:
         self._timing_samples = 0
         self._available_providers = available_providers_sorted
         self._requested_provider = provider_name
-        self._provider_fallback_note = provider_fallback_note
         self._trt_precision = trt_precision_name
         self._trt_engine_cache_path = trt_provider_options.get("trt_engine_cache_path", "")
         self._require_gpu = bool(require_gpu)
@@ -1968,7 +1488,6 @@ class AiSrOnnxEngine:
             "model_path": self._model_path,
             "provider": self._provider,
             "requested_provider": self._requested_provider,
-            "provider_fallback_note": self._provider_fallback_note,
             "trt_precision": self._trt_precision,
             "trt_engine_cache_path": self._trt_engine_cache_path,
             "available_providers": self._available_providers,
@@ -2519,8 +2038,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
         frame_duration = int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0
         time_scale = int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0
         frame_period_s = (float(frame_duration) / float(time_scale)) if frame_duration > 0 and time_scale > 0 else 0.0
-        target_buffer_frames = max(0, min(10, int(_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.get(out_id, 0))))
-        minimum_preroll_frames = max(1, int(getattr(out, "minimum_preroll_frames", 1)))
+        target_buffer_frames = max(0, min(10, int(_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.get(out_id, 2))))
         state = {
             "enabled": callable(schedule_fn) and callable(start_fn),
             "can_query_buffered": callable(buffered_fn),
@@ -2533,15 +2051,12 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
             "sync_next_emit_ts": 0.0,
             "schedule_epoch_perf_ts": 0.0,
             "target_buffer_frames": target_buffer_frames,
-            "minimum_preroll_frames": minimum_preroll_frames,
             "last_clock_resync_ts": 0.0,
             "padded_out": None,
             "last_buffered_count": -1,
             "starved_streak": 0,
-            "starvation_active": False,
             "overflow_streak": 0,
             "starvation_events": 0,
-            "clock_correction_events": 0,
             "overflow_events": 0,
             "auto_reprime_events": 0,
             "last_reprime_reason": "",
@@ -2576,7 +2091,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
         if frame_duration > 0 and time_scale > 0:
             try:
                 now_ts = time.perf_counter()
-                target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 0))))
+                target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                 buffered_before = _estimate_output_schedule_buffered_frames(state, now_ts)
                 if bool(state.get("can_query_buffered", False)):
                     try:
@@ -2585,14 +2100,10 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                         state["can_query_buffered"] = False
                 state["last_buffered_count"] = buffered_before
 
-                starved_now = bool(state.get("started", False)) and buffered_before <= 0
-                if starved_now:
+                if bool(state.get("started", False)) and buffered_before <= 0:
                     state["starved_streak"] = int(state.get("starved_streak", 0)) + 1
-                    if not bool(state.get("starvation_active", False)):
-                        state["starvation_events"] = int(state.get("starvation_events", 0)) + 1
                 else:
                     state["starved_streak"] = 0
-                state["starvation_active"] = starved_now
 
                 overflow_threshold = target_start_frames + _OUTPUT_SCHEDULE_LOCAL_OVERFLOW_HEADROOM_FRAMES
                 if (
@@ -2619,19 +2130,6 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                     state = _OUTPUT_SCHEDULE_STATE.get(out_id, state)
 
                 display_time = int(state.get("display_time", 0))
-                if starved_now and target_start_frames > 0:
-                    # Separate capture/output devices run on independent clocks.
-                    # Duplicate one frame when their drift consumes the buffer.
-                    out.schedule_frame_copy(
-                        payload,
-                        display_time,
-                        frame_duration,
-                        time_scale,
-                    )
-                    display_time += frame_duration
-                    state["display_time"] = display_time
-                    state["scheduled_frames"] = int(state.get("scheduled_frames", 0)) + 1
-                    state["clock_correction_events"] = int(state.get("clock_correction_events", 0)) + 1
                 out.schedule_frame_copy(
                     payload,
                     display_time,
@@ -2646,10 +2144,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                     # Playback begins at stream time zero, consuming the first
                     # scheduled frame immediately. Queue that presentation frame
                     # in addition to the requested retained buffer depth.
-                    required_preroll_frames = max(
-                        int(state.get("minimum_preroll_frames", 1)),
-                        target_start_frames + 1,
-                    )
+                    required_preroll_frames = max(1, target_start_frames + 1)
                     should_start = False
                     if bool(state.get("can_query_buffered", False)):
                         try:
@@ -2763,7 +2258,6 @@ def _reprime_output_schedule(out: object, reason: str = "manual") -> None:
     state["schedule_epoch_perf_ts"] = 0.0
     state["sync_next_emit_ts"] = 0.0
     state["starved_streak"] = 0
-    state["starvation_active"] = False
     state["overflow_streak"] = 0
     state["last_reprime_reason"] = str(reason)
     state["last_reprime_ts"] = time.perf_counter()
@@ -2927,9 +2421,6 @@ def run_processor_worker(
         str(startup_config.get("worker_process_priority", "above_normal"))
     )
     worker_process_priority, worker_process_priority_error = _apply_current_process_priority(worker_process_priority)
-    worker_keep_alive = _WindowsWorkerKeepAlive(
-        float(os.environ.get("VP_WORKER_KEEP_ALIVE_REFRESH_S", "30"))
-    )
 
     def _safe_put(message: dict[str, Any]) -> None:
         # Prioritize control-plane messages (ready/ack/error) over frame traffic so
@@ -3023,10 +2514,7 @@ def run_processor_worker(
     output_thread: threading.Thread | None = None
     parallel_basic_processors: list[Any] = []
     parallel_basic_worker_count = 1
-    parallel_basic_max_inflight = max(
-        1,
-        min(4, int(startup_config.get("basic_scaling_max_inflight", os.environ.get("VP_BASIC_SCALING_MAX_INFLIGHT", "1")))),
-    )
+    parallel_basic_max_inflight = max(1, min(4, int(os.environ.get("VP_BASIC_SCALING_MAX_INFLIGHT", "1"))))
     q_capture_to_preprocess: queue.Queue[_StageFrame] | None = None
     q_preprocess_to_upscale: queue.Queue[_StageFrame] | None = None
     q_upscale_to_output: queue.Queue[_StageFrame] | None = None
@@ -3202,9 +2690,6 @@ def run_processor_worker(
     rtx_roi_rebuild_pending = False
     rtx_roi_rebuild_due_ts = 0.0
     rtx_roi_rebuild_settle_s = 0.25
-    rtx_stage_last_error: str | None = None
-    rtx_stage_cooldown_until_ts = 0.0
-    rtx_stage_consecutive_failures = 0
     current_basic_scaling_method = str(startup_config.get("basic_scaling_method", "bilinear_sharp"))
     current_color_space = _normalize_color_space_name(str(startup_config.get("color_space", "rec709")))
     current_color_range = _normalize_color_range_name(str(startup_config.get("color_range", "limited")))
@@ -3250,137 +2735,12 @@ def run_processor_worker(
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
     current_denoise_method = str(startup_config.get("denoise_method", "off"))
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
-    current_effects_enabled = False
-    effect_media_states: dict[int, dict[str, object]] = {}
-    current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 0))))
+    current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 2))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
     current_basic_scaling_auto_mode = bool(startup_config.get("basic_scaling_auto_mode", True))
     current_basic_scaling_manual_scale = int(startup_config.get("basic_scaling_manual", startup_config.get("sr_scale", 4)))
     current_max_auto_basic_scaling = int(startup_config.get("max_auto_basic_scaling", startup_config.get("max_auto_sr_scale", 4)))
     state_lock = threading.Lock()
-    # Interlaced and temporal paths share one stateful processor.
-    shared_processor_lock = threading.Lock()
-
-    def _stop_effect_media_decoder() -> None:
-        for layer_index in list(effect_media_states):
-            _stop_effect_media_layer(layer_index)
-
-    def _stop_effect_media_layer(layer_index: int) -> None:
-        state = effect_media_states.pop(layer_index, None)
-        if state is None:
-            return
-        decoder = state.get("decoder")
-        stop_event = state.get("stop")
-        decode_thread = state.get("thread")
-        if isinstance(stop_event, threading.Event):
-            stop_event.set()
-        if isinstance(decode_thread, threading.Thread) and decode_thread is not threading.current_thread():
-            decode_thread.join(timeout=0.25)
-            if decode_thread.is_alive() and decoder is not None:
-                decoder.close()
-                decode_thread.join(timeout=1.0)
-        if decoder is not None:
-            decoder.close()
-
-    def _start_effect_media_decoder() -> None:
-        for layer_index, state in effect_media_states.items():
-            decoder = state.get("decoder")
-            if decoder is None or not bool(state.get("playing", False)):
-                continue
-            stop_event = state["stop"]
-            frame_ring = state["ring"]
-            frame_lock = state["lock"]
-            stop_event.clear()
-            while not frame_ring.empty():
-                try:
-                    frame_ring.get_nowait()
-                except queue.Empty:
-                    break
-            with frame_lock:
-                state["error"] = None
-            state["next_present_ts"] = time.perf_counter() + max(0.0, float(decoder.frame_interval_s))
-
-            def _decode_worker(
-                worker_layer_index: int = layer_index,
-                worker_state: dict[str, object] = state,
-                worker_decoder: EffectMediaDecoder | EffectCaptureDecoder = decoder,
-            ) -> None:
-                worker_stop = worker_state["stop"]
-                worker_ring = worker_state["ring"]
-                worker_lock = worker_state["lock"]
-                while not worker_stop.is_set():
-                    try:
-                        rgba = worker_decoder.next_rgba(loop=bool(worker_state.get("loop", True)))
-                    except Exception as exc:
-                        with worker_lock:
-                            worker_state["error"] = exc
-                        return
-                    frame_interval_s = max(0.0, float(worker_decoder.frame_interval_s))
-                    if frame_interval_s <= 0.0:
-                        if worker_ring.full():
-                            try:
-                                worker_ring.get_nowait()
-                            except queue.Empty:
-                                pass
-                        try:
-                            worker_ring.put_nowait(rgba)
-                        except queue.Full:
-                            pass
-                        continue
-                    while not worker_stop.is_set():
-                        try:
-                            worker_ring.put(rgba, timeout=0.05)
-                            break
-                        except queue.Full:
-                            continue
-
-            decode_thread = threading.Thread(
-                target=_decode_worker,
-                name=f"vp-effect-media-decode-{layer_index}",
-                daemon=True,
-            )
-            state["thread"] = decode_thread
-            decode_thread.start()
-
-    def _upload_next_effect_media() -> None:
-        if not current_effects_enabled:
-            return
-        for layer_index, state in list(effect_media_states.items()):
-            decoder = state.get("decoder")
-            if decoder is None or not bool(state.get("playing", False)):
-                continue
-            with state["lock"]:
-                decode_error = state.get("error")
-            if decode_error is not None:
-                _stop_effect_media_layer(layer_index)
-                processor.set_effect_layer_config(layer_index, False)
-                _safe_put({"type": "warning", "warning": f"Effects layer {layer_index} source stopped: {decode_error}"})
-                continue
-            frame_interval_s = max(0.0, float(decoder.frame_interval_s))
-            now = time.perf_counter()
-            if frame_interval_s > 0.0 and now < float(state.get("next_present_ts", 0.0)):
-                continue
-            frame_ring = state["ring"]
-            try:
-                rgba = frame_ring.get_nowait()
-                if frame_interval_s <= 0.0:
-                    while True:
-                        try:
-                            rgba = frame_ring.get_nowait()
-                        except queue.Empty:
-                            break
-                height, width = int(rgba.shape[0]), int(rgba.shape[1])
-                processor.upload_effect_layer_media_rgba(layer_index, rgba, width, height)
-                if frame_interval_s > 0.0:
-                    state["next_present_ts"] = max(
-                        float(state.get("next_present_ts", 0.0)) + frame_interval_s, now
-                    )
-            except queue.Empty:
-                continue
-            except Exception as exc:
-                _stop_effect_media_layer(layer_index)
-                processor.set_effect_layer_config(layer_index, False)
-                _safe_put({"type": "warning", "warning": f"Effects layer {layer_index} source stopped: {exc}"})
 
     def _is_live_passthrough_mode() -> bool:
         # Passthrough mode is valid only when no stage is expected to modify pixels.
@@ -3388,8 +2748,6 @@ def run_processor_worker(
         ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
         rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
         return (
-            (not current_effects_enabled)
-            and
             (not current_deinterlace_enabled)
             and (not denoise_enabled)
             and (not basic_scaling_enabled)
@@ -3398,12 +2756,13 @@ def run_processor_worker(
         )
 
     def _is_live_basic_scaling_fast_mode() -> bool:
-        # Keep native processing in the capture thread when no Python AI/RTX
-        # stage is active. process_frame fuses scaling, preprocess, and effects.
+        # Basic scaling fast mode keeps processing in capture thread when the
+        # pipeline is native-only (no Python AI/RTX stages). Native process_frame
+        # already fuses preprocess, so deinterlace/denoise can remain enabled.
         ai_stage_active = ai_sr_enabled and ai_sr_engine is not None
         rtx_stage_active = rtx_vsr_enabled and rtx_vsr_engine is not None
         return (
-            (basic_scaling_enabled or current_effects_enabled)
+            basic_scaling_enabled
             and (not ai_stage_active)
             and (not rtx_stage_active)
         )
@@ -4147,7 +3506,7 @@ def run_processor_worker(
             desired_cx = ideal_cx + residual_x
             desired_cy = ideal_cy + residual_y
             desired_w = ideal_w + residual_w
-            if _should_apply_roi_transition_overscan(s_w, t_w, target_scale, overscan_pct):
+            if target_scale >= 4.0 and overscan_pct > 0.0:
                 overscan_weight = max(0.0, 4.0 * curved_t * (1.0 - curved_t))
                 desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
                 field0_weight = max(0.0, 4.0 * curved_t_field0 * (1.0 - curved_t_field0))
@@ -4733,7 +4092,7 @@ def run_processor_worker(
 
         target_scale = FRAME_W / max(1.0, t_w)
         overscan_pct = float(state.get("overscan_percent", 0.0))
-        if _should_apply_roi_transition_overscan(s_w, t_w, target_scale, overscan_pct):
+        if target_scale >= 4.0 and overscan_pct > 0.0:
             overscan_weight = max(0.0, 4.0 * curved_t * (1.0 - curved_t))
             desired_w_backend = desired_w * (1.0 + ((overscan_pct / 100.0) * overscan_weight))
             overscan_weight_field0 = max(0.0, 4.0 * curved_t_field0 * (1.0 - curved_t_field0))
@@ -5157,10 +4516,15 @@ def run_processor_worker(
         except queue.Full:
             return True
 
-    def _put_stage_frame_blocking(stage_queue: queue.Queue[_StageFrame], item: _StageFrame) -> bool:
+    def _put_stage_frame_blocking(stage_queue: queue.Queue[_StageFrame], item: _StageFrame, timeout_s: float = 0.03) -> bool:
+        # Backpressure producers instead of evicting older frames.
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
         while not pipeline_stop_event.is_set():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                return False
             try:
-                stage_queue.put(item, timeout=0.005)
+                stage_queue.put(item, timeout=min(0.005, remaining))
                 return True
             except queue.Full:
                 continue
@@ -5288,8 +4652,7 @@ def run_processor_worker(
         shift_y: float,
     ) -> tuple[bytes, bool, bool, float]:
         nonlocal zeroed_output_warning_emitted
-        basic_scaling_active = _basic_scaling_enabled()
-        if not basic_scaling_active and not current_effects_enabled:
+        if not _basic_scaling_enabled():
             return frame_bytes, False, False, 0.0
 
         native_shift_applied = False
@@ -5325,7 +4688,7 @@ def run_processor_worker(
                 zeroed_output_warning_emitted = True
             return frame_bytes, False, False, basic_stage_ms
 
-        return scaled, basic_scaling_active, native_shift_applied, basic_stage_ms
+        return scaled, True, native_shift_applied, basic_stage_ms
 
     def _record_basic_scaling_timing(frame_ms: float) -> None:
         nonlocal basic_scaling_last_frame_ms, basic_scaling_avg_frame_ms, basic_scaling_max_frame_ms, basic_scaling_timing_samples
@@ -5342,18 +4705,8 @@ def run_processor_worker(
         frame_bytes: bytes,
         roi: tuple[int, int, int, int] | None = None,
     ) -> tuple[bytes, bool]:
-        nonlocal rtx_stage_last_error, rtx_stage_cooldown_until_ts, rtx_stage_consecutive_failures
         if not (rtx_vsr_enabled and rtx_vsr_engine is not None):
             return frame_bytes, False
-
-        now = time.perf_counter()
-        if rtx_stage_cooldown_until_ts > now:
-            # Recent evaluate failures: back off instead of retrying every
-            # frame, since a persistently failing GPU evaluate call (e.g. an
-            # unsupported ROI input:output scale ratio) can otherwise hammer
-            # the driver every captured frame and stall the whole pipeline.
-            return frame_bytes, False
-
         try:
             active_roi = roi or (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
             rtx_out = _apply_rtx_vsr(
@@ -5362,16 +4715,9 @@ def run_processor_worker(
             )
             if _looks_zeroed_uyvy_frame(rtx_out):
                 return frame_bytes, False
-            rtx_stage_consecutive_failures = 0
             return rtx_out, True
         except Exception as rtx_exc:
-            rtx_stage_consecutive_failures += 1
-            error_text = str(rtx_exc)
-            if error_text != rtx_stage_last_error:
-                _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {error_text}"})
-                rtx_stage_last_error = error_text
-            backoff_s = min(2.0, 0.1 * (2 ** min(6, rtx_stage_consecutive_failures)))
-            rtx_stage_cooldown_until_ts = now + backoff_s
+            _safe_put({"type": "warning", "warning": f"RTX VSR inference failed: {rtx_exc}"})
             return frame_bytes, False
 
     def _build_stage_stack() -> list[str]:
@@ -5391,8 +4737,6 @@ def run_processor_worker(
         # AI so final output sizing is handled by native CUDA path.
         if basic_stage_active:
             stack.append("basic_scaling")
-        elif current_effects_enabled:
-            stack.append("effects")
         return stack
 
     def _process_pipeline_frame(
@@ -5445,15 +4789,6 @@ def run_processor_worker(
                 )
                 if basic_applied:
                     _record_basic_scaling_timing(basic_stage_ms)
-                continue
-
-            if stage_name == "effects":
-                working = _run_native_uyvy_process(
-                    working,
-                    "process_frame_no_deinterlace",
-                    "process_frame_no_deinterlace_into",
-                    reusable_process_frame_no_deinterlace_out,
-                )
                 continue
 
         return working, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied
@@ -5515,19 +4850,7 @@ def run_processor_worker(
         pipeline_stop_event.clear()
         parallel_basic_processors = []
         parallel_basic_worker_count = 1
-        temporal_denoise_enabled = current_denoise_method in {
-            "field_temporal_luma",
-            "temporal",
-            "field_temporal",
-        }
-        parallel_basic_safe = (
-            _is_live_basic_scaling_fast_mode()
-            and not current_effects_enabled
-            and not output_mode_is_interlaced
-            and not current_basic_scaling_auto_mode
-            and not temporal_denoise_enabled
-        )
-        if parallel_basic_max_inflight > 1 and parallel_basic_safe:
+        if parallel_basic_max_inflight > 1 and _is_live_basic_scaling_fast_mode():
             for _ in range(parallel_basic_max_inflight):
                 try:
                     parallel_proc, _ = _create_processor(module, startup_config)
@@ -5544,16 +4867,6 @@ def run_processor_worker(
                 parallel_basic_processors.append(parallel_proc)
             if parallel_basic_processors:
                 parallel_basic_worker_count = len(parallel_basic_processors)
-        elif parallel_basic_max_inflight > 1:
-            _safe_put(
-                {
-                    "type": "warning",
-                    "warning": (
-                        "Parallel basic scaling requires progressive output, manual scaling, "
-                        "and non-temporal denoise; using the ordered fast path"
-                    ),
-                }
-            )
 
         q_capture_to_preprocess = queue.Queue(maxsize=max(2, parallel_basic_worker_count * 2))
         q_preprocess_to_upscale = None
@@ -5952,7 +5265,6 @@ def run_processor_worker(
                     roi_motion_trace = _snapshot_roi_motion_trace(shift_x, shift_y)
                     interlaced_phase = interlaced_phase_snapshot
                     try:
-                        _upload_next_effect_media()
                         if _reinterlace_enabled_for_output():
                             reinterlace_phase = interlaced_phase
                             if reinterlace_phase is None:
@@ -6120,8 +5432,6 @@ def run_processor_worker(
                         output_mode_is_interlaced
                         and isinstance(item.interlaced_field_phase, dict)
                     )
-                    # Temporal denoise requires consecutive frames on one processor.
-                    and current_denoise_method not in {"field_temporal_luma", "temporal", "field_temporal"}
                 )
 
                 if parallel_basic_active:
@@ -6221,93 +5531,77 @@ def run_processor_worker(
                         continue
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Parallel basic scaling worker failed: {exc}"})
-                        item.process_end_ts = time.perf_counter()
-                        item.output_bytes = item.input_bytes
-                        item.effective_sr_scale = 1
-                        item.native_shift_applied = False
-                        item.ai_applied = False
-                        item.rtx_applied = False
-                        item.output_queue_put_ts = time.perf_counter()
-                        if not _put_stage_frame_blocking(q_upscale_to_output, item):
-                            upscale_drop_count += 1
                         continue
 
-                # Interlaced and temporal frames use the shared processor in capture order.
-                with shared_processor_lock:
-                    try:
-                        item.preprocess_bytes = item.input_bytes
-                    except Exception as exc:
-                        preprocess_drop_count += 1
-                        _safe_put({"type": "warning", "warning": f"Preprocess stage failed: {exc}"})
-                        continue
+                try:
+                    item.preprocess_bytes = item.input_bytes
+                except Exception as exc:
+                    preprocess_drop_count += 1
+                    _safe_put({"type": "warning", "warning": f"Preprocess stage failed: {exc}"})
+                    continue
 
-                    preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
-                    try:
-                        _upload_next_effect_media()
-                        item.process_start_ts = time.perf_counter()
-                        item_roi = (int(item.roi_x), int(item.roi_y), int(item.roi_w), int(item.roi_h))
-                        _apply_processor_roi_for_phase(item_roi)
-                        interlaced_phase = item.interlaced_field_phase if isinstance(item.interlaced_field_phase, dict) else None
-                        if output_mode_is_interlaced and _reinterlace_enabled_for_output():
-                            if interlaced_phase is None:
-                                interlaced_phase = _build_static_interlaced_phase_for_reinterlace(float(item.shift_x), float(item.shift_y))
-                            output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
-                                preprocessed,
-                                interlaced_phase,
-                            )
-                            item.interlaced_phase_rendered = True
-                        elif output_mode_is_interlaced and _interlaced_phase_controls_active() and interlaced_phase is not None:
-                            output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline(
-                                preprocessed,
-                                interlaced_phase,
-                            )
-                            item.interlaced_phase_rendered = True
-                        else:
-                            output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
-                                preprocessed,
-                                float(item.shift_x),
-                                float(item.shift_y),
-                                item_roi,
-                            )
-                            item.interlaced_phase_rendered = False
-                        item.process_end_ts = time.perf_counter()
-                        stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
-                    except Exception as exc:
-                        _safe_put({"type": "warning", "warning": f"Upscale stage failed: {exc}"})
-                        continue
-
-                    if ai_sr_engine is not None and not stage_applied and _ai_inference_busy():
-                        ai_sr_dropped_frames += 1
-
-                    if preprocess_applied:
-                        stage_preprocess_applied_frames += 1
-                    if basic_applied:
-                        stage_basic_applied_frames += 1
-                    if ai_applied:
-                        stage_ai_applied_frames += 1
-                    if rtx_applied:
-                        stage_rtx_applied_frames += 1
-                    if not stage_applied:
-                        stage_passthrough_frames += 1
-
-                    last_stage_preprocess_applied = bool(preprocess_applied)
-                    last_stage_basic_applied = bool(basic_applied)
-                    last_stage_ai_applied = bool(ai_applied)
-                    last_stage_rtx_applied = bool(rtx_applied)
-                    last_stage_stack = _build_stage_stack()
-
-                    item.output_bytes = output_bytes
-                    item.effective_sr_scale = int(processor.get_effective_sr_scale()) if hasattr(processor, "get_effective_sr_scale") else 1
-                    item.ai_applied = bool(ai_applied)
-                    item.rtx_applied = bool(rtx_applied)
-                    item.native_shift_applied = bool(native_shift_applied)
-                    item.output_queue_put_ts = time.perf_counter()
-                    if parallel_basic_worker_count > 1:
-                        queued = _put_stage_frame_blocking(q_upscale_to_output, item)
+                preprocessed = item.preprocess_bytes if item.preprocess_bytes is not None else item.input_bytes
+                try:
+                    item.process_start_ts = time.perf_counter()
+                    item_roi = (int(item.roi_x), int(item.roi_y), int(item.roi_w), int(item.roi_h))
+                    _apply_processor_roi_for_phase(item_roi)
+                    interlaced_phase = item.interlaced_field_phase if isinstance(item.interlaced_field_phase, dict) else None
+                    if output_mode_is_interlaced and _reinterlace_enabled_for_output():
+                        if interlaced_phase is None:
+                            interlaced_phase = _build_static_interlaced_phase_for_reinterlace(float(item.shift_x), float(item.shift_y))
+                        output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline_reinterlace(
+                            preprocessed,
+                            interlaced_phase,
+                        )
+                        item.interlaced_phase_rendered = True
+                    elif output_mode_is_interlaced and _interlaced_phase_controls_active() and interlaced_phase is not None:
+                        output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _render_dual_phase_full_pipeline(
+                            preprocessed,
+                            interlaced_phase,
+                        )
+                        item.interlaced_phase_rendered = True
                     else:
-                        queued = not _put_latest_stage_frame(q_upscale_to_output, item)
-                    if not queued:
-                        upscale_drop_count += 1
+                        output_bytes, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied = _process_pipeline_frame(
+                            preprocessed,
+                            float(item.shift_x),
+                            float(item.shift_y),
+                            item_roi,
+                        )
+                        item.interlaced_phase_rendered = False
+                    item.process_end_ts = time.perf_counter()
+                    stage_applied = preprocess_applied or basic_applied or ai_applied or rtx_applied
+                except Exception as exc:
+                    _safe_put({"type": "warning", "warning": f"Upscale stage failed: {exc}"})
+                    continue
+
+                if ai_sr_engine is not None and not stage_applied and _ai_inference_busy():
+                    ai_sr_dropped_frames += 1
+
+                if preprocess_applied:
+                    stage_preprocess_applied_frames += 1
+                if basic_applied:
+                    stage_basic_applied_frames += 1
+                if ai_applied:
+                    stage_ai_applied_frames += 1
+                if rtx_applied:
+                    stage_rtx_applied_frames += 1
+                if not stage_applied:
+                    stage_passthrough_frames += 1
+
+                last_stage_preprocess_applied = bool(preprocess_applied)
+                last_stage_basic_applied = bool(basic_applied)
+                last_stage_ai_applied = bool(ai_applied)
+                last_stage_rtx_applied = bool(rtx_applied)
+                last_stage_stack = _build_stage_stack()
+
+                item.output_bytes = output_bytes
+                item.effective_sr_scale = int(processor.get_effective_sr_scale()) if hasattr(processor, "get_effective_sr_scale") else 1
+                item.ai_applied = bool(ai_applied)
+                item.rtx_applied = bool(rtx_applied)
+                item.native_shift_applied = bool(native_shift_applied)
+                item.output_queue_put_ts = time.perf_counter()
+                if _put_latest_stage_frame(q_upscale_to_output, item):
+                    upscale_drop_count += 1
 
         def _output_worker() -> None:
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
@@ -6429,9 +5723,7 @@ def run_processor_worker(
                 now_ts = time.perf_counter()
                 if item is not None:
                     item.output_dequeue_ts = now_ts
-                    item_frame_id = int(item.frame_id)
-                    if item_frame_id >= next_frame_id:
-                        reorder_pending[item_frame_id] = item
+                    reorder_pending[int(item.frame_id)] = item
 
                 while reorder_pending:
                     if next_frame_id in reorder_pending:
@@ -6440,14 +5732,11 @@ def run_processor_worker(
                         _emit_output_item(ready_item)
                         continue
 
-                    if parallel_basic_worker_count > 1:
-                        break
-
                     min_pending_id = min(reorder_pending.keys())
                     oldest_pending = min(reorder_pending.values(), key=lambda f: f.output_dequeue_ts)
                     oldest_wait_s = max(0.0, now_ts - oldest_pending.output_dequeue_ts)
                     if len(reorder_pending) >= max_reorder_buffer or oldest_wait_s >= max_reorder_wait_s:
-                        next_frame_id = max(next_frame_id, min_pending_id)
+                        next_frame_id = min_pending_id
                         continue
                     break
 
@@ -6711,12 +6000,8 @@ def run_processor_worker(
 
     def _refresh_rtx_vsr_engine() -> str | None:
         nonlocal rtx_vsr_engine, rtx_vsr_info, rtx_roi_rebuild_pending
-        nonlocal rtx_stage_last_error, rtx_stage_cooldown_until_ts, rtx_stage_consecutive_failures
 
         rtx_roi_rebuild_pending = False
-        rtx_stage_last_error = None
-        rtx_stage_cooldown_until_ts = 0.0
-        rtx_stage_consecutive_failures = 0
 
         if rtx_vsr_engine is not None:
             try:
@@ -7004,7 +6289,7 @@ def run_processor_worker(
                 device_index=int(message["in_device"]),
                 display_mode=resolved_in_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-                max_queue_frames=1,
+                max_queue_frames=8,
                 enable_format_detection=bool(enable_format_detection),
                 timecode_format=selected_timecode_format,
             )
@@ -7012,7 +6297,6 @@ def run_processor_worker(
                 device_index=int(message["out_device"]),
                 display_mode=resolved_out_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-                low_latency_output=True,
             )
 
             try:
@@ -7081,13 +6365,10 @@ def run_processor_worker(
                 "color_range": current_color_range,
                 "worker_process_priority": worker_process_priority,
                 "worker_process_priority_error": worker_process_priority_error,
-                "worker_keep_alive_enabled": bool(worker_keep_alive.enabled),
-                "worker_keep_alive_error": worker_keep_alive.error,
             }
         )
 
         while True:
-            worker_keep_alive.refresh()
             _maybe_run_pending_rtx_roi_rebuild()
             _maybe_apply_pending_ai_sr_build()
 
@@ -7186,8 +6467,6 @@ def run_processor_worker(
                 _stop_sessions()
                 _cleanup_ai_async()
                 _close_rtx_vsr_engine()
-                _stop_effect_media_decoder()
-                worker_keep_alive.close()
                 return
 
             if command == "start_decklink":
@@ -7321,7 +6600,6 @@ def run_processor_worker(
                             "target_buffer_frames": int(out_state.get("target_buffer_frames", 0)),
                             "last_buffered_count": int(out_state.get("last_buffered_count", -1)),
                             "starvation_events": int(out_state.get("starvation_events", 0)),
-                            "clock_correction_events": int(out_state.get("clock_correction_events", 0)),
                             "overflow_events": int(out_state.get("overflow_events", 0)),
                             "auto_reprime_events": int(out_state.get("auto_reprime_events", 0)),
                             "last_reprime_reason": str(out_state.get("last_reprime_reason", "")),
@@ -7427,7 +6705,6 @@ def run_processor_worker(
                     "ai_sr_timing_ms": ai_sr_timing_ms,
                     "rtx_vsr_applied": current_rtx_applied,
                     "rtx_effect_mean_abs_luma": current_rtx_delta,
-                    "rtx_stage_last_error": rtx_stage_last_error,
                     "stage_enable_flags": {
                         "preprocess": bool(_is_preprocess_stage_enabled()),
                         "basic_scaling": bool(_basic_scaling_enabled()),
@@ -7487,7 +6764,6 @@ def run_processor_worker(
             if command == "process_frame":
                 frame_id = int(message["frame_id"])
                 frame_bytes = message["frame_bytes"]
-                _upload_next_effect_media()
                 _advance_roi_microstep_transition_for_output_frame()
                 shift_x, shift_y = _step_smoothed_roi_shift()
                 interlaced_phase = _active_interlaced_field_phase_state(consume_manual_snapshot=True)
@@ -7634,9 +6910,6 @@ def run_processor_worker(
             if command == "start_roi_microstep_transition":
                 if timecode_roi_enabled:
                     continue
-                transition_sequence = int(message.get("roi_sequence", 0))
-                if transition_sequence > 0:
-                    last_roi_command_sequence = max(last_roi_command_sequence, transition_sequence)
                 start_from_current = bool(message.get("start_from_current", False))
                 if start_from_current:
                     start_roi = (current_roi_x, current_roi_y, current_roi_w, current_roi_h)
@@ -7870,114 +7143,6 @@ def run_processor_worker(
                 )
                 continue
 
-            if command == "set_effects_config":
-                requested_enabled = bool(message.get("enabled", False))
-                reload_source = bool(message.get("reload_source", True))
-                effects_error: str | None = None
-                pipeline_was_running = bool(pipeline_running)
-                if reload_source and pipeline_was_running:
-                    _stop_live_pipeline()
-                if reload_source:
-                    _stop_effect_media_decoder()
-                    current_effects_enabled = False
-                try:
-                    if reload_source:
-                        processor.clear_effect_media()
-                    layers = _effect_layers_from_payload(message)
-                    if requested_enabled:
-                        for layer in layers:
-                            if not bool(layer.get("enabled", False)):
-                                continue
-                            layer_index = int(layer.get("layer_index", 2))
-                            media_path = str(layer.get("media_path", "")).strip()
-                            capture_kind = str(layer.get("capture_kind", "")).strip().lower()
-                            source_kind = str(layer.get("source_kind", "media")).strip().lower()
-                            decoder = None
-                            if source_kind == "matte":
-                                matte_rgba = np.asarray(
-                                    layer.get("matte_rgba", [255, 255, 255, 255]), dtype=np.uint8
-                                ).reshape(1, 1, 4)
-                                processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
-                            elif reload_source and capture_kind == "webcam":
-                                decoder = EffectCaptureDecoder(int(layer.get("capture_device_index", 0)))
-                            elif reload_source and media_path:
-                                decoder = EffectMediaDecoder(media_path)
-                            if decoder is not None:
-                                rgba = decoder.next_rgba(loop=bool(layer.get("media_loop", True)))
-                                height, width = int(rgba.shape[0]), int(rgba.shape[1])
-                                processor.upload_effect_layer_media_rgba(layer_index, rgba, width, height)
-                                effect_media_states[layer_index] = {
-                                    "decoder": decoder,
-                                    "playing": capture_kind == "webcam" or bool(layer.get("media_playing", False)),
-                                    "loop": bool(layer.get("media_loop", True)),
-                                    "thread": None,
-                                    "stop": threading.Event(),
-                                    "lock": threading.Lock(),
-                                    "ring": queue.Queue(maxsize=_EFFECT_MEDIA_RING_FRAMES),
-                                    "error": None,
-                                    "next_present_ts": 0.0,
-                                }
-                    processor.set_effects_config(
-                        requested_enabled,
-                        float(message.get("opacity", 1.0)),
-                        str(message.get("blend_mode", "normal")),
-                        str(message.get("blur_method", "off")),
-                        float(message.get("blur_radius", 0.0)),
-                        str(message.get("blur_target", "both")),
-                        float(message.get("layer1_opacity", 1.0)),
-                        str(message.get("key_mode", "off")),
-                        int(message.get("key_color_r", 0)),
-                        int(message.get("key_color_g", 255)),
-                        int(message.get("key_color_b", 0)),
-                        float(message.get("key_similarity", 0.25)),
-                        float(message.get("key_softness", 0.10)),
-                        float(message.get("spill_suppression", 0.25)),
-                        float(message.get("luma_low", 0.0)),
-                        float(message.get("luma_high", 1.0)),
-                        float(message.get("luma_softness", 0.10)),
-                        bool(message.get("key_invert", False)),
-                        float(message.get("key_edge_feather", 0.0)),
-                        bool(message.get("output_connected", True)),
-                        bool(message.get("effect_color_from_alpha", False)),
-                        bool(message.get("effect_alpha_from_color", False)),
-                        bool(message.get("explicit_compositor_layers", False)),
-                    )
-                    _set_native_effects_input_transform(processor, message)
-                    layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
-                    for layer_index in range(1, 9):
-                        layer = (
-                            layers_by_index.get(
-                                layer_index, {"layer_index": layer_index, "enabled": False}
-                            )
-                            if requested_enabled
-                            else {"layer_index": layer_index, "enabled": False}
-                        )
-                        _set_native_effect_layer_config(processor, layer)
-                    _set_native_color_stages(processor, message)
-                    current_effects_enabled = requested_enabled
-                    if reload_source:
-                        _start_effect_media_decoder()
-                except Exception as exc:
-                    effects_error = str(exc)
-                    processor.clear_effect_media()
-                    _set_native_color_stages(processor, {"enabled": False})
-                    processor.set_effects_config(
-                        False, 1.0, "normal", "off", 0, "both", 0.0, "off",
-                        0, 255, 0, 0.25, 0.10, 0.25, 0.0, 1.0, 0.10, False, 0.0, False,
-                    )
-                    _stop_effect_media_decoder()
-                if reload_source and pipeline_was_running:
-                    _start_live_pipeline()
-                _safe_put(
-                    {
-                        "type": "ack",
-                        "cmd": "set_effects_config",
-                        "effects_enabled": bool(current_effects_enabled),
-                        "effects_error": effects_error,
-                    }
-                )
-                continue
-
             if command == "set_color_space":
                 current_color_space = _normalize_color_space_name(str(message.get("color_space", current_color_space)))
                 if hasattr(processor, "set_color_space"):
@@ -8029,34 +7194,6 @@ def run_processor_worker(
             if command in {"set_max_auto_basic_scaling", "set_max_auto_sr_scale"}:
                 current_max_auto_basic_scaling = int(message["scale"])
                 processor.set_max_auto_sr_scale(int(current_max_auto_basic_scaling))
-                continue
-
-            if command == "set_basic_scaling_max_inflight":
-                # Only affects the opt-in parallel worker pool used by basic CUDA
-                # scaling; takes effect on the next DeckLink session start since
-                # parallel_basic_processors are (re)built in _start_live_pipeline.
-                parallel_basic_max_inflight = max(1, min(4, int(message.get("max_inflight", parallel_basic_max_inflight))))
-                _safe_put(
-                    {
-                        "type": "ack",
-                        "cmd": "set_basic_scaling_max_inflight",
-                        "basic_scaling_max_inflight": int(parallel_basic_max_inflight),
-                    }
-                )
-                continue
-
-            if command == "set_basic_scaling_enabled":
-                # Lightweight runtime toggle: no processor/session recreation.
-                # Basic CUDA scaling is the always-available fallback layer
-                # underneath AI SR/RTX VSR, so this can be flipped instantly.
-                basic_scaling_enabled = bool(message.get("enabled", False))
-                _safe_put(
-                    {
-                        "type": "ack",
-                        "cmd": "set_basic_scaling_enabled",
-                        "basic_scaling_enabled": bool(basic_scaling_enabled),
-                    }
-                )
                 continue
 
             if command == "set_ai_sr_enabled":
@@ -8195,7 +7332,6 @@ def run_processor_worker(
         _stop_sessions()
         _cleanup_ai_async()
         _close_rtx_vsr_engine()
-        worker_keep_alive.close()
         try:
             _safe_put(
                 {

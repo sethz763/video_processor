@@ -18,44 +18,29 @@ from pathlib import Path
 from statistics import median
 
 import numpy as np
-from PySide6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QPointF, QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QEventPoint, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTouchEvent, QWheelEvent
+from PySide6.QtCore import QByteArray, QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QEventPoint, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QTouchEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
-    QDialog,
-    QFileDialog,
     QFormLayout,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
-    QMenu,
-    QMessageBox,
     QPushButton,
-    QPlainTextEdit,
     QScrollArea,
-    QSlider,
     QSizePolicy,
     QSpinBox,
     QSplitter,
-    QTabWidget,
     QLineEdit,
     QVBoxLayout,
     QWidget,
 )
-try:
-    from PySide6.QtMultimedia import QMediaDevices
-except ImportError:
-    QMediaDevices = None
 
 FRAME_W = 1920
 FRAME_H = 1080
@@ -80,13 +65,6 @@ SR_FLAVOR_LABEL_TO_NAME = {
     "Bicubic + Sharpen (Crisp)": "bicubic_sharpen",
 }
 SR_FLAVOR_NAME_TO_LABEL = {value: key for key, value in SR_FLAVOR_LABEL_TO_NAME.items()}
-
-# Single-select upscaling mode: which stage (if any) sits on top of the
-# always-available basic CUDA scaling/passthrough fallback.
-SCALING_MODE_BASIC = "Standard CUDA Scaling"
-SCALING_MODE_ONNX_SR = "ONNX SR"
-SCALING_MODE_RTX_SR = "Nvidia SR"
-SCALING_MODE_OPTIONS = [SCALING_MODE_BASIC, SCALING_MODE_ONNX_SR, SCALING_MODE_RTX_SR]
 
 DEINTERLACE_METHOD_LABEL_TO_NAME = {
     "Bob (Fast)": "bob",
@@ -363,10 +341,10 @@ if _project_root_for_imports not in sys.path:
 
 _worker_import_error: Exception | None = None
 try:
-    from gui.processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker
+    from gui.processor_worker import run_processor_worker
 except Exception as exc_gui_import:
     try:
-        from processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker
+        from processor_worker import run_processor_worker
     except Exception as exc_local_import:
         run_processor_worker = None
         _worker_import_error = exc_local_import
@@ -374,19 +352,6 @@ except Exception as exc_gui_import:
         _worker_import_error = None
 else:
     _worker_import_error = None
-
-
-def _windows_video_capture_devices() -> list[tuple[str, str]]:
-    if QMediaDevices is None:
-        return []
-    try:
-        return [
-            (f"Windows Camera: {device.description()}", f"webcam:{index}")
-            for index, device in enumerate(QMediaDevices.videoInputs())
-        ]
-    except Exception:
-        LOGGER.exception("Windows camera enumeration failed")
-        return []
 
 
 _CV2_RGB_RING: list[np.ndarray] = []
@@ -433,220 +398,6 @@ def _normalize_worker_priority_name(priority_name: str) -> str:
     if normalized in {"high", "high_priority", "highpriority"}:
         return "high"
     return "above_normal"
-
-
-def _effects_source_signature(payload: dict[str, object]) -> tuple[object, ...]:
-    layers = _effect_layers_from_payload(payload)
-    layer_signatures = []
-    for layer in layers:
-        layer_signatures.append(
-            (
-                int(layer.get("layer_index", 2)),
-                bool(layer.get("enabled", False)),
-                str(layer.get("source_kind", "media")).strip().lower(),
-                str(layer.get("capture_kind", "")).strip().lower(),
-                layer.get("capture_device_index", -1),
-                str(layer.get("media_path", "")).strip(),
-                bool(layer.get("media_playing", False)),
-                bool(layer.get("media_loop", True)),
-            )
-        )
-    return (bool(payload.get("enabled", False)), tuple(layer_signatures))
-
-
-def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
-    raw_layers = payload.get("layers")
-    if isinstance(raw_layers, list):
-        layers = [
-            dict(layer)
-            for layer in raw_layers
-            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
-        ]
-        if layers:
-            return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
-    return [
-        {
-            "layer_index": 2,
-            "enabled": bool(payload.get("enabled", False)),
-            "source_kind": str(payload.get("source_kind", "media")),
-            "media_path": str(payload.get("media_path", "")),
-            "media_playing": bool(payload.get("media_playing", False)),
-            "media_loop": bool(payload.get("media_loop", True)),
-            "capture_kind": str(payload.get("capture_kind", "")),
-            "capture_device_index": int(payload.get("capture_device_index", -1)),
-            "matte_rgba": payload.get("matte_rgba", [255, 255, 255, 255]),
-            "opacity": float(payload.get("opacity", 1.0)),
-            "blend_mode": str(payload.get("blend_mode", "normal")),
-            "blur_method": str(payload.get("blur_method", "off")),
-            "blur_radius": float(payload.get("blur_radius", 0.0)),
-            "blur_target": str(payload.get("blur_target", "both")),
-            "key": {
-                "mode": str(payload.get("key_mode", "off")),
-                "color": [
-                    int(payload.get("key_color_r", 0)),
-                    int(payload.get("key_color_g", 255)),
-                    int(payload.get("key_color_b", 0)),
-                ],
-                "similarity": float(payload.get("key_similarity", 0.25)),
-                "softness": float(payload.get("key_softness", 0.10)),
-                "spill_suppression": float(payload.get("spill_suppression", 0.25)),
-                "luma_low": float(payload.get("luma_low", 0.0)),
-                "luma_high": float(payload.get("luma_high", 1.0)),
-                "luma_softness": float(payload.get("luma_softness", 0.10)),
-                "edge_feather": float(payload.get("key_edge_feather", 0.0)),
-                "invert": bool(payload.get("key_invert", False)),
-            },
-            "effect_color_from_alpha": bool(payload.get("effect_color_from_alpha", False)),
-            "effect_alpha_from_color": bool(payload.get("effect_alpha_from_color", False)),
-            "mask_pattern": str(payload.get("mask_pattern", "off")),
-            "mask_softness": float(payload.get("mask_softness", 0.0)),
-            "mask_aspect": float(payload.get("mask_aspect", 1.0)),
-            "mask_invert": bool(payload.get("mask_invert", False)),
-            "mask_size": float(payload.get("mask_size", 1.0)),
-            "mask_x": float(payload.get("mask_x", 0.0)),
-            "mask_y": float(payload.get("mask_y", 0.0)),
-            "transform_x": float(payload.get("transform_x", 0.0)),
-            "transform_y": float(payload.get("transform_y", 0.0)),
-            "transform_z": float(payload.get("transform_z", 0.0)),
-            "rotate_x": float(payload.get("rotate_x", 0.0)),
-            "rotate_y": float(payload.get("rotate_y", 0.0)),
-            "rotate_z": float(payload.get("rotate_z", 0.0)),
-        }
-    ]
-
-
-def _set_native_effect_layer_config(processor: object, layer: dict[str, object]) -> None:
-    key = layer.get("key", {})
-    if not isinstance(key, dict):
-        key = {}
-    color = key.get("color", [0, 255, 0])
-    if not isinstance(color, (list, tuple)) or len(color) < 3:
-        color = [0, 255, 0]
-    processor.set_effect_layer_config(
-        int(layer.get("layer_index", 2)),
-        bool(layer.get("enabled", False)),
-        opacity=float(layer.get("opacity", 1.0)),
-        blend_mode=str(layer.get("blend_mode", "normal")),
-        blur_method=str(layer.get("blur_method", "off")),
-        blur_radius=float(layer.get("blur_radius", 0.0)),
-        blur_target=str(layer.get("blur_target", "both")),
-        key_mode=str(key.get("mode", "off")),
-        key_color_r=int(color[0]),
-        key_color_g=int(color[1]),
-        key_color_b=int(color[2]),
-        key_similarity=float(key.get("similarity", 0.25)),
-        key_softness=float(key.get("softness", 0.10)),
-        spill_suppression=float(key.get("spill_suppression", 0.25)),
-        luma_low=float(key.get("luma_low", 0.0)),
-        luma_high=float(key.get("luma_high", 1.0)),
-        luma_softness=float(key.get("luma_softness", 0.10)),
-        key_invert=bool(key.get("invert", False)),
-        key_edge_feather=float(key.get("edge_feather", 0.0)),
-        effect_color_from_alpha=bool(layer.get("effect_color_from_alpha", False)),
-        effect_alpha_from_color=bool(layer.get("effect_alpha_from_color", False)),
-        preserve_color_from_alpha_opacity=bool(layer.get("preserve_color_from_alpha_opacity", False)),
-        source_from_effects_input=bool(layer.get("source_kind") == "effects_input"),
-        key_alpha_from_effects_input=bool(layer.get("key_alpha_from_effects_input", False)),
-        mask_pattern=str(layer.get("mask_pattern", "off")),
-        mask_softness=float(layer.get("mask_softness", 0.0)),
-        mask_aspect=float(layer.get("mask_aspect", 1.0)),
-        mask_invert=bool(layer.get("mask_invert", False)),
-        mask_size=float(layer.get("mask_size", 1.0)),
-        mask_x=float(layer.get("mask_x", 0.0)),
-        mask_y=float(layer.get("mask_y", 0.0)),
-        transform_x=float(layer.get("transform_x", 0.0)),
-        transform_y=float(layer.get("transform_y", 0.0)),
-        transform_z=float(layer.get("transform_z", 0.0)),
-        rotate_x=float(layer.get("rotate_x", 0.0)),
-        rotate_y=float(layer.get("rotate_y", 0.0)),
-        rotate_z=float(layer.get("rotate_z", 0.0)),
-        materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
-    )
-    layer_index = int(layer.get("layer_index", 2))
-    processor.clear_effect_layer_channel_routes(layer_index)
-    channel_routes = layer.get("channel_routes", [])
-    if isinstance(channel_routes, list):
-        for target_channel, route in enumerate(channel_routes[:4]):
-            if not isinstance(route, dict):
-                continue
-            generator_settings = route.get("generator_settings", {})
-            if not isinstance(generator_settings, dict):
-                generator_settings = {}
-            processor.set_effect_layer_channel_route(
-                layer_index,
-                target_channel,
-                int(route.get("source_channel", -1)),
-                blur_method=str(route.get("blur_method", "off")),
-                blur_radius=float(route.get("blur_radius", 0.0)),
-                transform_x=float(route.get("transform_x", 0.0)),
-                transform_y=float(route.get("transform_y", 0.0)),
-                transform_z=float(route.get("transform_z", 0.0)),
-                rotate_x=float(route.get("rotate_x", 0.0)),
-                rotate_y=float(route.get("rotate_y", 0.0)),
-                rotate_z=float(route.get("rotate_z", 0.0)),
-                generator_type=str(route.get("generator_type", "off")),
-                key_color_r=int(generator_settings.get("key_color_r", 0)),
-                key_color_g=int(generator_settings.get("key_color_g", 255)),
-                key_color_b=int(generator_settings.get("key_color_b", 0)),
-                key_similarity=float(generator_settings.get("key_similarity", 0.25)),
-                key_softness=float(generator_settings.get("key_softness", 0.10)),
-                key_invert=bool(generator_settings.get("key_invert", False)),
-                mask_pattern=str(generator_settings.get("pattern", "off")),
-                mask_softness=float(generator_settings.get("softness", 0.0)),
-                mask_aspect=float(generator_settings.get("aspect", 1.0)),
-                mask_invert=bool(generator_settings.get("invert", False)),
-                mask_size=float(generator_settings.get("size", 1.0)),
-                mask_x=float(generator_settings.get("x", 0.0)),
-                mask_y=float(generator_settings.get("y", 0.0)),
-            )
-    raw_color_stages = layer.get("color_stages", []) if bool(layer.get("enabled", False)) else []
-    color_stages = [dict(stage) for stage in raw_color_stages if isinstance(stage, dict)] if isinstance(raw_color_stages, list) else []
-    setter = getattr(processor, "set_effect_layer_color_stages", None)
-    if callable(setter):
-        setter(layer_index, color_stages)
-    elif color_stages:
-        raise RuntimeError("Loaded video_processor build does not support per-layer color stages; rebuild the native module")
-
-
-def _set_native_color_stages(processor: object, payload: dict[str, object]) -> None:
-    if not hasattr(processor, "set_color_stages"):
-        return
-    raw_stages = payload.get("color_stages", []) if bool(payload.get("enabled", False)) else []
-    stages = [dict(stage) for stage in raw_stages if isinstance(stage, dict)] if isinstance(raw_stages, list) else []
-    processor.set_color_stages(stages)
-
-
-def _set_native_effects_input_transform(processor: object, payload: dict[str, object]) -> None:
-    values = (
-        float(payload.get("input_transform_x", 0.0)),
-        float(payload.get("input_transform_y", 0.0)),
-        float(payload.get("input_transform_z", 0.0)),
-        float(payload.get("input_rotate_x", 0.0)),
-        float(payload.get("input_rotate_y", 0.0)),
-        float(payload.get("input_rotate_z", 0.0)),
-    )
-    setter = getattr(processor, "set_effects_input_transform", None)
-    if not callable(setter):
-        if any(abs(value) > 1e-6 for value in values):
-            raise RuntimeError("Loaded video_processor build does not support Effects Input transforms; rebuild the native module")
-        return
-    setter(*values)
-
-
-def _legacy_effect_source_signature(payload: dict[str, object]) -> tuple[object, ...]:
-    matte_rgba = payload.get("matte_rgba", [255, 255, 255, 255])
-    if not isinstance(matte_rgba, (list, tuple)):
-        matte_rgba = [255, 255, 255, 255]
-    return (
-        bool(payload.get("enabled", False)),
-        str(payload.get("source_kind", "media")).strip().lower(),
-        str(payload.get("capture_kind", "")).strip().lower(),
-        payload.get("capture_device_index", -1),
-        str(payload.get("media_path", "")).strip(),
-        bool(payload.get("media_playing", False)),
-        bool(payload.get("media_loop", True)),
-        tuple(int(value) for value in matte_rgba),
-    )
 
 
 def _uyvy_to_rgb_limited(
@@ -1428,11 +1179,9 @@ def write_frame_to_output(out: object, frame_bytes: bytes) -> None:
             "enabled": callable(schedule_fn) and callable(start_fn),
             "can_query_buffered": callable(buffered_fn),
             "started": False,
-            "queued_before_start": 0,
             "display_time": 0,
             "frame_duration": int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0,
             "time_scale": int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0,
-            "minimum_preroll_frames": max(1, int(getattr(out, "minimum_preroll_frames", 1))),
         }
         _OUTPUT_SCHEDULE_STATE[out_id] = state
 
@@ -1450,24 +1199,23 @@ def write_frame_to_output(out: object, frame_bytes: bytes) -> None:
                 state["display_time"] = int(state["display_time"]) + frame_duration
 
                 if not bool(state["started"]):
-                    state["queued_before_start"] = int(state["queued_before_start"]) + 1
-                    required_preroll_frames = int(state["minimum_preroll_frames"])
                     should_start = False
                     if bool(state.get("can_query_buffered", False)):
                         try:
                             buffered_count = int(out.buffered_video_frame_count())
-                            effective_buffered = max(buffered_count, int(state["queued_before_start"]))
-                            should_start = effective_buffered >= required_preroll_frames
+                            # Small preroll prevents startup underflow while keeping latency low.
+                            should_start = buffered_count >= 2
                         except Exception:
+                            # Wrapper does not reliably expose buffered count; start without preroll.
                             state["can_query_buffered"] = False
-                            should_start = int(state["queued_before_start"]) >= required_preroll_frames
+                            should_start = True
                     else:
-                        should_start = int(state["queued_before_start"]) >= required_preroll_frames
+                        # No buffered count support in wrapper; start immediately.
+                        should_start = True
 
                     if should_start:
                         out.start_scheduled_playback(0, time_scale, 1.0)
                         state["started"] = True
-                        state["queued_before_start"] = 0
                 return
             except Exception:
                 LOGGER.exception("Scheduled DeckLink output failed; falling back to sync output")
@@ -2477,3277 +2225,6 @@ class ImageCanvas(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
-class EffectsPortButton(QPushButton):
-    dragStarted = Signal(QPointF)
-    dragMoved = Signal(QPointF)
-    dragFinished = Signal(QPointF, bool)
-
-    def __init__(self, parent: QWidget) -> None:
-        super().__init__("", parent)
-        self._drag_origin: QPointF | None = None
-        self._drag_moved = False
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self._drag_origin = event.globalPosition()
-            self._drag_moved = False
-            self.dragStarted.emit(event.globalPosition())
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_origin is not None and bool(event.buttons() & Qt.LeftButton):
-            delta = event.globalPosition() - self._drag_origin
-            self._drag_moved = self._drag_moved or math.hypot(delta.x(), delta.y()) >= QApplication.startDragDistance()
-            self.dragMoved.emit(event.globalPosition())
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton and self._drag_origin is not None:
-            moved = self._drag_moved
-            self._drag_origin = None
-            self._drag_moved = False
-            if not moved:
-                self.click()
-            self.dragFinished.emit(event.globalPosition(), moved)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-
-class EffectsNodeWidget(QWidget):
-    portClicked = Signal(str, str)
-    portDisconnectRequested = Signal(str, str)
-    nodeMoved = Signal()
-    selectionRequested = Signal(str, bool)
-    nodeDragStarted = Signal(str)
-    nodeDragFinished = Signal(str)
-    settingsRequested = Signal(str)
-    deleteRequested = Signal(str)
-    blurLevelChanged = Signal(str, float)
-    captureDeviceChanged = Signal(str, object, str)
-    mediaPathChanged = Signal(str, str)
-    mediaPlaybackChanged = Signal(str, bool, bool)
-    mediaKeyframePlaybackArmed = Signal(str, str, bool)
-    compositorSettingChanged = Signal(str, str, object)
-    colorSettingChanged = Signal(str, str, object)
-    compositorLayerActionRequested = Signal(str, str)
-    portDragStarted = Signal(str, str, QPointF)
-    portDragMoved = Signal(str, str, QPointF)
-    portDragFinished = Signal(str, str, QPointF, bool)
-
-    def __init__(self, node_id: str, node_type: str, title: str, parent: QWidget) -> None:
-        super().__init__(parent)
-        self.node_id = node_id
-        self.node_type = node_type
-        self._drag_offset: QPointF | None = None
-        self._selected = False
-        node_sizes = {
-            "keying": (380, 520),
-            "media": (300, 154),
-            "transform_3d": (250, 154),
-            "color_splitter": (250, 154),
-            "color_recombiner": (280, 184),
-        }
-        self.setFixedSize(*node_sizes.get(node_type, (250, 124)))
-        self.setCursor(Qt.OpenHandCursor)
-        self.setToolTip("Drag nodes to position. Drag output ports to inputs. Right-click a port to disconnect.")
-
-        title_label = QLabel(title, self)
-        title_label.setGeometry(14, 10, 180, 24)
-        title_label.setStyleSheet("font-weight: 600; color: #f4f4f4;")
-
-        self._status_label = QLabel(self)
-        self._status_label.setGeometry(14, 39, 220, 30)
-        self._status_label.setWordWrap(True)
-        self._status_label.setStyleSheet("color: #b9c0c8; font-size: 10px;")
-
-        self._ports: dict[str, QPushButton] = {}
-        self._port_labels: dict[str, QLabel] = {}
-        output_x = self.width() - 20
-        if node_type == "color_recombiner":
-            self._add_port("red_input", 0, 68, "Red channel input")
-            self._add_port("green_input", 0, 98, "Green channel input")
-            self._add_port("blue_input", 0, 128, "Blue channel input")
-            self._add_port("alpha_input", 0, 158, "Optional alpha channel input")
-        elif node_type == "chroma_key":
-            self._add_port("color_input", 0, 98, "Color input")
-        elif node_type not in {"effects_input", "keying", "capture", "media", "matte", "mask"}:
-            self._add_port("input", 0, 98, "Input")
-        if node_type == "color_splitter":
-            self._add_port("red_output", output_x, 68, "Red channel")
-            self._add_port("green_output", output_x, 98, "Green channel")
-            self._add_port("blue_output", output_x, 128, "Blue channel")
-        elif node_type == "color_recombiner":
-            self._add_port("output", output_x, 98, "Recombined color")
-            self._add_port("alpha_output", output_x, 128, "Recombined alpha")
-        elif node_type == "transform_3d":
-            self._add_port("alpha_input", 0, 128, "Alpha input")
-            self._add_port("output", output_x, 98, "Transformed color")
-            self._add_port("alpha_output", output_x, 128, "Generated alpha")
-        elif node_type in {"mask", "chroma_key"}:
-            self._add_port("alpha_output", output_x, 98, "Key alpha" if node_type == "chroma_key" else "Mask alpha")
-        elif node_type not in {"effects_output", "keying"}:
-            self._add_port("output", output_x, 128 if node_type == "media" else 98, "Color output")
-        if node_type == "media":
-            self._add_port("alpha_output", output_x, 98, "Source alpha")
-            self.setAcceptDrops(True)
-            self.media_browse = QPushButton("...", self)
-            self.media_browse.setGeometry(30, 72, 32, 24)
-            self.media_browse.setToolTip("Choose video, image, or image sequence")
-            self.media_browse.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
-            self.media_play = QPushButton("Play", self)
-            self.media_play.setGeometry(68, 72, 54, 24)
-            self.media_play.setCheckable(True)
-            self.media_play.setToolTip("Play or pause media")
-            self.media_play.toggled.connect(self._emit_media_playback)
-            self.media_loop = QCheckBox("Loop", self)
-            self.media_loop.setGeometry(128, 72, 58, 24)
-            self.media_loop.setChecked(True)
-            self.media_loop.toggled.connect(self._emit_media_playback)
-            self.media_key_play = QPushButton("Key Play", self)
-            self.media_key_play.setGeometry(30, 104, 82, 24)
-            self.media_key_play.setCheckable(True)
-            self.media_key_play.setToolTip("Toggle Play state arming for the next keyframe")
-            self.media_key_play.setStyleSheet(
-                "QPushButton:checked { background: #805d12; color: white; font-weight: 600; }"
-            )
-            self.media_key_play.toggled.connect(
-                lambda checked: self._set_media_keyframe_playback_arm("play", checked)
-            )
-            self.media_key_pause = QPushButton("Key Pause", self)
-            self.media_key_pause.setGeometry(118, 104, 88, 24)
-            self.media_key_pause.setCheckable(True)
-            self.media_key_pause.setToolTip("Toggle Pause state arming for the next keyframe")
-            self.media_key_pause.setStyleSheet(
-                "QPushButton:checked { background: #805d12; color: white; font-weight: 600; }"
-            )
-            self.media_key_pause.toggled.connect(
-                lambda checked: self._set_media_keyframe_playback_arm("pause", checked)
-            )
-        elif node_type == "matte":
-            self._add_port("alpha_output", output_x, 68, "Matte alpha")
-            self.matte_swatch = QPushButton(self)
-            self.matte_swatch.setGeometry(30, 72, 72, 24)
-            self.matte_swatch.setToolTip("Choose matte color")
-            self.matte_swatch.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
-        elif node_type == "mask":
-            self.mask_settings = QPushButton("Pattern...", self)
-            self.mask_settings.setGeometry(30, 72, 92, 24)
-            self.mask_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
-        elif node_type == "blur":
-            self._add_port("alpha_input", 0, 68, "Alpha input")
-            self._add_port("alpha_output", output_x, 68, "Blurred alpha")
-            self.blur_level = QDoubleSpinBox(self)
-            self.blur_level.setGeometry(55, 72, 100, 24)
-            self.blur_level.setRange(0.0, 16.0)
-            self.blur_level.setDecimals(2)
-            self.blur_level.setSingleStep(0.25)
-            self.blur_level.setSuffix(" px")
-            self.blur_level.setKeyboardTracking(False)
-            self.blur_level.setToolTip("GPU blur radius")
-            self.blur_level.valueChanged.connect(
-                lambda value: self.blurLevelChanged.emit(self.node_id, float(value))
-            )
-        elif node_type == "capture":
-            self.capture_device = QComboBox(self)
-            self.capture_device.setGeometry(14, 70, 176, 25)
-            self.capture_device.setToolTip("Video capture device")
-            self.capture_device.currentIndexChanged.connect(self._emit_capture_device)
-        elif node_type in {"proc_amp", "color_corrector", "chroma_key", "transform_3d"}:
-            self.adjust_settings = QPushButton("Adjust...", self)
-            self.adjust_settings.setGeometry(76, 72, 98, 26)
-            self.adjust_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
-        elif node_type == "keying":
-            blend_modes = ["normal", "multiply", "screen", "overlay", "soft_light", "hard_light", "difference", "additive_alpha"]
-            self.compositor_blends: dict[int, QComboBox] = {}
-            self.compositor_opacities: dict[int, QSlider] = {}
-            for layer_index in range(1, 9):
-                row_y = 112 + ((layer_index - 1) * 48)
-                self._add_port(f"layer{layer_index}_color", 0, row_y, f"Layer {layer_index} color")
-                self._add_port(f"layer{layer_index}_alpha", 0, row_y + 22, f"Layer {layer_index} alpha")
-                blend = QComboBox(self)
-                blend.setGeometry(102, row_y - 2, 126, 24)
-                blend.addItems(blend_modes)
-                blend.currentTextChanged.connect(
-                    lambda value, index=layer_index: self.compositorSettingChanged.emit(
-                        self.node_id, f"layer{index}_blend_mode", value
-                    )
-                )
-                opacity = QSlider(Qt.Horizontal, self)
-                opacity.setGeometry(102, row_y + 24, 126, 20)
-                opacity.setRange(0, 100)
-                opacity.setValue(100)
-                opacity.valueChanged.connect(
-                    lambda value, index=layer_index: self.compositorSettingChanged.emit(
-                        self.node_id, f"layer{index}_opacity", value / 100.0
-                    )
-                )
-                self.compositor_blends[layer_index] = blend
-                self.compositor_opacities[layer_index] = opacity
-            self._add_port("output", 360, 250, "Composite color")
-            self._add_port("alpha_output", 360, 280, "Composite alpha")
-            self.add_layer_top = QPushButton("+ Top", self)
-            self.add_layer_top.setGeometry(14, 72, 70, 26)
-            self.remove_layer_top = QPushButton("- Top", self)
-            self.remove_layer_top.setGeometry(88, 72, 70, 26)
-            self.add_layer_bottom = QPushButton("+ Bottom", self)
-            self.add_layer_bottom.setGeometry(162, 72, 82, 26)
-            self.remove_layer_bottom = QPushButton("- Bottom", self)
-            self.remove_layer_bottom.setGeometry(248, 72, 82, 26)
-            self.add_layer_top.clicked.connect(
-                lambda: self.compositorLayerActionRequested.emit(self.node_id, "add_top")
-            )
-            self.remove_layer_top.clicked.connect(
-                lambda: self.compositorLayerActionRequested.emit(self.node_id, "remove_top")
-            )
-            self.add_layer_bottom.clicked.connect(
-                lambda: self.compositorLayerActionRequested.emit(self.node_id, "add_bottom")
-            )
-            self.remove_layer_bottom.clicked.connect(
-                lambda: self.compositorLayerActionRequested.emit(self.node_id, "remove_bottom")
-            )
-            self.layer1_blend = self.compositor_blends[1]
-            self.layer2_blend = self.compositor_blends[2]
-            self.layer1_opacity = self.compositor_opacities[1]
-            self.layer2_opacity = self.compositor_opacities[2]
-            for slider in self.compositor_opacities.values():
-                slider.setRange(0, 100)
-                slider.setValue(100)
-        self._base_size = self.size()
-        self._base_child_geometries = {
-            child: child.geometry() for child in self.findChildren(QWidget, options=Qt.FindDirectChildrenOnly)
-        }
-
-    def _emit_capture_device(self) -> None:
-        combo = getattr(self, "capture_device", None)
-        if combo is not None:
-            self.captureDeviceChanged.emit(self.node_id, combo.currentData(), combo.currentText())
-
-    def _emit_media_playback(self) -> None:
-        play = getattr(self, "media_play", None)
-        loop = getattr(self, "media_loop", None)
-        if play is None or loop is None:
-            return
-        play.setText("Pause" if play.isChecked() else "Play")
-        self.mediaPlaybackChanged.emit(self.node_id, play.isChecked(), loop.isChecked())
-
-    def _set_media_keyframe_playback_arm(self, state: str, checked: bool) -> None:
-        opposite = self.media_key_pause if state == "play" else self.media_key_play
-        if checked and opposite.isChecked():
-            opposite.blockSignals(True)
-            opposite.setChecked(False)
-            opposite.blockSignals(False)
-        self.mediaKeyframePlaybackArmed.emit(self.node_id, state, bool(checked))
-
-    def set_media_state(self, playing: bool, loop: bool, has_media: bool = True) -> None:
-        play = getattr(self, "media_play", None)
-        loop_control = getattr(self, "media_loop", None)
-        if play is None or loop_control is None:
-            return
-        play.blockSignals(True)
-        loop_control.blockSignals(True)
-        play.setChecked(bool(playing))
-        play.setText("Pause" if playing else "Play")
-        play.setEnabled(bool(has_media))
-        loop_control.setChecked(bool(loop))
-        play.blockSignals(False)
-        loop_control.blockSignals(False)
-
-    def set_media_keyframe_playback_arm(self, state: str | None) -> None:
-        key_play = getattr(self, "media_key_play", None)
-        key_pause = getattr(self, "media_key_pause", None)
-        if key_play is None or key_pause is None:
-            return
-        key_play.blockSignals(True)
-        key_pause.blockSignals(True)
-        key_play.setChecked(state == "play")
-        key_pause.setChecked(state == "pause")
-        key_play.blockSignals(False)
-        key_pause.blockSignals(False)
-
-    def set_compositor_state(self, settings: dict[str, object]) -> None:
-        if self.node_type != "keying":
-            return
-        layer_count = max(2, min(8, int(settings.get("layer_count", 2))))
-        controls = tuple(self.compositor_blends.values()) + tuple(self.compositor_opacities.values())
-        for control in controls:
-            control.blockSignals(True)
-        for layer_index in range(1, 9):
-            visible = layer_index <= layer_count
-            self.compositor_blends[layer_index].setVisible(visible)
-            self.compositor_opacities[layer_index].setVisible(visible)
-            self._ports[f"layer{layer_index}_color"].setVisible(visible)
-            self._ports[f"layer{layer_index}_alpha"].setVisible(visible)
-            self._port_labels[f"layer{layer_index}_color"].setVisible(visible)
-            self._port_labels[f"layer{layer_index}_alpha"].setVisible(visible)
-            self.compositor_blends[layer_index].setCurrentText(
-                str(settings.get(f"layer{layer_index}_blend_mode", "normal"))
-            )
-            self.compositor_opacities[layer_index].setValue(
-                round(float(settings.get(f"layer{layer_index}_opacity", 1.0)) * 100.0)
-            )
-        for control in controls:
-            control.blockSignals(False)
-        self.add_layer_top.setEnabled(layer_count < 8)
-        self.add_layer_bottom.setEnabled(layer_count < 8)
-        self.remove_layer_top.setEnabled(layer_count > 2)
-        self.remove_layer_bottom.setEnabled(layer_count > 2)
-
-    def set_matte_state(self, settings: dict[str, object]) -> None:
-        swatch = getattr(self, "matte_swatch", None)
-        if swatch is None:
-            return
-        red = max(0, min(255, int(settings.get("red", 255))))
-        green = max(0, min(255, int(settings.get("green", 255))))
-        blue = max(0, min(255, int(settings.get("blue", 255))))
-        swatch.setStyleSheet(f"background-color: rgb({red}, {green}, {blue}); border: 1px solid #d9dde2;")
-
-    def set_color_state(self, settings: dict[str, object]) -> None:
-        del settings
-
-    def dragEnterEvent(self, event) -> None:
-        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-        if self.node_type == "media" and any(url.isLocalFile() for url in urls):
-            event.acceptProposedAction()
-            return
-        super().dragEnterEvent(event)
-
-    def dropEvent(self, event) -> None:
-        if self.node_type == "media" and event.mimeData().hasUrls():
-            local_paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-            if local_paths:
-                self.mediaPathChanged.emit(self.node_id, local_paths[0])
-                event.acceptProposedAction()
-                return
-        super().dropEvent(event)
-
-    def set_blur_level(self, value: float) -> None:
-        control = getattr(self, "blur_level", None)
-        if control is None:
-            return
-        control.blockSignals(True)
-        control.setValue(float(value))
-        control.blockSignals(False)
-
-    def set_capture_devices(self, devices: list[tuple[str, object]], selected_index: object = None) -> None:
-        combo = getattr(self, "capture_device", None)
-        if combo is None:
-            return
-        combo.blockSignals(True)
-        combo.clear()
-        for label, device_index in devices:
-            combo.addItem(label, device_index)
-        if combo.count() == 0:
-            combo.addItem("No capture devices", None)
-        for index in range(combo.count()):
-            if combo.itemData(index) == selected_index:
-                combo.setCurrentIndex(index)
-                break
-        combo.blockSignals(False)
-
-    def apply_zoom(self, zoom: float) -> None:
-        scale = max(0.5, min(2.0, float(zoom)))
-        self.setFixedSize(round(self._base_size.width() * scale), round(self._base_size.height() * scale))
-        for child, geometry in self._base_child_geometries.items():
-            child.setGeometry(
-                round(geometry.x() * scale),
-                round(geometry.y() * scale),
-                max(1, round(geometry.width() * scale)),
-                max(1, round(geometry.height() * scale)),
-            )
-
-    def _add_port(self, name: str, x: int, y: int, tooltip: str) -> None:
-        port = EffectsPortButton(self)
-        port.setGeometry(x, y, 20, 20)
-        port.setToolTip(tooltip)
-        port.setCursor(Qt.CrossCursor)
-        port.setContextMenuPolicy(Qt.CustomContextMenu)
-        port.setStyleSheet(
-            "QPushButton { background: #efb73e; border: 2px solid #1c2025; border-radius: 8px; }"
-            "QPushButton:hover { background: #fff0a6; }"
-        )
-        port.clicked.connect(lambda _checked=False, port_name=name: self.portClicked.emit(self.node_id, port_name))
-        port.dragStarted.connect(
-            lambda position, port_name=name: self.portDragStarted.emit(self.node_id, port_name, position)
-        )
-        port.dragMoved.connect(
-            lambda position, port_name=name: self.portDragMoved.emit(self.node_id, port_name, position)
-        )
-        port.dragFinished.connect(
-            lambda position, moved, port_name=name: self.portDragFinished.emit(
-                self.node_id, port_name, position, moved
-            )
-        )
-        port.customContextMenuRequested.connect(
-            lambda _position, port_name=name: self.portDisconnectRequested.emit(self.node_id, port_name)
-        )
-        self._ports[name] = port
-        label_names = {
-            **{f"layer{index}_color": f"L{index} Color" for index in range(1, 9)},
-            **{f"layer{index}_alpha": f"L{index} Alpha" for index in range(1, 9)},
-            "red_input": "Red",
-            "green_input": "Green",
-            "blue_input": "Blue",
-            "red_output": "Red",
-            "green_output": "Green",
-            "blue_output": "Blue",
-        }
-        label = QLabel(label_names.get(name, "Alpha" if "alpha" in name else "Color"), self)
-        label.setGeometry(x + 24 if x == 0 else x - 80, y - 1, 76, 22)
-        label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter if x == 0 else Qt.AlignRight | Qt.AlignVCenter)
-        label.setStyleSheet("color: #d9dde2; font-size: 9px;")
-        self._port_labels[name] = label
-
-    def port_center(self, name: str) -> QPointF:
-        port = self._ports[name]
-        return QPointF(self.x() + port.x() + (port.width() / 2.0), self.y() + port.y() + (port.height() / 2.0))
-
-    def set_status(self, text: str) -> None:
-        self._status_label.setText(text)
-
-    def set_selected(self, selected: bool) -> None:
-        self._selected = bool(selected)
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(QPen(Qt.GlobalColor.transparent))
-        painter.setBrush(Qt.GlobalColor.darkGray)
-        painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 6, 6)
-        painter.setPen(QPen(QColor("#efb73e") if self._selected else Qt.GlobalColor.gray, 3 if self._selected else 1))
-        painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 6, 6)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self.selectionRequested.emit(self.node_id, bool(event.modifiers() & Qt.ShiftModifier))
-            self._drag_offset = event.position()
-            self.setCursor(Qt.ClosedHandCursor)
-            self.raise_()
-            self.nodeDragStarted.emit(self.node_id)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_offset is None or not bool(event.buttons() & Qt.LeftButton):
-            return
-        target = self.mapToParent(event.position().toPoint()) - self._drag_offset.toPoint()
-        self.move(max(0, target.x()), max(0, target.y()))
-        self.nodeMoved.emit()
-        event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton and self._drag_offset is not None:
-            self._drag_offset = None
-            self.setCursor(Qt.OpenHandCursor)
-            self.nodeMoved.emit()
-            self.nodeDragFinished.emit(self.node_id)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def contextMenuEvent(self, event) -> None:
-        menu = QMenu(self)
-        settings_action = menu.addAction("Settings...")
-        delete_action = None
-        if self.node_type not in {"effects_input", "effects_output"}:
-            menu.addSeparator()
-            delete_action = menu.addAction("Delete node")
-        selected = menu.exec(event.globalPos())
-        if selected == settings_action:
-            self.settingsRequested.emit(self.node_id)
-        elif delete_action is not None and selected == delete_action:
-            self.deleteRequested.emit(self.node_id)
-
-
-class EffectsGraphCanvas(QWidget):
-    graphChanged = Signal()
-
-    NODE_TITLES = {
-        "effects_input": "Effects Input",
-        "effects_output": "Effects Output",
-        "denoise": "Noise Reduction",
-        "media": "Video / Image / Sequence",
-        "capture": "Video Capture",
-        "keying": "Compositor",
-        "blur": "Blur",
-        "matte": "Matte Color",
-        "mask": "Mask",
-        "proc_amp": "Basic Proc Amp",
-        "color_corrector": "Color Corrector",
-        "chroma_key": "Chroma Key",
-        "transform_3d": "3D Transform",
-        "color_splitter": "Color Splitter",
-        "color_recombiner": "Color Recombiner",
-    }
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setMinimumSize(900, 360)
-        self.setStyleSheet("background: #171a1f;")
-        self._nodes: dict[str, dict[str, object]] = {}
-        self._widgets: dict[str, EffectsNodeWidget] = {}
-        self._connections: list[tuple[str, str, str, str]] = []
-        self._pending_port: tuple[str, str] | None = None
-        self._drag_port: tuple[str, str] | None = None
-        self._drag_position: QPointF | None = None
-        self._selected_nodes: set[str] = set()
-        self._group_drag_driver: str | None = None
-        self._group_drag_origins: dict[str, QPointF] = {}
-        self._marquee_origin: QPointF | None = None
-        self._marquee_rect: QRectF | None = None
-        self._marquee_additive = False
-        self._capture_devices: list[tuple[str, object]] = []
-        self._media_keyframe_playback_arms: dict[str, str] = {}
-        self._key_dialogs: dict[str, QDialog] = {}
-        self._zoom = 1.0
-        self._next_node_number = 1
-        self._effects_enabled = True
-        self._create_node("effects_input", 40, 120, "effects_input")
-        self._create_node("effects_output", 620, 120, "effects_output")
-        self._connections.append(("effects_input", "output", "effects_output", "input"))
-
-    def _create_node(self, node_type: str, x: int, y: int, node_id: str | None = None) -> str:
-        if node_id is None:
-            node_id = f"{node_type}_{self._next_node_number}"
-            self._next_node_number += 1
-            while node_id in self._nodes:
-                node_id = f"{node_type}_{self._next_node_number}"
-                self._next_node_number += 1
-        settings: dict[str, object] = {}
-        if node_type == "denoise":
-            settings = {"method": "luma_gaussian3x3", "strength": 0.35}
-        elif node_type == "media":
-            settings = {"path": "", "opacity": 1.0, "playing": False, "loop": True, "runtime_supported": True}
-        elif node_type == "keying":
-            settings = {
-                "layer_count": 2,
-                "layer1_blend_mode": "normal", "layer1_opacity": 1.0,
-                "layer2_blend_mode": "normal", "layer2_opacity": 1.0,
-                "runtime_supported": True,
-            }
-        elif node_type == "blur":
-            settings = {"method": "gaussian", "radius": 3.0, "target": "both"}
-        elif node_type == "capture":
-            settings = {"device_index": None, "device_name": "No capture device selected"}
-        elif node_type == "matte":
-            settings = {"red": 255, "green": 255, "blue": 255, "alpha": 1.0}
-        elif node_type == "mask":
-            settings = {
-                "pattern": "circle", "softness": 0.0, "aspect": 1.0,
-                "size": 1.0, "x": 0.0, "y": 0.0, "invert": False,
-            }
-        elif node_type == "transform_3d":
-            settings = {
-                "x": 0.0, "y": 0.0, "z": 0.0,
-                "rotate_x": 0.0, "rotate_y": 0.0, "rotate_z": 0.0,
-            }
-        elif node_type == "proc_amp":
-            settings = {"saturation": 1.0, "hue": 0.0, "brightness": 0.0, "contrast": 1.0, "invert": False}
-        elif node_type == "color_corrector":
-            settings = {
-                "gain_r": 1.0, "gain_g": 1.0, "gain_b": 1.0,
-                "mid_r": 1.0, "mid_g": 1.0, "mid_b": 1.0,
-                "blacks_r": 0.0, "blacks_g": 0.0, "blacks_b": 0.0,
-            }
-        elif node_type == "chroma_key":
-            settings = {
-                "key_color_r": 0, "key_color_g": 255, "key_color_b": 0,
-                "key_similarity": 0.25, "key_softness": 0.10,
-                "key_edge_feather": 0.0, "spill_suppression": 0.25, "key_invert": False,
-            }
-        self._nodes[node_id] = {"id": node_id, "type": node_type, "x": int(x), "y": int(y), "settings": settings}
-        widget = EffectsNodeWidget(node_id, node_type, self.NODE_TITLES[node_type], self)
-        widget.move(int(x), int(y))
-        widget.portClicked.connect(self._on_port_clicked)
-        widget.portDragStarted.connect(self._on_port_drag_started)
-        widget.portDragMoved.connect(self._on_port_drag_moved)
-        widget.portDragFinished.connect(self._on_port_drag_finished)
-        widget.portDisconnectRequested.connect(self._disconnect_port)
-        widget.nodeMoved.connect(lambda node_key=node_id: self._on_node_moved(node_key))
-        widget.selectionRequested.connect(self._select_node)
-        widget.nodeDragStarted.connect(self._on_node_drag_started)
-        widget.nodeDragFinished.connect(self._on_node_drag_finished)
-        widget.settingsRequested.connect(self._edit_node_settings)
-        widget.deleteRequested.connect(self._delete_node)
-        widget.blurLevelChanged.connect(self._on_blur_level_changed)
-        widget.captureDeviceChanged.connect(self._on_capture_device_changed)
-        widget.mediaPathChanged.connect(self._on_media_path_changed)
-        widget.mediaPlaybackChanged.connect(self._on_media_playback_changed)
-        widget.mediaKeyframePlaybackArmed.connect(self._on_media_keyframe_playback_armed)
-        widget.compositorSettingChanged.connect(self._on_compositor_setting_changed)
-        widget.colorSettingChanged.connect(self._on_color_setting_changed)
-        widget.compositorLayerActionRequested.connect(self._on_compositor_layer_action)
-        widget.set_blur_level(float(settings.get("radius", 0.0)))
-        widget.set_media_state(
-            bool(settings.get("playing", False)),
-            bool(settings.get("loop", True)),
-            bool(str(settings.get("path", "")).strip()),
-        )
-        widget.set_capture_devices(self._capture_devices, settings.get("device_index"))
-        widget.set_compositor_state(settings)
-        widget.set_matte_state(settings)
-        widget.set_color_state(settings)
-        if node_type == "capture" and self._capture_devices and settings.get("device_index") is None:
-            settings.update({"device_index": self._capture_devices[0][1], "device_name": self._capture_devices[0][0]})
-        widget.apply_zoom(self._zoom)
-        widget.move(round(int(x) * self._zoom), round(int(y) * self._zoom))
-        widget.show()
-        self._widgets[node_id] = widget
-        self._refresh_node_status(node_id)
-        self._expand_to_nodes()
-        return node_id
-
-    def add_node(self, node_type: str) -> str | None:
-        if node_type not in {
-            "denoise", "media", "capture", "keying", "blur", "matte", "mask",
-            "proc_amp", "color_corrector", "chroma_key", "transform_3d",
-            "color_splitter", "color_recombiner",
-        }:
-            return None
-        if node_type == "capture":
-            existing_capture = next(
-                (node_id for node_id, node in self._nodes.items() if node["type"] == "capture"),
-                None,
-            )
-            if existing_capture is not None:
-                return existing_capture
-        node_x, node_y = self._next_free_node_position(node_type)
-        node_id = self._create_node(node_type, node_x, node_y)
-        self.update()
-        self.graphChanged.emit()
-        return node_id
-
-    def _next_free_node_position(self, node_type: str) -> tuple[int, int]:
-        if node_type == "keying":
-            node_width, node_height = 380, 520
-        elif node_type == "media":
-            node_width, node_height = 300, 154
-        elif node_type in {"transform_3d", "color_splitter"}:
-            node_width, node_height = 250, 154
-        elif node_type == "color_recombiner":
-            node_width, node_height = 280, 184
-        else:
-            node_width, node_height = 250, 124
-        candidate_x = 300
-        candidate_y = 70
-        while True:
-            candidate = QRect(candidate_x - 16, candidate_y - 16, node_width + 32, node_height + 32)
-            occupied = False
-            for node in self._nodes.values():
-                existing_type = str(node.get("type", ""))
-                if existing_type == "keying":
-                    existing_width, existing_height = 380, 520
-                elif existing_type == "media":
-                    existing_width, existing_height = 300, 154
-                elif existing_type == "transform_3d":
-                    existing_width, existing_height = 250, 154
-                else:
-                    existing_width, existing_height = 250, 124
-                existing = QRect(
-                    int(node.get("x", 0)), int(node.get("y", 0)), existing_width, existing_height
-                )
-                if candidate.intersects(existing):
-                    occupied = True
-                    break
-            if not occupied:
-                return candidate_x, candidate_y
-            candidate_y += 160
-
-    def _first_available_compositor_layer(self, compositor_id: str, channel: str) -> int:
-        node = self._nodes.get(compositor_id, {})
-        settings = node.get("settings", {}) if isinstance(node, dict) else {}
-        layer_count = max(2, min(8, int(settings.get("layer_count", 2)))) if isinstance(settings, dict) else 2
-        occupied = {
-            target_port
-            for _source, _source_port, target, target_port in self._connections
-            if target == compositor_id
-        }
-        if channel == "alpha":
-            for layer_index in range(2, layer_count + 1):
-                if (
-                    f"layer{layer_index}_color" in occupied
-                    and f"layer{layer_index}_alpha" not in occupied
-                ):
-                    return layer_index
-        for layer_index in range(2, layer_count + 1):
-            if f"layer{layer_index}_{channel}" not in occupied:
-                return layer_index
-        if layer_count < 8:
-            self._on_compositor_layer_action(compositor_id, "add_top")
-            return layer_count + 1
-        return layer_count
-
-    def migrate_legacy_denoise(self, method: str, strength: float) -> None:
-        if method in {"off", "none"} or strength <= 0.0:
-            return
-        node_id = self.add_node("denoise")
-        if node_id is None:
-            return
-        settings = self._nodes[node_id]["settings"]
-        if isinstance(settings, dict):
-            settings.update({"method": str(method), "strength": max(0.0, min(1.0, float(strength)))})
-        self._refresh_node_status(node_id)
-
-    def _on_node_moved(self, node_id: str) -> None:
-        widget = self._widgets[node_id]
-        self._nodes[node_id]["x"] = round(widget.x() / self._zoom)
-        self._nodes[node_id]["y"] = round(widget.y() / self._zoom)
-        if self._group_drag_driver == node_id and node_id in self._group_drag_origins:
-            driver_origin = self._group_drag_origins[node_id]
-            delta = QPointF(widget.pos()) - driver_origin
-            for selected_id, origin in self._group_drag_origins.items():
-                if selected_id == node_id or selected_id not in self._widgets:
-                    continue
-                selected_widget = self._widgets[selected_id]
-                selected_widget.move(
-                    max(0, round(origin.x() + delta.x())),
-                    max(0, round(origin.y() + delta.y())),
-                )
-                self._nodes[selected_id]["x"] = round(selected_widget.x() / self._zoom)
-                self._nodes[selected_id]["y"] = round(selected_widget.y() / self._zoom)
-        self._expand_to_nodes()
-        self.update()
-        self.graphChanged.emit()
-
-    def _set_selected_nodes(self, node_ids: set[str]) -> None:
-        self._selected_nodes = {node_id for node_id in node_ids if node_id in self._nodes}
-        for node_id, widget in self._widgets.items():
-            widget.set_selected(node_id in self._selected_nodes)
-        self.update()
-
-    def _select_node(self, node_id: str, additive: bool) -> None:
-        selected = set(self._selected_nodes)
-        if additive:
-            if node_id in selected:
-                selected.remove(node_id)
-            else:
-                selected.add(node_id)
-        else:
-            selected = {node_id}
-        self._set_selected_nodes(selected)
-
-    def selected_node_ids(self) -> list[str]:
-        return [node_id for node_id in self._nodes if node_id in self._selected_nodes]
-
-    def _on_node_drag_started(self, node_id: str) -> None:
-        if node_id not in self._selected_nodes:
-            self._set_selected_nodes({node_id})
-        self._group_drag_driver = node_id
-        self._group_drag_origins = {
-            selected_id: QPointF(self._widgets[selected_id].pos())
-            for selected_id in self._selected_nodes
-            if selected_id in self._widgets
-        }
-
-    def _on_node_drag_finished(self, node_id: str) -> None:
-        if self._group_drag_driver != node_id:
-            return
-        self._group_drag_driver = None
-        self._group_drag_origins.clear()
-
-    def _expand_to_nodes(self) -> None:
-        if not self._widgets:
-            return
-        needed_w = max(int(node["x"]) + 290 for node in self._nodes.values())
-        needed_h = max(int(node["y"]) + 204 for node in self._nodes.values())
-        self.setMinimumSize(round(max(900, needed_w) * self._zoom), round(max(360, needed_h) * self._zoom))
-
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        delta = event.angleDelta().y()
-        if delta == 0:
-            super().wheelEvent(event)
-            return
-        next_zoom = max(0.5, min(2.0, self._zoom * (1.1 if delta > 0 else (1.0 / 1.1))))
-        if abs(next_zoom - self._zoom) < 1e-6:
-            event.accept()
-            return
-        self._zoom = next_zoom
-        for node_id, widget in self._widgets.items():
-            widget.apply_zoom(self._zoom)
-            node = self._nodes[node_id]
-            widget.move(round(int(node["x"]) * self._zoom), round(int(node["y"]) * self._zoom))
-        self._expand_to_nodes()
-        self.update()
-        event.accept()
-
-    def set_capture_devices(self, devices: list[tuple[str, object]]) -> None:
-        self._capture_devices = list(devices)
-        for node_id, node in self._nodes.items():
-            if node["type"] == "capture" and isinstance(node["settings"], dict):
-                selected = node["settings"].get("device_index")
-                valid_indices = {device_index for _label, device_index in devices}
-                if selected not in valid_indices:
-                    selected = devices[0][1] if devices else None
-                    selected_name = devices[0][0] if devices else "No capture device selected"
-                    node["settings"].update({"device_index": selected, "device_name": selected_name})
-                self._widgets[node_id].set_capture_devices(devices, selected)
-                self._refresh_node_status(node_id)
-
-    def _on_port_clicked(self, node_id: str, port_name: str) -> None:
-        is_output = self._is_output_port(port_name)
-        if self._pending_port is None:
-            if is_output:
-                self._pending_port = (node_id, port_name)
-                self._widgets[node_id].setStyleSheet("border: 2px solid #efb73e;")
-            return
-        source_id, source_port = self._pending_port
-        self._widgets[source_id].setStyleSheet("")
-        self._pending_port = None
-        if is_output or source_id == node_id:
-            return
-        self._connect_ports(source_id, source_port, node_id, port_name)
-
-    def _connect_ports(self, source_id: str, source_port: str, node_id: str, port_name: str) -> None:
-        input_ports = {
-            "input", "color_input", "alpha_input", "red_input", "green_input", "blue_input",
-        } | {
-            f"layer{layer_index}_{channel}"
-            for layer_index in range(1, 9)
-            for channel in ("color", "alpha")
-        }
-        if source_id == node_id or not self._is_output_port(source_port) or port_name not in input_ports:
-            return
-        candidate = (source_id, source_port, node_id, port_name)
-        retained = [connection for connection in self._connections if connection[2:4] != candidate[2:4]]
-        retained.append(candidate)
-        if self._main_connections_have_cycle(retained):
-            return
-        self._connections = retained
-        self.update()
-        self.graphChanged.emit()
-
-    def _on_port_drag_started(self, node_id: str, port_name: str, global_position: QPointF) -> None:
-        if not self._is_output_port(port_name):
-            return
-        if self._pending_port is not None:
-            pending_node_id, _pending_port_name = self._pending_port
-            self._widgets[pending_node_id].setStyleSheet("")
-        self._pending_port = None
-        self._drag_port = (node_id, port_name)
-        self._drag_position = QPointF(self.mapFromGlobal(global_position.toPoint()))
-        self.update()
-
-    def _on_port_drag_moved(self, node_id: str, port_name: str, global_position: QPointF) -> None:
-        if self._drag_port != (node_id, port_name):
-            return
-        self._drag_position = QPointF(self.mapFromGlobal(global_position.toPoint()))
-        self.update()
-
-    def _on_port_drag_finished(
-        self,
-        node_id: str,
-        port_name: str,
-        global_position: QPointF,
-        moved: bool,
-    ) -> None:
-        source = self._drag_port
-        self._drag_port = None
-        self._drag_position = None
-        if source != (node_id, port_name):
-            self.update()
-            return
-        if not moved:
-            self.update()
-            return
-        for target_id, widget in reversed(list(self._widgets.items())):
-            for target_port, port in widget._ports.items():
-                if self._is_output_port(target_port):
-                    continue
-                if port.rect().contains(port.mapFromGlobal(global_position.toPoint())):
-                    self._connect_ports(node_id, port_name, target_id, target_port)
-                    return
-        self.update()
-
-    @staticmethod
-    def _is_output_port(port_name: str) -> bool:
-        return port_name == "output" or port_name.endswith("_output")
-
-    def _disconnect_port(self, node_id: str, port_name: str) -> None:
-        retained = [
-            connection for connection in self._connections
-            if connection[0:2] != (node_id, port_name) and connection[2:4] != (node_id, port_name)
-        ]
-        if len(retained) == len(self._connections):
-            return
-        self._connections = retained
-        self.update()
-        self.graphChanged.emit()
-
-    def _on_blur_level_changed(self, node_id: str, value: float) -> None:
-        settings = self._nodes.get(node_id, {}).get("settings")
-        if not isinstance(settings, dict):
-            return
-        settings["radius"] = max(0.0, min(16.0, float(value)))
-        self._refresh_node_status(node_id)
-        self.graphChanged.emit()
-
-    def _on_capture_device_changed(self, node_id: str, device_index: object, device_name: str) -> None:
-        settings = self._nodes.get(node_id, {}).get("settings")
-        if not isinstance(settings, dict):
-            return
-        settings.update({"device_index": device_index, "device_name": str(device_name)})
-        if node_id not in self._widgets:
-            return
-        self._refresh_node_status(node_id)
-        self.graphChanged.emit()
-
-    def _on_media_path_changed(self, node_id: str, media_path: str) -> None:
-        settings = self._nodes.get(node_id, {}).get("settings")
-        path = Path(media_path)
-        if not isinstance(settings, dict) or not path.is_file():
-            return
-        settings.update({"path": str(path), "playing": False})
-        self._refresh_node_status(node_id)
-        self.graphChanged.emit()
-
-    def _on_media_playback_changed(self, node_id: str, playing: bool, loop: bool) -> None:
-        settings = self._nodes.get(node_id, {}).get("settings")
-        if not isinstance(settings, dict):
-            return
-        settings.update({"playing": bool(playing), "loop": bool(loop)})
-        self.graphChanged.emit()
-
-    def _on_media_keyframe_playback_armed(self, node_id: str, state: str, armed: bool) -> None:
-        if armed:
-            self._media_keyframe_playback_arms[node_id] = state
-            self._set_selected_nodes(self._selected_nodes | {node_id})
-        elif self._media_keyframe_playback_arms.get(node_id) == state:
-            self._media_keyframe_playback_arms.pop(node_id, None)
-
-    def _on_compositor_setting_changed(self, node_id: str, name: str, value: object) -> None:
-        settings = self._nodes.get(node_id, {}).get("settings")
-        if not isinstance(settings, dict):
-            return
-        settings[name] = value
-        self._refresh_node_status(node_id)
-        self.graphChanged.emit()
-
-    def _on_color_setting_changed(self, node_id: str, name: str, value: object) -> None:
-        settings = self._nodes.get(node_id, {}).get("settings")
-        if not isinstance(settings, dict):
-            return
-        settings[name] = value
-        self._refresh_node_status(node_id)
-        self.graphChanged.emit()
-
-    def _on_compositor_layer_action(self, node_id: str, action: str) -> None:
-        node = self._nodes.get(node_id)
-        settings = node.get("settings") if isinstance(node, dict) else None
-        if not isinstance(settings, dict):
-            return
-        layer_setting_defaults: dict[str, object] = {"blend_mode": "normal", "opacity": 1.0}
-
-        def layer_setting(source: dict[str, object], layer_index: int, name: str) -> object:
-            prefixed_name = f"layer{layer_index}_{name}"
-            return source.get(prefixed_name, layer_setting_defaults[name])
-
-        def set_layer_setting(layer_index: int, name: str, value: object) -> None:
-            prefixed_name = f"layer{layer_index}_{name}"
-            settings[prefixed_name] = value
-
-        def reset_layer_settings(layer_index: int, remove: bool = False) -> None:
-            for name, default in layer_setting_defaults.items():
-                prefixed_name = f"layer{layer_index}_{name}"
-                if remove:
-                    settings.pop(prefixed_name, None)
-                else:
-                    settings[prefixed_name] = default
-
-        layer_count = max(2, min(8, int(settings.get("layer_count", 2))))
-        if action.startswith("add_") and layer_count >= 8:
-            return
-        if action.startswith("remove_") and layer_count <= 2:
-            return
-
-        if action == "add_top":
-            settings["layer_count"] = layer_count + 1
-            reset_layer_settings(layer_count + 1)
-        elif action == "remove_top":
-            self._connections = [
-                connection for connection in self._connections
-                if connection[2:4] not in {
-                    (node_id, f"layer{layer_count}_color"),
-                    (node_id, f"layer{layer_count}_alpha"),
-                }
-            ]
-            reset_layer_settings(layer_count, remove=True)
-            settings["layer_count"] = layer_count - 1
-        elif action in {"add_bottom", "remove_bottom"}:
-            if action == "add_bottom":
-                layer_range = range(layer_count, 1, -1)
-                offset = 1
-                settings["layer_count"] = layer_count + 1
-            else:
-                self._connections = [
-                    connection for connection in self._connections
-                    if connection[2:4] not in {
-                        (node_id, "layer2_color"),
-                        (node_id, "layer2_alpha"),
-                    }
-                ]
-                layer_range = range(3, layer_count + 1)
-                offset = -1
-                settings["layer_count"] = layer_count - 1
-            remapped: list[tuple[str, str, str, str]] = []
-            for source, source_port, target, target_port in self._connections:
-                if target == node_id:
-                    for layer_index in layer_range:
-                        for channel in ("color", "alpha"):
-                            if target_port == f"layer{layer_index}_{channel}":
-                                target_port = f"layer{layer_index + offset}_{channel}"
-                                break
-                remapped.append((source, source_port, target, target_port))
-            self._connections = remapped
-            source_settings = dict(settings)
-            for layer_index in layer_range:
-                target_index = layer_index + offset
-                for name in layer_setting_defaults:
-                    set_layer_setting(target_index, name, layer_setting(source_settings, layer_index, name))
-            if action == "add_bottom":
-                reset_layer_settings(2)
-            else:
-                reset_layer_settings(layer_count, remove=True)
-        else:
-            return
-
-        self._refresh_node_status(node_id)
-        self.update()
-        self.graphChanged.emit()
-
-    def _main_connections_have_cycle(self, connections: list[tuple[str, str, str, str]]) -> bool:
-        edges: dict[str, set[str]] = {}
-        for source, _source_port, target, _target_port in connections:
-            edges.setdefault(source, set()).add(target)
-
-        def visits_cycle(node_id: str, active: set[str], complete: set[str]) -> bool:
-            if node_id in active:
-                return True
-            if node_id in complete:
-                return False
-            active.add(node_id)
-            if any(visits_cycle(target, active, complete) for target in edges.get(node_id, set())):
-                return True
-            active.remove(node_id)
-            complete.add(node_id)
-            return False
-
-        complete: set[str] = set()
-        for start in edges:
-            if visits_cycle(start, set(), complete):
-                return True
-        return False
-
-    def _delete_node(self, node_id: str) -> None:
-        node = self._nodes.get(node_id)
-        if node is None or node["type"] in {"effects_input", "effects_output"}:
-            return
-        incoming = next((c for c in self._connections if c[2] == node_id and c[3] in {"input", "layer1_color"}), None)
-        outgoing = next((c for c in self._connections if c[0] == node_id and c[1] == "output"), None)
-        self._connections = [c for c in self._connections if c[0] != node_id and c[2] != node_id]
-        if incoming is not None and outgoing is not None:
-            self._connections.append((incoming[0], incoming[1], outgoing[2], outgoing[3]))
-        self._widgets.pop(node_id).deleteLater()
-        self._nodes.pop(node_id)
-        self._selected_nodes.discard(node_id)
-        self._media_keyframe_playback_arms.pop(node_id, None)
-        self.update()
-        self.graphChanged.emit()
-
-    def _edit_node_settings(self, node_id: str) -> None:
-        node = self._nodes[node_id]
-        node_type = str(node["type"])
-        settings = node["settings"]
-        if not isinstance(settings, dict):
-            return
-        if node_type == "denoise":
-            labels = list(DENOISE_METHOD_LABEL_TO_NAME.keys())
-            current_label = DENOISE_METHOD_NAME_TO_LABEL.get(str(settings.get("method", "off")), "Off")
-            selected, accepted = QInputDialog.getItem(self, "Noise Reduction", "Method", labels, labels.index(current_label), False)
-            if not accepted:
-                return
-            strength, accepted = QInputDialog.getDouble(
-                self, "Noise Reduction", "Strength", float(settings.get("strength", 0.35)), 0.0, 1.0, 2, 0.05
-            )
-            if not accepted:
-                return
-            settings.update({"method": DENOISE_METHOD_LABEL_TO_NAME[selected], "strength": strength})
-        elif node_type == "media":
-            path, _selected_filter = QFileDialog.getOpenFileName(
-                self,
-                "Choose Video, Image, or Image Sequence Frame",
-                str(settings.get("path", "")),
-                "Media (*.mov *.mp4 *.m4v *.mkv *.avi *.webm *.wmv *.mpg *.mpeg *.mxf *.flv *.vob *.ogv *.3gp *.ts *.mts *.m2ts *.hevc *.h265 *.h264 *.gif *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr);;All files (*)",
-            )
-            if path:
-                settings.update({"path": path, "playing": False})
-            opacity, accepted = QInputDialog.getDouble(
-                self, "Media Layer", "Opacity", float(settings.get("opacity", 1.0)), 0.0, 1.0, 2, 0.05
-            )
-            if accepted:
-                settings["opacity"] = opacity
-        elif node_type in {"proc_amp", "color_corrector"}:
-            self._show_color_settings(node_id)
-            return
-        elif node_type == "transform_3d":
-            self._show_transform_settings(node_id)
-            return
-        elif node_type == "chroma_key":
-            self._show_chroma_key_settings(node_id)
-            return
-        elif node_type == "matte":
-            current = QColor(
-                int(settings.get("red", 255)),
-                int(settings.get("green", 255)),
-                int(settings.get("blue", 255)),
-            )
-            picker = QColorDialog(current, self)
-            picker.setWindowTitle("Matte Color")
-
-            def apply_color(color: QColor) -> None:
-                if not color.isValid():
-                    return
-                settings.update({"red": color.red(), "green": color.green(), "blue": color.blue()})
-                self._refresh_node_status(node_id)
-                self.graphChanged.emit()
-
-            picker.currentColorChanged.connect(apply_color)
-            if picker.exec() != QDialog.Accepted:
-                apply_color(current)
-                return
-            apply_color(picker.selectedColor())
-            alpha, accepted = QInputDialog.getDouble(
-                self, "Matte Color", "Alpha", float(settings.get("alpha", 1.0)), 0.0, 1.0, 2, 0.05
-            )
-            if accepted:
-                settings["alpha"] = alpha
-        elif node_type == "mask":
-            self._show_mask_settings(node_id)
-            return
-        elif node_type == "blur":
-            methods = ["gaussian", "box"]
-            current_method = str(settings.get("method", "gaussian"))
-            selected, accepted = QInputDialog.getItem(
-                self, "Blur", "Method", methods, methods.index(current_method) if current_method in methods else 0, False
-            )
-            if not accepted:
-                return
-            settings["method"] = selected
-            targets = ["color", "alpha", "both"]
-            current_target = str(settings.get("target", "both"))
-            selected_target, accepted = QInputDialog.getItem(
-                self, "Blur", "Channels", targets, targets.index(current_target) if current_target in targets else 2, False
-            )
-            if accepted:
-                settings["target"] = selected_target
-        else:
-            return
-        self._refresh_node_status(node_id)
-        self.graphChanged.emit()
-
-    def _add_live_slider(
-        self,
-        form: QFormLayout,
-        dialog: QDialog,
-        node_id: str,
-        label: str,
-        name: str,
-        minimum: float,
-        maximum: float,
-        scale: int,
-        decimals: int = 2,
-        suffix: str = "",
-    ) -> None:
-        settings = self._nodes[node_id]["settings"]
-        if not isinstance(settings, dict):
-            return
-        row = QWidget(dialog)
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        slider = QSlider(Qt.Horizontal, row)
-        slider.setRange(round(minimum * scale), round(maximum * scale))
-        slider.setProperty("setting_name", name)
-        slider.setProperty("setting_scale", scale)
-        slider.setValue(round(float(settings.get(name, minimum)) * scale))
-        value_control = QDoubleSpinBox(row)
-        value_control.setRange(minimum, maximum)
-        value_control.setProperty("setting_name", name)
-        value_control.setDecimals(decimals)
-        value_control.setSingleStep(1.0 / float(scale))
-        value_control.setSuffix(suffix)
-        value_control.setValue(float(settings.get(name, minimum)))
-        value_control.setKeyboardTracking(True)
-        value_control.setFixedWidth(92)
-        row_layout.addWidget(slider, 1)
-        row_layout.addWidget(value_control)
-
-        def slider_changed(raw_value: int) -> None:
-            value = float(raw_value) / float(scale)
-            value_control.blockSignals(True)
-            value_control.setValue(value)
-            value_control.blockSignals(False)
-            self._on_color_setting_changed(node_id, name, value)
-
-        def value_changed(value: float) -> None:
-            slider.blockSignals(True)
-            slider.setValue(round(float(value) * scale))
-            slider.blockSignals(False)
-            self._on_color_setting_changed(node_id, name, float(value))
-
-        slider.valueChanged.connect(slider_changed)
-        value_control.valueChanged.connect(value_changed)
-        form.addRow(label, row)
-
-    def _open_settings_dialog(self, node_id: str, title: str) -> tuple[QDialog, QFormLayout] | None:
-        existing = self._key_dialogs.get(node_id)
-        if existing is not None:
-            existing.show()
-            existing.raise_()
-            existing.activateWindow()
-            return None
-        dialog = QDialog(self, Qt.Tool)
-        dialog.setWindowTitle(title)
-        dialog.setMinimumWidth(430)
-        dialog.setStyleSheet(
-            "QDialog { background: #20242a; color: #f4f4f4; }"
-            "QLabel { color: #d9dde2; }"
-            "QCheckBox { background: #555555; color: #f4f4f4; border-radius: 4px; padding: 4px 6px; }"
-            "QCheckBox::indicator { width: 14px; height: 14px; background: #606870; border: 1px solid #d9dde2; }"
-            "QCheckBox::indicator:checked { background: #efb73e; border-color: #efb73e; }"
-        )
-        form = QFormLayout(dialog)
-        dialog.destroyed.connect(lambda: self._key_dialogs.pop(node_id, None))
-        self._key_dialogs[node_id] = dialog
-        return dialog, form
-
-    def _finish_settings_dialog(self, dialog: QDialog, form: QFormLayout) -> None:
-        close_button = QPushButton("Close", dialog)
-        close_button.clicked.connect(dialog.close)
-        form.addRow(close_button)
-        dialog.show()
-
-    def _show_color_settings(self, node_id: str) -> None:
-        node_type = str(self._nodes[node_id]["type"])
-        opened = self._open_settings_dialog(
-            node_id,
-            "Basic Proc Amp" if node_type == "proc_amp" else "Color Corrector",
-        )
-        if opened is None:
-            return
-        dialog, form = opened
-        if node_type == "proc_amp":
-            for spec in (
-                ("Saturation", "saturation", 0.0, 4.0, 100, 2, ""),
-                ("Hue", "hue", -180.0, 180.0, 1, 0, " deg"),
-                ("Brightness", "brightness", -1.0, 1.0, 100, 2, ""),
-                ("Contrast", "contrast", 0.0, 4.0, 100, 2, ""),
-            ):
-                self._add_live_slider(form, dialog, node_id, *spec)
-            settings = self._nodes[node_id]["settings"]
-            invert = QCheckBox("Invert", dialog)
-            invert.setProperty("setting_name", "invert")
-            invert.setChecked(bool(settings.get("invert", False)) if isinstance(settings, dict) else False)
-            invert.toggled.connect(lambda value: self._on_color_setting_changed(node_id, "invert", bool(value)))
-            form.addRow(invert)
-        else:
-            for heading, prefix, minimum, maximum, scale in (
-                ("Gain", "gain", 0.0, 4.0, 100),
-                ("Mid", "mid", 0.1, 4.0, 100),
-                ("Blacks", "blacks", -1.0, 1.0, 100),
-            ):
-                for channel, channel_label in (("r", "Red"), ("g", "Green"), ("b", "Blue")):
-                    self._add_live_slider(
-                        form, dialog, node_id, f"{heading} {channel_label}",
-                        f"{prefix}_{channel}", minimum, maximum, scale,
-                    )
-        self._finish_settings_dialog(dialog, form)
-
-    def _show_chroma_key_settings(self, node_id: str) -> None:
-        opened = self._open_settings_dialog(node_id, "Chroma Key")
-        if opened is None:
-            return
-        dialog, form = opened
-        for label, name in (("Key red", "key_color_r"), ("Key green", "key_color_g"), ("Key blue", "key_color_b")):
-            self._add_live_slider(form, dialog, node_id, label, name, 0.0, 255.0, 1, 0)
-        self._add_live_slider(form, dialog, node_id, "Similarity", "key_similarity", 0.0, 1.0, 1000, 3)
-        self._add_live_slider(form, dialog, node_id, "Softness", "key_softness", 0.0, 1.0, 1000, 3)
-        self._add_live_slider(form, dialog, node_id, "Edge feather", "key_edge_feather", 0.0, 16.0, 10, 1, " px")
-        self._add_live_slider(form, dialog, node_id, "Spill suppression", "spill_suppression", 0.0, 1.0, 1000, 3)
-        settings = self._nodes[node_id]["settings"]
-        invert = QCheckBox("Invert alpha", dialog)
-        invert.setProperty("setting_name", "key_invert")
-        invert.setChecked(bool(settings.get("key_invert", False)) if isinstance(settings, dict) else False)
-        invert.toggled.connect(lambda value: self._on_color_setting_changed(node_id, "key_invert", bool(value)))
-        form.addRow(invert)
-        self._finish_settings_dialog(dialog, form)
-
-    def _show_transform_settings(self, node_id: str) -> None:
-        opened = self._open_settings_dialog(node_id, "3D Transform")
-        if opened is None:
-            return
-        dialog, form = opened
-        for spec in (
-            ("X", "x", -100.0, 100.0, 10, 1, "%"),
-            ("Y", "y", -100.0, 100.0, 10, 1, "%"),
-            ("Z", "z", -90.0, 90.0, 10, 1, "%"),
-            ("Rotate X", "rotate_x", -180.0, 180.0, 10, 1, " deg"),
-            ("Rotate Y", "rotate_y", -180.0, 180.0, 10, 1, " deg"),
-            ("Rotate Z", "rotate_z", -180.0, 180.0, 10, 1, " deg"),
-        ):
-            self._add_live_slider(form, dialog, node_id, *spec)
-        self._finish_settings_dialog(dialog, form)
-
-    def _mask_icon(self, pattern: str) -> QIcon:
-        pixmap = QPixmap(56, 56)
-        pixmap.fill(QColor("#262b31"))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#f1f3f5"))
-        if pattern == "circle":
-            painter.drawEllipse(QRectF(9, 9, 38, 38))
-        elif pattern == "diamond":
-            painter.drawPolygon(QPolygonF([QPointF(28, 6), QPointF(50, 28), QPointF(28, 50), QPointF(6, 28)]))
-        else:
-            painter.drawRect(QRectF(9, 9, 38, 38))
-        painter.end()
-        return QIcon(pixmap)
-
-    def _show_mask_settings(self, node_id: str) -> None:
-        settings = self._nodes[node_id]["settings"]
-        if not isinstance(settings, dict):
-            return
-        dialog = QDialog(self, Qt.Tool)
-        dialog.setWindowTitle("Mask")
-        dialog.destroyed.connect(lambda: self._key_dialogs.pop(node_id, None))
-        self._key_dialogs[node_id] = dialog
-        layout = QVBoxLayout(dialog)
-        pattern_grid = QGridLayout()
-        pattern_buttons: dict[str, QPushButton] = {}
-        for column, pattern in enumerate(("square", "circle", "diamond")):
-            button = QPushButton(pattern.title(), dialog)
-            button.setCheckable(True)
-            button.setIcon(self._mask_icon(pattern))
-            button.setIconSize(QPixmap(56, 56).size())
-            button.setMinimumSize(86, 84)
-            button.setChecked(str(settings.get("pattern", "circle")) == pattern)
-            pattern_grid.addWidget(button, 0, column)
-            pattern_buttons[pattern] = button
-        layout.addLayout(pattern_grid)
-
-        form = QFormLayout()
-        softness = QSlider(Qt.Horizontal, dialog)
-        softness.setRange(0, 100)
-        softness.setValue(round(float(settings.get("softness", 0.0)) * 100.0))
-        softness.setProperty("setting_name", "softness")
-        softness.setProperty("setting_scale", 100)
-        aspect = QSlider(Qt.Horizontal, dialog)
-        aspect.setRange(25, 400)
-        aspect.setValue(round(float(settings.get("aspect", 1.0)) * 100.0))
-        aspect.setProperty("setting_name", "aspect")
-        aspect.setProperty("setting_scale", 100)
-        size = QSlider(Qt.Horizontal, dialog)
-        size.setRange(10, 400)
-        size.setValue(round(float(settings.get("size", 1.0)) * 100.0))
-        size.setProperty("setting_name", "size")
-        size.setProperty("setting_scale", 100)
-        position_x = QSlider(Qt.Horizontal, dialog)
-        position_x.setRange(-100, 100)
-        position_x.setValue(round(float(settings.get("x", 0.0))))
-        position_x.setProperty("setting_name", "x")
-        position_x.setProperty("setting_scale", 1)
-        position_y = QSlider(Qt.Horizontal, dialog)
-        position_y.setRange(-100, 100)
-        position_y.setValue(round(float(settings.get("y", 0.0))))
-        position_y.setProperty("setting_name", "y")
-        position_y.setProperty("setting_scale", 1)
-        invert = QCheckBox("Invert mask", dialog)
-        invert.setProperty("setting_name", "invert")
-        invert.setChecked(bool(settings.get("invert", False)))
-        form.addRow("Softness", softness)
-        form.addRow("Aspect", aspect)
-        form.addRow("Size", size)
-        form.addRow("X position (%)", position_x)
-        form.addRow("Y position (%)", position_y)
-        form.addRow(invert)
-        layout.addLayout(form)
-        close_button = QPushButton("Close", dialog)
-        layout.addWidget(close_button)
-
-        def select_pattern(selected_pattern: str) -> None:
-            for pattern, button in pattern_buttons.items():
-                button.setChecked(pattern == selected_pattern)
-            self._on_compositor_setting_changed(node_id, "pattern", selected_pattern)
-
-        for pattern, button in pattern_buttons.items():
-            button.clicked.connect(lambda _checked=False, value=pattern: select_pattern(value))
-        softness.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "softness", value / 100.0)
-        )
-        aspect.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "aspect", value / 100.0)
-        )
-        size.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "size", value / 100.0)
-        )
-        position_x.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "x", float(value))
-        )
-        position_y.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "y", float(value))
-        )
-        invert.toggled.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "invert", value)
-        )
-        close_button.clicked.connect(dialog.close)
-        dialog.show()
-
-    def _refresh_node_status(self, node_id: str) -> None:
-        node = self._nodes[node_id]
-        settings = node["settings"] if isinstance(node["settings"], dict) else {}
-        node_type = str(node["type"])
-        if node_type == "effects_input":
-            status = "GPU frame source"
-        elif node_type == "effects_output":
-            status = "GPU frame destination"
-        elif node_type == "denoise":
-            status = f"{settings.get('method', 'off')}  {float(settings.get('strength', 0.0)):.2f}"
-        elif node_type == "media":
-            source_name = Path(str(settings.get("path", ""))).name or "No source selected"
-            status = f"{source_name}\nGPU color + alpha"
-        elif node_type == "keying":
-            status = f"L2 {settings.get('layer2_blend_mode', 'normal')}  {float(settings.get('layer2_opacity', 1.0)):.2f}"
-        elif node_type == "capture":
-            status = str(settings.get("device_name", "No capture device selected"))
-        elif node_type == "matte":
-            status = "#{:02X}{:02X}{:02X}  alpha {:.2f}".format(
-                int(settings.get("red", 255)), int(settings.get("green", 255)),
-                int(settings.get("blue", 255)), float(settings.get("alpha", 1.0)),
-            )
-        elif node_type == "mask":
-            status = "{}{}  size {:.2f}\nX {:.0f}%  Y {:.0f}%".format(
-                str(settings.get("pattern", "circle")).title(),
-                " inverted" if bool(settings.get("invert", False)) else "",
-                float(settings.get("size", 1.0)),
-                float(settings.get("x", 0.0)), float(settings.get("y", 0.0)),
-            )
-        elif node_type == "transform_3d":
-            status = "XYZ {:.0f}, {:.0f}, {:.0f}%\nRot {:.0f}, {:.0f}, {:.0f} deg".format(
-                float(settings.get("x", 0.0)), float(settings.get("y", 0.0)), float(settings.get("z", 0.0)),
-                float(settings.get("rotate_x", 0.0)), float(settings.get("rotate_y", 0.0)),
-                float(settings.get("rotate_z", 0.0)),
-            )
-        elif node_type == "proc_amp":
-            status = "Sat {:.2f}  Hue {:.1f}\nBright {:.2f}  Contrast {:.2f}{}".format(
-                float(settings.get("saturation", 1.0)), float(settings.get("hue", 0.0)),
-                float(settings.get("brightness", 0.0)), float(settings.get("contrast", 1.0)),
-                "  Invert" if bool(settings.get("invert", False)) else "",
-            )
-        elif node_type == "color_corrector":
-            status = "RGB lift / gamma / gain"
-        elif node_type == "chroma_key":
-            status = "#{:02X}{:02X}{:02X}  sim {:.3f}\nSoft {:.3f}  Feather {:.1f}px{}".format(
-                int(settings.get("key_color_r", 0)), int(settings.get("key_color_g", 255)),
-                int(settings.get("key_color_b", 0)), float(settings.get("key_similarity", 0.25)),
-                float(settings.get("key_softness", 0.10)), float(settings.get("key_edge_feather", 0.0)),
-                "  Invert" if bool(settings.get("key_invert", False)) else "",
-            )
-        else:
-            status = f"{settings.get('method', 'gaussian')} {settings.get('target', 'both')}"
-        self._widgets[node_id].set_status(status)
-        self._widgets[node_id].set_blur_level(float(settings.get("radius", 0.0)))
-        self._widgets[node_id].set_compositor_state(settings)
-        self._widgets[node_id].set_matte_state(settings)
-        self._widgets[node_id].set_color_state(settings)
-        self._widgets[node_id].set_media_state(
-            bool(settings.get("playing", False)),
-            bool(settings.get("loop", True)),
-            bool(str(settings.get("path", "")).strip()),
-        )
-        dialog = self._key_dialogs.get(node_id)
-        if dialog is not None:
-            for checkbox in dialog.findChildren(QCheckBox):
-                setting_name = checkbox.property("setting_name")
-                if isinstance(setting_name, str) and setting_name in settings:
-                    checkbox.blockSignals(True)
-                    checkbox.setChecked(bool(settings[setting_name]))
-                    checkbox.blockSignals(False)
-            for value_control in dialog.findChildren(QDoubleSpinBox):
-                setting_name = value_control.property("setting_name")
-                if isinstance(setting_name, str) and setting_name in settings:
-                    value_control.blockSignals(True)
-                    value_control.setValue(float(settings[setting_name]))
-                    value_control.blockSignals(False)
-            for slider in dialog.findChildren(QSlider):
-                setting_name = slider.property("setting_name")
-                setting_scale = slider.property("setting_scale")
-                if isinstance(setting_name, str) and setting_name in settings and isinstance(setting_scale, int):
-                    slider.blockSignals(True)
-                    slider.setValue(round(float(settings[setting_name]) * setting_scale))
-                    slider.blockSignals(False)
-        if node_type == "capture":
-            self._widgets[node_id].set_capture_devices(self._capture_devices, settings.get("device_index"))
-
-    def active_capture_device(self) -> int | None:
-        edges = {
-            source: target for source, source_port, target, target_port in self._connections
-            if source_port == "output" and target_port == "input"
-        }
-        for node_id, node in self._nodes.items():
-            if node["type"] != "capture" or edges.get(node_id) is None or not isinstance(node["settings"], dict):
-                continue
-            current = node_id
-            visited: set[str] = set()
-            while current in edges and current not in visited:
-                visited.add(current)
-                current = edges[current]
-                if current == "effects_output":
-                    device_index = node["settings"].get("device_index")
-                    if isinstance(device_index, str) and device_index.startswith("webcam:"):
-                        return None
-                    return int(device_index) if device_index is not None else None
-        return None
-
-    def active_denoise_settings(self) -> tuple[str, float]:
-        edges = {
-            source: target for source, source_port, target, target_port in self._connections
-            if source_port == "output" and target_port in {"input", "layer1_color"}
-        }
-        current = self._active_main_source()
-        visited: set[str] = set()
-        active: tuple[str, float] = ("off", 0.0)
-        while current in edges and current not in visited:
-            visited.add(current)
-            current = edges[current]
-            node = self._nodes.get(current)
-            if node is not None and node["type"] == "denoise" and isinstance(node["settings"], dict):
-                settings = node["settings"]
-                active = (str(settings.get("method", "off")), float(settings.get("strength", 0.0)))
-            if current == "effects_output":
-                return active
-        return "off", 0.0
-
-    def _active_main_source(self) -> str:
-        capture_sources = [
-            node_id for node_id, node in self._nodes.items()
-            if node["type"] == "capture" and any(
-                connection[0] == node_id and connection[1] == "output"
-                and connection[3] in {"input", "layer1_color"}
-                for connection in self._connections
-            )
-        ]
-        return capture_sources[-1] if capture_sources else "effects_input"
-
-    def native_effects_payload(self) -> dict[str, object]:
-        def resolve_generated_alpha(
-            source_id: str | None,
-            source_port: str,
-        ) -> tuple[str | None, str, dict[str, object]]:
-            if source_id is None or source_port != "alpha_output":
-                return source_id, source_port, {}
-            source_node = self._nodes.get(source_id, {})
-            source_type = source_node.get("type")
-            settings = source_node.get("settings", {})
-            if not isinstance(settings, dict):
-                settings = {}
-            if source_type == "mask":
-                return source_id, "alpha_output", {"type": "mask", "settings": dict(settings)}
-            if source_type != "chroma_key":
-                return source_id, source_port, {}
-            incoming = next(
-                (candidate for candidate in self._connections if candidate[2:4] == (source_id, "color_input")),
-                None,
-            )
-            if incoming is None:
-                return None, "", {}
-            return incoming[0], "alpha_output", {"type": "chroma_key", "settings": dict(settings)}
-
-        def resolve_transform_source(
-            connection: tuple[str, str, str, str] | None,
-        ) -> tuple[str | None, str, dict[str, object]]:
-            if connection is None:
-                return None, "", {}
-            source_id, source_port = connection[0], connection[1]
-            transform_settings: dict[str, object] = {}
-            visited: set[str] = set()
-
-            while source_id is not None and source_id not in visited:
-                visited.add(source_id)
-                source_node = self._nodes.get(source_id, {})
-                source_type = source_node.get("type")
-
-                if source_type == "transform_3d":
-                    candidate_settings = source_node.get("settings", {})
-                    if isinstance(candidate_settings, dict):
-                        transform_settings = dict(candidate_settings)
-                    preferred_inputs = (
-                        ("alpha_input", "input")
-                        if source_port == "alpha_output"
-                        else ("input", "alpha_input")
-                    )
-                    incoming = next(
-                        (
-                            candidate
-                            for input_port in preferred_inputs
-                            for candidate in self._connections
-                            if candidate[2:4] == (source_id, input_port)
-                        ),
-                        None,
-                    )
-                    if incoming is None:
-                        return None, "", transform_settings
-                    source_id = incoming[0]
-                    source_port = (
-                        "alpha_output"
-                        if source_port == "alpha_output"
-                        or incoming[1] == "alpha_output"
-                        or incoming[3] == "alpha_input"
-                        else "output"
-                    )
-                    continue
-
-                if source_type in {"proc_amp", "color_corrector"}:
-                    incoming = next(
-                        (candidate for candidate in self._connections if candidate[2:4] == (source_id, "input")),
-                        None,
-                    )
-                    if incoming is None:
-                        return None, "", transform_settings
-                    source_id, source_port = incoming[0], incoming[1]
-                    continue
-
-                return source_id, source_port, transform_settings
-
-            return None, "", transform_settings
-
-        def build_color_stage_payload(
-            node_type: str,
-            settings: dict[str, object],
-        ) -> dict[str, object] | None:
-            if node_type == "proc_amp":
-                return {
-                    "type": node_type,
-                    "params": [
-                        float(settings.get("saturation", 1.0)),
-                        float(settings.get("hue", 0.0)),
-                        float(settings.get("brightness", 0.0)),
-                        float(settings.get("contrast", 1.0)),
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ],
-                    "invert": bool(settings.get("invert", False)),
-                }
-            if node_type == "color_corrector":
-                return {
-                    "type": node_type,
-                    "params": [
-                        float(settings.get("gain_r", 1.0)),
-                        float(settings.get("gain_g", 1.0)),
-                        float(settings.get("gain_b", 1.0)),
-                        float(settings.get("mid_r", 1.0)),
-                        float(settings.get("mid_g", 1.0)),
-                        float(settings.get("mid_b", 1.0)),
-                        float(settings.get("blacks_r", 0.0)),
-                        float(settings.get("blacks_g", 0.0)),
-                        float(settings.get("blacks_b", 0.0)),
-                    ],
-                    "invert": False,
-                }
-            return None
-
-        def resolve_effect_chain(
-            connection: tuple[str, str, str, str] | None,
-        ) -> tuple[str | None, str, dict[str, object], dict[str, object], list[dict[str, object]]]:
-            if connection is None:
-                return None, "", {}, {}, []
-
-            source_id, source_port = connection[0], connection[1]
-            transform_settings: dict[str, object] = {}
-            blur_settings: dict[str, object] = {}
-            color_stage_payloads: list[dict[str, object]] = []
-            visited: set[str] = set()
-
-            while source_id is not None and source_id not in visited:
-                visited.add(source_id)
-                source_node = self._nodes.get(source_id, {})
-                source_type = source_node.get("type")
-                settings = source_node.get("settings", {})
-                if not isinstance(settings, dict):
-                    settings = {}
-
-                if source_type == "transform_3d":
-                    if not transform_settings:
-                        transform_settings = dict(settings)
-                    preferred_inputs = (
-                        ("alpha_input", "input")
-                        if source_port == "alpha_output"
-                        else ("input", "alpha_input")
-                    )
-                    incoming = next(
-                        (
-                            candidate
-                            for input_port in preferred_inputs
-                            for candidate in self._connections
-                            if candidate[2:4] == (source_id, input_port)
-                        ),
-                        None,
-                    )
-                    if incoming is None:
-                        return None, "", transform_settings, blur_settings, color_stage_payloads
-                    source_id = incoming[0]
-                    source_port = (
-                        "alpha_output"
-                        if source_port == "alpha_output"
-                        or incoming[1] == "alpha_output"
-                        or incoming[3] == "alpha_input"
-                        else "output"
-                    )
-                    continue
-
-                if source_type == "blur":
-                    if not blur_settings:
-                        blur_settings = dict(settings)
-                    preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
-                    incoming = next(
-                        (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
-                        None,
-                    )
-                    if incoming is None:
-                        return None, "", transform_settings, blur_settings, color_stage_payloads
-                    source_id, source_port = incoming[0], incoming[1]
-                    continue
-
-                if source_type in {"proc_amp", "color_corrector"}:
-                    stage_payload = build_color_stage_payload(str(source_type), settings)
-                    if stage_payload is not None:
-                        color_stage_payloads.insert(0, stage_payload)
-                    incoming = next(
-                        (candidate for candidate in self._connections if candidate[2:4] == (source_id, "input")),
-                        None,
-                    )
-                    if incoming is None:
-                        return None, "", transform_settings, blur_settings, color_stage_payloads
-                    source_id, source_port = incoming[0], incoming[1]
-                    continue
-
-                return source_id, source_port, transform_settings, blur_settings, color_stage_payloads
-
-            return None, "", transform_settings, blur_settings, color_stage_payloads
-
-        def resolve_channel_recombiner(
-            connection: tuple[str, str, str, str] | None,
-        ) -> tuple[str | None, list[dict[str, object]], list[dict[str, object]]]:
-            if connection is None or self._nodes.get(connection[0], {}).get("type") != "color_recombiner":
-                return None, [], []
-            recombiner_id = connection[0]
-            source_ids: set[str] = set()
-            routes: list[dict[str, object]] = []
-            alpha_generators: list[dict[str, object]] = []
-            component_ports = ("red_input", "green_input", "blue_input", "alpha_input")
-            splitter_channels = {"red_output": 0, "green_output": 1, "blue_output": 2}
-            for component_index, component_port in enumerate(component_ports):
-                current = next(
-                    (candidate for candidate in self._connections if candidate[2:4] == (recombiner_id, component_port)),
-                    None,
-                )
-                route: dict[str, object] = {
-                    "source_channel": -1,
-                    "generator_type": "off",
-                    "blur_method": "off",
-                    "blur_radius": 0.0,
-                    "transform_x": 0.0,
-                    "transform_y": 0.0,
-                    "transform_z": 0.0,
-                    "rotate_x": 0.0,
-                    "rotate_y": 0.0,
-                    "rotate_z": 0.0,
-                }
-                visited: set[str] = set()
-                while current is not None and current[0] not in visited:
-                    source_id, source_port = current[0], current[1]
-                    visited.add(source_id)
-                    source_type = self._nodes.get(source_id, {}).get("type")
-                    settings = self._nodes.get(source_id, {}).get("settings", {})
-                    if not isinstance(settings, dict):
-                        settings = {}
-                    if source_type == "transform_3d":
-                        for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z"):
-                            route["transform_" + name if name in {"x", "y", "z"} else name] = float(settings.get(name, 0.0))
-                        preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
-                        current = next(
-                            (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
-                            None,
-                        )
-                        continue
-                    if source_type == "blur":
-                        route["blur_method"] = str(settings.get("method", "off"))
-                        route["blur_radius"] = float(settings.get("radius", 0.0))
-                        preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
-                        current = next(
-                            (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
-                            None,
-                        )
-                        continue
-                    if source_type == "color_splitter":
-                        current = next(
-                            (candidate for candidate in self._connections if candidate[2:4] == (source_id, "input")),
-                            None,
-                        )
-                        if current is not None:
-                            route["source_channel"] = (
-                                3 if current[1] == "alpha_output"
-                                else splitter_channels.get(source_port, component_index)
-                            )
-                            source_ids.add(current[0])
-                        break
-                    resolved_id, resolved_port, alpha_generator = resolve_generated_alpha(source_id, source_port)
-                    if alpha_generator:
-                        route["source_channel"] = 3
-                        route["generator_type"] = str(alpha_generator.get("type", "off"))
-                        generator_settings = alpha_generator.get("settings", {})
-                        if isinstance(generator_settings, dict):
-                            route["generator_settings"] = dict(generator_settings)
-                        alpha_generators.append(alpha_generator)
-                        if resolved_id is not None and self._nodes.get(resolved_id, {}).get("type") != "mask":
-                            source_ids.add(resolved_id)
-                        break
-                    route["source_channel"] = 3 if source_port == "alpha_output" else component_index
-                    source_ids.add(source_id)
-                    break
-                routes.append(route)
-            if not source_ids and alpha_generators and all(generator.get("type") == "mask" for generator in alpha_generators):
-                source_ids.add(recombiner_id)
-            return (next(iter(source_ids)) if len(source_ids) == 1 else None), routes, alpha_generators
-
-        edges = {
-            source: target
-            for source, source_port, target, target_port in self._connections
-            if source_port == "output" and target_port in {"input", "layer1_color"}
-        }
-        active_nodes: list[str] = []
-        main_source_id = self._active_main_source()
-        current = main_source_id
-        main_capture_id = current if self._nodes.get(current, {}).get("type") == "capture" else None
-        visited: set[str] = set()
-        while current in edges and current not in visited:
-            visited.add(current)
-            current = edges[current]
-            active_nodes.append(current)
-            if current == "effects_output":
-                break
-        output_source_connection = next(
-            (
-                connection for connection in self._connections
-                if connection[2] == "effects_output" and connection[3] == "input"
-            ),
-            None,
-        )
-        explicit_compositor_id = (
-            output_source_connection[0]
-            if output_source_connection is not None
-            and self._nodes.get(output_source_connection[0], {}).get("type") == "keying"
-            else None
-        )
-        if explicit_compositor_id is not None:
-            if explicit_compositor_id in active_nodes:
-                compositor_position = active_nodes.index(explicit_compositor_id)
-                active_nodes = active_nodes[: compositor_position + 1]
-                if not active_nodes or active_nodes[-1] != "effects_output":
-                    active_nodes.append("effects_output")
-            else:
-                active_nodes = [explicit_compositor_id, "effects_output"]
-        direct_source_id, direct_source_port, direct_transform_settings = resolve_transform_source(
-            output_source_connection
-        )
-        if self._nodes.get(direct_source_id, {}).get("type") not in {"media", "matte"}:
-            direct_source_id = None
-        if direct_source_id is not None:
-            active_nodes = [direct_source_id, "effects_output"]
-        compositor_ids = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "keying"]
-        compositor_id = compositor_ids[-1] if compositor_ids else None
-        compositor_position = active_nodes.index(compositor_id) if compositor_id is not None else -1
-        base_transform_ids = [
-            node_id for position, node_id in enumerate(active_nodes)
-            if compositor_position < 0
-            and main_source_id == "effects_input"
-            and self._nodes.get(node_id, {}).get("type") == "transform_3d"
-        ]
-        base_transform_settings = (
-            self._nodes[base_transform_ids[-1]].get("settings", {})
-            if base_transform_ids
-            else {}
-        )
-        if not isinstance(base_transform_settings, dict):
-            base_transform_settings = {}
-        base_transform_active = any(
-            abs(float(base_transform_settings.get(name, 0.0))) > 1e-6
-            for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z")
-        )
-        color_stages: list[dict[str, object]] = []
-        for position, node_id in enumerate(active_nodes):
-            node = self._nodes.get(node_id, {})
-            node_type = str(node.get("type", ""))
-            settings = node.get("settings", {})
-            if node_type not in {"proc_amp", "color_corrector"} or not isinstance(settings, dict):
-                continue
-            if compositor_position >= 0 and position <= compositor_position:
-                continue
-            stage_payload = build_color_stage_payload(node_type, settings)
-            if stage_payload is None:
-                continue
-            stage_payload["after_composite"] = compositor_position >= 0 and position > compositor_position
-            color_stages.append(stage_payload)
-        layer2_media_id = next(
-            (
-                source for source, source_port, target, target_port in self._connections
-                if compositor_id is not None and target == compositor_id and target_port == "layer2_color"
-                and self._nodes.get(source, {}).get("type") == "media"
-            ),
-            None,
-        )
-        layer2_capture_id = next(
-            (
-                source for source, source_port, target, target_port in self._connections
-                if compositor_id is not None and target == compositor_id and target_port == "layer2_color"
-                and source_port == "output" and self._nodes.get(source, {}).get("type") == "capture"
-            ),
-            None,
-        )
-        layer2_matte_id = next(
-            (
-                source for source, _source_port, target, target_port in self._connections
-                if compositor_id is not None and target == compositor_id and target_port == "layer2_color"
-                and self._nodes.get(source, {}).get("type") == "matte"
-            ),
-            None,
-        )
-        layer2_mask_id = next(
-            (
-                source for source, source_port, target, target_port in self._connections
-                if compositor_id is not None and target == compositor_id and target_port == "layer2_alpha"
-                and source_port == "alpha_output" and self._nodes.get(source, {}).get("type") == "mask"
-            ),
-            None,
-        )
-        capture_source_id = layer2_capture_id or main_capture_id
-        capture_settings = self._nodes.get(capture_source_id, {}).get("settings", {})
-        if not isinstance(capture_settings, dict):
-            capture_settings = {}
-        capture_device_id = capture_settings.get("device_index")
-        capture_kind = "webcam" if isinstance(capture_device_id, str) and capture_device_id.startswith("webcam:") else ""
-        capture_device_index = int(capture_device_id.split(":", 1)[1]) if capture_kind else -1
-        media_nodes = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "media"]
-        if layer2_media_id is not None and layer2_media_id not in media_nodes:
-            media_nodes.append(layer2_media_id)
-        blur_ids = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "blur"] if compositor_id is None else []
-        if not active_nodes or active_nodes[-1] != "effects_output":
-            return {"enabled": False, "output_connected": False}
-        media_id = media_nodes[0] if media_nodes else None
-        media_settings = self._nodes[media_id]["settings"] if media_id is not None else {}
-        if not isinstance(media_settings, dict):
-            media_settings = {}
-        direct_source_type = self._nodes.get(direct_source_id, {}).get("type")
-        matte_id = direct_source_id if direct_source_type == "matte" else layer2_matte_id
-        matte_settings = self._nodes.get(matte_id, {}).get("settings", {})
-        if not isinstance(matte_settings, dict):
-            matte_settings = {}
-        mask_settings = self._nodes.get(layer2_mask_id, {}).get("settings", {})
-        if not isinstance(mask_settings, dict):
-            mask_settings = {}
-        blend_mode = "normal"
-        key_opacity = 1.0
-        compositor_settings: dict[str, object] = {}
-        if compositor_id is not None and isinstance(self._nodes[compositor_id]["settings"], dict):
-            compositor_settings = self._nodes[compositor_id]["settings"]
-            blend_mode = str(compositor_settings.get("layer2_blend_mode", "normal"))
-            key_opacity = float(compositor_settings.get("layer2_opacity", 1.0))
-        blur_settings: dict[str, object] = {"method": "off", "radius": 0, "target": "both"}
-        selected_blur = blur_ids
-        if selected_blur:
-            candidate = self._nodes[selected_blur[-1]]["settings"]
-            if isinstance(candidate, dict):
-                blur_settings = dict(candidate)
-        direct_uploaded_source = direct_source_id is not None or (capture_kind == "webcam" and compositor_id is None)
-        uploaded_source_id = capture_source_id or media_id or matte_id
-        effect_color_from_alpha = any(
-            source == uploaded_source_id and source_port == "alpha_output"
-            and ((target == "effects_output" and target_port == "input")
-                 or (target == compositor_id and target_port == "layer2_color"))
-            for source, source_port, target, target_port in self._connections
-        )
-        if direct_source_id is not None:
-            effect_color_from_alpha = direct_source_port == "alpha_output"
-        effect_alpha_from_color = any(
-            source == uploaded_source_id and source_port == "output"
-            and target == compositor_id and target_port == "layer2_alpha"
-            for source, source_port, target, target_port in self._connections
-        )
-        layer1_opacity = 0.0 if direct_uploaded_source else float(compositor_settings.get("layer1_opacity", 1.0))
-        source_opacity = float(matte_settings.get("alpha", 1.0)) if matte_id is not None else float(media_settings.get("opacity", 1.0))
-        layer2_opacity = max(0.0, min(1.0, source_opacity * key_opacity))
-        key_config = {
-            "mode": "off", "color": [0, 255, 0], "similarity": 0.25,
-            "softness": 0.10, "edge_feather": 0.0, "spill_suppression": 0.25,
-            "luma_low": 0.0, "luma_high": 1.0, "luma_softness": 0.10, "invert": False,
-        }
-        layer_payloads: list[dict[str, object]] = []
-        layer_count = max(2, min(8, int(compositor_settings.get("layer_count", 2))))
-        if compositor_id is not None:
-            for layer_index in range(1, layer_count + 1):
-                color_connection = next(
-                    (
-                        connection for connection in self._connections
-                        if connection[2:4] == (compositor_id, f"layer{layer_index}_color")
-                    ),
-                    None,
-                )
-                alpha_connection = next(
-                    (
-                        connection for connection in self._connections
-                        if connection[2:4] == (compositor_id, f"layer{layer_index}_alpha")
-                    ),
-                    None,
-                )
-                recombiner_source_id, channel_routes, channel_alpha_generators = resolve_channel_recombiner(color_connection)
-                (
-                    color_source_id,
-                    color_source_port,
-                    color_transform_settings,
-                    color_blur_settings,
-                    layer_color_stages,
-                ) = resolve_effect_chain(color_connection)
-                (
-                    alpha_source_id,
-                    alpha_source_port,
-                    alpha_transform_settings,
-                    alpha_blur_settings,
-                    _alpha_color_stages,
-                ) = resolve_effect_chain(alpha_connection)
-                color_source_id, color_source_port, direct_alpha_generator = resolve_generated_alpha(
-                    color_source_id, color_source_port
-                )
-                resolved_alpha_source_id, resolved_alpha_source_port, opacity_alpha_generator = resolve_generated_alpha(
-                    alpha_source_id, alpha_source_port
-                )
-                source_id = recombiner_source_id or color_source_id or alpha_source_id
-                source_port = color_source_port if color_source_id is not None else alpha_source_port
-                transform_settings = (
-                    color_transform_settings
-                    if color_transform_settings
-                    else alpha_transform_settings
-                )
-                layer_blur_settings = (
-                    color_blur_settings
-                    if color_blur_settings
-                    else alpha_blur_settings
-                )
-                source_node = self._nodes.get(source_id, {})
-                source_type = str(source_node.get("type", "")) if isinstance(source_node, dict) else ""
-                mask_generator = next(
-                    (generator for generator in (direct_alpha_generator,) if generator.get("type") == "mask"),
-                    None,
-                )
-                chroma_generator = next(
-                    (
-                        generator for generator in (direct_alpha_generator, opacity_alpha_generator)
-                        if generator.get("type") == "chroma_key"
-                    ),
-                    None,
-                )
-                source_settings = source_node.get("settings", {}) if isinstance(source_node, dict) else {}
-                if not isinstance(source_settings, dict):
-                    source_settings = {}
-                layer_capture_id = source_settings.get("device_index") if source_type == "capture" else None
-                layer_capture_kind = (
-                    "webcam"
-                    if isinstance(layer_capture_id, str) and layer_capture_id.startswith("webcam:")
-                    else ""
-                )
-                layer_capture_index = int(layer_capture_id.split(":", 1)[1]) if layer_capture_kind else -1
-                layer_media_path = str(source_settings.get("path", "")) if source_type == "media" else ""
-                layer_matte_rgba = [
-                    int(source_settings.get("red", 255)),
-                    int(source_settings.get("green", 255)),
-                    int(source_settings.get("blue", 255)),
-                    255,
-                ]
-                layer_source_opacity = (
-                    float(source_settings.get("alpha", 1.0))
-                    if source_type == "matte"
-                    else float(source_settings.get("opacity", 1.0))
-                )
-                mask_id = None
-                if alpha_connection is not None and self._nodes.get(alpha_connection[0], {}).get("type") == "mask":
-                    mask_id = alpha_connection[0]
-                layer_mask_settings = self._nodes.get(mask_id, {}).get("settings", {})
-                if mask_generator is not None:
-                    layer_mask_settings = mask_generator.get("settings", {})
-                if not isinstance(layer_mask_settings, dict):
-                    layer_mask_settings = {}
-                prefix = f"layer{layer_index}_"
-                chroma_key_id = (
-                    alpha_connection[0]
-                    if alpha_connection is not None
-                    and self._nodes.get(alpha_connection[0], {}).get("type") == "chroma_key"
-                    else None
-                )
-                chroma_key_settings = self._nodes.get(chroma_key_id, {}).get("settings", {})
-                if chroma_generator is not None:
-                    chroma_key_settings = chroma_generator.get("settings", {})
-                if not isinstance(chroma_key_settings, dict):
-                    chroma_key_settings = {}
-                layer_key = dict(key_config)
-                if chroma_key_id is not None or chroma_generator is not None:
-                    layer_key.update({
-                        "mode": "chroma",
-                        "color": [
-                            int(chroma_key_settings.get("key_color_r", 0)),
-                            int(chroma_key_settings.get("key_color_g", 255)),
-                            int(chroma_key_settings.get("key_color_b", 0)),
-                        ],
-                        "similarity": float(chroma_key_settings.get("key_similarity", 0.25)),
-                        "softness": float(chroma_key_settings.get("key_softness", 0.10)),
-                        "edge_feather": float(chroma_key_settings.get("key_edge_feather", 0.0)),
-                        "spill_suppression": float(chroma_key_settings.get("spill_suppression", 0.25)),
-                        "invert": bool(chroma_key_settings.get("key_invert", False)),
-                    })
-                generated_mask_source = source_type in {"mask", "color_recombiner"} and (
-                    mask_generator is not None
-                    or any(generator.get("type") == "mask" for generator in channel_alpha_generators)
-                )
-                effects_input_source = source_type == "effects_input"
-                layer_enabled = (
-                    source_type == "matte" or generated_mask_source or effects_input_source
-                    or bool(layer_media_path) or layer_capture_kind == "webcam"
-                )
-                preserve_color_from_alpha_opacity = bool(
-                    color_connection is not None
-                    and alpha_connection is not None
-                    and color_connection[0:2] == alpha_connection[0:2]
-                    and color_source_port == "alpha_output"
-                )
-                layer_payloads.append(
-                    {
-                        "layer_index": layer_index,
-                        "enabled": layer_enabled,
-                        "source_node_id": source_id,
-                        "source_kind": (
-                            "effects_input" if effects_input_source
-                            else "matte" if source_type == "matte" or generated_mask_source
-                            else "webcam" if layer_capture_kind
-                            else "media"
-                        ),
-                        "media_path": layer_media_path,
-                        "media_playing": layer_capture_kind == "webcam" or bool(source_settings.get("playing", False)),
-                        "media_loop": bool(source_settings.get("loop", True)),
-                        "capture_kind": layer_capture_kind,
-                        "capture_device_index": layer_capture_index,
-                        "matte_rgba": [255, 255, 255, 255] if generated_mask_source else layer_matte_rgba,
-                        "opacity": max(0.0, min(1.0, layer_source_opacity * float(compositor_settings.get(prefix + "opacity", 1.0)))),
-                        "blend_mode": str(compositor_settings.get(prefix + "blend_mode", "normal")),
-                        "blur_method": str(layer_blur_settings.get("method", "off")),
-                        "blur_radius": float(layer_blur_settings.get("radius", 0.0)),
-                        "blur_target": str(layer_blur_settings.get("target", "both")),
-                        "color_stages": list(layer_color_stages),
-                        "key": layer_key,
-                        "materialize_key_alpha": chroma_generator is not None,
-                        "key_alpha_from_effects_input": bool(
-                            opacity_alpha_generator.get("type") == "chroma_key"
-                            and resolved_alpha_source_id == "effects_input"
-                            and resolved_alpha_source_port == "alpha_output"
-                        ),
-                        "effect_color_from_alpha": color_source_port == "alpha_output",
-                        "effect_alpha_from_color": bool(
-                            alpha_source_id == source_id
-                            and alpha_source_port == "output"
-                        ),
-                        "preserve_color_from_alpha_opacity": preserve_color_from_alpha_opacity,
-                        "mask_pattern": str(layer_mask_settings.get("pattern", "off")) if mask_id is not None or mask_generator is not None else "off",
-                        "mask_softness": float(layer_mask_settings.get("softness", 0.0)),
-                        "mask_aspect": float(layer_mask_settings.get("aspect", 1.0)),
-                        "mask_invert": bool(layer_mask_settings.get("invert", False)),
-                        "mask_size": float(layer_mask_settings.get("size", 1.0)),
-                        "mask_x": float(layer_mask_settings.get("x", 0.0)),
-                        "mask_y": float(layer_mask_settings.get("y", 0.0)),
-                        "transform_x": float(transform_settings.get("x", 0.0)),
-                        "transform_y": float(transform_settings.get("y", 0.0)),
-                        "transform_z": float(transform_settings.get("z", 0.0)),
-                        "rotate_x": float(transform_settings.get("rotate_x", 0.0)),
-                        "rotate_y": float(transform_settings.get("rotate_y", 0.0)),
-                        "rotate_z": float(transform_settings.get("rotate_z", 0.0)),
-                        "channel_routes": channel_routes,
-                    }
-                )
-        if not layer_payloads:
-            layer_payloads.append(
-                {
-                    "layer_index": 2,
-                    "enabled": bool(str(media_settings.get("path", "")).strip()) or capture_kind == "webcam" or matte_id is not None,
-                    "source_kind": "matte" if matte_id is not None else ("webcam" if capture_kind else "media"),
-                    "media_path": str(media_settings.get("path", "")),
-                    "media_playing": capture_kind == "webcam" or bool(media_settings.get("playing", False)),
-                    "media_loop": bool(media_settings.get("loop", True)),
-                    "capture_kind": capture_kind,
-                    "capture_device_index": capture_device_index,
-                    "matte_rgba": [
-                        int(matte_settings.get("red", 255)), int(matte_settings.get("green", 255)),
-                        int(matte_settings.get("blue", 255)), 255,
-                    ],
-                    "opacity": layer2_opacity,
-                    "blend_mode": blend_mode,
-                    "blur_method": str(blur_settings.get("method", "off")),
-                    "blur_radius": float(blur_settings.get("radius", 0.0)),
-                    "blur_target": str(blur_settings.get("target", "both")),
-                    "key": key_config,
-                    "effect_color_from_alpha": effect_color_from_alpha,
-                    "effect_alpha_from_color": effect_alpha_from_color,
-                    "mask_pattern": str(mask_settings.get("pattern", "off")) if layer2_mask_id is not None else "off",
-                    "mask_softness": float(mask_settings.get("softness", 0.0)),
-                    "mask_aspect": float(mask_settings.get("aspect", 1.0)),
-                    "mask_invert": bool(mask_settings.get("invert", False)),
-                    "mask_size": float(mask_settings.get("size", 1.0)),
-                    "mask_x": float(mask_settings.get("x", 0.0)),
-                    "mask_y": float(mask_settings.get("y", 0.0)),
-                    "transform_x": float(direct_transform_settings.get("x", 0.0)),
-                    "transform_y": float(direct_transform_settings.get("y", 0.0)),
-                    "transform_z": float(direct_transform_settings.get("z", 0.0)),
-                    "rotate_x": float(direct_transform_settings.get("rotate_x", 0.0)),
-                    "rotate_y": float(direct_transform_settings.get("rotate_y", 0.0)),
-                    "rotate_z": float(direct_transform_settings.get("rotate_z", 0.0)),
-                }
-            )
-        legacy_layer = layer_payloads[0]
-        legacy_key = legacy_layer.get("key", key_config)
-        if not isinstance(legacy_key, dict):
-            legacy_key = key_config
-        return {
-            "enabled": self._effects_enabled and (
-                any(bool(layer.get("enabled", False)) for layer in layer_payloads)
-                or bool(selected_blur)
-                or bool(color_stages)
-                or base_transform_active
-                or compositor_id is not None
-            ),
-            "output_connected": True,
-            "explicit_compositor_layers": self._effects_enabled and compositor_id is not None,
-            "media_path": str(legacy_layer.get("media_path", "")),
-            "media_playing": bool(legacy_layer.get("media_playing", False)),
-            "media_loop": bool(legacy_layer.get("media_loop", True)),
-            "capture_kind": str(legacy_layer.get("capture_kind", "")),
-            "capture_device_index": int(legacy_layer.get("capture_device_index", -1)),
-            "source_kind": str(legacy_layer.get("source_kind", "media")),
-            "matte_rgba": list(legacy_layer.get("matte_rgba", [255, 255, 255, 255])),
-            "opacity": float(legacy_layer.get("opacity", 1.0)),
-            "blend_mode": str(legacy_layer.get("blend_mode", "normal")),
-            "blur_method": str(legacy_layer.get("blur_method", "off")),
-            "blur_radius": float(legacy_layer.get("blur_radius", 0.0)),
-            "blur_target": str(legacy_layer.get("blur_target", "both")),
-            "layer1_opacity": layer1_opacity,
-            "layer1_blend_mode": str(compositor_settings.get("layer1_blend_mode", "normal")),
-            "input_transform_x": float(base_transform_settings.get("x", 0.0)),
-            "input_transform_y": float(base_transform_settings.get("y", 0.0)),
-            "input_transform_z": float(base_transform_settings.get("z", 0.0)),
-            "input_rotate_x": float(base_transform_settings.get("rotate_x", 0.0)),
-            "input_rotate_y": float(base_transform_settings.get("rotate_y", 0.0)),
-            "input_rotate_z": float(base_transform_settings.get("rotate_z", 0.0)),
-            "layers": layer_payloads,
-            "color_stages": color_stages,
-            "key_mode": str(legacy_key.get("mode", "off")),
-            "key_color_r": int(legacy_key.get("color", [0, 255, 0])[0]),
-            "key_color_g": int(legacy_key.get("color", [0, 255, 0])[1]),
-            "key_color_b": int(legacy_key.get("color", [0, 255, 0])[2]),
-            "key_similarity": float(legacy_key.get("similarity", 0.25)),
-            "key_softness": float(legacy_key.get("softness", 0.10)),
-            "key_edge_feather": float(legacy_key.get("edge_feather", 0.0)),
-            "spill_suppression": float(legacy_key.get("spill_suppression", 0.25)),
-            "luma_low": float(legacy_key.get("luma_low", 0.0)),
-            "luma_high": float(legacy_key.get("luma_high", 1.0)),
-            "luma_softness": float(legacy_key.get("luma_softness", 0.10)),
-            "key_invert": bool(legacy_key.get("invert", False)),
-            "effect_color_from_alpha": bool(legacy_layer.get("effect_color_from_alpha", False)),
-            "effect_alpha_from_color": bool(legacy_layer.get("effect_alpha_from_color", False)),
-            "mask_pattern": str(legacy_layer.get("mask_pattern", "off")),
-            "mask_softness": float(legacy_layer.get("mask_softness", 0.0)),
-            "mask_aspect": float(legacy_layer.get("mask_aspect", 1.0)),
-            "mask_invert": bool(legacy_layer.get("mask_invert", False)),
-            "mask_size": float(legacy_layer.get("mask_size", 1.0)),
-            "mask_x": float(legacy_layer.get("mask_x", 0.0)),
-            "mask_y": float(legacy_layer.get("mask_y", 0.0)),
-            "transform_x": float(legacy_layer.get("transform_x", 0.0)),
-            "transform_y": float(legacy_layer.get("transform_y", 0.0)),
-            "transform_z": float(legacy_layer.get("transform_z", 0.0)),
-            "rotate_x": float(legacy_layer.get("rotate_x", 0.0)),
-            "rotate_y": float(legacy_layer.get("rotate_y", 0.0)),
-            "rotate_z": float(legacy_layer.get("rotate_z", 0.0)),
-        }
-
-    def set_effects_enabled(self, enabled: bool) -> None:
-        enabled = bool(enabled)
-        if enabled == self._effects_enabled:
-            return
-        self._effects_enabled = enabled
-        self.graphChanged.emit()
-
-    def effects_enabled(self) -> bool:
-        return self._effects_enabled
-
-    def serialize(self) -> dict[str, object]:
-        return {
-            "version": 6,
-            "enabled": self._effects_enabled,
-            "nodes": list(self._nodes.values()),
-            "connections": [list(connection) for connection in self._connections],
-        }
-
-    def restore(self, payload: object) -> bool:
-        if not isinstance(payload, dict) or not isinstance(payload.get("nodes"), list):
-            return False
-        self._effects_enabled = bool(payload.get("enabled", True))
-        valid_types = set(self.NODE_TITLES)
-        normalized_nodes = [node for node in payload["nodes"] if isinstance(node, dict) and str(node.get("type")) in valid_types]
-        if not any(node.get("type") == "effects_input" for node in normalized_nodes) or not any(
-            node.get("type") == "effects_output" for node in normalized_nodes
-        ):
-            return False
-        for widget in self._widgets.values():
-            widget.deleteLater()
-        self._nodes.clear()
-        self._widgets.clear()
-        self._connections.clear()
-        self._selected_nodes.clear()
-        self._media_keyframe_playback_arms.clear()
-        for raw_node in normalized_nodes:
-            node_id = str(raw_node.get("id", ""))
-            if not node_id or node_id in self._nodes:
-                continue
-            self._create_node(str(raw_node["type"]), int(raw_node.get("x", 0)), int(raw_node.get("y", 0)), node_id)
-            if isinstance(raw_node.get("settings"), dict):
-                settings = self._nodes[node_id]["settings"]
-                if isinstance(settings, dict):
-                    settings.update(raw_node["settings"])
-                self._refresh_node_status(node_id)
-        raw_connections = payload.get("connections", [])
-        if isinstance(raw_connections, list):
-            for raw_connection in raw_connections:
-                if isinstance(raw_connection, list) and len(raw_connection) == 4:
-                    connection_parts = [str(part) for part in raw_connection]
-                    if connection_parts[1] == "adjustment_output":
-                        connection_parts[1] = "alpha_output"
-                    if connection_parts[3] == "adjustment_input":
-                        connection_parts[3] = "alpha_input"
-                    connection = tuple(connection_parts)
-                    if connection[0] in self._nodes and connection[2] in self._nodes:
-                        self._connections.append(connection)
-        if int(payload.get("version", 1)) < 3:
-            self._migrate_keying_nodes_to_compositors()
-        if int(payload.get("version", 1)) < 4:
-            self._connections = [
-                connection for connection in self._connections
-                if not (
-                    self._nodes.get(connection[2], {}).get("type") == "media"
-                    and connection[3] in {"input", "alpha_input"}
-                )
-            ]
-        if int(payload.get("version", 1)) < 6:
-            self._migrate_compositor_chroma_keys()
-        self._expand_to_nodes()
-        self.update()
-        self.graphChanged.emit()
-        return True
-
-    def _migrate_compositor_chroma_keys(self) -> None:
-        key_setting_names = (
-            "key_mode", "key_color_r", "key_color_g", "key_color_b",
-            "key_similarity", "key_softness", "key_edge_feather", "spill_suppression",
-            "luma_low", "luma_high", "luma_softness", "key_invert",
-        )
-        compositor_ids = [node_id for node_id, node in self._nodes.items() if node["type"] == "keying"]
-        for compositor_id in compositor_ids:
-            compositor = self._nodes[compositor_id]
-            settings = compositor.get("settings", {})
-            if not isinstance(settings, dict):
-                continue
-            layer_count = max(2, min(8, int(settings.get("layer_count", 2))))
-            for layer_index in range(2, layer_count + 1):
-                prefix = f"layer{layer_index}_"
-                mode = str(settings.get(prefix + "key_mode", settings.get("key_mode", "off") if layer_index == 2 else "off"))
-                color_connection = next(
-                    (connection for connection in self._connections if connection[2:4] == (compositor_id, f"layer{layer_index}_color")),
-                    None,
-                )
-                if mode != "chroma" or color_connection is None:
-                    continue
-                chroma_id = self._create_node(
-                    "chroma_key",
-                    max(20, int(compositor.get("x", 0)) - 280),
-                    int(compositor.get("y", 0)) + ((layer_index - 2) * 150),
-                )
-                chroma_settings = self._nodes[chroma_id]["settings"]
-                if isinstance(chroma_settings, dict):
-                    for name in (
-                        "key_color_r", "key_color_g", "key_color_b", "key_similarity",
-                        "key_softness", "key_edge_feather", "spill_suppression", "key_invert",
-                    ):
-                        default = chroma_settings[name]
-                        chroma_settings[name] = settings.get(prefix + name, settings.get(name, default))
-                    self._refresh_node_status(chroma_id)
-                self._connections = [
-                    connection for connection in self._connections
-                    if connection[2:4] != (compositor_id, f"layer{layer_index}_alpha")
-                ]
-                self._connections.extend(
-                    [
-                        (color_connection[0], color_connection[1], chroma_id, "color_input"),
-                        (chroma_id, "alpha_output", compositor_id, f"layer{layer_index}_alpha"),
-                    ]
-                )
-            for name in key_setting_names:
-                settings.pop(name, None)
-                for layer_index in range(2, 9):
-                    settings.pop(f"layer{layer_index}_{name}", None)
-
-    def _migrate_keying_nodes_to_compositors(self) -> None:
-        compositor_ids = [node_id for node_id, node in self._nodes.items() if node["type"] == "keying"]
-        for compositor_id in compositor_ids:
-            settings = self._nodes[compositor_id]["settings"]
-            if isinstance(settings, dict):
-                settings["layer2_blend_mode"] = str(settings.get("blend_mode", settings.get("layer2_blend_mode", "normal")))
-                settings["layer2_opacity"] = float(settings.get("opacity", settings.get("layer2_opacity", 1.0)))
-                settings["runtime_supported"] = True
-            if any(connection[0] == compositor_id and connection[1] == "output" for connection in self._connections):
-                continue
-            media_id = next(
-                (node_id for node_id, node in self._nodes.items() if node["type"] == "media"),
-                None,
-            )
-            if media_id is None:
-                continue
-            media_input = next((c for c in self._connections if c[2:4] == (media_id, "input")), None)
-            media_output = next((c for c in self._connections if c[0:2] == (media_id, "output")), None)
-            if media_input is None or media_output is None:
-                continue
-            self._connections = [
-                connection for connection in self._connections
-                if connection not in {media_input, media_output}
-                and not (connection[0] == compositor_id or connection[2] == compositor_id)
-            ]
-            self._connections.extend(
-                [
-                    (media_input[0], media_input[1], compositor_id, "layer1_color"),
-                    (media_id, "output", compositor_id, "layer2_color"),
-                    (media_id, "alpha_output", compositor_id, "layer2_alpha"),
-                    (compositor_id, "output", media_output[2], media_output[3]),
-                ]
-            )
-            self._refresh_node_status(compositor_id)
-            self._separate_compositor_nodes(compositor_id)
-
-    def _separate_compositor_nodes(self, compositor_id: str) -> None:
-        compositor_widget = self._widgets[compositor_id]
-        for media_id, node in self._nodes.items():
-            if node["type"] != "media":
-                continue
-            media_widget = self._widgets[media_id]
-            if media_widget.geometry().intersects(compositor_widget.geometry()):
-                media_widget.move(
-                    max(24, compositor_widget.x() - media_widget.width() - 48),
-                    compositor_widget.y() + compositor_widget.height() + 32,
-                )
-                node["x"] = round(media_widget.x() / self._zoom)
-                node["y"] = round(media_widget.y() / self._zoom)
-        output_widget = self._widgets["effects_output"]
-        minimum_output_x = compositor_widget.x() + compositor_widget.width() + 48
-        if output_widget.x() < minimum_output_x:
-            output_widget.move(minimum_output_x, output_widget.y())
-            self._nodes["effects_output"]["x"] = round(output_widget.x() / self._zoom)
-        self._expand_to_nodes()
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), Qt.GlobalColor.black)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(QPen(Qt.GlobalColor.darkGray, 1, Qt.DotLine))
-        for x in range(0, self.width(), 32):
-            painter.drawLine(x, 0, x, self.height())
-        for y in range(0, self.height(), 32):
-            painter.drawLine(0, y, self.width(), y)
-        painter.setPen(QPen(Qt.GlobalColor.yellow, 3))
-        for source_id, source_port, target_id, target_port in self._connections:
-            source = self._widgets.get(source_id)
-            target = self._widgets.get(target_id)
-            if source is None or target is None or source_port not in source._ports or target_port not in target._ports:
-                continue
-            start = source.port_center(source_port)
-            end = target.port_center(target_port)
-            bend = max(60.0, abs(end.x() - start.x()) * 0.5)
-            path = QPainterPath(start)
-            path.cubicTo(start.x() + bend, start.y(), end.x() - bend, end.y(), end.x(), end.y())
-            painter.drawPath(path)
-        if self._drag_port is not None and self._drag_position is not None:
-            source_id, source_port = self._drag_port
-            start = self._widgets[source_id].port_center(source_port)
-            end = self._drag_position
-            bend = max(60.0, abs(end.x() - start.x()) * 0.5)
-            path = QPainterPath(start)
-            path.cubicTo(start.x() + bend, start.y(), end.x() - bend, end.y(), end.x(), end.y())
-            painter.drawPath(path)
-        if self._marquee_rect is not None:
-            painter.setPen(QPen(QColor("#efb73e"), 1, Qt.DashLine))
-            painter.setBrush(QColor(239, 183, 62, 38))
-            painter.drawRect(self._marquee_rect)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton and bool(event.modifiers() & Qt.ShiftModifier):
-            self._marquee_origin = event.position()
-            self._marquee_rect = QRectF(self._marquee_origin, self._marquee_origin)
-            self._marquee_additive = True
-            event.accept()
-            return
-        if event.button() == Qt.LeftButton:
-            self._set_selected_nodes(set())
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._marquee_origin is not None and bool(event.buttons() & Qt.LeftButton):
-            self._marquee_rect = QRectF(self._marquee_origin, event.position()).normalized()
-            self.update()
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton and self._marquee_origin is not None:
-            selection_rect = self._marquee_rect or QRectF(self._marquee_origin, event.position()).normalized()
-            selected = set(self._selected_nodes) if self._marquee_additive else set()
-            if selection_rect.width() >= 3.0 or selection_rect.height() >= 3.0:
-                selected.update(
-                    node_id
-                    for node_id, widget in self._widgets.items()
-                    if selection_rect.intersects(QRectF(widget.geometry()))
-                )
-            self._marquee_origin = None
-            self._marquee_rect = None
-            self._set_selected_nodes(selected)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-
-class EffectsTimelineWidget(QWidget):
-    frameRequested = Signal(int)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._duration = 1
-        self._current_frame = 0
-        self._expanded = True
-        self._scrubbing = False
-        self._tracks: list[tuple[str, str, list[int]]] = []
-        self.setMinimumHeight(74)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-    def set_timeline(self, duration: int, current_frame: int, tracks: list[tuple[str, str, list[int]]]) -> None:
-        self._duration = max(1, int(duration))
-        self._current_frame = max(0, min(int(current_frame), self._duration - 1))
-        self._tracks = tracks
-        self.setFixedHeight(48 + (24 * len(tracks) if self._expanded else 24))
-        self.update()
-
-    def _timeline_left(self) -> int:
-        return 180
-
-    def _frame_x(self, frame: int) -> float:
-        usable = max(1.0, float(self.width() - self._timeline_left() - 14))
-        return float(self._timeline_left()) + (float(frame) / float(max(1, self._duration - 1))) * usable
-
-    def _frame_at_x(self, x: float) -> int:
-        usable = max(1.0, float(self.width() - self._timeline_left() - 14))
-        ratio = max(0.0, min(1.0, (float(x) - self._timeline_left()) / usable))
-        return round(ratio * float(max(1, self._duration - 1)))
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() != Qt.LeftButton:
-            super().mousePressEvent(event)
-            return
-        if event.position().x() < 28 and event.position().y() < 28:
-            self._expanded = not self._expanded
-            self.set_timeline(self._duration, self._current_frame, self._tracks)
-        elif event.position().x() >= self._timeline_left():
-            self._scrubbing = True
-            self.frameRequested.emit(self._frame_at_x(event.position().x()))
-        event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._scrubbing and bool(event.buttons() & Qt.LeftButton):
-            self.frameRequested.emit(self._frame_at_x(event.position().x()))
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton and self._scrubbing:
-            self._scrubbing = False
-            self.frameRequested.emit(self._frame_at_x(event.position().x()))
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#20242a"))
-        painter.setPen(QPen(QColor("#555d66"), 1))
-        painter.drawLine(self._timeline_left(), 0, self._timeline_left(), self.height())
-        visible_tracks = self._tracks if self._expanded else []
-        master_frames = sorted({frame for _node_id, _title, frames in self._tracks for frame in frames})
-        rows = [("Master Effect", master_frames)] + [(title, frames) for _node_id, title, frames in visible_tracks]
-        for row_index, (title, frames) in enumerate(rows):
-            center_y = 18 + (row_index * 24)
-            painter.setPen(QColor("#d9dde2"))
-            prefix = "v " if row_index == 0 and self._expanded else ("> " if row_index == 0 else "  ")
-            painter.drawText(8, center_y + 4, prefix + title)
-            painter.setPen(QPen(QColor("#6b737c"), 1))
-            painter.drawLine(self._timeline_left(), center_y, self.width() - 14, center_y)
-            painter.setPen(QPen(QColor("#efb73e"), 3))
-            for frame in frames:
-                x = round(self._frame_x(frame))
-                painter.drawLine(x, center_y - 7, x, center_y + 7)
-        playhead_x = round(self._frame_x(self._current_frame))
-        painter.setPen(QPen(QColor("#f45b5b"), 2))
-        painter.drawLine(playhead_x, 0, playhead_x, self.height())
-
-
-class EffectsGraphEditor(QGroupBox):
-    graphChanged = Signal()
-
-    NODE_MENU = {
-        "Noise Reduction": "denoise",
-        "Video Clip / Image / Image Sequence": "media",
-        "Video Capture Device": "capture",
-        "Compositor": "keying",
-        "Blur": "blur",
-        "Matte Color": "matte",
-        "Mask": "mask",
-        "Basic Proc Amp": "proc_amp",
-        "Color Corrector": "color_corrector",
-        "Chroma Key": "chroma_key",
-        "3D Transform": "transform_3d",
-        "Color Splitter": "color_splitter",
-        "Color Recombiner": "color_recombiner",
-    }
-
-    def __init__(self) -> None:
-        super().__init__("Effects")
-        self._node_keyframes: dict[str, dict[int, dict[str, object]]] = {}
-        self._palette_entries: list[dict[str, object]] = []
-        self._current_palette_index: int | None = None
-        self._current_frame = 0
-        self._duration = 1
-        self._playing = False
-        self._frame_rate = 30.0
-        self._playback_started_at = 0.0
-        self._playback_start_frame = 0
-        self._external_timecode_text = ""
-        self._external_timecode_frame: int | None = None
-        self._external_origin_frame: int | None = None
-        self._external_timeline_origin = 0
-        self._play_timer = QTimer(self)
-        self._play_timer.setInterval(16)
-        self._play_timer.setTimerType(Qt.PreciseTimer)
-        self._play_timer.timeout.connect(self._advance_playback)
-
-        layout = QVBoxLayout(self)
-        top_bar = QHBoxLayout()
-        self.bypass_toggle = QCheckBox("Bypass effects")
-        self.bypass_toggle.setChecked(False)
-        self.bypass_toggle.setToolTip("Pass video through without processing the effects graph")
-        top_bar.addWidget(self.bypass_toggle)
-        top_bar.addStretch(1)
-        self.previous_key_button = QPushButton("Previous Key")
-        self.keyframe_button = QPushButton("Keyframe")
-        self.delete_keyframe_button = QPushButton("Delete Key")
-        self.next_key_button = QPushButton("Next Key")
-        self.play_button = QPushButton("Play")
-        self.play_button.setCheckable(True)
-        self.previous_key_button.clicked.connect(lambda: self._jump_keyframe(-1))
-        self.keyframe_button.clicked.connect(self._store_selected_keyframes)
-        self.delete_keyframe_button.clicked.connect(self._delete_selected_keyframes)
-        self.next_key_button.clicked.connect(lambda: self._jump_keyframe(1))
-        self.play_button.toggled.connect(self._set_playing)
-        self.keyframe_button.setToolTip("Store selected nodes; replaces only an existing key at this frame")
-        self.delete_keyframe_button.setToolTip("Delete selected nodes' keyframes at the current frame")
-        for button in (
-            self.previous_key_button,
-            self.keyframe_button,
-            self.delete_keyframe_button,
-            self.next_key_button,
-            self.play_button,
-        ):
-            top_bar.addWidget(button)
-        self.clock_source_combo = QComboBox()
-        self.clock_source_combo.addItems(["Internal", "External Timecode"])
-        self.clock_source_combo.setToolTip("Run from the timeline clock or follow incoming source timecode")
-        self.clock_source_combo.currentTextChanged.connect(self._on_clock_source_changed)
-        top_bar.addWidget(self.clock_source_combo)
-        self.timeline_fps_spin = QDoubleSpinBox()
-        self.timeline_fps_spin.setRange(1.0, 120.0)
-        self.timeline_fps_spin.setDecimals(3)
-        self.timeline_fps_spin.setSingleStep(1.0)
-        self.timeline_fps_spin.setValue(self._frame_rate)
-        self.timeline_fps_spin.setSuffix(" fps")
-        self.timeline_fps_spin.setToolTip("Timeline frame rate")
-        self.timeline_fps_spin.valueChanged.connect(self.set_frame_rate)
-        top_bar.addWidget(self.timeline_fps_spin)
-        self.frame_spin = QSpinBox()
-        self.frame_spin.setRange(0, 999999)
-        self.frame_spin.setPrefix("Frame ")
-        self.frame_spin.valueChanged.connect(self._seek_frame_expanding)
-        top_bar.addWidget(self.frame_spin)
-        self.timecode_display = QLabel("00:00:00:00")
-        self.timecode_display.setMinimumWidth(92)
-        self.timecode_display.setAlignment(Qt.AlignCenter)
-        self.timecode_display.setStyleSheet("font-family: Consolas; font-weight: 600; color: #efb73e;")
-        top_bar.addWidget(self.timecode_display)
-        layout.addLayout(top_bar)
-
-        self.tabs = QTabWidget()
-        node_view = QWidget()
-        node_layout = QVBoxLayout(node_view)
-        toolbar = QHBoxLayout()
-        self.node_combo = QComboBox()
-        self.node_combo.addItem("Add effect node...")
-        self.node_combo.addItems(list(self.NODE_MENU))
-        self.node_combo.currentIndexChanged.connect(self._add_selected_node)
-        toolbar.addWidget(self.node_combo, 1)
-        self.current_effect_label = QLabel("Current effect: Unsaved")
-        self.current_effect_label.setMinimumWidth(220)
-        toolbar.addWidget(self.current_effect_label)
-        self.update_effect_button = QPushButton("Update Current")
-        self.update_effect_button.setToolTip("Overwrite the currently loaded palette effect")
-        self.update_effect_button.clicked.connect(self._update_current_palette_item)
-        toolbar.addWidget(self.update_effect_button)
-        self.save_effect_button = QPushButton("Save New")
-        self.save_effect_button.setToolTip("Save the current graph as a new palette effect")
-        self.save_effect_button.clicked.connect(self._save_effect_to_palette)
-        toolbar.addWidget(self.save_effect_button)
-        node_layout.addLayout(toolbar)
-
-        self.canvas = EffectsGraphCanvas()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(False)
-        scroll.setMinimumHeight(310)
-        scroll.setWidget(self.canvas)
-        node_layout.addWidget(scroll)
-        self.tabs.addTab(node_view, "Node View")
-
-        palette_page = QWidget()
-        palette_layout = QVBoxLayout(palette_page)
-        self.palette_list = QListWidget()
-        self.palette_list.setIconSize(QPixmap(160, 90).size())
-        self.palette_list.currentItemChanged.connect(self._on_palette_selection_changed)
-        self.palette_list.itemDoubleClicked.connect(self._recall_palette_item)
-        palette_layout.addWidget(self.palette_list)
-        palette_actions = QHBoxLayout()
-        self.rename_effect_button = QPushButton("Rename Effect")
-        self.rename_effect_button.clicked.connect(self._rename_palette_item)
-        palette_actions.addWidget(self.rename_effect_button)
-        self.delete_effect_button = QPushButton("Delete Effect")
-        self.delete_effect_button.clicked.connect(self._delete_palette_item)
-        palette_actions.addWidget(self.delete_effect_button)
-        palette_layout.addLayout(palette_actions)
-        self.tabs.addTab(palette_page, "Effects Palette")
-        layout.addWidget(self.tabs)
-
-        self.timeline = EffectsTimelineWidget()
-        self.timeline.frameRequested.connect(self.set_current_frame)
-        layout.addWidget(self.timeline)
-        self.canvas.graphChanged.connect(self._on_canvas_changed)
-        self.bypass_toggle.toggled.connect(self._set_effects_bypassed)
-        self._refresh_palette_controls()
-        self._refresh_timeline()
-
-    def _on_canvas_changed(self) -> None:
-        valid_ids = set(self.canvas._nodes)
-        self._node_keyframes = {
-            node_id: keyframes for node_id, keyframes in self._node_keyframes.items() if node_id in valid_ids
-        }
-        self._refresh_timeline()
-        self.graphChanged.emit()
-
-    def _refresh_timeline(self) -> None:
-        tracks = []
-        for node_id, node in self.canvas._nodes.items():
-            title = self.canvas.NODE_TITLES.get(str(node.get("type", "")), str(node_id))
-            tracks.append((node_id, title, sorted(self._node_keyframes.get(node_id, {}))))
-        self.timeline.set_timeline(self._duration, self._current_frame, tracks)
-        if self.clock_source_combo.currentText() == "External Timecode" and self._external_timecode_text:
-            self.timecode_display.setText(self._external_timecode_text)
-        else:
-            nominal_fps = max(1, int(round(self._frame_rate)))
-            total_seconds = self._current_frame // nominal_fps
-            frames = self._current_frame % nominal_fps
-            self.timecode_display.setText(
-                f"{total_seconds // 3600:02d}:{(total_seconds // 60) % 60:02d}:{total_seconds % 60:02d}:{frames:02d}"
-            )
-        self.frame_spin.blockSignals(True)
-        self.frame_spin.setValue(self._current_frame)
-        self.frame_spin.blockSignals(False)
-
-    def _seek_frame_expanding(self, frame: int) -> None:
-        self._duration = max(self._duration, int(frame) + 1)
-        self.set_current_frame(frame)
-
-    def _store_selected_keyframes(self) -> None:
-        selected_ids = self.canvas.selected_node_ids()
-        if not selected_ids:
-            return
-        for node_id in selected_ids:
-            settings = self.canvas._nodes.get(node_id, {}).get("settings", {})
-            if isinstance(settings, dict):
-                snapshot = dict(settings)
-                if self.canvas._nodes[node_id].get("type") == "media":
-                    playback_arm = self.canvas._media_keyframe_playback_arms.get(node_id)
-                    snapshot.pop("playing", None)
-                    if playback_arm is not None:
-                        snapshot["playing"] = playback_arm == "play"
-                self._node_keyframes.setdefault(node_id, {})[self._current_frame] = snapshot
-        self._duration = max(self._duration, self._current_frame + 1)
-        self._refresh_timeline()
-        self.graphChanged.emit()
-
-    def _delete_selected_keyframes(self) -> None:
-        deleted = False
-        for node_id in self.canvas.selected_node_ids():
-            keyframes = self._node_keyframes.get(node_id)
-            if keyframes is None or self._current_frame not in keyframes:
-                continue
-            keyframes.pop(self._current_frame)
-            if not keyframes:
-                self._node_keyframes.pop(node_id, None)
-            deleted = True
-        if not deleted:
-            return
-        self.set_current_frame(self._current_frame)
-        self.graphChanged.emit()
-
-    def _sync_media_keyframe_arms(self) -> None:
-        for node_id, node in self.canvas._nodes.items():
-            if node.get("type") != "media" or node_id not in self.canvas._widgets:
-                continue
-            playing_keys = [
-                (frame, settings["playing"])
-                for frame, settings in self._node_keyframes.get(node_id, {}).items()
-                if "playing" in settings
-            ]
-            if playing_keys:
-                previous = [item for item in playing_keys if item[0] <= self._current_frame]
-                if previous:
-                    _frame, playing = max(previous, key=lambda item: item[0])
-                else:
-                    _frame, playing = min(playing_keys, key=lambda item: item[0])
-                state = "play" if bool(playing) else "pause"
-                self.canvas._media_keyframe_playback_arms[node_id] = state
-            else:
-                state = None
-                self.canvas._media_keyframe_playback_arms.pop(node_id, None)
-            self.canvas._widgets[node_id].set_media_keyframe_playback_arm(state)
-
-    @staticmethod
-    def _interpolate_settings(
-        left: dict[str, object], right: dict[str, object], progress: float
-    ) -> dict[str, object]:
-        eased = progress * progress * (3.0 - (2.0 * progress))
-        result: dict[str, object] = {}
-        for name in left.keys() | right.keys():
-            if name not in left:
-                if progress >= 1.0:
-                    result[name] = right[name]
-                continue
-            left_value = left[name]
-            if name not in right:
-                result[name] = left_value
-                continue
-            right_value = right[name]
-            if (
-                isinstance(left_value, (int, float)) and not isinstance(left_value, bool)
-                and isinstance(right_value, (int, float)) and not isinstance(right_value, bool)
-            ):
-                value = float(left_value) + ((float(right_value) - float(left_value)) * eased)
-                result[name] = round(value) if isinstance(left_value, int) and isinstance(right_value, int) else value
-            else:
-                result[name] = left_value if progress < 1.0 else right_value
-        return result
-
-    @classmethod
-    def _settings_at_frame(
-        cls,
-        keyframes: dict[int, dict[str, object]],
-        frame: int,
-    ) -> dict[str, object]:
-        result: dict[str, object] = {}
-        setting_names = {
-            name
-            for settings in keyframes.values()
-            for name in settings
-        }
-        for name in setting_names:
-            value_keys = sorted(
-                (key_frame, settings[name])
-                for key_frame, settings in keyframes.items()
-                if name in settings
-            )
-            previous = [item for item in value_keys if item[0] <= frame]
-            following = [item for item in value_keys if item[0] >= frame]
-            left_frame, left_value = previous[-1] if previous else value_keys[0]
-            right_frame, right_value = following[0] if following else value_keys[-1]
-            if left_frame == right_frame:
-                result[name] = left_value
-                continue
-            progress = (frame - left_frame) / float(right_frame - left_frame)
-            result.update(cls._interpolate_settings({name: left_value}, {name: right_value}, progress))
-        return result
-
-    def set_current_frame(self, frame: int) -> None:
-        self._current_frame = max(0, min(int(frame), self._duration - 1))
-        changed = False
-        for node_id, keyframes in self._node_keyframes.items():
-            if node_id not in self.canvas._nodes or not keyframes:
-                continue
-            interpolated = self._settings_at_frame(keyframes, self._current_frame)
-            settings = self.canvas._nodes[node_id].get("settings")
-            if isinstance(settings, dict) and any(settings.get(name) != value for name, value in interpolated.items()):
-                settings.update(interpolated)
-                self.canvas._refresh_node_status(node_id)
-                if self.canvas._nodes[node_id].get("type") == "media":
-                    self.canvas._widgets[node_id].set_media_state(
-                        bool(settings.get("playing", False)),
-                        bool(settings.get("loop", True)),
-                        bool(str(settings.get("path", "")).strip()),
-                    )
-                changed = True
-        self._sync_media_keyframe_arms()
-        self._refresh_timeline()
-        if changed:
-            self.graphChanged.emit()
-
-    def _set_playing(self, playing: bool) -> None:
-        self._playing = bool(playing)
-        external = self.clock_source_combo.currentText() == "External Timecode"
-        self.play_button.setText("Syncing" if self._playing and external else ("Pause" if self._playing else "Play"))
-        if self._playing:
-            if external:
-                self._external_origin_frame = self._external_timecode_frame
-                self._external_timeline_origin = self._current_frame
-                self._play_timer.stop()
-            else:
-                self._playback_started_at = time.perf_counter()
-                self._playback_start_frame = self._current_frame
-                self._play_timer.start()
-        else:
-            self._play_timer.stop()
-
-    def _advance_playback(self) -> None:
-        elapsed_frames = int((time.perf_counter() - self._playback_started_at) * self._frame_rate)
-        target_frame = self._playback_start_frame + elapsed_frames
-        if target_frame >= self._duration:
-            self.set_current_frame(self._duration - 1)
-            self.play_button.setChecked(False)
-            return
-        if target_frame != self._current_frame:
-            self.set_current_frame(target_frame)
-
-    def set_frame_rate(self, frame_rate: float) -> None:
-        self._frame_rate = max(1.0, min(120.0, float(frame_rate)))
-        if abs(self.timeline_fps_spin.value() - self._frame_rate) > 0.0005:
-            self.timeline_fps_spin.blockSignals(True)
-            self.timeline_fps_spin.setValue(self._frame_rate)
-            self.timeline_fps_spin.blockSignals(False)
-        interval_ms = max(1, int(round(500.0 / self._frame_rate)))
-        self._play_timer.setInterval(interval_ms)
-        if self._playing and self.clock_source_combo.currentText() == "Internal":
-            self._playback_started_at = time.perf_counter()
-            self._playback_start_frame = self._current_frame
-        self._refresh_timeline()
-
-    def _on_clock_source_changed(self, source: str) -> None:
-        self._external_origin_frame = None
-        self._external_timeline_origin = self._current_frame
-        if self._playing:
-            self._set_playing(True)
-        else:
-            self._refresh_timeline()
-
-    def _jump_keyframe(self, direction: int) -> None:
-        frames = sorted({frame for keyframes in self._node_keyframes.values() for frame in keyframes})
-        candidates = [frame for frame in frames if frame > self._current_frame] if direction > 0 else [frame for frame in frames if frame < self._current_frame]
-        if candidates:
-            self.set_current_frame(candidates[0] if direction > 0 else candidates[-1])
-
-    def _palette_index_from_item(self, item: QListWidgetItem | None) -> int | None:
-        if item is None:
-            return None
-        try:
-            index = int(item.data(Qt.UserRole))
-        except (TypeError, ValueError):
-            return None
-        return index if 0 <= index < len(self._palette_entries) else None
-
-    def _selected_palette_index(self) -> int | None:
-        return self._palette_index_from_item(self.palette_list.currentItem())
-
-    def _on_palette_selection_changed(self, _current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        self._refresh_palette_controls()
-
-    def _refresh_palette_controls(self) -> None:
-        selected_index = self._selected_palette_index()
-        current_index = self._current_palette_index if self._current_palette_index is not None else None
-        if current_index is not None and not 0 <= current_index < len(self._palette_entries):
-            current_index = None
-            self._current_palette_index = None
-        self.rename_effect_button.setEnabled(selected_index is not None)
-        self.delete_effect_button.setEnabled(selected_index is not None)
-        self.update_effect_button.setEnabled(current_index is not None)
-        if current_index is None:
-            self.current_effect_label.setText("Current effect: Unsaved")
-        else:
-            current_name = str(self._palette_entries[current_index].get("name", f"Effect {current_index + 1}"))
-            self.current_effect_label.setText(f"Current effect: {current_name}")
-
-    def _build_palette_entry(self, name: str) -> dict[str, object]:
-        entry = {
-            "name": name.strip(),
-            "graph": self.canvas.serialize(),
-            "keyframes": self._serialize_keyframes(),
-        }
-        thumbnail = self.canvas.grab().scaled(160, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        thumbnail_bytes = QByteArray()
-        thumbnail_buffer = QBuffer(thumbnail_bytes)
-        if thumbnail_buffer.open(QIODevice.WriteOnly) and thumbnail.save(thumbnail_buffer, "PNG"):
-            entry["thumbnail"] = bytes(thumbnail_bytes.toBase64()).decode("ascii")
-        return entry
-
-    def _palette_item(self, index: int, entry: dict[str, object]) -> QListWidgetItem:
-        icon = QIcon()
-        thumbnail_text = entry.get("thumbnail", "")
-        if isinstance(thumbnail_text, str) and thumbnail_text:
-            thumbnail = QPixmap()
-            thumbnail.loadFromData(QByteArray.fromBase64(thumbnail_text.encode("ascii")), "PNG")
-            icon = QIcon(thumbnail)
-        item = QListWidgetItem(icon, str(entry.get("name", f"Effect {index + 1}")))
-        item.setData(Qt.UserRole, index)
-        return item
-
-    def _rebuild_palette_list(self, selected_index: int | None = None) -> None:
-        self.palette_list.clear()
-        for index, entry in enumerate(self._palette_entries):
-            self.palette_list.addItem(self._palette_item(index, entry))
-        if selected_index is not None and 0 <= selected_index < self.palette_list.count():
-            self.palette_list.setCurrentRow(selected_index)
-        self._refresh_palette_controls()
-
-    def _save_effect_to_palette(self) -> None:
-        default_name = ""
-        if self._current_palette_index is not None and 0 <= self._current_palette_index < len(self._palette_entries):
-            default_name = str(self._palette_entries[self._current_palette_index].get("name", ""))
-        name, accepted = QInputDialog.getText(self, "Save New Effect", "Effect name", text=default_name)
-        if not accepted or not name.strip():
-            return
-        entry = self._build_palette_entry(name)
-        self._palette_entries.append(entry)
-        self._current_palette_index = len(self._palette_entries) - 1
-        self._rebuild_palette_list(self._current_palette_index)
-        self.graphChanged.emit()
-
-    def _update_current_palette_item(self) -> None:
-        if self._current_palette_index is None or not 0 <= self._current_palette_index < len(self._palette_entries):
-            return
-        current_name = str(self._palette_entries[self._current_palette_index].get("name", "Effect"))
-        self._palette_entries[self._current_palette_index] = self._build_palette_entry(current_name)
-        self._rebuild_palette_list(self._current_palette_index)
-        self.graphChanged.emit()
-
-    def _rename_palette_item(self) -> None:
-        item = self.palette_list.currentItem()
-        index = self._palette_index_from_item(item)
-        if index is None:
-            return
-        name, accepted = QInputDialog.getText(self, "Rename Effect", "Effect name", text=item.text())
-        if accepted and name.strip():
-            self._palette_entries[index]["name"] = name.strip()
-            item.setText(name.strip())
-            self._refresh_palette_controls()
-            self.graphChanged.emit()
-
-    def _delete_palette_item(self) -> None:
-        index = self._selected_palette_index()
-        if index is None:
-            return
-        entry_name = str(self._palette_entries[index].get("name", f"Effect {index + 1}"))
-        response = QMessageBox.question(
-            self,
-            "Delete Effect",
-            f'Delete "{entry_name}" from the effects palette?',
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if response != QMessageBox.Yes:
-            return
-        self._palette_entries.pop(index)
-        if self._current_palette_index == index:
-            self._current_palette_index = None
-        elif self._current_palette_index is not None and index < self._current_palette_index:
-            self._current_palette_index -= 1
-        next_index = min(index, len(self._palette_entries) - 1) if self._palette_entries else None
-        self._rebuild_palette_list(next_index)
-        self.graphChanged.emit()
-
-    def _recall_palette_item(self, item: QListWidgetItem, _column: int = 0) -> None:
-        index = self._palette_index_from_item(item)
-        if index is None:
-            return
-        entry = self._palette_entries[index]
-        if self.canvas.restore(entry.get("graph")):
-            self._restore_keyframes(entry.get("keyframes"))
-            self._current_palette_index = index
-            self._rebuild_palette_list(index)
-            self.set_current_frame(0)
-            self.tabs.setCurrentIndex(0)
-
-    def _serialize_keyframes(self) -> dict[str, dict[str, dict[str, object]]]:
-        return {
-            node_id: {str(frame): dict(settings) for frame, settings in keyframes.items()}
-            for node_id, keyframes in self._node_keyframes.items()
-        }
-
-    def _restore_keyframes(self, payload: object) -> None:
-        restored: dict[str, dict[int, dict[str, object]]] = {}
-        if isinstance(payload, dict):
-            for node_id, raw_keyframes in payload.items():
-                if node_id not in self.canvas._nodes or not isinstance(raw_keyframes, dict):
-                    continue
-                restored[str(node_id)] = {
-                    max(0, int(frame)): dict(settings)
-                    for frame, settings in raw_keyframes.items()
-                    if isinstance(settings, dict)
-                }
-        self._node_keyframes = restored
-        self._duration = max(
-            [1] + [frame + 1 for keyframes in restored.values() for frame in keyframes]
-        )
-        self._current_frame = min(self._current_frame, self._duration - 1)
-        self._sync_media_keyframe_arms()
-        self._refresh_timeline()
-
-    def _set_effects_bypassed(self, bypassed: bool) -> None:
-        self.canvas.set_effects_enabled(not bypassed)
-
-    def _add_selected_node(self, _index: int = 0) -> None:
-        node_type = self.NODE_MENU.get(self.node_combo.currentText())
-        if node_type is None:
-            return
-        self.canvas.add_node(node_type)
-        self.node_combo.setCurrentIndex(0)
-
-    def serialize(self) -> dict[str, object]:
-        return {
-            "editor_version": 2,
-            "graph": self.canvas.serialize(),
-            "keyframes": self._serialize_keyframes(),
-            "duration": self._duration,
-            "frame_rate": self._frame_rate,
-            "clock_source": self.clock_source_combo.currentText(),
-            "palette": self._palette_entries,
-        }
-
-    def restore(self, payload: object) -> bool:
-        editor_payload = payload if isinstance(payload, dict) and "graph" in payload else None
-        graph_payload = editor_payload.get("graph") if isinstance(editor_payload, dict) else payload
-        restored = self.canvas.restore(graph_payload)
-        if restored:
-            if isinstance(editor_payload, dict):
-                self._restore_keyframes(editor_payload.get("keyframes"))
-                self._duration = max(self._duration, int(editor_payload.get("duration", 1)))
-                self.timeline_fps_spin.setValue(float(editor_payload.get("frame_rate", self._frame_rate)))
-                clock_source = str(editor_payload.get("clock_source", "Internal"))
-                self.clock_source_combo.setCurrentText(
-                    clock_source if clock_source in {"Internal", "External Timecode"} else "Internal"
-                )
-                raw_palette = editor_payload.get("palette", [])
-                self._palette_entries = [
-                    dict(entry) for entry in raw_palette
-                    if isinstance(entry, dict) and isinstance(entry.get("graph"), dict)
-                ] if isinstance(raw_palette, list) else []
-                self._current_palette_index = None
-            else:
-                self._restore_keyframes(None)
-                self._palette_entries = []
-                self._current_palette_index = None
-            self._rebuild_palette_list()
-            self.bypass_toggle.blockSignals(True)
-            self.bypass_toggle.setChecked(not self.canvas.effects_enabled())
-            self.bypass_toggle.blockSignals(False)
-            self._refresh_timeline()
-        return restored
-
-    def set_composition_timecode(
-        self,
-        display_text: str,
-        info: dict[str, object] | None = None,
-    ) -> None:
-        self._external_timecode_text = display_text.strip()
-        external_frame: int | None = None
-        if isinstance(info, dict) and bool(info.get("present", False)):
-            timecode_text = str(info.get("text", "")).strip()
-            count_fps = _timecode_count_fps(str(info.get("format_name", "")), self._frame_rate)
-            base_frame = _timecode_to_frame_number(
-                _timecode_with_drop_frame_separator(timecode_text, bool(info.get("drop_frame", False))),
-                count_fps,
-            )
-            if base_frame is not None:
-                rate_ratio = self._frame_rate / float(max(1, count_fps))
-                external_frame = round(float(base_frame) * rate_ratio)
-                if rate_ratio > 1.5 and bool(info.get("field_mark", False)):
-                    external_frame += 1
-        self._external_timecode_frame = external_frame
-        if self.clock_source_combo.currentText() != "External Timecode":
-            return
-        if self._playing and external_frame is not None:
-            if self._external_origin_frame is None:
-                self._external_origin_frame = external_frame
-                self._external_timeline_origin = self._current_frame
-            target = self._external_timeline_origin + (external_frame - self._external_origin_frame)
-            self.set_current_frame(target)
-        else:
-            self._refresh_timeline()
-
-    def migrate_legacy_denoise(self, method: str, strength: float) -> None:
-        self.canvas.migrate_legacy_denoise(method, strength)
-
-    def active_denoise_settings(self) -> tuple[str, float]:
-        return self.canvas.active_denoise_settings()
-
-    def active_capture_device(self) -> int | None:
-        return self.canvas.active_capture_device()
-
-    def set_capture_devices(self, devices: list[tuple[str, object]]) -> None:
-        self.canvas.set_capture_devices(devices)
-
-    def native_effects_payload(self) -> dict[str, object]:
-        return self.canvas.native_effects_payload()
-
-
 class VideoProcessorController:
     def __init__(self, module) -> None:
         self._module = module
@@ -5762,7 +2239,6 @@ class VideoProcessorController:
         self.basic_scaling_manual = 4
         self.basic_scaling_auto_mode = True
         self.basic_scaling_method_supported = False
-        self.basic_scaling_max_inflight = 1
         self.color_space = _normalize_color_space_name(os.environ.get("VP_COLOR_SPACE", "rec709"))
         self.color_range = _normalize_color_range_name(os.environ.get("VP_COLOR_RANGE", "limited"))
         self.ai_sr_enabled = False
@@ -5797,16 +2273,13 @@ class VideoProcessorController:
         self.rtx_thdr_saturation = 50
         self.rtx_thdr_middle_gray = 50
         self.rtx_thdr_max_luminance = 1000
-        self.decklink_output_buffer_frames = 0
+        self.decklink_output_buffer_frames = 2
         self.worker_process_priority = _normalize_worker_priority_name(
             os.environ.get("VP_WORKER_PROCESS_PRIORITY", "above_normal")
         )
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
         self.processor = None
-        self.effects_payload: dict[str, object] = {"enabled": False}
-        self._effect_media_decoders: dict[int, EffectMediaDecoder | EffectCaptureDecoder] = {}
-        self._loaded_effect_source_signature: tuple[object, ...] | None = None
         self._zeroed_output_warning_emitted = False
 
     def create(self, roi: Roi) -> None:
@@ -5836,8 +2309,6 @@ class VideoProcessorController:
             self.processor.set_denoise_method(self.denoise_method)
         if hasattr(self.processor, "set_denoise_strength"):
             self.processor.set_denoise_strength(self.denoise_strength)
-        self._loaded_effect_source_signature = None
-        self.set_effects_config(self.effects_payload)
 
     def set_roi(self, roi: Roi) -> bool:
         if self.processor is not None:
@@ -5899,98 +2370,10 @@ class VideoProcessorController:
             if hasattr(self.processor, "set_denoise_strength"):
                 self.processor.set_denoise_strength(self.denoise_strength)
 
-    def set_effects_config(self, payload: dict[str, object]) -> None:
-        self.effects_payload = dict(payload)
-        if self.processor is None:
-            return
-        source_signature = _effects_source_signature(payload)
-        reload_source = source_signature != self._loaded_effect_source_signature
-        if reload_source:
-            for decoder in self._effect_media_decoders.values():
-                decoder.close()
-            self._effect_media_decoders.clear()
-        if reload_source:
-            self.processor.clear_effect_media()
-        enabled = bool(payload.get("enabled", False))
-        layers = _effect_layers_from_payload(payload)
-        try:
-            if enabled:
-                for layer in layers:
-                    if not bool(layer.get("enabled", False)):
-                        continue
-                    layer_index = int(layer.get("layer_index", 2))
-                    source_kind = str(layer.get("source_kind", "media")).strip().lower()
-                    capture_kind = str(layer.get("capture_kind", "")).strip().lower()
-                    media_path = str(layer.get("media_path", "")).strip()
-                    if source_kind == "matte":
-                        matte_rgba = np.asarray(
-                            layer.get("matte_rgba", [255, 255, 255, 255]), dtype=np.uint8
-                        ).reshape(1, 1, 4)
-                        self.processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
-                    elif reload_source and capture_kind == "webcam":
-                        decoder = EffectCaptureDecoder(int(layer.get("capture_device_index", 0)))
-                        self._effect_media_decoders[layer_index] = decoder
-                        rgba = decoder.next_rgba()
-                        self.processor.upload_effect_layer_media_rgba(
-                            layer_index, rgba, int(rgba.shape[1]), int(rgba.shape[0])
-                        )
-                    elif reload_source and media_path:
-                        decoder = EffectMediaDecoder(media_path)
-                        self._effect_media_decoders[layer_index] = decoder
-                        rgba = decoder.next_rgba(loop=bool(layer.get("media_loop", True)))
-                        self.processor.upload_effect_layer_media_rgba(
-                            layer_index, rgba, int(rgba.shape[1]), int(rgba.shape[0])
-                        )
-        except Exception:
-            self._loaded_effect_source_signature = None
-            self.processor.clear_effect_media()
-            self.processor.set_effects_config(False, output_connected=False)
-            raise
-        self.processor.set_effects_config(
-            enabled,
-            float(payload.get("opacity", 1.0)),
-            str(payload.get("blend_mode", "normal")),
-            str(payload.get("blur_method", "off")),
-            float(payload.get("blur_radius", 0.0)),
-            str(payload.get("blur_target", "both")),
-            float(payload.get("layer1_opacity", 1.0)),
-            str(payload.get("key_mode", "off")),
-            int(payload.get("key_color_r", 0)),
-            int(payload.get("key_color_g", 255)),
-            int(payload.get("key_color_b", 0)),
-            float(payload.get("key_similarity", 0.25)),
-            float(payload.get("key_softness", 0.10)),
-            float(payload.get("spill_suppression", 0.25)),
-            float(payload.get("luma_low", 0.0)),
-            float(payload.get("luma_high", 1.0)),
-            float(payload.get("luma_softness", 0.10)),
-            bool(payload.get("key_invert", False)),
-            float(payload.get("key_edge_feather", 0.0)),
-            bool(payload.get("output_connected", True)),
-            bool(payload.get("effect_color_from_alpha", False)),
-            bool(payload.get("effect_alpha_from_color", False)),
-            bool(payload.get("explicit_compositor_layers", False)),
-        )
-        _set_native_effects_input_transform(self.processor, payload)
-        layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
-        for layer_index in range(1, 9):
-            layer = (
-                layers_by_index.get(layer_index, {"layer_index": layer_index, "enabled": False})
-                if enabled
-                else {"layer_index": layer_index, "enabled": False}
-            )
-            _set_native_effect_layer_config(self.processor, layer)
-        _set_native_color_stages(self.processor, payload)
-        self._loaded_effect_source_signature = source_signature
-
     def set_max_auto_basic_scaling(self, scale: int) -> None:
         self.max_auto_basic_scaling = scale
         if self.processor is not None:
             self.processor.set_max_auto_sr_scale(scale)
-
-    def set_basic_scaling_max_inflight(self, max_inflight: int) -> None:
-        # In-process backend has no worker parallel-scaling pool to configure.
-        self.basic_scaling_max_inflight = max(1, min(4, int(max_inflight)))
 
     def set_basic_scaling_method(self, basic_scaling_method: str) -> None:
         self.basic_scaling_method = basic_scaling_method
@@ -6064,34 +2447,6 @@ class VideoProcessorController:
     def process_frame(self, frame_bytes: bytes) -> bytes:
         if self.processor is None:
             raise RuntimeError("VideoProcessor is not initialized")
-        effect_layers = _effect_layers_from_payload(self.effects_payload)
-        if (
-            bool(self.effects_payload.get("enabled", False))
-            and any(
-                bool(layer.get("media_playing", False))
-                or str(layer.get("capture_kind", "")) == "webcam"
-                for layer in effect_layers
-            )
-            and self._effect_media_decoders
-        ):
-            layers_by_index = {
-                int(layer.get("layer_index", 2)): layer
-                for layer in effect_layers
-            }
-            for layer_index, decoder in list(self._effect_media_decoders.items()):
-                layer = layers_by_index.get(layer_index, {})
-                if not bool(layer.get("media_playing", False)) and str(layer.get("capture_kind", "")) != "webcam":
-                    continue
-                try:
-                    rgba = decoder.next_rgba(loop=bool(layer.get("media_loop", True)))
-                    self.processor.upload_effect_layer_media_rgba(
-                        layer_index, rgba, int(rgba.shape[1]), int(rgba.shape[0])
-                    )
-                except Exception:
-                    decoder.close()
-                    self._effect_media_decoders.pop(layer_index, None)
-                    self.processor.set_effect_layer_config(layer_index, False)
-                    raise
         output = self.processor.process_frame(frame_bytes)
         if looks_zeroed_uyvy_frame(output):
             if not self._zeroed_output_warning_emitted:
@@ -6101,16 +2456,7 @@ class VideoProcessorController:
         return output
 
     def close(self) -> None:
-        for decoder in self._effect_media_decoders.values():
-            decoder.close()
-        self._effect_media_decoders.clear()
-        self._loaded_effect_source_signature = None
         self.processor = None
-
-    def set_basic_scaling_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
-        # In-process backend: enable_placeholder_sr is constructor-only, so the
-        # caller (MainWindow) recreates the processor via create() as needed.
-        self.enable_basic_scaling = bool(enabled)
 
     def set_ai_sr_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
         self.ai_sr_enabled = bool(enabled)
@@ -6326,7 +2672,6 @@ class ProcessVideoProcessorController:
         self.basic_scaling_manual = 4
         self.basic_scaling_auto_mode = True
         self.basic_scaling_method_supported = True
-        self.basic_scaling_max_inflight = max(1, min(4, int(os.environ.get("VP_BASIC_SCALING_MAX_INFLIGHT", "1"))))
         self.color_space = _normalize_color_space_name(os.environ.get("VP_COLOR_SPACE", "rec709"))
         self.color_range = _normalize_color_range_name(os.environ.get("VP_COLOR_RANGE", "limited"))
         self.ai_sr_model_path = os.environ.get("VP_AI_SR_MODEL", "")
@@ -6378,7 +2723,7 @@ class ProcessVideoProcessorController:
         self.rtx_thdr_saturation = max(0, int(os.environ.get("VP_RTX_THDR_SATURATION", "50")))
         self.rtx_thdr_middle_gray = max(0, int(os.environ.get("VP_RTX_THDR_MIDDLE_GRAY", "50")))
         self.rtx_thdr_max_luminance = max(0, int(os.environ.get("VP_RTX_THDR_MAX_LUMINANCE", "1000")))
-        self.decklink_output_buffer_frames = max(0, min(10, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "0"))))
+        self.decklink_output_buffer_frames = max(0, min(10, int(os.environ.get("VP_DECKLINK_OUTPUT_BUFFER_FRAMES", "2"))))
         self.interlaced_field2_phase_fraction = _clamp_interlaced_field2_phase_fraction(
             float(os.environ.get("VP_INTERLACED_FIELD2_PHASE_FRACTION", "0.50"))
         )
@@ -6386,13 +2731,9 @@ class ProcessVideoProcessorController:
             os.environ.get("VP_WORKER_PROCESS_PRIORITY", "above_normal")
         )
         self.worker_process_priority_error: str | None = None
-        self.worker_keep_alive_enabled = False
-        self.worker_keep_alive_error: str | None = None
         self.rtx_vsr_active = False
         self.rtx_vsr_error: str | None = None
         self.rtx_vsr_info: dict[str, object] | None = None
-        self.effects_payload: dict[str, object] = {"enabled": False}
-        self._effect_source_configured = False
 
         self._ctx = mp.get_context("spawn")
         self._request_queue = None
@@ -6429,7 +2770,6 @@ class ProcessVideoProcessorController:
         self._decklink_ai_timing_ms: dict[str, object] = {}
         self._decklink_rtx_vsr_applied = False
         self._decklink_rtx_effect_mean_abs_luma = 0.0
-        self._decklink_rtx_last_error: str | None = None
         self._decklink_stage_enable_flags: dict[str, bool] = {
             "preprocess": False,
             "basic_scaling": False,
@@ -6668,7 +3008,6 @@ class ProcessVideoProcessorController:
         self._decklink_rtx_effect_mean_abs_luma = float(
             message.get("rtx_effect_mean_abs_luma", self._decklink_rtx_effect_mean_abs_luma)
         )
-        self._decklink_rtx_last_error = message.get("rtx_stage_last_error", self._decklink_rtx_last_error)
         self._decklink_stage_enable_flags = dict(message.get("stage_enable_flags", self._decklink_stage_enable_flags))
         self._decklink_stage_last_applied = dict(message.get("stage_last_applied", self._decklink_stage_last_applied))
         self._decklink_stage_apply_counts = dict(message.get("stage_apply_counts", self._decklink_stage_apply_counts))
@@ -6802,10 +3141,7 @@ class ProcessVideoProcessorController:
         if run_processor_worker is None:
             raise RuntimeError("Process worker module is unavailable")
 
-        # Basic CUDA scaling is always kept available as the worker-side
-        # fallback layer beneath AI SR/RTX VSR (toggled at runtime via
-        # set_basic_scaling_enabled), so it is not suppressed here anymore.
-        effective_basic_scaling_enabled = bool(self.enable_basic_scaling)
+        effective_basic_scaling_enabled = bool(self.enable_basic_scaling) and not bool(self.ai_sr_enabled)
         sr_scale = 0 if self.basic_scaling_auto_mode else self.basic_scaling_manual
         project_root = str(Path(__file__).resolve().parents[1])
         startup_config = {
@@ -6850,7 +3186,6 @@ class ProcessVideoProcessorController:
             "ai_sr_hold_last_frame": bool(self.ai_sr_hold_last_frame),
             "ai_sr_max_hold_ms": float(self.ai_sr_max_hold_ms),
             "ai_sr_max_inflight": int(self.ai_sr_max_inflight),
-            "basic_scaling_max_inflight": int(self.basic_scaling_max_inflight),
             "rtx_vsr_enabled": self.rtx_vsr_enabled,
             "rtx_vsr_quality": self.rtx_vsr_quality,
             "rtx_vsr_scale": self.rtx_vsr_scale,
@@ -6899,8 +3234,6 @@ class ProcessVideoProcessorController:
         self._decklink_tick_pending_since = 0.0
         self._reset_decklink_fps_tracking()
         self._wait_for_ready(timeout_seconds=5.0)
-        if bool(self.effects_payload.get("enabled", False)):
-            self.set_effects_config(self.effects_payload)
 
     def _wait_for_ready(self, timeout_seconds: float) -> None:
         if self._response_queue is None:
@@ -6934,12 +3267,6 @@ class ProcessVideoProcessorController:
                 self.worker_process_priority_error = (
                     str(message.get("worker_process_priority_error", "")).strip() or None
                 )
-                self.worker_keep_alive_enabled = bool(message.get("worker_keep_alive_enabled", False))
-                self.worker_keep_alive_error = (
-                    str(message.get("worker_keep_alive_error", "")).strip() or None
-                )
-                if self.worker_keep_alive_error:
-                    LOGGER.warning("Worker keep-alive setup warning: %s", self.worker_keep_alive_error)
                 return
             if message_type == "error":
                 raise RuntimeError(
@@ -7125,8 +3452,6 @@ class ProcessVideoProcessorController:
                 ack_cmd = str(message.get("cmd", ""))
                 if ack_cmd in {"set_basic_scaling_method", "set_sr_flavor"}:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
-                elif ack_cmd == "set_basic_scaling_enabled":
-                    self.enable_basic_scaling = bool(message.get("basic_scaling_enabled", self.enable_basic_scaling))
                 elif ack_cmd == "set_deinterlace_enabled":
                     self.deinterlace_enabled = bool(message.get("deinterlace_enabled", self.deinterlace_enabled))
                 elif ack_cmd == "set_reinterlace_enabled":
@@ -7155,11 +3480,6 @@ class ProcessVideoProcessorController:
                     self.decklink_output_buffer_frames = max(
                         0,
                         min(10, int(message.get("decklink_output_buffer_frames", self.decklink_output_buffer_frames))),
-                    )
-                elif ack_cmd == "set_basic_scaling_max_inflight":
-                    self.basic_scaling_max_inflight = max(
-                        1,
-                        min(4, int(message.get("basic_scaling_max_inflight", self.basic_scaling_max_inflight))),
                     )
                 elif ack_cmd == "set_worker_process_priority":
                     self.worker_process_priority = _normalize_worker_priority_name(
@@ -7380,11 +3700,9 @@ class ProcessVideoProcessorController:
         start_from_current: bool = False,
         enforce_full_frame_scale_1x: bool = False,
     ) -> None:
-        roi_sequence = self._next_roi_command_sequence()
         self._send_control(
             {
                 "cmd": "start_roi_microstep_transition",
-                "roi_sequence": roi_sequence,
                 "start_x": int(start_roi.x),
                 "start_y": int(start_roi.y),
                 "start_w": int(start_roi.w),
@@ -7452,28 +3770,9 @@ class ProcessVideoProcessorController:
         )
         self._wait_for_ack("set_denoise_settings", timeout_seconds=1.0)
 
-    def set_effects_config(self, payload: dict[str, object]) -> None:
-        reload_source = (
-            not self._effect_source_configured
-            or _effects_source_signature(payload) != _effects_source_signature(self.effects_payload)
-        )
-        self.effects_payload = dict(payload)
-        command = dict(payload)
-        command["cmd"] = "set_effects_config"
-        command["reload_source"] = reload_source
-        self._send_control(command)
-        self._wait_for_ack("set_effects_config", timeout_seconds=5.0)
-        self._effect_source_configured = True
-
     def set_max_auto_basic_scaling(self, scale: int) -> None:
         self.max_auto_basic_scaling = scale
         self._send_control({"cmd": "set_max_auto_basic_scaling", "scale": int(scale)})
-
-    def set_basic_scaling_max_inflight(self, max_inflight: int) -> None:
-        self.basic_scaling_max_inflight = max(1, min(4, int(max_inflight)))
-        self._send_control(
-            {"cmd": "set_basic_scaling_max_inflight", "max_inflight": self.basic_scaling_max_inflight}
-        )
 
     def set_basic_scaling_method(self, basic_scaling_method: str) -> None:
         self.basic_scaling_method = basic_scaling_method
@@ -7541,8 +3840,6 @@ class ProcessVideoProcessorController:
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
                 if expected_cmd == "set_sr_flavor":
                     self.basic_scaling_method = str(message.get("basic_scaling_method", message.get("sr_flavor", self.basic_scaling_method)))
-                if expected_cmd == "set_basic_scaling_enabled":
-                    self.enable_basic_scaling = bool(message.get("basic_scaling_enabled", self.enable_basic_scaling))
                 if expected_cmd == "set_deinterlace_method":
                     self.deinterlace_method = str(message.get("deinterlace_method", self.deinterlace_method))
                 if expected_cmd == "set_deinterlace_enabled":
@@ -7552,11 +3849,6 @@ class ProcessVideoProcessorController:
                 if expected_cmd == "set_denoise_settings":
                     self.denoise_method = str(message.get("denoise_method", self.denoise_method))
                     self.denoise_strength = float(message.get("denoise_strength", self.denoise_strength))
-                if expected_cmd == "set_effects_config":
-                    raw_effects_error = message.get("effects_error")
-                    effects_error = str(raw_effects_error).strip() if raw_effects_error is not None else ""
-                    if effects_error:
-                        raise RuntimeError(effects_error)
                 if expected_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
                     self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                     self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
@@ -7823,13 +4115,6 @@ class ProcessVideoProcessorController:
         self._manual_roi_mailbox_seq = None
         self._decklink_tick_pending = False
         self._decklink_tick_pending_since = 0.0
-        self._effect_source_configured = False
-
-    def set_basic_scaling_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
-        self.enable_basic_scaling = bool(enabled)
-        self._send_control({"cmd": "set_basic_scaling_enabled", "enabled": bool(enabled)})
-        if wait_for_ack:
-            self._wait_for_ack("set_basic_scaling_enabled", timeout_seconds=max(0.5, float(timeout_seconds)))
 
     def set_ai_sr_enabled(self, enabled: bool, wait_for_ack: bool = False, timeout_seconds: float = 3.0) -> None:
         self.ai_sr_enabled = bool(enabled)
@@ -7974,9 +4259,6 @@ class ProcessVideoProcessorController:
     def decklink_rtx_stats(self) -> tuple[bool, float]:
         return bool(self._decklink_rtx_vsr_applied), float(self._decklink_rtx_effect_mean_abs_luma)
 
-    def decklink_rtx_last_error(self) -> str | None:
-        return self._decklink_rtx_last_error
-
     def decklink_stage_telemetry(self) -> tuple[dict[str, bool], dict[str, bool], dict[str, int]]:
         return (
             dict(self._decklink_stage_enable_flags),
@@ -8059,7 +4341,6 @@ class MainWindow(QMainWindow):
         )
         self._manual_drag_worker_send_hz = max(60.0, min(120.0, float(os.environ.get("VP_MANUAL_DRAG_WORKER_SEND_HZ", "60"))))
         self._manual_drag_worker_send_interval_ms = max(1, int(math.floor(1000.0 / self._manual_drag_worker_send_hz)))
-        self._last_effects_payload: dict[str, object] | None = None
         self._manual_roi_frame_lock_to_output = os.environ.get("VP_MANUAL_ROI_FRAME_LOCK", "1") != "0"
         self._manual_roi_last_send_ts = 0.0
         self._roi_keyframes: dict[int, RoiKeyframe] = {}
@@ -8138,7 +4419,7 @@ class MainWindow(QMainWindow):
         self._health_last_buffer_starvation = 0
         self._health_last_buffer_overflow = 0
         self._health_last_buffer_reprime = 0
-        self._decklink_buffer_guard_enabled = os.environ.get("VP_DECKLINK_BUFFER_GUARD", "0") == "1"
+        self._decklink_buffer_guard_enabled = os.environ.get("VP_DECKLINK_BUFFER_GUARD", "1") != "0"
         self._decklink_buffer_guard_floor_frames = max(
             1,
             min(10, int(os.environ.get("VP_DECKLINK_BUFFER_GUARD_FLOOR", "2"))),
@@ -8217,7 +4498,7 @@ class MainWindow(QMainWindow):
         self._decklink_tick_poll_fps = max(1.0, float(os.environ.get("VP_DECKLINK_TICK_POLL_FPS", "90")))
         self._decklink_output_buffer_frames = max(
             0,
-            min(10, int(getattr(self._controller, "decklink_output_buffer_frames", 0))),
+            min(10, int(getattr(self._controller, "decklink_output_buffer_frames", 2))),
         )
         self._decklink_output_buffer_user_target_frames = int(self._decklink_output_buffer_frames)
 
@@ -8396,6 +4677,7 @@ class MainWindow(QMainWindow):
         self._load_settings()
         self._apply_manual_drag_tuning_to_controller()
         self._apply_interlaced_phase_tuning_to_controller()
+        self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
@@ -8408,7 +4690,7 @@ class MainWindow(QMainWindow):
             self._update_status("Ready | Processing backend: worker process")
         else:
             self._update_status("Ready | Processing backend: in-process")
-            self._set_decklink_status("Worker backend not active; running in GUI process")
+            self.decklink_status_label.setText("Worker backend not active; running in GUI process")
         LOGGER.info("GUI initialized; default source mode=%s", self._source_mode)
         QTimer.singleShot(0, self._apply_initial_viewer_layout)
 
@@ -8438,7 +4720,7 @@ class MainWindow(QMainWindow):
         if hasattr(self._controller, "worker_process_priority"):
             self._controller.worker_process_priority = _normalize_worker_priority_name(self._worker_process_priority)
         self._controller.create(self._roi)
-        self._apply_scaling_mode_visibility(self.scaling_mode_combo.currentText())
+        self._sync_ai_sr_basic_scaling_ui(notify=False)
         self._apply_startup_ai_sr_settings()
         self._apply_controller_color_settings_from_ui()
         self._apply_worker_process_priority_to_controller(notify=False)
@@ -8487,7 +4769,6 @@ class MainWindow(QMainWindow):
             self.preview_downsample_combo,
             self.color_space_combo,
             self.color_range_combo,
-            self.scaling_mode_combo,
             self.sr_mode_combo,
             self.sr_flavor_combo,
             self.sr_manual_combo,
@@ -8516,6 +4797,9 @@ class MainWindow(QMainWindow):
             combo.currentTextChanged.connect(self._schedule_settings_save)
 
         checkbox_widgets = [
+            self.enable_sr_checkbox,
+            self.enable_ai_sr_checkbox,
+            self.enable_rtx_vsr_checkbox,
             self.deinterlace_checkbox,
             self.reinterlace_checkbox,
             self.perf_guard_checkbox,
@@ -8536,7 +4820,6 @@ class MainWindow(QMainWindow):
             self.preview_request_fps_spin,
             self.preview_poll_fps_spin,
             self.decklink_output_buffer_spin,
-            self.basic_scaling_max_inflight_spin,
             self.roi_x_spin,
             self.roi_y_spin,
             self.roi_w_spin,
@@ -8613,17 +4896,14 @@ class MainWindow(QMainWindow):
             "basic_scaling_method": str(self.sr_flavor_combo.currentText()),
             "basic_scaling_manual": str(self.sr_manual_combo.currentText()),
             "basic_scaling_auto_max": str(self.auto_sr_max_combo.currentText()),
-            "basic_scaling_max_inflight": int(self.basic_scaling_max_inflight_spin.value()),
-            "scaling_mode": str(self.scaling_mode_combo.currentText()),
-            "basic_scaling_enabled": self.scaling_mode_combo.currentText() == SCALING_MODE_BASIC,
+            "basic_scaling_enabled": bool(self.enable_sr_checkbox.isChecked()) and not bool(self.enable_ai_sr_checkbox.isChecked()),
             "deinterlace_enabled": bool(self.deinterlace_checkbox.isChecked()),
             "reinterlace_enabled": bool(self.reinterlace_checkbox.isChecked()),
             "deinterlace_method": str(self.deinterlace_method_combo.currentText()),
             "denoise_method": str(self.denoise_method_combo.currentText()),
             "denoise_strength": float(self.denoise_strength_spin.value()),
-            "effects_graph": self.effects_graph.serialize(),
             "perf_guard_enabled": bool(self.perf_guard_checkbox.isChecked()),
-            "ai_sr_enabled": self.scaling_mode_combo.currentText() == SCALING_MODE_ONNX_SR,
+            "ai_sr_enabled": bool(self.enable_ai_sr_checkbox.isChecked()),
             "ai_sr_model_path": str(self.ai_sr_model_combo.currentText().strip()),
             "ai_sr_provider": str(self.ai_sr_provider_combo.currentText()),
             "ai_sr_trt_precision": str(self.ai_sr_trt_precision_combo.currentText()),
@@ -8640,7 +4920,7 @@ class MainWindow(QMainWindow):
             "ai_sr_post_artifact_reduction_strength": float(self.ai_sr_post_artifact_reduction_strength_spin.value()),
             "ai_sr_post_exaggeration_enabled": bool(self.ai_sr_post_exaggeration_checkbox.isChecked()),
             "ai_sr_post_exaggeration_gain": float(self.ai_sr_post_exaggeration_gain_spin.value()),
-            "rtx_vsr_enabled": self.scaling_mode_combo.currentText() == SCALING_MODE_RTX_SR,
+            "rtx_vsr_enabled": bool(self.enable_rtx_vsr_checkbox.isChecked()),
             "rtx_vsr_quality": str(self.rtx_vsr_quality_combo.currentText()),
             "rtx_vsr_scale": str(self.rtx_vsr_scale_combo.currentText()),
             "rtx_vsr_post_scale_method": str(self.rtx_vsr_post_scale_method_combo.currentText()),
@@ -8728,33 +5008,16 @@ class MainWindow(QMainWindow):
             self.sr_flavor_combo.setCurrentText(str(raw.get("basic_scaling_method", self.sr_flavor_combo.currentText())))
             self.sr_manual_combo.setCurrentText(str(raw.get("basic_scaling_manual", self.sr_manual_combo.currentText())))
             self.auto_sr_max_combo.setCurrentText(str(raw.get("basic_scaling_auto_max", self.auto_sr_max_combo.currentText())))
-            self.basic_scaling_max_inflight_spin.setValue(
-                max(1, min(4, int(raw.get("basic_scaling_max_inflight", self.basic_scaling_max_inflight_spin.value()))))
-            )
 
-            if "scaling_mode" in raw:
-                restored_scaling_mode = str(raw.get("scaling_mode", SCALING_MODE_BASIC))
-            elif bool(raw.get("ai_sr_enabled", False)):
-                restored_scaling_mode = SCALING_MODE_ONNX_SR
-            elif bool(raw.get("rtx_vsr_enabled", False)):
-                restored_scaling_mode = SCALING_MODE_RTX_SR
-            else:
-                restored_scaling_mode = SCALING_MODE_BASIC
-            if restored_scaling_mode not in SCALING_MODE_OPTIONS:
-                restored_scaling_mode = SCALING_MODE_BASIC
-            self.scaling_mode_combo.setCurrentText(restored_scaling_mode)
-            self._apply_scaling_mode_visibility(restored_scaling_mode)
+            self.enable_sr_checkbox.setChecked(bool(raw.get("basic_scaling_enabled", self.enable_sr_checkbox.isChecked())))
             self.deinterlace_checkbox.setChecked(bool(raw.get("deinterlace_enabled", self.deinterlace_checkbox.isChecked())))
             self.reinterlace_checkbox.setChecked(bool(raw.get("reinterlace_enabled", self.reinterlace_checkbox.isChecked())))
             self.deinterlace_method_combo.setCurrentText(str(raw.get("deinterlace_method", self.deinterlace_method_combo.currentText())))
             self.denoise_method_combo.setCurrentText(str(raw.get("denoise_method", self.denoise_method_combo.currentText())))
             self.denoise_strength_spin.setValue(float(raw.get("denoise_strength", self.denoise_strength_spin.value())))
-            graph_restored = self.effects_graph.restore(raw.get("effects_graph"))
-            if not graph_restored:
-                legacy_method = DENOISE_METHOD_LABEL_TO_NAME.get(self.denoise_method_combo.currentText(), "off")
-                self.effects_graph.migrate_legacy_denoise(legacy_method, float(self.denoise_strength_spin.value()))
             self.perf_guard_checkbox.setChecked(bool(raw.get("perf_guard_enabled", self.perf_guard_checkbox.isChecked())))
 
+            self.enable_ai_sr_checkbox.setChecked(bool(raw.get("ai_sr_enabled", self.enable_ai_sr_checkbox.isChecked())))
             self.ai_sr_model_combo.setCurrentText(str(raw.get("ai_sr_model_path", self.ai_sr_model_combo.currentText())))
             persisted_provider = str(raw.get("ai_sr_provider", self.ai_sr_provider_combo.currentText())).strip().lower()
             if persisted_provider == "trt_int8":
@@ -8827,6 +5090,7 @@ class MainWindow(QMainWindow):
                 )
             )
 
+            self.enable_rtx_vsr_checkbox.setChecked(bool(raw.get("rtx_vsr_enabled", self.enable_rtx_vsr_checkbox.isChecked())))
             self.rtx_vsr_quality_combo.setCurrentText(str(raw.get("rtx_vsr_quality", self.rtx_vsr_quality_combo.currentText())))
             self.rtx_vsr_scale_combo.setCurrentText(str(raw.get("rtx_vsr_scale", self.rtx_vsr_scale_combo.currentText())))
             self.rtx_vsr_post_scale_method_combo.setCurrentText(str(raw.get("rtx_vsr_post_scale_method", self.rtx_vsr_post_scale_method_combo.currentText())))
@@ -8918,7 +5182,6 @@ class MainWindow(QMainWindow):
         self._update_roi_key_buttons()
 
         self._update_timer_interval()
-        self._on_effects_graph_changed()
 
     def _current_ai_sr_profile(self) -> dict[str, object]:
         return {
@@ -9064,13 +5327,7 @@ class MainWindow(QMainWindow):
 
     def _apply_startup_ai_sr_settings(self) -> None:
         model_path = self._resolve_startup_ai_sr_model_path()
-        scaling_mode = self.scaling_mode_combo.currentText()
-        ai_enabled = scaling_mode == SCALING_MODE_ONNX_SR
-        rtx_enabled = scaling_mode == SCALING_MODE_RTX_SR
-
-        # Basic CUDA scaling is always kept enabled at the worker as the live
-        # fallback layer beneath AI SR/RTX VSR.
-        self._set_basic_scaling_enabled_effective(True)
+        ai_enabled = bool(self.enable_ai_sr_checkbox.isChecked())
 
         if model_path and model_path != self.ai_sr_model_combo.currentText().strip():
             self.ai_sr_model_combo.blockSignals(True)
@@ -9133,11 +5390,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             LOGGER.warning("Failed to apply startup AI SR settings: %s", exc)
             self._update_status(f"Startup AI SR apply failed: {exc}")
-
-        try:
-            self._controller.set_rtx_vsr_enabled(rtx_enabled)
-        except Exception as exc:
-            LOGGER.warning("Failed to apply startup RTX VSR enabled state: %s", exc)
 
     def _discover_ai_sr_model_paths(self) -> list[str]:
         models_root = Path(__file__).resolve().parents[1] / "models"
@@ -9217,28 +5469,17 @@ class MainWindow(QMainWindow):
         self.auto_sr_max_combo.setCurrentText("4")
         self.auto_sr_max_combo.currentIndexChanged.connect(self._on_auto_sr_max_changed)
 
-        self.basic_scaling_max_inflight_spin = QSpinBox()
-        self.basic_scaling_max_inflight_spin.setRange(1, 4)
-        self.basic_scaling_max_inflight_spin.setValue(int(getattr(self._controller, "basic_scaling_max_inflight", 1)))
-        self.basic_scaling_max_inflight_spin.setToolTip(
-            "Parallel basic-scaling worker pool depth (opt-in). Only engages for progressive output + "
-            "Manual scaling + non-temporal-luma denoise; applies on next DeckLink Apply/start. "
-            "Auto mode or interlaced output always run the single-worker path regardless of this value."
-        )
-        self.basic_scaling_max_inflight_spin.valueChanged.connect(self._on_basic_scaling_max_inflight_changed)
+        self.enable_sr_checkbox = QCheckBox("Enable basic CUDA scaling")
+        self.enable_sr_checkbox.setChecked(True)
+        self.enable_sr_checkbox.toggled.connect(self._on_enable_sr_toggled)
 
-        if bool(getattr(self._controller, "ai_sr_enabled", False)):
-            initial_scaling_mode = SCALING_MODE_ONNX_SR
-        elif bool(getattr(self._controller, "rtx_vsr_enabled", False)):
-            initial_scaling_mode = SCALING_MODE_RTX_SR
-        else:
-            initial_scaling_mode = SCALING_MODE_BASIC
+        self.enable_ai_sr_checkbox = QCheckBox("Enable AI SR (ONNX model)")
+        self.enable_ai_sr_checkbox.setChecked(getattr(self._controller, "ai_sr_enabled", False))
+        self.enable_ai_sr_checkbox.toggled.connect(self._on_enable_ai_sr_toggled)
 
-        self.scaling_mode_combo = QComboBox()
-        self.scaling_mode_combo.addItems(SCALING_MODE_OPTIONS)
-        self.scaling_mode_combo.setCurrentText(initial_scaling_mode)
-        self.scaling_mode_combo.currentTextChanged.connect(self._on_scaling_mode_changed)
-
+        self.enable_rtx_vsr_checkbox = QCheckBox("Enable RTX VSR (NVIDIA SDK path)")
+        self.enable_rtx_vsr_checkbox.setChecked(bool(getattr(self._controller, "rtx_vsr_enabled", False)))
+        self.enable_rtx_vsr_checkbox.toggled.connect(self._on_enable_rtx_vsr_toggled)
 
         self.ai_sr_model_combo = QComboBox()
         self.ai_sr_model_combo.setEditable(True)
@@ -9387,8 +5628,8 @@ class MainWindow(QMainWindow):
         self.ai_sr_runtime_label.setWordWrap(True)
         ai_sr_runtime_layout.addWidget(self.ai_sr_runtime_label)
 
-        self.rtx_vsr_box = QGroupBox("RTX Video SDK (VSR)")
-        rtx_vsr_form = QFormLayout(self.rtx_vsr_box)
+        rtx_vsr_box = QGroupBox("RTX Video SDK (VSR)")
+        rtx_vsr_form = QFormLayout(rtx_vsr_box)
 
         self.rtx_vsr_quality_combo = QComboBox()
         self.rtx_vsr_quality_combo.addItems(["low", "medium", "high", "ultra"])
@@ -9470,64 +5711,42 @@ class MainWindow(QMainWindow):
         self.denoise_strength_spin.setValue(float(getattr(self._controller, "denoise_strength", 0.35)))
         self.denoise_strength_spin.valueChanged.connect(self._on_denoise_settings_changed)
 
-        self.effects_graph = EffectsGraphEditor()
-        self.effects_graph.set_frame_rate(float(self.fps_spin.value()))
-        self.effects_graph.graphChanged.connect(self._on_effects_graph_changed)
-
         deinterlace_box = QGroupBox("De-interlacing")
         deinterlace_form = QFormLayout(deinterlace_box)
         deinterlace_form.addRow(self.deinterlace_checkbox)
         deinterlace_form.addRow(self.reinterlace_checkbox)
         deinterlace_form.addRow("Method", self.deinterlace_method_combo)
 
-        upscaling_box = QGroupBox("Upscaling")
-        self.upscaling_form = QFormLayout(upscaling_box)
-        self.upscaling_form.addRow("Scaling mode", self.scaling_mode_combo)
+        denoise_box = QGroupBox("Noise Reduction")
+        denoise_form = QFormLayout(denoise_box)
+        denoise_form.addRow("Method", self.denoise_method_combo)
+        denoise_form.addRow("Strength", self.denoise_strength_spin)
 
-        self._basic_scaling_mode_rows = [
-            self.sr_mode_combo,
-            self.sr_flavor_combo,
-            self.sr_manual_combo,
-            self.auto_sr_max_combo,
-            self.basic_scaling_max_inflight_spin,
-        ]
-        self.upscaling_form.addRow("Basic scaling mode", self.sr_mode_combo)
-        self.upscaling_form.addRow("Basic scaling method", self.sr_flavor_combo)
-        self.upscaling_form.addRow("Manual basic scaling", self.sr_manual_combo)
-        self.upscaling_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
-        self.upscaling_form.addRow("Basic scaling max inflight", self.basic_scaling_max_inflight_spin)
+        upscaling_box = QGroupBox("Upscaling (Basic or AI)")
+        upscaling_form = QFormLayout(upscaling_box)
+        upscaling_form.addRow(self.enable_sr_checkbox)
+        upscaling_form.addRow("Basic scaling mode", self.sr_mode_combo)
+        upscaling_form.addRow("Basic scaling method", self.sr_flavor_combo)
+        upscaling_form.addRow("Manual basic scaling", self.sr_manual_combo)
+        upscaling_form.addRow("Auto basic scaling max", self.auto_sr_max_combo)
+        upscaling_form.addRow(self.enable_ai_sr_checkbox)
+        upscaling_form.addRow(self.enable_rtx_vsr_checkbox)
+        upscaling_form.addRow("AI SR model", self.ai_sr_model_combo)
+        upscaling_form.addRow(ai_sr_model_actions)
+        upscaling_form.addRow("AI SR provider", self.ai_sr_provider_combo)
+        upscaling_form.addRow("TensorRT precision", self.ai_sr_trt_precision_combo)
+        upscaling_form.addRow(self.ai_sr_require_gpu_checkbox)
+        upscaling_form.addRow("AI inference FPS", self.ai_sr_frame_interval_spin)
+        upscaling_form.addRow(self.ai_sr_strict_checkbox)
+        upscaling_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
+        upscaling_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
+        upscaling_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
+        upscaling_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
+        upscaling_form.addRow(ai_sr_tuning_actions)
+        upscaling_form.addRow(ai_sr_runtime_box)
 
-        self._ai_sr_mode_rows = [
-            self.ai_sr_model_combo,
-            ai_sr_model_actions,
-            self.ai_sr_provider_combo,
-            self.ai_sr_trt_precision_combo,
-            self.ai_sr_require_gpu_checkbox,
-            self.ai_sr_frame_interval_spin,
-            self.ai_sr_strict_checkbox,
-            self.ai_sr_input_align_combo,
-            self.ai_sr_overscan_spin,
-            self.ai_sr_inference_divisor_spin,
-            self.ai_sr_detail_preserve_spin,
-            ai_sr_tuning_actions,
-            ai_sr_runtime_box,
-        ]
-        self.upscaling_form.addRow("AI SR model", self.ai_sr_model_combo)
-        self.upscaling_form.addRow(ai_sr_model_actions)
-        self.upscaling_form.addRow("AI SR provider", self.ai_sr_provider_combo)
-        self.upscaling_form.addRow("TensorRT precision", self.ai_sr_trt_precision_combo)
-        self.upscaling_form.addRow(self.ai_sr_require_gpu_checkbox)
-        self.upscaling_form.addRow("AI inference FPS", self.ai_sr_frame_interval_spin)
-        self.upscaling_form.addRow(self.ai_sr_strict_checkbox)
-        self.upscaling_form.addRow("AI SR input alignment", self.ai_sr_input_align_combo)
-        self.upscaling_form.addRow("AI SR ROI overscan %", self.ai_sr_overscan_spin)
-        self.upscaling_form.addRow("AI SR inference divisor", self.ai_sr_inference_divisor_spin)
-        self.upscaling_form.addRow("AI SR detail preserve %", self.ai_sr_detail_preserve_spin)
-        self.upscaling_form.addRow(ai_sr_tuning_actions)
-        self.upscaling_form.addRow(ai_sr_runtime_box)
-
-        self.ai_sr_postprocess_box = QGroupBox("AI SR Post Process Noise Reduction")
-        ai_sr_postprocess_form = QFormLayout(self.ai_sr_postprocess_box)
+        ai_sr_postprocess_box = QGroupBox("AI SR Post Process Noise Reduction")
+        ai_sr_postprocess_form = QFormLayout(ai_sr_postprocess_box)
         ai_sr_postprocess_form.addRow("Noise Method", self.ai_sr_post_denoise_method_combo)
         ai_sr_postprocess_form.addRow("Noise Level", self.ai_sr_post_denoise_strength_spin)
         ai_sr_postprocess_form.addRow("Artifact Method", self.ai_sr_post_artifact_reduction_method_combo)
@@ -9614,7 +5833,7 @@ class MainWindow(QMainWindow):
         decklink_form.addRow("DeckLink output buffer (frames)", self.decklink_output_buffer_spin)
 
         self.decklink_fps_priority_guard_checkbox = QCheckBox(
-            "Warn when output timing becomes unstable"
+            "Prioritize output frame rate (temporary buffer boost when needed)"
         )
         self.decklink_fps_priority_guard_checkbox.setChecked(bool(self._decklink_buffer_guard_enabled))
         self.decklink_fps_priority_guard_checkbox.toggled.connect(self._on_decklink_buffer_guard_toggled)
@@ -9644,19 +5863,9 @@ class MainWindow(QMainWindow):
         self.decklink_refresh_btn.clicked.connect(self._refresh_decklink_catalog)
         decklink_form.addRow(self.decklink_refresh_btn)
 
-        self.status_dialog = QDialog(self, Qt.Tool)
-        self.status_dialog.setWindowTitle("Runtime Status")
-        self.status_dialog.resize(760, 360)
-        status_dialog_layout = QVBoxLayout(self.status_dialog)
-        self.status_text = QPlainTextEdit(self.status_dialog)
-        self.status_text.setReadOnly(True)
-        self.status_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
-        status_dialog_layout.addWidget(self.status_text)
-
-        self.status_button = QPushButton("Open Status Window")
-        self.status_button.setToolTip("Open detailed runtime and DeckLink status")
-        self.status_button.clicked.connect(self._show_status_dialog)
-        decklink_form.addRow(self.status_button)
+        self.decklink_status_label = QLabel()
+        self.decklink_status_label.setWordWrap(True)
+        decklink_form.addRow(self.decklink_status_label)
 
         roi_box = QGroupBox("ROI")
         roi_form = QFormLayout(roi_box)
@@ -9869,6 +6078,9 @@ class MainWindow(QMainWindow):
         post_vsr_scaling_form.addRow(self.rtx_vsr_scaling_apply_btn)
         post_vsr_scaling_form.addRow(self.rtx_vsr_scaling_info_label)
 
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+
         controls_hint = QLabel(
             "Controls:\n"
             "- Input view only: Mouse drag to move ROI\n"
@@ -9884,24 +6096,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(roi_box)
         layout.addWidget(decklink_box)
         layout.addWidget(deinterlace_box)
-        layout.addWidget(self.effects_graph)
+        layout.addWidget(denoise_box)
         layout.addWidget(upscaling_box)
-        layout.addWidget(self.rtx_vsr_box)
+        layout.addWidget(rtx_vsr_box)
         layout.addWidget(settings_box)
-        layout.addWidget(self.ai_sr_postprocess_box)
+        layout.addWidget(ai_sr_postprocess_box)
         layout.addWidget(post_vsr_scaling_box)
         layout.addWidget(controls_hint)
+        layout.addWidget(self.status_label)
         layout.addStretch(1)
-        self._apply_scaling_mode_visibility(self.scaling_mode_combo.currentText())
         return panel
-
-    def _show_status_dialog(self) -> None:
-        self.status_dialog.show()
-        self.status_dialog.raise_()
-        self.status_dialog.activateWindow()
-
-    def _set_decklink_status(self, text: str) -> None:
-        self._update_status(str(text))
 
     def _build_fullscreen_keyframe_toolbar(self, view_name: str) -> QWidget:
         toolbar = QWidget()
@@ -10583,7 +6787,7 @@ class MainWindow(QMainWindow):
                         perf["tick"][0],
                         perf["tick"][1],
                     )
-                    self._set_decklink_status(
+                    self.decklink_status_label.setText(
                         (
                             f"DeckLink streaming via worker process | preview_fps={fps:.1f} | "
                             f"output_fps={worker_fps:.1f} | {health_summary} | "
@@ -10861,7 +7065,7 @@ class MainWindow(QMainWindow):
                     perf["tick"][1],
                 )
                 if self._source_mode == "Blackmagic DeckLink":
-                    self._set_decklink_status("DeckLink streaming")
+                    self.decklink_status_label.setText("DeckLink streaming")
 
                 self._refresh_ai_sr_runtime_panel()
                 self._refresh_rtx_vsr_runtime_panel()
@@ -11084,8 +7288,6 @@ class MainWindow(QMainWindow):
 
     def _update_timer_interval(self) -> None:
         fps = max(1, self.fps_spin.value())
-        if hasattr(self, "effects_graph"):
-            self.effects_graph.set_frame_rate(float(fps))
         poll_fps = float(fps)
         if self._source_mode == "Blackmagic DeckLink" and self._controller_backend == "worker-process":
             # In worker DeckLink mode, preview cadence should follow the dedicated
@@ -11199,12 +7401,24 @@ class MainWindow(QMainWindow):
 
     def _on_decklink_buffer_guard_toggled(self, checked: bool) -> None:
         self._decklink_buffer_guard_enabled = bool(checked)
-        self._decklink_buffer_guard_active = False
-        self._decklink_buffer_guard_stable_windows = 0
+        if not self._decklink_buffer_guard_enabled:
+            self._decklink_buffer_guard_active = False
+            self._decklink_buffer_guard_stable_windows = 0
+            requested_frames = int(self._decklink_output_buffer_user_target_frames)
+            if self._decklink_output_buffer_frames != requested_frames:
+                self._decklink_output_buffer_frames = requested_frames
+                try:
+                    if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                        self._controller.set_decklink_output_buffer_frames(requested_frames)
+                    self._update_status(
+                        f"FPS-priority guard disabled; restoring requested DeckLink buffer={requested_frames}"
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to restore requested DeckLink buffer after disabling FPS-priority guard")
+            return
+
         self._update_status(
-            "DeckLink timing warnings enabled; output buffer remains user-selected"
-            if self._decklink_buffer_guard_enabled
-            else "DeckLink timing warnings disabled; output buffer remains user-selected"
+            "FPS-priority guard enabled; buffer remains user-selected and only temporarily increases during deadline stress"
         )
 
     def _apply_worker_process_priority_to_controller(self, notify: bool) -> None:
@@ -11257,6 +7471,16 @@ class MainWindow(QMainWindow):
         if not self._decklink_buffer_guard_enabled:
             return
         requested_frames = int(self._decklink_output_buffer_user_target_frames)
+        guard_floor = int(self._decklink_buffer_guard_floor_frames)
+        if interaction_active:
+            guard_floor = max(
+                guard_floor,
+                int(self._decklink_buffer_guard_transition_floor_frames),
+            )
+        if requested_frames >= guard_floor:
+            self._decklink_buffer_guard_active = False
+            self._decklink_buffer_guard_stable_windows = 0
+            return
 
         engage = (
             float(deadline_miss_ratio) >= float(self._decklink_buffer_guard_engage_miss_ratio)
@@ -11267,16 +7491,22 @@ class MainWindow(QMainWindow):
 
         if engage:
             self._decklink_buffer_guard_stable_windows = 0
-            if not self._decklink_buffer_guard_active:
+            if self._decklink_output_buffer_frames < guard_floor:
                 self._decklink_buffer_guard_active = True
-                self._update_status(
-                    (
-                        "DeckLink timing warning: buffer remains at requested "
-                        f"{requested_frames} frame(s) "
-                        f"(dl_miss={deadline_miss_ratio * 100.0:.1f}%, streak={deadline_miss_streak}, "
-                        f"interaction={'yes' if interaction_active else 'no'})"
+                self._decklink_output_buffer_frames = guard_floor
+                try:
+                    if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                        self._controller.set_decklink_output_buffer_frames(int(guard_floor))
+                    self._update_status(
+                        (
+                            "DeckLink buffer guard engaged: requested "
+                            f"{requested_frames}, temporarily applying {guard_floor} "
+                            f"(dl_miss={deadline_miss_ratio * 100.0:.1f}%, streak={deadline_miss_streak}, "
+                            f"interaction={'yes' if interaction_active else 'no'})"
+                        )
                     )
-                )
+                except Exception:
+                    LOGGER.exception("DeckLink buffer guard failed to apply raised buffer")
             return
 
         if not self._decklink_buffer_guard_active:
@@ -11297,9 +7527,18 @@ class MainWindow(QMainWindow):
 
         self._decklink_buffer_guard_active = False
         self._decklink_buffer_guard_stable_windows = 0
-        self._update_status(
-            f"DeckLink timing stable; output buffer remains at requested {requested_frames} frame(s)"
-        )
+        self._decklink_output_buffer_frames = requested_frames
+        try:
+            if hasattr(self._controller, "set_decklink_output_buffer_frames"):
+                self._controller.set_decklink_output_buffer_frames(int(requested_frames))
+            self._update_status(
+                (
+                    "DeckLink buffer guard released: restoring requested buffer "
+                    f"{requested_frames} frame(s) after stable timing"
+                )
+            )
+        except Exception:
+            LOGGER.exception("DeckLink buffer guard failed to restore requested buffer")
 
     def _on_manual_drag_endpoint(self, x: float, y: float, w: float, h: float) -> None:
         if (
@@ -12030,76 +8269,38 @@ class MainWindow(QMainWindow):
         if self._timecode_adjustment_paused:
             self._roi_control_adjustment_timer.start()
 
-    def _apply_scaling_mode_visibility(self, mode_text: str) -> None:
-        is_basic = mode_text == SCALING_MODE_BASIC
-        is_ai = mode_text == SCALING_MODE_ONNX_SR
-        is_rtx = mode_text == SCALING_MODE_RTX_SR
+    def _sync_ai_sr_basic_scaling_ui(self, notify: bool = False, runtime_force_disable: bool = False) -> None:
+        ai_sr_selected = bool(self.enable_ai_sr_checkbox.isChecked())
+        basic_forced_off = False
 
-        for widget in self._basic_scaling_mode_rows:
-            self.upscaling_form.setRowVisible(widget, is_basic)
-        for widget in self._ai_sr_mode_rows:
-            self.upscaling_form.setRowVisible(widget, is_ai)
-        self.ai_sr_postprocess_box.setVisible(is_ai)
-        self.rtx_vsr_box.setVisible(is_rtx)
-
-    def _set_basic_scaling_enabled_effective(self, enabled: bool) -> None:
-        # Worker backend: instant runtime toggle, no processor/session recreation.
-        if self._controller_backend == "worker-process" and hasattr(self._controller, "set_basic_scaling_enabled"):
-            self._controller.enable_basic_scaling = bool(enabled)
-            self._controller.set_basic_scaling_enabled(enabled)
-            return
-
-        # In-process backend: basic scaling is a constructor-only native option.
-        previous_value = self._controller.enable_basic_scaling
-        self._controller.enable_basic_scaling = bool(enabled)
-        try:
-            self._controller.create(self._roi)
-            if self._source_mode == "Blackmagic DeckLink":
-                self._start_decklink_sessions()
-        except Exception as exc:
-            self._controller.enable_basic_scaling = previous_value
-            try:
-                self._controller.create(self._roi)
-                if self._source_mode == "Blackmagic DeckLink":
-                    self._start_decklink_sessions()
-            except Exception:
-                pass
-            self._update_status(f"Processor recreate failed: {exc}")
-
-    def _apply_scaling_mode_runtime(self, mode_text: str) -> None:
-        want_ai = mode_text == SCALING_MODE_ONNX_SR
-        want_rtx = mode_text == SCALING_MODE_RTX_SR
-
-        # Basic CUDA scaling stays enabled at the worker as the live fallback
-        # layer (shown until AI SR/RTX VSR actually becomes active), so
-        # switching modes never blacks out or requires a processor restart.
-        self._set_basic_scaling_enabled_effective(True)
-
-        try:
-            if not want_ai and bool(getattr(self._controller, "ai_sr_enabled", False)):
-                self._controller.set_ai_sr_enabled(False)
-            if not want_rtx and bool(getattr(self._controller, "rtx_vsr_enabled", False)):
-                self._controller.set_rtx_vsr_enabled(False)
-            if want_ai:
-                self._controller.set_ai_sr_enabled(True)
-                model_path = self.ai_sr_model_combo.currentText().strip()
-                self._update_status(f"ONNX SR mode selected | awaiting worker ack | model={model_path}")
-            elif want_rtx:
-                self._controller.set_rtx_vsr_enabled(True)
-                self._update_status("Nvidia SR (RTX VSR) mode selected | awaiting worker ack")
+        if ai_sr_selected and self.enable_sr_checkbox.isChecked():
+            if runtime_force_disable:
+                self.enable_sr_checkbox.setChecked(False)
             else:
-                self._update_status("Standard CUDA scaling mode selected")
-        except Exception as exc:
-            self._update_status(f"Scaling mode change failed: {exc}")
+                self.enable_sr_checkbox.blockSignals(True)
+                self.enable_sr_checkbox.setChecked(False)
+                self.enable_sr_checkbox.blockSignals(False)
+                self._controller.enable_basic_scaling = False
+            basic_forced_off = True
 
-    def _on_scaling_mode_changed(self, mode_text: str) -> None:
-        self._apply_scaling_mode_visibility(mode_text)
-        if self._updating_controls:
-            return
-        self._apply_scaling_mode_runtime(mode_text)
+        self.enable_sr_checkbox.setEnabled(not ai_sr_selected)
+
+        basic_controls_enabled = bool(self.enable_sr_checkbox.isChecked()) and not ai_sr_selected
+        self.sr_mode_combo.setEnabled(basic_controls_enabled)
+        self.sr_flavor_combo.setEnabled(basic_controls_enabled)
+        self.sr_manual_combo.setEnabled(basic_controls_enabled)
+        self.auto_sr_max_combo.setEnabled(basic_controls_enabled)
+
+        if ai_sr_selected:
+            self.enable_sr_checkbox.setToolTip("Basic CUDA scaling is disabled while AI SR (ONNX) is enabled.")
+        else:
+            self.enable_sr_checkbox.setToolTip("")
+
+        if notify and basic_forced_off:
+            self._update_status("AI SR ONNX selected: basic CUDA scaling has been disabled automatically")
 
     def _on_sr_mode_changed(self) -> None:
-        if self.scaling_mode_combo.currentText() != SCALING_MODE_BASIC:
+        if self.enable_ai_sr_checkbox.isChecked():
             return
         mode = self.sr_mode_combo.currentText()
         try:
@@ -12148,17 +8349,44 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._update_status(f"Auto basic scaling max change failed: {exc}")
 
-    def _on_basic_scaling_max_inflight_changed(self, value: int) -> None:
+    def _on_enable_sr_toggled(self, checked: bool) -> None:
         if self._updating_controls:
+            self._controller.enable_basic_scaling = bool(checked)
+            self._sync_ai_sr_basic_scaling_ui(notify=False)
             return
+
+        if checked and self.enable_ai_sr_checkbox.isChecked():
+            self.enable_sr_checkbox.blockSignals(True)
+            self.enable_sr_checkbox.setChecked(False)
+            self.enable_sr_checkbox.blockSignals(False)
+            self._controller.enable_basic_scaling = False
+            self._sync_ai_sr_basic_scaling_ui(notify=False)
+            self._update_status("Basic CUDA scaling remains disabled while AI SR ONNX is enabled")
+            return
+
+        previous_value = self._controller.enable_basic_scaling
+        self._controller.enable_basic_scaling = checked
         try:
-            self._controller.set_basic_scaling_max_inflight(int(value))
-            self._update_status(
-                f"Basic scaling max inflight set to {int(value)} | applies on next DeckLink Apply/start "
-                "(only engages for progressive + Manual scaling + non-temporal denoise)"
-            )
+            self._controller.create(self._roi)
+            if self._source_mode == "Blackmagic DeckLink":
+                self._start_decklink_sessions()
+            self._sync_ai_sr_basic_scaling_ui(notify=False)
+            self._update_status("Recreated processor after basic scaling toggle")
         except Exception as exc:
-            self._update_status(f"Basic scaling max inflight change failed: {exc}")
+            # Roll back to previous SR enable state so the app can recover in-place.
+            self._controller.enable_basic_scaling = previous_value
+            try:
+                self._controller.create(self._roi)
+                if self._source_mode == "Blackmagic DeckLink":
+                    self._start_decklink_sessions()
+            except Exception:
+                pass
+
+            self.enable_sr_checkbox.blockSignals(True)
+            self.enable_sr_checkbox.setChecked(previous_value)
+            self.enable_sr_checkbox.blockSignals(False)
+            self._sync_ai_sr_basic_scaling_ui(notify=False)
+            self._update_status(f"Processor recreate failed: {exc}")
 
     def _on_deinterlace_toggled(self, checked: bool) -> None:
         try:
@@ -12201,52 +8429,40 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._update_status(f"Denoise setting update failed: {exc}")
 
-    def _on_effects_graph_changed(self) -> None:
-        if self._updating_controls:
-            return
-        method_name, strength = self.effects_graph.active_denoise_settings()
-        method_label = DENOISE_METHOD_NAME_TO_LABEL.get(method_name, "Off")
-        self.denoise_method_combo.blockSignals(True)
-        self.denoise_strength_spin.blockSignals(True)
-        self.denoise_method_combo.setCurrentText(method_label)
-        self.denoise_strength_spin.setValue(strength)
-        self.denoise_method_combo.blockSignals(False)
-        self.denoise_strength_spin.blockSignals(False)
-        if (
-            method_name != str(getattr(self._controller, "denoise_method", "off"))
-            or abs(strength - float(getattr(self._controller, "denoise_strength", 0.0))) > 1e-6
-        ):
-            self._on_denoise_settings_changed()
-        capture_device = self.effects_graph.active_capture_device()
-        if capture_device is not None:
-            self.decklink_auto_detect_devices.blockSignals(True)
-            self.decklink_auto_detect_devices.setChecked(False)
-            self.decklink_auto_detect_devices.blockSignals(False)
-            for index in range(self.decklink_input_device_combo.count()):
-                if self.decklink_input_device_combo.itemData(index) == capture_device:
-                    self.decklink_input_device_combo.blockSignals(True)
-                    self.decklink_input_device_combo.setCurrentIndex(index)
-                    self.decklink_input_device_combo.blockSignals(False)
-                    self._populate_mode_combos()
-                    break
-        effects_payload = self.effects_graph.native_effects_payload()
-        effects_error = str(effects_payload.get("error", "")).strip()
-        if effects_error:
-            self._update_status(effects_error)
-        elif effects_payload != self._last_effects_payload:
-            try:
-                self._controller.set_effects_config(effects_payload)
-                self._last_effects_payload = dict(effects_payload)
-                state = "enabled" if bool(effects_payload.get("enabled", False)) else "disabled"
-                self._update_status(f"GPU effects compositor {state}")
-            except Exception as exc:
-                self._update_status(f"Effects graph update failed: {exc}")
-        self._schedule_settings_save()
-
     def _on_perf_guard_toggled(self, checked: bool) -> None:
         self._perf_guard_enabled = checked
         self._perf_guard_low_fps_seconds = 0
         self._perf_guard_last_action = ""
+
+    def _on_enable_ai_sr_toggled(self, checked: bool) -> None:
+        if self._updating_controls:
+            self._controller.ai_sr_enabled = bool(checked)
+            self._sync_ai_sr_basic_scaling_ui(notify=False)
+            return
+
+        self._sync_ai_sr_basic_scaling_ui(notify=checked, runtime_force_disable=checked)
+        try:
+            self._controller.set_ai_sr_enabled(checked)
+            if checked:
+                model_path = self.ai_sr_model_combo.currentText().strip()
+                self._update_status(f"AI SR ONNX mode requested | basic CUDA scaling disabled | awaiting worker ack | model={model_path}")
+            else:
+                self._update_status("AI SR disable requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"AI SR toggle failed: {exc}")
+
+    def _on_enable_rtx_vsr_toggled(self, checked: bool) -> None:
+        try:
+            self._controller.set_rtx_vsr_enabled(checked)
+            if checked:
+                if bool(getattr(self._controller, "ai_sr_enabled", False)):
+                    self._update_status("RTX VSR enable requested | awaiting worker ack | note: with AI SR enabled, RTX runs as fallback when AI is unavailable on a frame")
+                else:
+                    self._update_status("RTX VSR enable requested | awaiting worker ack")
+            else:
+                self._update_status("RTX VSR disable requested | awaiting worker ack")
+        except Exception as exc:
+            self._update_status(f"RTX VSR toggle failed: {exc}")
 
     def _on_ai_sr_model_path_changed(self, model_path: str) -> None:
         if self._updating_controls:
@@ -12486,7 +8702,6 @@ class MainWindow(QMainWindow):
         post_exaggeration_passes = int(info.get("post_exaggeration_passes", 2 if post_exaggeration_enabled else 1))
         onnx_output_copy_to_cpu = bool(info.get("onnx_output_copy_to_cpu", True))
         detail_preserve_note = str(info.get("detail_preserve_note", "")).strip()
-        provider_fallback_note = str(info.get("provider_fallback_note", "") or "").strip()
 
         lines = [
             f"Enabled: {enabled} | Active: {active} | Loading: {loading}",
@@ -12527,18 +8742,13 @@ class MainWindow(QMainWindow):
                 "the current mode keeps rendering live until it is ready."
             )
 
-        if provider_fallback_note:
-            lines.append(f"Provider fallback: {provider_fallback_note}")
-
         if isinstance(timing_warmup_frames, (int, float)) and isinstance(timing_warmup_remaining, (int, float)):
             lines.append(
                 f"Timing warmup: excluded first {int(timing_warmup_frames)} sample(s), remaining={max(0, int(timing_warmup_remaining))}"
             )
 
-        if enabled and not active:
-            lines.append("Mode: basic CUDA scaling remains live as fallback until the AI SR engine becomes active.")
-        elif enabled:
-            lines.append("Mode: ONNX AI SR active (basic CUDA scaling is bypassed while AI SR is producing output).")
+        if enabled:
+            lines.append("Mode: ONNX AI SR only (basic CUDA scaling is disabled while AI SR is enabled).")
 
         lines.append("Scheduler: worker skips frames and submits inference jobs to match the target AI inference FPS.")
         if onnx_output_copy_to_cpu:
@@ -12599,12 +8809,6 @@ class MainWindow(QMainWindow):
         if error_text:
             lines.append(f"Error: {error_text}")
 
-        stage_error = None
-        if hasattr(self._controller, "decklink_rtx_last_error"):
-            stage_error = self._controller.decklink_rtx_last_error()
-        if stage_error:
-            lines.append(f"Last inference error (falling back to passthrough): {stage_error}")
-
         self.rtx_vsr_runtime_label.setText("\n".join(lines))
         self.rtx_vsr_scaling_info_label.setText(
             (
@@ -12659,7 +8863,6 @@ class MainWindow(QMainWindow):
                 output_buffer_health = {}
 
         starvation_events = int(output_buffer_health.get("starvation_events", 0))
-        clock_correction_events = int(output_buffer_health.get("clock_correction_events", 0))
         overflow_events = int(output_buffer_health.get("overflow_events", 0))
         reprime_events = int(output_buffer_health.get("auto_reprime_events", 0))
         buffered_count = int(output_buffer_health.get("last_buffered_count", -1))
@@ -12734,7 +8937,7 @@ class MainWindow(QMainWindow):
                     "HEALTH | level=%s | output_fps=%.2f | nominal_fps=%.2f | ratio=%.3f | "
                     "interp_active=%s | reasons=%s | "
                     "timing[frames=%d,dl_miss_ratio=%.3f,dl_streak=%d,dl_max=%d,e2e_ema_ms=%.2f,proc_ema_ms=%.2f,cq_ema_ms=%.2f,oq_ema_ms=%.2f,ow_ema_ms=%.2f,emit_ema_ms=%.2f,late_ema_ms=%.2f,path=%s] | "
-                    "buffer[target=%d,current=%d,s=%d,c=%d,o=%d,r=%d,reason=%s]"
+                    "buffer[target=%d,current=%d,s=%d,o=%d,r=%d,reason=%s]"
                 ),
                 health_level,
                 float(output_fps),
@@ -12757,7 +8960,6 @@ class MainWindow(QMainWindow):
                 target_buffer,
                 buffered_count,
                 starvation_events,
-                clock_correction_events,
                 overflow_events,
                 reprime_events,
                 last_reprime_reason,
@@ -12767,12 +8969,12 @@ class MainWindow(QMainWindow):
         if not health_reasons:
             return (
                 f"health=ok ({interp_tag}) | out={output_fps:.1f}/{nominal_fps:.1f} | "
-                f"buf={buffered_count}/{target_buffer} | corrections={clock_correction_events}"
+                f"buf={buffered_count}/{target_buffer}"
             )
 
         return (
             f"health={health_level} ({interp_tag}) | out={output_fps:.1f}/{nominal_fps:.1f} | "
-            f"buf={buffered_count}/{target_buffer} | corrections={clock_correction_events} | "
+            f"buf={buffered_count}/{target_buffer} | "
             f"dl_miss={deadline_miss_ratio * 100.0:.1f}% (streak={deadline_miss_streak}) | "
             f"e2e={e2e_ms_ema:.1f}ms proc={process_ms_ema:.1f}ms cq={capture_queue_ms_ema:.1f}ms oq={output_queue_ms_ema:.1f}ms | "
             f"{' ; '.join(health_reasons)}"
@@ -12795,11 +8997,6 @@ class MainWindow(QMainWindow):
 
         self._perf_guard_low_fps_seconds += 1
         if self._perf_guard_low_fps_seconds < 2:
-            return
-
-        if self.scaling_mode_combo.currentText() != SCALING_MODE_BASIC:
-            # Basic scaling is only the sole active stage in this mode; AI
-            # SR/RTX VSR performance is not affected by these mitigations.
             return
 
         # First mitigation: clamp basic-scaling cost by switching to manual x2.
@@ -12828,7 +9025,7 @@ class MainWindow(QMainWindow):
             and measured_fps < severe_threshold
             and self._perf_guard_last_action != "disable_sr"
         ):
-            self._set_basic_scaling_enabled_effective(False)
+            self.enable_sr_checkbox.setChecked(False)
             self._perf_guard_last_action = "disable_sr"
             self._perf_guard_low_fps_seconds = 0
             LOGGER.warning(
@@ -12845,7 +9042,7 @@ class MainWindow(QMainWindow):
         if self._source_mode == "Synthetic":
             self._stop_decklink_sessions()
             self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
-            self._set_decklink_status("Synthetic mode active")
+            self.decklink_status_label.setText("Synthetic mode active")
             self._update_fps_control_lock()
             return
 
@@ -12903,7 +9100,7 @@ class MainWindow(QMainWindow):
         if self._source_mode != "Blackmagic DeckLink":
             self._stop_decklink_sessions()
             self._set_decklink_timecode_display(None, placeholder="Timecode: unavailable in Synthetic mode")
-            self._set_decklink_status("Synthetic mode active")
+            self.decklink_status_label.setText("Synthetic mode active")
             self._update_status("Applied source mode: Synthetic")
             return
 
@@ -12914,7 +9111,7 @@ class MainWindow(QMainWindow):
             return
 
         if d is None:
-            self._set_decklink_status("decklink_wrapper is not available in this environment")
+            self.decklink_status_label.setText("decklink_wrapper is not available in this environment")
             self._update_status("DeckLink unavailable: install or activate decklink_wrapper environment")
             return
 
@@ -12925,7 +9122,7 @@ class MainWindow(QMainWindow):
             self._start_decklink_sessions()
         except Exception as exc:
             LOGGER.exception("DeckLink setup failed")
-            self._set_decklink_status(f"DeckLink setup failed: {exc}")
+            self.decklink_status_label.setText(f"DeckLink setup failed: {exc}")
             self._update_status(f"DeckLink setup failed: {exc}")
 
     def _start_decklink_sessions(self) -> None:
@@ -12999,7 +9196,7 @@ class MainWindow(QMainWindow):
                 device_index=in_device,
                 display_mode=in_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-                max_queue_frames=1,
+                max_queue_frames=8,
                 enable_format_detection=self.decklink_enable_format_detection.isChecked(),
                 timecode_format=int(timecode_format),
             )
@@ -13008,7 +9205,6 @@ class MainWindow(QMainWindow):
                 device_index=out_device,
                 display_mode=out_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-                low_latency_output=True,
             )
 
             self._capture_session.start()
@@ -13040,7 +9236,7 @@ class MainWindow(QMainWindow):
         timecode_format_name = self.decklink_timecode_format_combo.currentText()
         hfrtc_supported = getattr(self, "_decklink_hfrtc_support_by_index", {}).get(int(in_device))
         hfrtc_text = "unknown" if hfrtc_supported is None else ("supported" if hfrtc_supported else "unsupported")
-        self._set_decklink_status(
+        self.decklink_status_label.setText(
             "DeckLink configured: "
             f"in={input_name} mode='{in_mode_name}' ({in_mode}); "
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
@@ -13084,10 +9280,8 @@ class MainWindow(QMainWindow):
         return output_fps
 
     def _refresh_decklink_catalog(self) -> None:
-        windows_cameras = _windows_video_capture_devices()
-        self.effects_graph.set_capture_devices(windows_cameras)
         if d is None:
-            self._set_decklink_status("decklink_wrapper is not available in this environment")
+            self.decklink_status_label.setText("decklink_wrapper is not available in this environment")
             LOGGER.error("DeckLink catalog refresh failed: wrapper unavailable")
             return
 
@@ -13095,7 +9289,7 @@ class MainWindow(QMainWindow):
             devices = _call_decklink_api("list_devices")
         except Exception as exc:
             LOGGER.exception("DeckLink catalog refresh failed while listing devices")
-            self._set_decklink_status(f"DeckLink refresh failed: {exc}")
+            self.decklink_status_label.setText(f"DeckLink refresh failed: {exc}")
             self._update_status(f"DeckLink refresh failed: {exc}")
             self.decklink_input_device_combo.clear()
             self.decklink_output_device_combo.clear()
@@ -13126,15 +9320,6 @@ class MainWindow(QMainWindow):
             if dev.supports_output:
                 self.decklink_output_device_combo.addItem(label, int(dev.index))
                 output_count += 1
-
-        self.effects_graph.set_capture_devices(
-            [
-                (f"{dev.display_name} [{dev.model_name}]", int(dev.index))
-                for dev in devices
-                if dev.supports_input
-            ]
-            + windows_cameras
-        )
 
         self.decklink_input_device_combo.blockSignals(False)
         self.decklink_output_device_combo.blockSignals(False)
@@ -14203,14 +10388,6 @@ class MainWindow(QMainWindow):
         self._decklink_timecode_display_text = display_text
         if hasattr(self, "decklink_timecode_label"):
             self.decklink_timecode_label.setText(display_text)
-        if hasattr(self, "effects_graph"):
-            effect_timecode = ""
-            if isinstance(info, dict) and bool(info.get("present", False)):
-                effect_timecode = str(info.get("text", "")).strip()
-            self.effects_graph.set_composition_timecode(
-                effect_timecode or "00:00:00:00",
-                info if isinstance(info, dict) else None,
-            )
         for label in self._fullscreen_timecode_display_labels.values():
             label.setText(display_text)
         self._apply_timecode_roi_for_current_timecode()
@@ -14305,8 +10482,6 @@ class MainWindow(QMainWindow):
         self._manual_roi_send_timer.stop()
         self._manual_live_target_roi = None
         self._pending_manual_controller_roi = None
-        if hasattr(self._controller, "clear_manual_roi_endpoint"):
-            self._controller.clear_manual_roi_endpoint()
 
         target = clamp_roi(target_roi)
         total_frames = max(1, min(600, int(duration_frames)))
@@ -14788,7 +10963,7 @@ class MainWindow(QMainWindow):
         if unchanged and within_window:
             return
 
-        self.status_text.setPlainText(text)
+        self.status_label.setText(text)
         LOGGER.info("STATUS: %s", text)
         self._last_status_text = text
         self._last_status_log_ts = now
