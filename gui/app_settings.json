@@ -24,12 +24,12 @@
   "basic_scaling_mode": "Auto",
   "color_range": "Limited (Video)",
   "color_space": "Rec.2020 HLG (HDR)",
-  "decklink_auto_detect": false,
+  "decklink_auto_detect": true,
   "decklink_enable_format_detection": false,
-  "decklink_fps_priority_guard": true,
+  "decklink_fps_priority_guard": false,
   "decklink_input_device": 1,
   "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
-  "decklink_output_buffer_frames": 2,
+  "decklink_output_buffer_frames": 1,
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_timecode_format": "RP188 LTC",
@@ -43,7 +43,7 @@
     366
   ],
   "effects_graph": {
-    "clock_source": "Internal",
+    "clock_source": "External Timecode",
     "duration": 1,
     "editor_version": 2,
     "frame_rate": 60.0,
@@ -123,8 +123,8 @@
           "id": "effects_output",
           "settings": {},
           "type": "effects_output",
-          "x": 1332,
-          "y": 288
+          "x": 2122,
+          "y": 224
         },
         {
           "id": "keying_1",
@@ -149,8 +149,8 @@
             "runtime_supported": true
           },
           "type": "keying",
-          "x": 1136,
-          "y": 160
+          "x": 1364,
+          "y": 106
         },
         {
           "id": "mask_1",
@@ -184,13 +184,13 @@
           "settings": {
             "brightness": 0.72,
             "contrast": 2.79,
-            "hue": 0,
+            "hue": 64.0,
             "invert": false,
-            "saturation": 0
+            "saturation": 0.0
           },
           "type": "proc_amp",
-          "x": 476,
-          "y": 264
+          "x": 485,
+          "y": 237
         },
         {
           "id": "media_1",
@@ -217,8 +217,8 @@
             "y": 0
           },
           "type": "mask",
-          "x": 718,
-          "y": 165
+          "x": 860,
+          "y": 56
         },
         {
           "id": "transform_3d_1",
@@ -231,8 +231,8 @@
             "z": 27
           },
           "type": "transform_3d",
-          "x": 298,
-          "y": 135
+          "x": 490,
+          "y": 47
         },
         {
           "id": "matte_2",
@@ -250,8 +250,8 @@
           "id": "color_splitter_3",
           "settings": {},
           "type": "color_splitter",
-          "x": 407,
-          "y": 279
+          "x": 549,
+          "y": 379
         }
       ],
       "version": 6
@@ -3106,6 +3106,117 @@
         },
         "name": "glitchy3",
         "thumbnail": "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"
+      },
+      {
+        "graph": {
+          "connections": [
+            [
+              "keying_1",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "effects_input",
+              "output",
+              "transform_3d_2",
+              "input"
+            ],
+            [
+              "transform_3d_2",
+              "output",
+              "keying_1",
+              "layer1_color"
+            ],
+            [
+              "capture_3",
+              "output",
+              "transform_3d_4",
+              "input"
+            ],
+            [
+              "transform_3d_4",
+              "output",
+              "keying_1",
+              "layer2_color"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 26,
+              "y": 83
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 2120,
+              "y": 192
+            },
+            {
+              "id": "keying_1",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1.0,
+                "layer2_blend_mode": "normal",
+                "layer2_opacity": 1.0,
+                "layer_count": 2,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 1137,
+              "y": 110
+            },
+            {
+              "id": "transform_3d_2",
+              "settings": {
+                "rotate_x": 0.0,
+                "rotate_y": 0.0,
+                "rotate_z": 0.0,
+                "x": -36.6,
+                "y": 0.0,
+                "z": -90.0
+              },
+              "type": "transform_3d",
+              "x": 606,
+              "y": 121
+            },
+            {
+              "id": "capture_3",
+              "settings": {
+                "capture_height": 1080,
+                "capture_width": 1920,
+                "device_index": "webcam:0",
+                "device_name": "Windows Camera: HP Wide Vision 5MP Camera"
+              },
+              "type": "capture",
+              "x": 19,
+              "y": 340
+            },
+            {
+              "id": "transform_3d_4",
+              "settings": {
+                "rotate_x": 0.0,
+                "rotate_y": 0.0,
+                "rotate_z": 0.0,
+                "x": 76.1,
+                "y": 0.0,
+                "z": -90.0
+              },
+              "type": "transform_3d",
+              "x": 602,
+              "y": 342
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {},
+        "name": "webcam test",
+        "thumbnail": "iVBORw0KGgoAAAANSUhEUgAAAKAAAAAkCAIAAACBjKa0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAADZUlEQVR4nO2ayVMTQRTGv+7pCSYhgSxMCJsG0LIsyypKcTl49391uXnyAAcPeolVXigXCGsCJmESBUJm6fYwVYjSKhPJCE3/bsmbb2Y6X0/P65dHKKWUUpwazjmAUBIhhBAiAgnn3DCMvkoA+L5/gSRsfGIym81SStvtryP5bLlc/vNZKKVCCEIIgGza/CW63/G7LpcKA0koQkmCg/stCY6/QBJmWdb4xBSAgtM9eb5SaXryaokx1mw2Z2dKz589PQpZmdiDx0+6Xaderxeskfl7cwDKbxdevnoT6rbOCiHEf7nuOYe17N1cNgNgeWU1nRDF4o8Y58hljHQ65Xl+KpUCd9NpcA7fhxAwTcRMEzCmrpYGYmZz96vBGPCXSffg4aNgqjGDbm1tViqVvg5Pw9bW1tbX16UxSpGONw6cSrEw0mrZwtn1fQBgDIwhX+CHe19aTiKeH2vvta/PDp/mepY1SgihhuG6jm3bZzgSjRRmmmYsFgs+eJ7nOM5RjHMsr7cZW/r8cQkA59zzIAQSCQwPi+ommb8/nXYNMpi5QiTuUgrLAqXgHEJACJ8Q8r78ur3PS9emAGxvb0cyxksNm7s7n0ymKKVdp2tSLC4uHA9Pz8yOjk1SQhqNxs0bsy9ePIvHMTSEjQ1SyJLC6PjRmtxqtZc+fEqSVrEIzjkhRAiysxNYCyFAaZDg1QG8s5tRD/Sywg47na7jcd8/6HRmJgePv4MBjI+yocxQIp4wDBpj7tgYXFdUqzi5f0mlBu/cvrX03q7VAITY3pwVhBCdZ52EffvWzufyruCp5MDqRqtW+ylMeM1MHI7kcvVGc2cL1SqEIIDkdzQMI5lMsJBbN02/YZWVldXfp7LVHRuw1yorUd5Tb+jHVwrrWel6wu80fvmye3jwb/ejOWMIYyxUxSSyumMEEgCc87CSi1Wq/A/ZkCZK1DG4h1r3ZUAdgzVStMGKow1WHHUM1vtgKeoYrJGijsE6i5bCfN/voScrFD1Igm6pcysJO5kik+DERGdhm+6CP236LQnaviKQIGQDYUBYSQ8ltt4kkkrWZV7Zemhsu3Dod7DiqGOw3iZJUcdgjRR1DNZLtBR1DNZI0QYrjjZYcdQxWGfRUtQxWCNFHYN1Fi1FHYP1Ei1FHYP1EyxFHYM1Ur4D6V+ZzR8OI0oAAAAASUVORK5CYII="
       }
     ]
   },
@@ -3115,11 +3226,11 @@
     300,
     400
   ],
-  "fullscreen_selected_scale_index": 2,
-  "interlaced_field2_phase_fraction": 0.5,
+  "fullscreen_selected_scale_index": 1,
+  "interlaced_field2_phase_fraction": 0.25,
   "main_splitter_sizes": [
-    698,
-    698
+    326,
+    1070
   ],
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
@@ -3131,21 +3242,21 @@
   "roi_keyframe_duration_override": true,
   "roi_keyframes": {
     "1": {
-      "duration_frames": 60,
+      "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        532,
-        19,
+        710,
+        521,
         480,
         270
       ]
     },
     "2": {
-      "duration_frames": 60,
+      "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1322,
-        792,
+        716,
+        280,
         480,
         270
       ]
@@ -3175,7 +3286,7 @@
   "roi_manual_drag_hold_s": 0.4,
   "roi_timecode_keyframes": [],
   "roi_timecode_playback_enabled": false,
-  "roi_transition_duration_frames": 60,
+  "roi_transition_duration_frames": 40,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,

@@ -249,9 +249,9 @@ inline AlphaMixOperandConfig ClampAlphaMixOperandConfig(AlphaMixOperandConfig op
     operand.source_channel = std::clamp(operand.source_channel, 0, 3);
     operand.blur_method = operand.blur_method == 2 ? 2 : (operand.blur_method == 1 ? 1 : 0);
     operand.blur_radius = std::clamp(operand.blur_radius, 0.0f, 16.0f);
-    operand.transform_x = std::clamp(operand.transform_x, -100.0f, 100.0f);
-    operand.transform_y = std::clamp(operand.transform_y, -100.0f, 100.0f);
-    operand.transform_z = std::clamp(operand.transform_z, -90.0f, 90.0f);
+    operand.transform_x = std::clamp(operand.transform_x, -10000.0f, 10000.0f);
+    operand.transform_y = std::clamp(operand.transform_y, -10000.0f, 10000.0f);
+    operand.transform_z = std::clamp(operand.transform_z, -100000000.0f, 1000.0f);
     operand.rotate_x = std::clamp(operand.rotate_x, -180.0f, 180.0f);
     operand.rotate_y = std::clamp(operand.rotate_y, -180.0f, 180.0f);
     operand.rotate_z = std::clamp(operand.rotate_z, -180.0f, 180.0f);
@@ -991,6 +991,9 @@ void VideoProcessor::InitializeBuffers() {
 }
 
 bool VideoProcessor::EffectsActiveLocked() const {
+    if (effects_bypassed_) {
+        return false;
+    }
     if (effects_explicit_compositor_layers_) {
         return true;
     }
@@ -1023,6 +1026,9 @@ bool VideoProcessor::EffectsActiveLocked() const {
 }
 
 const uchar3* VideoProcessor::ApplyColorStages(const uchar3* input, bool after_composite) {
+    if (effects_bypassed_) {
+        return input;
+    }
     std::vector<ColorStageConfig> active_stages;
     active_stages.reserve(color_stages_.size());
     for (const ColorStageConfig& stage : color_stages_) {
@@ -1079,6 +1085,7 @@ void VideoProcessor::SetEffectsConfig(
 ) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
     EffectLayerState& layer = effect_layers_[static_cast<size_t>(2 - kFirstEffectLayer)];
+    effects_bypassed_ = !enabled;
     layer.enabled = enabled;
     layer.opacity = std::clamp(opacity, 0.0f, 1.0f);
     effects_layer1_opacity_ = explicit_compositor_layers
@@ -1121,12 +1128,43 @@ void VideoProcessor::SetEffectsInputTransform(
     float rotate_z
 ) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
-    effects_input_transform_x_ = std::clamp(transform_x, -100.0f, 100.0f);
-    effects_input_transform_y_ = std::clamp(transform_y, -100.0f, 100.0f);
-    effects_input_transform_z_ = std::clamp(transform_z, -90.0f, 90.0f);
+    effects_input_transform_x_ = std::clamp(transform_x, -10000.0f, 10000.0f);
+    effects_input_transform_y_ = std::clamp(transform_y, -10000.0f, 10000.0f);
+    effects_input_transform_z_ = std::clamp(transform_z, -100000000.0f, 1000.0f);
     effects_input_rotate_x_ = std::clamp(rotate_x, -180.0f, 180.0f);
     effects_input_rotate_y_ = std::clamp(rotate_y, -180.0f, 180.0f);
     effects_input_rotate_z_ = std::clamp(rotate_z, -180.0f, 180.0f);
+}
+
+void VideoProcessor::SetEffectLayerComposition(int layer_index, int target, int source) {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    if (layer_index < 1 || layer_index > 64 || target < 0 || target > 64 || source < 0 || source > 64 || (source && source >= target))
+        throw std::invalid_argument("Invalid composition dependency");
+    composition_targets_[layer_index - 1] = target;
+    composition_sources_[layer_index - 1] = source;
+}
+
+void VideoProcessor::SetEffectLayerCompositionSource(int layer_index, int slot, int source) {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    if (layer_index < 1 || layer_index > 64 || slot < 1 || slot > 7 || source < 0 || source > 64 || (source && source >= composition_targets_[layer_index - 1]))
+        throw std::invalid_argument("Invalid composition image dependency");
+    composition_image_sources_[layer_index - 1][slot] = source;
+}
+
+std::string VideoProcessor::GetEffectsRgbaOutput() {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    if (!last_effects_color_) return {};
+    std::vector<uint8_t> color(rgb_pixels_ * 3), alpha(rgb_pixels_, 255);
+    CheckCuda(cudaMemcpy(color.data(), last_effects_color_, color.size(), cudaMemcpyDeviceToHost), "download composition color");
+    if (last_effects_alpha_)
+        CheckCuda(cudaMemcpy(alpha.data(), last_effects_alpha_, alpha.size(), cudaMemcpyDeviceToHost), "download composition alpha");
+    std::string rgba(rgb_pixels_ * 4, '\0');
+    for (size_t i = 0; i < rgb_pixels_; ++i) {
+        for (size_t c = 0; c < 3; ++c)
+            rgba[i * 4 + c] = static_cast<char>(alpha[i] ? std::min(255, (int(color[i * 3 + c]) * 255 + alpha[i] / 2) / alpha[i]) : 0);
+        rgba[i * 4 + 3] = alpha[i];
+    }
+    return rgba;
 }
 
 void VideoProcessor::SetEffectLayerConfig(
@@ -1170,7 +1208,7 @@ void VideoProcessor::SetEffectLayerConfig(
     bool materialize_key_alpha
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     std::lock_guard<std::mutex> process_lock(process_mutex_);
     EffectLayerState& layer = effect_layers_[static_cast<size_t>(layer_index - kFirstEffectLayer)];
@@ -1208,9 +1246,9 @@ void VideoProcessor::SetEffectLayerConfig(
     layer.mask_size = std::clamp(mask_size, 0.1f, 4.0f);
     layer.mask_x = std::clamp(mask_x, -100.0f, 100.0f);
     layer.mask_y = std::clamp(mask_y, -100.0f, 100.0f);
-    layer.transform_x = std::clamp(transform_x, -100.0f, 100.0f);
-    layer.transform_y = std::clamp(transform_y, -100.0f, 100.0f);
-    layer.transform_z = std::clamp(transform_z, -90.0f, 90.0f);
+    layer.transform_x = std::clamp(transform_x, -10000.0f, 10000.0f);
+    layer.transform_y = std::clamp(transform_y, -10000.0f, 10000.0f);
+    layer.transform_z = std::clamp(transform_z, -100000000.0f, 1000.0f);
     layer.rotate_x = std::clamp(rotate_x, -180.0f, 180.0f);
     layer.rotate_y = std::clamp(rotate_y, -180.0f, 180.0f);
     layer.rotate_z = std::clamp(rotate_z, -180.0f, 180.0f);
@@ -1223,7 +1261,7 @@ void VideoProcessor::SetEffectLayerAlphaMix(
     const std::vector<AlphaMixOpConfig>& ops
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     if (ops.size() > 32) {
         throw std::invalid_argument("At most 32 alpha mix operations are supported.");
@@ -1255,7 +1293,7 @@ void VideoProcessor::SetEffectLayerChannelAlphaMix(
     const std::vector<AlphaMixOpConfig>& ops
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     if (target_channel < 0 || target_channel > 3) {
         throw std::out_of_range("Effect channel indices must be in [0, 3].");
@@ -1292,7 +1330,7 @@ void VideoProcessor::UploadEffectLayerMediaRgba(
     int height
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     if (rgba == nullptr || width <= 0 || height <= 0) {
         throw std::invalid_argument("Effect media RGBA buffer and dimensions must be valid.");
@@ -1325,7 +1363,7 @@ void VideoProcessor::UploadEffectLayerSourceRgba(
     int height
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     if (source_slot < 1 || source_slot > 7) {
         throw std::out_of_range("Auxiliary effect source slot must be in [1, 7].");
@@ -1359,7 +1397,7 @@ void VideoProcessor::UploadEffectLayerSourceRgba(
 
 void VideoProcessor::ClearEffectLayerChannelRoutes(int layer_index) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     std::lock_guard<std::mutex> process_lock(process_mutex_);
     EffectLayerState& layer = effect_layers_[static_cast<size_t>(layer_index - kFirstEffectLayer)];
@@ -1395,7 +1433,7 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     float mask_y
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     if (target_channel < 0 || target_channel > 3 || source_channel < -1 || source_channel > 3) {
         throw std::out_of_range("Effect channel indices must be in [0, 3], or -1 for no source.");
@@ -1407,9 +1445,9 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     route.source_channel = source_channel;
     route.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
     route.blur_radius = std::clamp(blur_radius, 0.0f, 16.0f);
-    route.transform_x = std::clamp(transform_x, -100.0f, 100.0f);
-    route.transform_y = std::clamp(transform_y, -100.0f, 100.0f);
-    route.transform_z = std::clamp(transform_z, -90.0f, 90.0f);
+    route.transform_x = std::clamp(transform_x, -10000.0f, 10000.0f);
+    route.transform_y = std::clamp(transform_y, -10000.0f, 10000.0f);
+    route.transform_z = std::clamp(transform_z, -100000000.0f, 1000.0f);
     route.rotate_x = std::clamp(rotate_x, -180.0f, 180.0f);
     route.rotate_y = std::clamp(rotate_y, -180.0f, 180.0f);
     route.rotate_z = std::clamp(rotate_z, -180.0f, 180.0f);
@@ -1449,7 +1487,7 @@ void VideoProcessor::ClearEffectMedia() {
 
 void VideoProcessor::SetEffectLayerColorStages(int layer_index, const std::vector<ColorStageConfig>& stages) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
-        throw std::out_of_range("Effect layer index must be in [1, 8].");
+        throw std::out_of_range("Effect layer index must be in [1, 64].");
     }
     if (stages.size() > 32) {
         throw std::invalid_argument("At most 32 color adjustment stages are supported.");
@@ -2145,67 +2183,13 @@ std::string VideoProcessor::ProcessFrameInternal(
 
     const bool effects_active = EffectsActiveLocked();
 
-    // Preserve byte-identical full-frame output. When basic scaling is enabled,
-    // exercise its selected GPU kernels so the first ROI transition is not cold.
+    // Preserve byte-identical full-frame output without launching GPU work.
+    // Repeated warm-up kernels discard their result and consume the live frame
+    // budget even though no scaling, effects, or preprocessing are required.
     if (!effects_active && !deinterlace_only && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
         (!enable_placeholder_sr_ || sr_scale <= 1) &&
         roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_ &&
         !HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
-        if (enable_placeholder_sr_) {
-            const int color_matrix = ToColorMatrixId(color_space);
-            const int color_range_id = ToColorRangeId(color_range);
-            CheckCuda(
-                cudaMemcpyAsync(d_uyvy_in_, input_frame, uyvy_bytes_, cudaMemcpyHostToDevice, stream_),
-                "cudaMemcpyAsync H2D full-frame warm path"
-            );
-            cuda_kernels::LaunchUyvyToRgb(
-                d_uyvy_in_,
-                d_rgb_full_,
-                width_,
-                height_,
-                color_matrix,
-                color_range_id,
-                stream_
-            );
-            switch (sr_flavor) {
-                case SrFlavor::Bilinear:
-                    cuda_kernels::LaunchCropZoomBilinear(
-                        d_rgb_full_, width_, height_, d_rgb_zoom_, width_, height_,
-                        0, 0, width_, height_, stream_
-                    );
-                    break;
-                case SrFlavor::BilinearSharp:
-                    cuda_kernels::LaunchCropZoomBilinearSharp(
-                        d_rgb_full_, width_, height_, d_rgb_zoom_, width_, height_,
-                        0, 0, width_, height_, stream_
-                    );
-                    break;
-                case SrFlavor::Bicubic:
-                case SrFlavor::BicubicSharpen:
-                    cuda_kernels::LaunchCropZoomBicubic(
-                        d_rgb_full_, width_, height_, d_rgb_zoom_, width_, height_,
-                        0, 0, width_, height_, stream_
-                    );
-                    break;
-            }
-            const uchar3* warm_output = d_rgb_zoom_;
-            if (sr_flavor == SrFlavor::BicubicSharpen) {
-                cuda_kernels::LaunchSharpen3x3(
-                    d_rgb_zoom_, d_rgb_bob_, width_, height_, true, stream_
-                );
-                warm_output = d_rgb_bob_;
-            }
-            cuda_kernels::LaunchRgbToUyvy(
-                warm_output,
-                d_uyvy_out_,
-                width_,
-                height_,
-                color_matrix,
-                color_range_id,
-                stream_
-            );
-            CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize full-frame warm path");
-        }
         return std::string(reinterpret_cast<const char*>(input_frame), uyvy_bytes_);
     }
 
@@ -2743,6 +2727,7 @@ std::string VideoProcessor::ProcessFrameInternal(
 
             final_output = ApplyColorStages(final_output, false);
 
+    last_effects_alpha_ = nullptr;
     if (effects_active) {
         const uchar3* composite_color = final_output;
         const uint8_t* composite_alpha = nullptr;
@@ -2793,6 +2778,12 @@ std::string VideoProcessor::ProcessFrameInternal(
             const uchar3* operand_color = use_effects_input ? final_output : layer_source_color;
             const uint8_t* operand_alpha = use_effects_input ? nullptr : layer_source_alpha;
             if (!use_effects_input && operand.source_slot > 0 && operand.source_slot < 8) {
+                const int composition = composition_image_sources_[&layer - effect_layers_.data()][operand.source_slot];
+                if (composition) {
+                    operand_color = composition_buffers_[composition].color;
+                    operand_alpha = composition_buffers_[composition].alpha;
+                    if (!operand_color || !operand_alpha) throw std::runtime_error("Composition alpha source has not been rendered");
+                } else {
                 EffectLayerState::ImageSourceState& source = layer.image_sources[static_cast<size_t>(operand.source_slot)];
                 if (source.d_rgba == nullptr || source.width <= 0 || source.height <= 0) {
                     return nullptr;
@@ -2803,6 +2794,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                 );
                 operand_color = source.d_color;
                 operand_alpha = source.d_alpha;
+                }
             }
             if (!operand.color_stages.empty() && operand_color != nullptr) {
                 CheckCuda(
@@ -2894,13 +2886,34 @@ std::string VideoProcessor::ProcessFrameInternal(
             }
             return current;
         };
+        int active_group = 0;
+        auto save_group = [&]() {
+            if (!active_group) return;
+            auto& buffer = composition_buffers_[active_group];
+            if (!buffer.color) CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffer.color), rgb_pixels_ * 3), "allocate composition color");
+            if (!buffer.alpha) CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffer.alpha), rgb_pixels_), "allocate composition alpha");
+            CheckCuda(cudaMemcpyAsync(buffer.color, composite_color, rgb_pixels_ * 3, cudaMemcpyDeviceToDevice, stream_), "save composition color");
+            if (composite_alpha) CheckCuda(cudaMemcpyAsync(buffer.alpha, composite_alpha, rgb_pixels_, cudaMemcpyDeviceToDevice, stream_), "save composition alpha");
+            else CheckCuda(cudaMemsetAsync(buffer.alpha, 255, rgb_pixels_, stream_), "save opaque composition alpha");
+            cuda_kernels::LaunchUnpremultiplyColor(buffer.color, buffer.alpha, width_, height_, stream_);
+        };
         for (size_t slot = 0; slot < effect_layers_.size(); ++slot) {
             EffectLayerState& layer = effect_layers_[slot];
+            const int target = composition_targets_[slot];
+            if (target && target != active_group) {
+                save_group();
+                active_group = target;
+                CheckCuda(cudaMemsetAsync(d_effect_composite_, 0, rgb_pixels_ * 3, stream_), "clear composition color");
+                CheckCuda(cudaMemsetAsync(d_effect_composite_alpha_a_, 0, rgb_pixels_, stream_), "clear composition alpha");
+                composite_color = d_effect_composite_;
+                composite_alpha = d_effect_composite_alpha_a_;
+            }
+            const int source_group = composition_sources_[slot];
             if (!layer.enabled) {
                 continue;
             }
             const bool has_effect_media = layer.d_media_rgba != nullptr && layer.media_width > 0 && layer.media_height > 0;
-            const bool has_effect_source = has_effect_media || layer.source_from_effects_input;
+            const bool has_effect_source = has_effect_media || layer.source_from_effects_input || source_group > 0;
             if (!has_effect_source) {
                 if (slot == 0 && layer.blur_method != 0 && layer.blur_radius > 0.0f && (layer.blur_target & 1) != 0) {
                     cuda_kernels::LaunchBlurColor(
@@ -2911,7 +2924,12 @@ std::string VideoProcessor::ProcessFrameInternal(
                 }
                 continue;
             }
-            if (layer.source_from_effects_input) {
+            if (source_group > 0) {
+                const auto& source = composition_buffers_[source_group];
+                if (!source.color || !source.alpha) throw std::runtime_error("Composition source has not been rendered");
+                CheckCuda(cudaMemcpyAsync(d_effect_color_a_, source.color, rgb_pixels_ * 3, cudaMemcpyDeviceToDevice, stream_), "read composition color");
+                CheckCuda(cudaMemcpyAsync(d_effect_alpha_a_, source.alpha, rgb_pixels_, cudaMemcpyDeviceToDevice, stream_), "read composition alpha");
+            } else if (layer.source_from_effects_input) {
                 CheckCuda(
                     cudaMemcpyAsync(
                         d_effect_color_a_, final_output, rgb_pixels_ * kRgbBytesPerPixel,
@@ -3219,6 +3237,9 @@ std::string VideoProcessor::ProcessFrameInternal(
             composite_alpha = output_alpha;
             composite_pass_complete = true;
         }
+        // Only intermediate groups need snapshots. The final output is already
+        // in the composite buffers and is exposed through last_effects_* below.
+        last_effects_alpha_ = composite_alpha;
         if (composite_pass_complete || composite_color != final_output) {
             final_output = composite_color;
         }
@@ -3227,6 +3248,8 @@ std::string VideoProcessor::ProcessFrameInternal(
     final_output = ApplyColorStages(final_output, true);
 
     if (!effects_output_connected_) {
+        CheckCuda(cudaMemsetAsync(d_effect_composite_alpha_a_, 0, rgb_pixels_, stream_), "clear disconnected alpha");
+        last_effects_alpha_ = d_effect_composite_alpha_a_;
         CheckCuda(
             cudaMemsetAsync(d_effect_composite_, 0, rgb_pixels_ * kRgbBytesPerPixel, stream_),
             "cudaMemsetAsync disconnected effects output"
@@ -3234,6 +3257,7 @@ std::string VideoProcessor::ProcessFrameInternal(
         final_output = d_effect_composite_;
     }
 
+    last_effects_color_ = final_output;
     cuda_kernels::LaunchRgbToUyvy(final_output, d_uyvy_out_, width_, height_, color_matrix, color_range_id, stream_);
 
     const uint8_t* final_uyvy = d_uyvy_out_;
@@ -3277,6 +3301,13 @@ std::string VideoProcessor::ProcessFrameInternal(
 }
 
 void VideoProcessor::Cleanup() {
+    last_effects_color_ = nullptr;
+    last_effects_alpha_ = nullptr;
+    for (auto& buffer : composition_buffers_) {
+        if (buffer.color) cudaFree(buffer.color);
+        if (buffer.alpha) cudaFree(buffer.alpha);
+        buffer = {};
+    }
     for (EffectLayerState& layer : effect_layers_) {
         if (layer.d_media_rgba != nullptr) {
             cudaFree(layer.d_media_rgba);

@@ -333,6 +333,9 @@ void LaunchTransformColorAlpha3D(
     cudaStream_t stream
 );
 
+// Convert stored premultiplied compositor color to a straight-alpha source.
+void LaunchUnpremultiplyColor(uchar3* color, const uint8_t* alpha, int width, int height, cudaStream_t stream);
+
 void LaunchApplyProceduralAlphaMask(
     uint8_t* d_alpha,
     int width,

@@ -1487,7 +1487,9 @@ __global__ void TransformAlpha3DKernel(
     const float r22 = cy * cx;
     const float tx = translate_x / 50.0f;
     const float ty = translate_y / 50.0f;
-    const float tz = translate_z / 100.0f;
+    // Preserve the original depth curve through +90; extend smoothly to 10x.
+    const float tz = translate_z <= 90.0f ? translate_z / 100.0f
+        : 0.9f + (fminf(1000.0f, translate_z) - 90.0f) * (1.8f / 910.0f);
     constexpr float camera_distance = 3.0f;
     const float screen_x = ((static_cast<float>(x) + 0.5f) / (0.5f * width)) - 1.0f;
     const float screen_y = ((static_cast<float>(y) + 0.5f) / (0.5f * height)) - 1.0f;
@@ -1556,7 +1558,9 @@ __global__ void TransformColorAlpha3DKernel(
     const float r22 = cy * cx;
     const float tx = translate_x / 50.0f;
     const float ty = translate_y / 50.0f;
-    const float tz = translate_z / 100.0f;
+    // Preserve the original depth curve through +90; extend smoothly to 10x.
+    const float tz = translate_z <= 90.0f ? translate_z / 100.0f
+        : 0.9f + (fminf(1000.0f, translate_z) - 90.0f) * (1.8f / 910.0f);
     constexpr float camera_distance = 3.0f;
     const float screen_x = ((static_cast<float>(x) + 0.5f) / (0.5f * width)) - 1.0f;
     const float screen_y = ((static_cast<float>(y) + 0.5f) / (0.5f * height)) - 1.0f;
@@ -1590,6 +1594,16 @@ __global__ void TransformColorAlpha3DKernel(
     const int source_index = sample_y * width + sample_x;
     output_color[output_index] = input_color[source_index];
     output_alpha[output_index] = input_alpha[source_index];
+}
+
+__global__ void UnpremultiplyColorKernel(uchar3* color, const uint8_t* alpha, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int i = y * width + x;
+    const float factor = alpha[i] ? 255.0f / alpha[i] : 0.0f;
+    const uchar3 c = color[i];
+    color[i] = make_uchar3(ClampToU8(c.x * factor + 0.5f), ClampToU8(c.y * factor + 0.5f), ClampToU8(c.z * factor + 0.5f));
 }
 
 __global__ void ApplyProceduralAlphaMaskKernel(
@@ -2638,6 +2652,11 @@ void LaunchTransformColorAlpha3D(
         translate_x, translate_y, translate_z, rotate_x, rotate_y, rotate_z
     );
     CheckKernelLaunch("TransformColorAlpha3DKernel launch");
+}
+
+void LaunchUnpremultiplyColor(uchar3* color, const uint8_t* alpha, int width, int height, cudaStream_t stream) {
+    UnpremultiplyColorKernel<<<Grid2D(width, height, 16, 16), dim3(16, 16), 0, stream>>>(color, alpha, width, height);
+    CheckKernelLaunch("UnpremultiplyColorKernel launch");
 }
 
 void LaunchApplyProceduralAlphaMask(

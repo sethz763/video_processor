@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 import bisect
 import math
 import multiprocessing as mp
@@ -19,7 +20,7 @@ from statistics import median
 
 import numpy as np
 from PySide6.QtCore import QByteArray, QBuffer, QEvent, QIODevice, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QEventPoint, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTouchEvent, QWheelEvent
+from PySide6.QtGui import QAction, QKeySequence, QColor, QEventPoint, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTouchEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -363,10 +364,10 @@ if _project_root_for_imports not in sys.path:
 
 _worker_import_error: Exception | None = None
 try:
-    from gui.processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker
+    from gui.processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker, effect_layer_updates, bypassed_effects_payload
 except Exception as exc_gui_import:
     try:
-        from processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker
+        from processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker, effect_layer_updates, bypassed_effects_payload
     except Exception as exc_local_import:
         run_processor_worker = None
         _worker_import_error = exc_local_import
@@ -451,6 +452,9 @@ def _effects_source_signature(payload: dict[str, object]) -> tuple[object, ...]:
                 bool(source.get("media_loop", True)),
                 str(source.get("capture_kind", "")),
                 source.get("capture_device_index", -1),
+                int(source.get("capture_width", 0)),
+                int(source.get("capture_height", 0)),
+                int(source.get("capture_reload_token", 0)),
                 tuple(source.get("matte_rgba", [])) if isinstance(source.get("matte_rgba"), (list, tuple)) else (),
             )
             for source in image_sources
@@ -463,6 +467,9 @@ def _effects_source_signature(payload: dict[str, object]) -> tuple[object, ...]:
                 str(layer.get("source_kind", "media")).strip().lower(),
                 str(layer.get("capture_kind", "")).strip().lower(),
                 layer.get("capture_device_index", -1),
+                int(layer.get("capture_width", 0)),
+                int(layer.get("capture_height", 0)),
+                int(layer.get("capture_reload_token", 0)),
                 str(layer.get("media_path", "")).strip(),
                 bool(layer.get("media_playing", False)),
                 bool(layer.get("media_loop", True)),
@@ -478,7 +485,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
         layers = [
             dict(layer)
             for layer in raw_layers
-            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
+            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 64
         ]
         if layers:
             return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
@@ -492,6 +499,8 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "media_loop": bool(payload.get("media_loop", True)),
             "capture_kind": str(payload.get("capture_kind", "")),
             "capture_device_index": int(payload.get("capture_device_index", -1)),
+            "capture_width": int(payload.get("capture_width", 0)),
+            "capture_height": int(payload.get("capture_height", 0)),
             "matte_rgba": payload.get("matte_rgba", [255, 255, 255, 255]),
             "opacity": float(payload.get("opacity", 1.0)),
             "blend_mode": str(payload.get("blend_mode", "normal")),
@@ -534,6 +543,13 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
 
 
 def _set_native_effect_layer_config(processor: object, layer: dict[str, object]) -> None:
+    if hasattr(processor, 'set_effect_layer_composition'):
+        processor.set_effect_layer_composition(int(layer.get('layer_index', 2)), int(layer.get('composite_target', 0)), int(layer.get('composite_source', 0)))
+        sources = {int(image['slot']): int(image.get('composite_source', 0)) for image in layer.get('image_sources', [])}
+        for slot in range(1, 8):
+            processor.set_effect_layer_composition_source(int(layer.get('layer_index', 2)), slot, sources.get(slot, 0))
+    elif layer.get('composite_target') or int(layer.get('layer_index', 2)) > 8:
+        raise RuntimeError('Rebuild the native module to enable composition passes and additional layers')
     key = layer.get("key", {})
     if not isinstance(key, dict):
         key = {}
@@ -689,6 +705,8 @@ def _legacy_effect_source_signature(payload: dict[str, object]) -> tuple[object,
         str(payload.get("source_kind", "media")).strip().lower(),
         str(payload.get("capture_kind", "")).strip().lower(),
         payload.get("capture_device_index", -1),
+        int(payload.get("capture_width", 0)),
+        int(payload.get("capture_height", 0)),
         str(payload.get("media_path", "")).strip(),
         bool(payload.get("media_playing", False)),
         bool(payload.get("media_loop", True)),
@@ -2625,6 +2643,8 @@ class EffectsNodeWidget(QWidget):
     deleteRequested = Signal(str)
     blurLevelChanged = Signal(str, float)
     captureDeviceChanged = Signal(str, object, str)
+    captureSettingsRequested = Signal(str)
+    captureReloadRequested = Signal(str)
     mediaPathChanged = Signal(str, str)
     mediaPlaybackChanged = Signal(str, bool, bool)
     mediaKeyframePlaybackArmed = Signal(str, str, bool)
@@ -2644,6 +2664,7 @@ class EffectsNodeWidget(QWidget):
         node_sizes = {
             "keying": (380, 520),
             "media": (300, 154),
+            "capture": (250, 154),
             "mix": (250, 154),
             "transform_3d": (250, 154),
             "color_splitter": (250, 154),
@@ -2675,7 +2696,7 @@ class EffectsNodeWidget(QWidget):
             self._add_port("b_input", 0, 128, "Secondary alpha input")
         elif node_type == "chroma_key":
             self._add_port("color_input", 0, 98, "Color input")
-        elif node_type not in {"effects_input", "keying", "capture", "media", "matte", "mask", "mix"}:
+        elif node_type not in {"effects_input", "keying", "capture", "media", "composition", "matte", "mask", "mix"}:
             self._add_port("input", 0, 98, "Input")
         if node_type == "color_splitter":
             self._add_port("red_output", output_x, 68, "Red channel")
@@ -2694,6 +2715,8 @@ class EffectsNodeWidget(QWidget):
             self._add_port("alpha_output", output_x, 98, "Key alpha" if node_type == "chroma_key" else "Mask alpha")
         elif node_type not in {"effects_output", "keying"}:
             self._add_port("output", output_x, 128 if node_type == "media" else 98, "Color output")
+        if node_type == "composition":
+            self._add_port("alpha_output", output_x, 68, "Composition alpha")
         if node_type == "media":
             self._add_port("alpha_output", output_x, 98, "Source alpha")
             self.setAcceptDrops(True)
@@ -2755,41 +2778,21 @@ class EffectsNodeWidget(QWidget):
                 lambda value: self.blurLevelChanged.emit(self.node_id, float(value))
             )
         elif node_type == "capture":
-            self.capture_device = QComboBox(self)
-            self.capture_device.setGeometry(14, 70, 176, 25)
-            self.capture_device.setToolTip("Video capture device")
-            self.capture_device.currentIndexChanged.connect(self._emit_capture_device)
+            self._capture_devices: list[tuple[str, object]] = []
+            self._selected_capture_device: object = None
+            self.capture_device_label = QLabel("No capture device selected", self)
+            self.capture_device_label.setGeometry(14, 70, 206, 58)
+            self.capture_device_label.setWordWrap(True)
+            self.capture_device_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.capture_device_label.setStyleSheet("color: #f4f4f4; font-size: 11px;")
         elif node_type in {"proc_amp", "color_corrector", "chroma_key", "transform_3d", "mix"}:
             self.adjust_settings = QPushButton("Adjust...", self)
             self.adjust_settings.setGeometry(76, 72, 98, 26)
             self.adjust_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
         elif node_type == "keying":
-            blend_modes = ["normal", "multiply", "screen", "overlay", "soft_light", "hard_light", "difference", "additive_alpha"]
             self.compositor_blends: dict[int, QComboBox] = {}
             self.compositor_opacities: dict[int, QSlider] = {}
-            for layer_index in range(1, 9):
-                row_y = 112 + ((layer_index - 1) * 48)
-                self._add_port(f"layer{layer_index}_color", 0, row_y, f"Layer {layer_index} color")
-                self._add_port(f"layer{layer_index}_alpha", 0, row_y + 22, f"Layer {layer_index} alpha")
-                blend = QComboBox(self)
-                blend.setGeometry(102, row_y - 2, 126, 24)
-                blend.addItems(blend_modes)
-                blend.currentTextChanged.connect(
-                    lambda value, index=layer_index: self.compositorSettingChanged.emit(
-                        self.node_id, f"layer{index}_blend_mode", value
-                    )
-                )
-                opacity = QSlider(Qt.Horizontal, self)
-                opacity.setGeometry(102, row_y + 24, 126, 20)
-                opacity.setRange(0, 100)
-                opacity.setValue(100)
-                opacity.valueChanged.connect(
-                    lambda value, index=layer_index: self.compositorSettingChanged.emit(
-                        self.node_id, f"layer{index}_opacity", value / 100.0
-                    )
-                )
-                self.compositor_blends[layer_index] = blend
-                self.compositor_opacities[layer_index] = opacity
+            self._ensure_compositor_layers(2)
             self._add_port("output", 360, 250, "Composite color")
             self._add_port("alpha_output", 360, 280, "Composite alpha")
             self.add_layer_top = QPushButton("+ Top", self)
@@ -2823,11 +2826,6 @@ class EffectsNodeWidget(QWidget):
         self._base_child_geometries = {
             child: child.geometry() for child in self.findChildren(QWidget, options=Qt.FindDirectChildrenOnly)
         }
-
-    def _emit_capture_device(self) -> None:
-        combo = getattr(self, "capture_device", None)
-        if combo is not None:
-            self.captureDeviceChanged.emit(self.node_id, combo.currentData(), combo.currentText())
 
     def _emit_media_playback(self) -> None:
         play = getattr(self, "media_play", None)
@@ -2871,33 +2869,74 @@ class EffectsNodeWidget(QWidget):
         key_play.blockSignals(False)
         key_pause.blockSignals(False)
 
+    def _ensure_compositor_layers(self, count: int) -> None:
+        blend_modes = ["normal", "multiply", "screen", "overlay", "soft_light", "hard_light", "difference", "additive_alpha"]
+        for layer_index in range(len(self.compositor_blends) + 1, count + 1):
+            row_y = 112 + ((layer_index - 1) * 48)
+            self._add_port(f"layer{layer_index}_color", 0, row_y, f"Layer {layer_index} color")
+            self._add_port(f"layer{layer_index}_alpha", 0, row_y + 22, f"Layer {layer_index} alpha")
+            blend = QComboBox(self)
+            blend.setGeometry(102, row_y - 2, 126, 24)
+            blend.addItems(blend_modes)
+            blend.currentTextChanged.connect(
+                lambda value, index=layer_index: self.compositorSettingChanged.emit(
+                    self.node_id, f"layer{index}_blend_mode", value
+                )
+            )
+            opacity = QSlider(Qt.Horizontal, self)
+            opacity.setGeometry(102, row_y + 24, 126, 20)
+            opacity.setRange(0, 100)
+            opacity.setValue(100)
+            opacity.valueChanged.connect(
+                lambda value, index=layer_index: self.compositorSettingChanged.emit(
+                    self.node_id, f"layer{index}_opacity", value / 100.0
+                )
+            )
+            self.compositor_blends[layer_index] = blend
+            self.compositor_opacities[layer_index] = opacity
+            opacity.sliderReleased.connect(lambda: self.parent()._record_history())
+            # New rows use unscaled geometry; retain it for subsequent zooms.
+            geometries = getattr(self, '_base_child_geometries', None)
+            if geometries is not None:
+                for child in (blend, opacity, self._ports[f'layer{layer_index}_color'], self._ports[f'layer{layer_index}_alpha'], self._port_labels[f'layer{layer_index}_color'], self._port_labels[f'layer{layer_index}_alpha']):
+                    geometries[child] = child.geometry()
+
     def set_compositor_state(self, settings: dict[str, object]) -> None:
         if self.node_type != "keying":
             return
-        layer_count = max(2, min(8, int(settings.get("layer_count", 2))))
-        controls = tuple(self.compositor_blends.values()) + tuple(self.compositor_opacities.values())
-        for control in controls:
-            control.blockSignals(True)
-        for layer_index in range(1, 9):
-            visible = layer_index <= layer_count
-            self.compositor_blends[layer_index].setVisible(visible)
-            self.compositor_opacities[layer_index].setVisible(visible)
-            self._ports[f"layer{layer_index}_color"].setVisible(visible)
-            self._ports[f"layer{layer_index}_alpha"].setVisible(visible)
-            self._port_labels[f"layer{layer_index}_color"].setVisible(visible)
-            self._port_labels[f"layer{layer_index}_alpha"].setVisible(visible)
-            self.compositor_blends[layer_index].setCurrentText(
-                str(settings.get(f"layer{layer_index}_blend_mode", "normal"))
-            )
-            self.compositor_opacities[layer_index].setValue(
-                round(float(settings.get(f"layer{layer_index}_opacity", 1.0)) * 100.0)
-            )
-        for control in controls:
-            control.blockSignals(False)
-        self.add_layer_top.setEnabled(layer_count < 8)
-        self.add_layer_bottom.setEnabled(layer_count < 8)
-        self.remove_layer_top.setEnabled(layer_count > 2)
-        self.remove_layer_bottom.setEnabled(layer_count > 2)
+        layer_count = max(2, min(64, int(settings.get("layer_count", 2))))
+        state = (layer_count, tuple((str(settings.get(f"layer{i}_blend_mode", "normal")),
+                                   round(float(settings.get(f"layer{i}_opacity", 1.0)) * 100))
+                                  for i in range(1, layer_count + 1)))
+        previous = getattr(self, '_compositor_state', None)
+        if state == previous:
+            return
+        if previous is None or previous[0] != layer_count:
+            self._ensure_compositor_layers(layer_count)
+            self._base_size = QSize(380, max(320, 112 + layer_count * 48))
+            self.apply_zoom(getattr(self.parent(), "_zoom", 1.0))
+            for index in self.compositor_blends:
+                visible = index <= layer_count
+                for control in (self.compositor_blends[index], self.compositor_opacities[index],
+                                self._ports[f"layer{index}_color"], self._ports[f"layer{index}_alpha"],
+                                self._port_labels[f"layer{index}_color"], self._port_labels[f"layer{index}_alpha"]):
+                    control.setVisible(visible)
+            self.add_layer_top.setEnabled(layer_count < 64)
+            self.add_layer_bottom.setEnabled(layer_count < 64)
+            self.remove_layer_top.setEnabled(layer_count > 2)
+            self.remove_layer_bottom.setEnabled(layer_count > 2)
+        for index, (blend, opacity) in enumerate(state[1], 1):
+            if previous is not None and index <= previous[0] and previous[1][index - 1] == (blend, opacity):
+                continue
+            blend_control = self.compositor_blends[index]
+            opacity_control = self.compositor_opacities[index]
+            blend_control.blockSignals(True)
+            opacity_control.blockSignals(True)
+            blend_control.setCurrentText(blend)
+            opacity_control.setValue(opacity)
+            blend_control.blockSignals(False)
+            opacity_control.blockSignals(False)
+        self._compositor_state = state
 
     def set_matte_state(self, settings: dict[str, object]) -> None:
         swatch = getattr(self, "matte_swatch", None)
@@ -2936,23 +2975,37 @@ class EffectsNodeWidget(QWidget):
         control.blockSignals(False)
 
     def set_capture_devices(self, devices: list[tuple[str, object]], selected_index: object = None) -> None:
-        combo = getattr(self, "capture_device", None)
-        if combo is None:
+        label = getattr(self, "capture_device_label", None)
+        if label is None:
             return
-        combo.blockSignals(True)
-        combo.clear()
-        for label, device_index in devices:
-            combo.addItem(label, device_index)
-        if combo.count() == 0:
-            combo.addItem("No capture devices", None)
-        for index in range(combo.count()):
-            if combo.itemData(index) == selected_index:
-                combo.setCurrentIndex(index)
-                break
-        combo.blockSignals(False)
+        self._capture_devices = list(devices)
+        self._selected_capture_device = selected_index
+        selected_name = next(
+            (name for name, device_index in devices if device_index == selected_index),
+            "No capture device selected",
+        )
+        label.setText(selected_name)
+        label.setToolTip(selected_name)
+
+    def _add_capture_device_menu(self, menu: QMenu) -> QMenu:
+        device_menu = menu.addMenu("Capture Device")
+        if self._capture_devices:
+            for device_name, device_index in self._capture_devices:
+                device_action = device_menu.addAction(device_name)
+                device_action.setCheckable(True)
+                device_action.setChecked(device_index == self._selected_capture_device)
+                device_action.triggered.connect(
+                    lambda _checked=False, index=device_index, name=device_name: self.captureDeviceChanged.emit(
+                        self.node_id, index, name
+                    )
+                )
+        else:
+            no_devices_action = device_menu.addAction("No capture devices")
+            no_devices_action.setEnabled(False)
+        return device_menu
 
     def apply_zoom(self, zoom: float) -> None:
-        scale = max(0.5, min(2.0, float(zoom)))
+        scale = max(0.25, min(2.0, float(zoom)))
         self.setFixedSize(round(self._base_size.width() * scale), round(self._base_size.height() * scale))
         for child, geometry in self._base_child_geometries.items():
             child.setGeometry(
@@ -2989,8 +3042,8 @@ class EffectsNodeWidget(QWidget):
         )
         self._ports[name] = port
         label_names = {
-            **{f"layer{index}_color": f"L{index} Color" for index in range(1, 9)},
-            **{f"layer{index}_alpha": f"L{index} Alpha" for index in range(1, 9)},
+            **{f"layer{index}_color": f"L{index} Color" for index in range(1, 65)},
+            **{f"layer{index}_alpha": f"L{index} Alpha" for index in range(1, 65)},
             "a_input": "Alpha A",
             "b_input": "Alpha B",
             "red_input": "Red",
@@ -3058,25 +3111,36 @@ class EffectsNodeWidget(QWidget):
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
+        device_menu = None
+        reload_action = None
+        if self.node_type == "capture":
+            device_menu = self._add_capture_device_menu(menu)
+            menu.addSeparator()
+            reload_action = menu.addAction("Reload Camera")
         settings_action = menu.addAction("Settings...")
         delete_action = None
         if self.node_type not in {"effects_input", "effects_output"}:
             menu.addSeparator()
             delete_action = menu.addAction("Delete node")
         selected = menu.exec(event.globalPos())
-        if selected == settings_action:
+        del device_menu
+        if reload_action is not None and selected == reload_action:
+            self.captureReloadRequested.emit(self.node_id)
+        elif selected == settings_action:
             self.settingsRequested.emit(self.node_id)
         elif delete_action is not None and selected == delete_action:
             self.deleteRequested.emit(self.node_id)
 
 
 class EffectsGraphCanvas(QWidget):
+    captureSettingsRequested = Signal(object)
     graphChanged = Signal()
 
     NODE_TITLES = {
         "effects_input": "Effects Input",
         "effects_output": "Effects Output",
         "denoise": "Noise Reduction",
+        "composition": "Composition Source",
         "media": "Video / Image / Sequence",
         "capture": "Video Capture",
         "keying": "Compositor",
@@ -3094,6 +3158,7 @@ class EffectsGraphCanvas(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(900, 360)
         self.setStyleSheet("background: #171a1f;")
         self._nodes: dict[str, dict[str, object]] = {}
@@ -3109,6 +3174,7 @@ class EffectsGraphCanvas(QWidget):
         self._marquee_rect: QRectF | None = None
         self._marquee_additive = False
         self._capture_devices: list[tuple[str, object]] = []
+        self._capture_reload_tokens: dict[str, int] = {}
         self._media_keyframe_playback_arms: dict[str, str] = {}
         self._key_dialogs: dict[str, QDialog] = {}
         self._zoom = 1.0
@@ -3117,6 +3183,96 @@ class EffectsGraphCanvas(QWidget):
         self._create_node("effects_input", 40, 120, "effects_input")
         self._create_node("effects_output", 620, 120, "effects_output")
         self._connections.append(("effects_input", "output", "effects_output", "input"))
+        self._history = [self._history_snapshot()]
+        self._history_index = 0
+        self._restoring_history = False
+        self.graphChanged.connect(self._record_history)
+
+    def _history_snapshot(self) -> dict[str, object]:
+        state = self.serialize()
+        editor = getattr(self, '_editor', None)
+        if editor is not None:
+            state['_history_keyframes'] = deepcopy({node_id: frames for node_id, frames in editor._node_keyframes.items() if node_id in self._nodes})
+            state['_history_duration'] = editor._duration
+        return state
+
+    def _record_history(self) -> None:
+        if self._restoring_history or self._group_drag_driver is not None:
+            return
+        if any(slider.isSliderDown() for slider in self.findChildren(QSlider)):
+            return
+        state = self._history_snapshot()
+        if state == self._history[self._history_index]:
+            return
+        self._history = self._history[:self._history_index + 1]
+        self._history.append(state)
+        self._history = self._history[-101:]
+        self._history_index = len(self._history) - 1
+
+    def _travel_history(self, offset: int) -> None:
+        index = self._history_index + offset
+        if not 0 <= index < len(self._history):
+            return
+        self._restoring_history = True
+        try:
+            self._history_index = index
+            editor = getattr(self, '_editor', None)
+            if editor is not None:
+                editor._node_keyframes = deepcopy(self._history[index].get('_history_keyframes', {}))
+                editor._duration = int(self._history[index].get('_history_duration', editor._duration))
+                editor._current_frame = min(editor._current_frame, max(0, editor._duration - 1))
+            self.restore(deepcopy(self._history[index]))
+        finally:
+            self._restoring_history = False
+
+    def undo(self) -> None:
+        self._travel_history(-1)
+
+    def redo(self) -> None:
+        self._travel_history(1)
+
+    def copy_nodes(self) -> None:
+        ids = {i for i in self._selected_nodes if self._nodes[i]['type'] not in {'effects_input', 'effects_output'}}
+        if ids:
+            QApplication.clipboard().setText(json.dumps({
+                'node_editor_clipboard': 1,
+                'nodes': [self._nodes[i] for i in self._nodes if i in ids],
+                'connections': [c for c in self._connections if c[0] in ids and c[2] in ids],
+                'keyframes': {node_id: frames for node_id, frames in getattr(getattr(self, '_editor', None), '_node_keyframes', {}).items() if node_id in ids},
+            }))
+
+    def paste_nodes(self) -> None:
+        try:
+            clipboard_text = QApplication.clipboard().text()
+            data = json.loads(clipboard_text)
+            if not isinstance(data, dict) or data.get('node_editor_clipboard') != 1:
+                return
+            nodes = data['nodes']
+            if not isinstance(nodes, list) or any(not isinstance(n, dict) or n.get('type') not in self.NODE_TITLES or n['type'] in {'effects_input', 'effects_output'} or not isinstance(n.get('settings'), dict) for n in nodes):
+                return
+            # Validate before changing the graph.
+            paste_count = getattr(self, '_paste_count', 0) + 1 if getattr(self, '_clipboard_text', None) == clipboard_text else 1
+            copies = [(str(n['id']), n['type'], int(n['x']) + 40 * paste_count, int(n['y']) + 40 * paste_count, deepcopy(n['settings'])) for n in nodes]
+            connections = [tuple(c) for c in data.get('connections', []) if isinstance(c, list) and len(c) == 4 and all(isinstance(part, str) for part in c)]
+        except (ValueError, TypeError, KeyError):
+            return
+        remap = {}
+        self._clipboard_text, self._paste_count = clipboard_text, paste_count
+        for old, kind, x, y, settings in copies:
+            new = self._create_node(kind, x, y)
+            remap[old] = new
+            self._nodes[new]['settings'] = settings
+            self._refresh_node_status(new)
+        editor = getattr(self, '_editor', None)
+        if editor is not None:
+            for old, frames in (data.get('keyframes') if isinstance(data.get('keyframes'), dict) else {}).items():
+                if old in remap and isinstance(frames, dict):
+                    editor._node_keyframes[remap[old]] = {int(frame): deepcopy(settings) for frame, settings in frames.items() if str(frame).isdigit() and isinstance(settings, dict)}
+                    editor._duration = max(editor._duration, 1 + max(editor._node_keyframes[remap[old]], default=0))
+        self._connections.extend((remap[a], b, remap[c], d) for a, b, c, d in connections if a in remap and c in remap)
+        self._set_selected_nodes(set(remap.values()))
+        self.update()
+        self.graphChanged.emit()
 
     def _create_node(self, node_type: str, x: int, y: int, node_id: str | None = None) -> str:
         if node_id is None:
@@ -3140,7 +3296,12 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "blur":
             settings = {"method": "gaussian", "radius": 3.0, "target": "both"}
         elif node_type == "capture":
-            settings = {"device_index": None, "device_name": "No capture device selected"}
+            settings = {
+                "device_index": None,
+                "device_name": "No capture device selected",
+                "capture_width": 0,
+                "capture_height": 0,
+            }
         elif node_type == "matte":
             settings = {"red": 255, "green": 255, "blue": 255, "alpha": 1.0}
         elif node_type == "mask":
@@ -3182,9 +3343,11 @@ class EffectsGraphCanvas(QWidget):
         widget.nodeDragStarted.connect(self._on_node_drag_started)
         widget.nodeDragFinished.connect(self._on_node_drag_finished)
         widget.settingsRequested.connect(self._edit_node_settings)
-        widget.deleteRequested.connect(self._delete_node)
+        widget.deleteRequested.connect(self._delete_requested)
         widget.blurLevelChanged.connect(self._on_blur_level_changed)
         widget.captureDeviceChanged.connect(self._on_capture_device_changed)
+        widget.captureSettingsRequested.connect(self._on_capture_settings_requested)
+        widget.captureReloadRequested.connect(self._on_capture_reload_requested)
         widget.mediaPathChanged.connect(self._on_media_path_changed)
         widget.mediaPlaybackChanged.connect(self._on_media_playback_changed)
         widget.mediaKeyframePlaybackArmed.connect(self._on_media_keyframe_playback_armed)
@@ -3270,7 +3433,7 @@ class EffectsGraphCanvas(QWidget):
     def _first_available_compositor_layer(self, compositor_id: str, channel: str) -> int:
         node = self._nodes.get(compositor_id, {})
         settings = node.get("settings", {}) if isinstance(node, dict) else {}
-        layer_count = max(2, min(8, int(settings.get("layer_count", 2)))) if isinstance(settings, dict) else 2
+        layer_count = max(2, min(64, int(settings.get("layer_count", 2)))) if isinstance(settings, dict) else 2
         occupied = {
             target_port
             for _source, _source_port, target, target_port in self._connections
@@ -3286,7 +3449,7 @@ class EffectsGraphCanvas(QWidget):
         for layer_index in range(2, layer_count + 1):
             if f"layer{layer_index}_{channel}" not in occupied:
                 return layer_index
-        if layer_count < 8:
+        if layer_count < 64:
             self._on_compositor_layer_action(compositor_id, "add_top")
             return layer_count + 1
         return layer_count
@@ -3330,6 +3493,7 @@ class EffectsGraphCanvas(QWidget):
         self.update()
 
     def _select_node(self, node_id: str, additive: bool) -> None:
+        self.setFocus(Qt.MouseFocusReason)
         selected = set(self._selected_nodes)
         if additive:
             if node_id in selected:
@@ -3358,12 +3522,13 @@ class EffectsGraphCanvas(QWidget):
             return
         self._group_drag_driver = None
         self._group_drag_origins.clear()
+        self._record_history()
 
     def _expand_to_nodes(self) -> None:
         if not self._widgets:
             return
         needed_w = max(int(node["x"]) + 290 for node in self._nodes.values())
-        needed_h = max(int(node["y"]) + 204 for node in self._nodes.values())
+        needed_h = max(int(node["y"]) + self._widgets[node_id]._base_size.height() + 24 for node_id, node in self._nodes.items())
         self.setMinimumSize(round(max(900, needed_w) * self._zoom), round(max(360, needed_h) * self._zoom))
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -3371,7 +3536,7 @@ class EffectsGraphCanvas(QWidget):
         if delta == 0:
             super().wheelEvent(event)
             return
-        next_zoom = max(0.5, min(2.0, self._zoom * (1.1 if delta > 0 else (1.0 / 1.1))))
+        next_zoom = max(0.25, min(2.0, self._zoom * (1.1 if delta > 0 else (1.0 / 1.1))))
         if abs(next_zoom - self._zoom) < 1e-6:
             event.accept()
             return
@@ -3416,7 +3581,7 @@ class EffectsGraphCanvas(QWidget):
             "input", "color_input", "alpha_input", "a_input", "b_input", "red_input", "green_input", "blue_input",
         } | {
             f"layer{layer_index}_{channel}"
-            for layer_index in range(1, 9)
+            for layer_index in range(1, 65)
             for channel in ("color", "alpha")
         }
         if source_id == node_id or not self._is_output_port(source_port) or port_name not in input_ports:
@@ -3465,6 +3630,8 @@ class EffectsGraphCanvas(QWidget):
             return
         for target_id, widget in reversed(list(self._widgets.items())):
             for target_port, port in widget._ports.items():
+                if not port.isVisible():
+                    continue
                 if self._is_output_port(target_port):
                     continue
                 if port.rect().contains(port.mapFromGlobal(global_position.toPoint())):
@@ -3502,7 +3669,24 @@ class EffectsGraphCanvas(QWidget):
         settings.update({"device_index": device_index, "device_name": str(device_name)})
         if node_id not in self._widgets:
             return
+        self._widgets[node_id].set_capture_devices(self._capture_devices, device_index)
         self._refresh_node_status(node_id)
+        self.graphChanged.emit()
+
+    def _on_capture_settings_requested(self, node_id: str) -> None:
+        settings = self._nodes.get(node_id, {}).get("settings")
+        if not isinstance(settings, dict):
+            return
+        self.captureSettingsRequested.emit(settings.get("device_index"))
+
+    def _on_capture_reload_requested(self, node_id: str) -> None:
+        settings = self._nodes.get(node_id, {}).get("settings")
+        if not isinstance(settings, dict):
+            return
+        device_index = settings.get("device_index")
+        if not isinstance(device_index, str) or not device_index.startswith("webcam:"):
+            return
+        self._capture_reload_tokens[node_id] = self._capture_reload_tokens.get(node_id, 0) + 1
         self.graphChanged.emit()
 
     def _on_media_path_changed(self, node_id: str, media_path: str) -> None:
@@ -3567,8 +3751,8 @@ class EffectsGraphCanvas(QWidget):
                 else:
                     settings[prefixed_name] = default
 
-        layer_count = max(2, min(8, int(settings.get("layer_count", 2))))
-        if action.startswith("add_") and layer_count >= 8:
+        layer_count = max(2, min(64, int(settings.get("layer_count", 2))))
+        if action.startswith("add_") and layer_count >= 64:
             return
         if action.startswith("remove_") and layer_count <= 2:
             return
@@ -3625,6 +3809,7 @@ class EffectsGraphCanvas(QWidget):
             return
 
         self._refresh_node_status(node_id)
+        self._expand_to_nodes()
         self.update()
         self.graphChanged.emit()
 
@@ -3651,7 +3836,7 @@ class EffectsGraphCanvas(QWidget):
                 return True
         return False
 
-    def _delete_node(self, node_id: str) -> None:
+    def _delete_node(self, node_id: str, emit_changed: bool = True) -> None:
         node = self._nodes.get(node_id)
         if node is None or node["type"] in {"effects_input", "effects_output"}:
             return
@@ -3665,7 +3850,43 @@ class EffectsGraphCanvas(QWidget):
         self._selected_nodes.discard(node_id)
         self._media_keyframe_playback_arms.pop(node_id, None)
         self.update()
+        if emit_changed:
+            self.graphChanged.emit()
+
+    def _delete_selected_nodes(self) -> None:
+        deletable = [
+            node_id for node_id in self.selected_node_ids()
+            if self._nodes[node_id]["type"] not in {"effects_input", "effects_output"}
+        ]
+        if not deletable:
+            return
+        for node_id in deletable:
+            self._delete_node(node_id, emit_changed=False)
+        self._set_selected_nodes(set())
+        self._expand_to_nodes()
         self.graphChanged.emit()
+
+    def _delete_requested(self, node_id: str) -> None:
+        if node_id in self._selected_nodes and len(self._selected_nodes) > 1:
+            self._delete_selected_nodes()
+            return
+        self._delete_node(node_id)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        for key, callback in ((QKeySequence.Undo, self.undo), (QKeySequence.Redo, self.redo), (QKeySequence.Copy, self.copy_nodes), (QKeySequence.Paste, self.paste_nodes)):
+            if event.matches(key):
+                callback()
+                event.accept()
+                return
+        if event.key() == Qt.Key_Z and event.modifiers() == (Qt.ControlModifier | Qt.ShiftModifier):
+            self.redo()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Delete:
+            self._delete_selected_nodes()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _edit_node_settings(self, node_id: str) -> None:
         node = self._nodes[node_id]
@@ -3699,6 +3920,9 @@ class EffectsGraphCanvas(QWidget):
             )
             if accepted:
                 settings["opacity"] = opacity
+        elif node_type == "capture":
+            self._show_capture_settings(node_id)
+            return
         elif node_type in {"proc_amp", "color_corrector"}:
             self._show_color_settings(node_id)
             return
@@ -3761,6 +3985,57 @@ class EffectsGraphCanvas(QWidget):
         self._refresh_node_status(node_id)
         self.graphChanged.emit()
 
+    def _show_capture_settings(self, node_id: str) -> None:
+        settings = self._nodes.get(node_id, {}).get("settings")
+        if not isinstance(settings, dict):
+            return
+        opened = self._open_settings_dialog(node_id, "Video Capture Settings")
+        if opened is None:
+            return
+        dialog, form = opened
+        resolution = QComboBox(dialog)
+        presets = (
+            ("Device default", (0, 0)),
+            ("640 x 480", (640, 480)),
+            ("1280 x 720", (1280, 720)),
+            ("1920 x 1080", (1920, 1080)),
+            ("2560 x 1440", (2560, 1440)),
+            ("3840 x 2160", (3840, 2160)),
+        )
+        selected = (
+            max(0, int(settings.get("capture_width", 0))),
+            max(0, int(settings.get("capture_height", 0))),
+        )
+        for label, dimensions in presets:
+            resolution.addItem(label, dimensions)
+        selected_index = resolution.findData(selected)
+        if selected_index < 0 and selected != (0, 0):
+            resolution.addItem(f"{selected[0]} x {selected[1]}", selected)
+            selected_index = resolution.count() - 1
+        resolution.setCurrentIndex(max(0, selected_index))
+
+        def resolution_changed(_index: int) -> None:
+            dimensions = resolution.currentData()
+            if not isinstance(dimensions, tuple) or len(dimensions) != 2:
+                return
+            settings.update(
+                {
+                    "capture_width": int(dimensions[0]),
+                    "capture_height": int(dimensions[1]),
+                }
+            )
+            self._refresh_node_status(node_id)
+            self.graphChanged.emit()
+
+        resolution.currentIndexChanged.connect(resolution_changed)
+        form.addRow("Resolution", resolution)
+        native_settings = QPushButton("Device property page...", dialog)
+        native_settings.clicked.connect(
+            lambda: self.captureSettingsRequested.emit(settings.get("device_index"))
+        )
+        form.addRow(native_settings)
+        self._finish_settings_dialog(dialog, form)
+
     def _add_live_slider(
         self,
         form: QFormLayout,
@@ -3781,7 +4056,7 @@ class EffectsGraphCanvas(QWidget):
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
         slider = QSlider(Qt.Horizontal, row)
-        slider.setRange(round(minimum * scale), round(maximum * scale))
+        slider.setRange(round(max(minimum, -1000.0) * scale), round(maximum * scale))
         slider.setProperty("setting_name", name)
         slider.setProperty("setting_scale", scale)
         slider.setValue(round(float(settings.get(name, minimum)) * scale))
@@ -3793,7 +4068,7 @@ class EffectsGraphCanvas(QWidget):
         value_control.setSuffix(suffix)
         value_control.setValue(float(settings.get(name, minimum)))
         value_control.setKeyboardTracking(True)
-        value_control.setFixedWidth(92)
+        value_control.setMinimumWidth(120)
         row_layout.addWidget(slider, 1)
         row_layout.addWidget(value_control)
 
@@ -3811,6 +4086,7 @@ class EffectsGraphCanvas(QWidget):
             self._on_color_setting_changed(node_id, name, float(value))
 
         slider.valueChanged.connect(slider_changed)
+        slider.sliderReleased.connect(self._record_history)
         value_control.valueChanged.connect(value_changed)
         form.addRow(label, row)
 
@@ -3903,9 +4179,9 @@ class EffectsGraphCanvas(QWidget):
             return
         dialog, form = opened
         for spec in (
-            ("X", "x", -100.0, 100.0, 10, 1, "%"),
-            ("Y", "y", -100.0, 100.0, 10, 1, "%"),
-            ("Z", "z", -90.0, 90.0, 10, 1, "%"),
+            ("X", "x", -10000.0, 10000.0, 10, 1, "%"),
+            ("Y", "y", -10000.0, 10000.0, 10, 1, "%"),
+            ("Z (1000 = 10×)", "z", -100000000.0, 1000.0, 10, 1, "%"),
             ("Rotate X", "rotate_x", -180.0, 180.0, 10, 1, " deg"),
             ("Rotate Y", "rotate_y", -180.0, 180.0, 10, 1, " deg"),
             ("Rotate Z", "rotate_z", -180.0, 180.0, 10, 1, " deg"),
@@ -4044,8 +4320,10 @@ class EffectsGraphCanvas(QWidget):
         node_type = str(node["type"])
         if node_type == "effects_input":
             status = "GPU frame source"
+        elif node_type == "composition":
+            status = str(settings.get("name", "Composition")) + "\nColor + alpha"
         elif node_type == "effects_output":
-            status = "GPU frame destination"
+            status = "GPU color + alpha destination"
         elif node_type == "denoise":
             status = f"{settings.get('method', 'off')}  {float(settings.get('strength', 0.0)):.2f}"
         elif node_type == "media":
@@ -4054,7 +4332,9 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "keying":
             status = f"L2 {settings.get('layer2_blend_mode', 'normal')}  {float(settings.get('layer2_opacity', 1.0)):.2f}"
         elif node_type == "capture":
-            status = str(settings.get("device_name", "No capture device selected"))
+            width = max(0, int(settings.get("capture_width", 0)))
+            height = max(0, int(settings.get("capture_height", 0)))
+            status = f"Resolution: {width} x {height}" if width and height else "Resolution: Device default"
         elif node_type == "matte":
             status = "#{:02X}{:02X}{:02X}  alpha {:.2f}".format(
                 int(settings.get("red", 255)), int(settings.get("green", 255)),
@@ -4150,6 +4430,8 @@ class EffectsGraphCanvas(QWidget):
         return None
 
     def active_denoise_settings(self) -> tuple[str, float]:
+        if not self._effects_enabled:
+            return "off", 0.0
         edges = {
             source: target for source, source_port, target, target_port in self._connections
             if source_port == "output" and target_port in {"input", "layer1_color"}
@@ -4180,6 +4462,17 @@ class EffectsGraphCanvas(QWidget):
         return capture_sources[-1] if capture_sources else "effects_input"
 
     def native_effects_payload(self) -> dict[str, object]:
+        if not self._effects_enabled:
+            return bypassed_effects_payload()
+        if any(n['type'] == 'composition' for n in self._nodes.values()) or sum(n['type'] == 'keying' for n in self._nodes.values()) > 1:
+            try:
+                from .composition_graph import compile_compositions
+            except ImportError:
+                from composition_graph import compile_compositions
+            return compile_compositions(self, EffectsGraphCanvas._single_pass_payload)
+        return self._single_pass_payload()
+
+    def _single_pass_payload(self) -> dict[str, object]:
         mix_modes = {"add", "multiply", "subtract", "overlay", "difference"}
 
         def resolve_generated_alpha(
@@ -4821,7 +5114,7 @@ class EffectsGraphCanvas(QWidget):
             "luma_low": 0.0, "luma_high": 1.0, "luma_softness": 0.10, "invert": False,
         }
         layer_payloads: list[dict[str, object]] = []
-        layer_count = max(2, min(8, int(compositor_settings.get("layer_count", 2))))
+        layer_count = max(2, min(64, int(compositor_settings.get("layer_count", 2))))
         if compositor_id is not None:
             for layer_index in range(1, layer_count + 1):
                 color_connection = next(
@@ -5053,6 +5346,9 @@ class EffectsGraphCanvas(QWidget):
                                 "media_loop": bool(operand_settings.get("loop", True)),
                                 "capture_kind": operand_capture_kind,
                                 "capture_device_index": int(operand_capture_id.split(":", 1)[1]) if operand_capture_kind else -1,
+                                "capture_width": int(operand_settings.get("capture_width", 0)),
+                                "capture_height": int(operand_settings.get("capture_height", 0)),
+                                "capture_reload_token": self._capture_reload_tokens.get(operand_node_id, 0),
                                 "matte_rgba": [
                                     int(operand_settings.get("red", 255)),
                                     int(operand_settings.get("green", 255)),
@@ -5092,6 +5388,9 @@ class EffectsGraphCanvas(QWidget):
                         "media_loop": bool(source_settings.get("loop", True)),
                         "capture_kind": layer_capture_kind,
                         "capture_device_index": layer_capture_index,
+                        "capture_width": int(source_settings.get("capture_width", 0)),
+                        "capture_height": int(source_settings.get("capture_height", 0)),
+                        "capture_reload_token": self._capture_reload_tokens.get(source_id, 0),
                         "matte_rgba": [255, 255, 255, 255] if generated_mask_source else layer_matte_rgba,
                         "opacity": max(0.0, min(1.0, layer_source_opacity * float(compositor_settings.get(prefix + "opacity", 1.0)))),
                         "blend_mode": str(compositor_settings.get(prefix + "blend_mode", "normal")),
@@ -5148,6 +5447,9 @@ class EffectsGraphCanvas(QWidget):
                     "media_loop": bool(media_settings.get("loop", True)),
                     "capture_kind": capture_kind,
                     "capture_device_index": capture_device_index,
+                    "capture_width": int(capture_settings.get("capture_width", 0)),
+                    "capture_height": int(capture_settings.get("capture_height", 0)),
+                    "capture_reload_token": self._capture_reload_tokens.get(capture_source_id, 0),
                     "matte_rgba": [
                         int(matte_settings.get("red", 255)), int(matte_settings.get("green", 255)),
                         int(matte_settings.get("blue", 255)), 255,
@@ -5254,7 +5556,7 @@ class EffectsGraphCanvas(QWidget):
         return {
             "version": 6,
             "enabled": self._effects_enabled,
-            "nodes": list(self._nodes.values()),
+            "nodes": deepcopy(list(self._nodes.values())),
             "connections": [list(connection) for connection in self._connections],
         }
 
@@ -5268,13 +5570,20 @@ class EffectsGraphCanvas(QWidget):
             node.get("type") == "effects_output" for node in normalized_nodes
         ):
             return False
+        for dialog in list(self._key_dialogs.values()):
+            dialog.close()
+            dialog.deleteLater()
+        self._key_dialogs.clear()
+        self._pending_port = self._drag_port = None
         for widget in self._widgets.values():
+            widget.hide()
             widget.deleteLater()
         self._nodes.clear()
         self._widgets.clear()
         self._connections.clear()
         self._selected_nodes.clear()
         self._media_keyframe_playback_arms.clear()
+        self._capture_reload_tokens.clear()
         for raw_node in normalized_nodes:
             node_id = str(raw_node.get("id", ""))
             if not node_id or node_id in self._nodes:
@@ -5326,7 +5635,7 @@ class EffectsGraphCanvas(QWidget):
             settings = compositor.get("settings", {})
             if not isinstance(settings, dict):
                 continue
-            layer_count = max(2, min(8, int(settings.get("layer_count", 2))))
+            layer_count = max(2, min(64, int(settings.get("layer_count", 2))))
             for layer_index in range(2, layer_count + 1):
                 prefix = f"layer{layer_index}_"
                 mode = str(settings.get(prefix + "key_mode", settings.get("key_mode", "off") if layer_index == 2 else "off"))
@@ -5457,6 +5766,7 @@ class EffectsGraphCanvas(QWidget):
             painter.drawRect(self._marquee_rect)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        self.setFocus(Qt.MouseFocusReason)
         if event.button() == Qt.LeftButton and bool(event.modifiers() & Qt.ShiftModifier):
             self._marquee_origin = event.position()
             self._marquee_rect = QRectF(self._marquee_origin, self._marquee_origin)
@@ -5581,11 +5891,14 @@ class EffectsTimelineWidget(QWidget):
 
 class EffectsGraphEditor(QGroupBox):
     graphChanged = Signal()
+    captureStartRequested = Signal(object)
+    captureSettingsRequested = Signal(object)
 
     NODE_MENU = {
         "Noise Reduction": "denoise",
         "Video Clip / Image / Image Sequence": "media",
         "Video Capture Device": "capture",
+        "Composition Source": "composition",
         "Compositor": "keying",
         "Blur": "blur",
         "Matte Color": "matte",
@@ -5604,6 +5917,7 @@ class EffectsGraphEditor(QGroupBox):
         self._node_keyframes: dict[str, dict[int, dict[str, object]]] = {}
         self._palette_entries: list[dict[str, object]] = []
         self._current_palette_index: int | None = None
+        self._clean_graph_state: dict[str, object] | None = None
         self._current_frame = 0
         self._duration = 1
         self._playing = False
@@ -5682,6 +5996,10 @@ class EffectsGraphEditor(QGroupBox):
         self.node_combo.addItems(list(self.NODE_MENU))
         self.node_combo.currentIndexChanged.connect(self._add_selected_node)
         toolbar.addWidget(self.node_combo, 1)
+        self.new_graph_button = QPushButton("New Graph")
+        self.new_graph_button.setToolTip("Clear the current graph and start a new one")
+        self.new_graph_button.clicked.connect(self._new_graph)
+        toolbar.addWidget(self.new_graph_button)
         self.current_effect_label = QLabel("Current effect: Unsaved")
         self.current_effect_label.setMinimumWidth(220)
         toolbar.addWidget(self.current_effect_label)
@@ -5696,6 +6014,12 @@ class EffectsGraphEditor(QGroupBox):
         node_layout.addLayout(toolbar)
 
         self.canvas = EffectsGraphCanvas()
+        self.canvas._editor = self
+        self.canvas._history = [self.canvas._history_snapshot()]
+        for label, callback in (("Undo", self.canvas.undo), ("Redo", self.canvas.redo), ("Copy", self.canvas.copy_nodes), ("Paste", self.canvas.paste_nodes)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            toolbar.addWidget(button)
         scroll = QScrollArea()
         scroll.setWidgetResizable(False)
         scroll.setMinimumHeight(310)
@@ -5725,7 +6049,9 @@ class EffectsGraphEditor(QGroupBox):
         self.timeline.frameRequested.connect(self.set_current_frame)
         layout.addWidget(self.timeline)
         self.canvas.graphChanged.connect(self._on_canvas_changed)
+        self.canvas.captureSettingsRequested.connect(self.captureSettingsRequested.emit)
         self.bypass_toggle.toggled.connect(self._set_effects_bypassed)
+        self._mark_graph_clean()
         self._refresh_palette_controls()
         self._refresh_timeline()
 
@@ -5735,7 +6061,20 @@ class EffectsGraphEditor(QGroupBox):
             node_id: keyframes for node_id, keyframes in self._node_keyframes.items() if node_id in valid_ids
         }
         self._refresh_timeline()
+        self._refresh_palette_controls()
         self.graphChanged.emit()
+
+    def _current_graph_state(self) -> dict[str, object]:
+        return {
+            "graph": self.canvas.serialize(),
+            "keyframes": self._serialize_keyframes(),
+        }
+
+    def _mark_graph_clean(self) -> None:
+        self._clean_graph_state = self._current_graph_state()
+
+    def _has_unsaved_graph_changes(self) -> bool:
+        return self._clean_graph_state != self._current_graph_state()
 
     def _refresh_timeline(self) -> None:
         tracks = []
@@ -5775,6 +6114,7 @@ class EffectsGraphEditor(QGroupBox):
                         snapshot["playing"] = playback_arm == "play"
                 self._node_keyframes.setdefault(node_id, {})[self._current_frame] = snapshot
         self._duration = max(self._duration, self._current_frame + 1)
+        self.canvas._record_history()
         self._refresh_timeline()
         self.graphChanged.emit()
 
@@ -5791,6 +6131,7 @@ class EffectsGraphEditor(QGroupBox):
         if not deleted:
             return
         self.set_current_frame(self._current_frame)
+        self.canvas._record_history()
         self.graphChanged.emit()
 
     def _sync_media_keyframe_arms(self) -> None:
@@ -5870,9 +6211,27 @@ class EffectsGraphEditor(QGroupBox):
             result.update(cls._interpolate_settings({name: left_value}, {name: right_value}, progress))
         return result
 
+    @staticmethod
+    def _composition_has_animation(nodes, depth: int = 0) -> bool:
+        if depth > 32:
+            return False
+        for node in nodes:
+            if node.get('type') != 'composition':
+                continue
+            settings = node.get('settings', {})
+            graph = settings.get('graph', {})
+            if not graph.get('enabled', True):
+                continue
+            if any(len(frames) > 1 for frames in settings.get('keyframes', {}).values()):
+                return True
+            if EffectsGraphEditor._composition_has_animation(graph.get('nodes', []), depth + 1):
+                return True
+        return False
+
     def set_current_frame(self, frame: int) -> None:
+        previous_frame = self._current_frame
         self._current_frame = max(0, min(int(frame), self._duration - 1))
-        changed = False
+        changed = self._current_frame != previous_frame and self._composition_has_animation(self.canvas._nodes.values())
         for node_id, keyframes in self._node_keyframes.items():
             if node_id not in self.canvas._nodes or not keyframes:
                 continue
@@ -5971,16 +6330,18 @@ class EffectsGraphEditor(QGroupBox):
         self.delete_effect_button.setEnabled(selected_index is not None)
         self.update_effect_button.setEnabled(current_index is not None)
         if current_index is None:
-            self.current_effect_label.setText("Current effect: Unsaved")
+            label = "Current effect: Unsaved"
         else:
             current_name = str(self._palette_entries[current_index].get("name", f"Effect {current_index + 1}"))
-            self.current_effect_label.setText(f"Current effect: {current_name}")
+            label = f"Current effect: {current_name}"
+        self.current_effect_label.setText(label + (" *" if self._has_unsaved_graph_changes() else ""))
 
     def _build_palette_entry(self, name: str) -> dict[str, object]:
         entry = {
             "name": name.strip(),
             "graph": self.canvas.serialize(),
             "keyframes": self._serialize_keyframes(),
+            "duration": self._duration,
         }
         thumbnail = self.canvas.grab().scaled(160, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         thumbnail_bytes = QByteArray()
@@ -6008,26 +6369,66 @@ class EffectsGraphEditor(QGroupBox):
             self.palette_list.setCurrentRow(selected_index)
         self._refresh_palette_controls()
 
-    def _save_effect_to_palette(self) -> None:
+    def _save_effect_to_palette(self) -> bool:
         default_name = ""
         if self._current_palette_index is not None and 0 <= self._current_palette_index < len(self._palette_entries):
             default_name = str(self._palette_entries[self._current_palette_index].get("name", ""))
         name, accepted = QInputDialog.getText(self, "Save New Effect", "Effect name", text=default_name)
         if not accepted or not name.strip():
-            return
+            return False
         entry = self._build_palette_entry(name)
         self._palette_entries.append(entry)
         self._current_palette_index = len(self._palette_entries) - 1
+        self._mark_graph_clean()
         self._rebuild_palette_list(self._current_palette_index)
         self.graphChanged.emit()
+        return True
 
-    def _update_current_palette_item(self) -> None:
+    def _update_current_palette_item(self) -> bool:
         if self._current_palette_index is None or not 0 <= self._current_palette_index < len(self._palette_entries):
-            return
+            return False
         current_name = str(self._palette_entries[self._current_palette_index].get("name", "Effect"))
         self._palette_entries[self._current_palette_index] = self._build_palette_entry(current_name)
+        self._mark_graph_clean()
         self._rebuild_palette_list(self._current_palette_index)
         self.graphChanged.emit()
+        return True
+
+    def _new_graph(self) -> None:
+        if self._has_unsaved_graph_changes():
+            response = QMessageBox.warning(
+                self,
+                "Unsaved Graph Changes",
+                "Save changes to the current graph before starting a new graph?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if response == QMessageBox.Cancel:
+                return
+            if response == QMessageBox.Save:
+                saved = (
+                    self._update_current_palette_item()
+                    if self._current_palette_index is not None
+                    else self._save_effect_to_palette()
+                )
+                if not saved:
+                    return
+        empty_graph = {
+            "version": 6,
+            "enabled": True,
+            "nodes": [
+                {"id": "effects_input", "type": "effects_input", "x": 40, "y": 120, "settings": {}},
+                {"id": "effects_output", "type": "effects_output", "x": 620, "y": 120, "settings": {}},
+            ],
+            "connections": [["effects_input", "output", "effects_output", "input"]],
+        }
+        if not self.canvas.restore(empty_graph):
+            return
+        self.canvas._next_node_number = 1
+        self._restore_keyframes(None)
+        self._current_palette_index = None
+        self._mark_graph_clean()
+        self._rebuild_palette_list()
 
     def _rename_palette_item(self) -> None:
         item = self.palette_list.currentItem()
@@ -6074,6 +6475,11 @@ class EffectsGraphEditor(QGroupBox):
             self._current_palette_index = index
             self._rebuild_palette_list(index)
             self.set_current_frame(0)
+            self._mark_graph_clean()
+            self._refresh_palette_controls()
+            capture_device = self.active_capture_device()
+            if capture_device is not None:
+                self.captureStartRequested.emit(capture_device)
 
     def _serialize_keyframes(self) -> dict[str, dict[str, dict[str, object]]]:
         return {
@@ -6107,7 +6513,24 @@ class EffectsGraphEditor(QGroupBox):
         node_type = self.NODE_MENU.get(self.node_combo.currentText())
         if node_type is None:
             return
-        self.canvas.add_node(node_type)
+        if node_type == 'composition':
+            entries = self._palette_entries
+            if not entries:
+                QMessageBox.information(self, 'Composition Source', 'Save a composition to the palette first.')
+            else:
+                labels = [f"{i + 1}: {e.get('name', 'Composition')}" for i,e in enumerate(entries)]
+                label, accepted = QInputDialog.getItem(self, 'Composition Source', 'Saved composition', labels, 0, False)
+                if accepted:
+                    entry = entries[labels.index(label)]
+                    x, y = self.canvas._next_free_node_position('composition')
+                    node_id = self.canvas._create_node('composition', x, y)
+                    self.canvas._nodes[node_id]['settings'] = {'name': entry.get('name', ''), 'graph': deepcopy(entry['graph']), 'keyframes': deepcopy(entry.get('keyframes', {}))}
+                    self._duration = max(self._duration, int(entry.get('duration', 1)), 1 + max((int(frame) for keys in entry.get('keyframes', {}).values() for frame in keys), default=0))
+                    self._refresh_timeline()
+                    self.canvas._refresh_node_status(node_id)
+                    self.canvas.graphChanged.emit()
+        else:
+            self.canvas.add_node(node_type)
         self.node_combo.setCurrentIndex(0)
 
     def serialize(self) -> dict[str, object]:
@@ -6149,6 +6572,7 @@ class EffectsGraphEditor(QGroupBox):
             self.bypass_toggle.setChecked(not self.canvas.effects_enabled())
             self.bypass_toggle.blockSignals(False)
             self._refresh_timeline()
+            self._mark_graph_clean()
         return restored
 
     def set_composition_timecode(
@@ -6195,6 +6619,8 @@ class EffectsGraphEditor(QGroupBox):
         self.canvas.set_capture_devices(devices)
 
     def native_effects_payload(self) -> dict[str, object]:
+        self.canvas._composition_frame = self._current_frame
+        self.canvas._composition_settings_at_frame = self._settings_at_frame
         return self.canvas.native_effects_payload()
 
 
@@ -6349,6 +6775,24 @@ class VideoProcessorController:
             if hasattr(self.processor, "set_denoise_strength"):
                 self.processor.set_denoise_strength(self.denoise_strength)
 
+    def show_capture_settings(self, device_index: int) -> None:
+        decoder = next(
+            (
+                decoder for decoder in self._effect_media_decoders.values()
+                if isinstance(decoder, EffectCaptureDecoder) and decoder.device_index == int(device_index)
+            ),
+            None,
+        )
+        temporary_decoder = None
+        try:
+            if decoder is None:
+                temporary_decoder = EffectCaptureDecoder(int(device_index))
+                decoder = temporary_decoder
+            decoder.show_settings()
+        finally:
+            if temporary_decoder is not None:
+                temporary_decoder.close()
+
     def set_effects_config(self, payload: dict[str, object]) -> None:
         self.effects_payload = dict(payload)
         if self.processor is None:
@@ -6378,7 +6822,11 @@ class VideoProcessorController:
                         ).reshape(1, 1, 4)
                         self.processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
                     elif reload_source and capture_kind == "webcam":
-                        decoder = EffectCaptureDecoder(int(layer.get("capture_device_index", 0)))
+                        decoder = EffectCaptureDecoder(
+                            int(layer.get("capture_device_index", 0)),
+                            int(layer.get("capture_width", 0)),
+                            int(layer.get("capture_height", 0)),
+                        )
                         self._effect_media_decoders[(layer_index, 0)] = decoder
                         rgba = decoder.next_rgba()
                         self.processor.upload_effect_layer_media_rgba(
@@ -6409,7 +6857,11 @@ class VideoProcessorController:
                                 layer_index, source_slot, source_rgba, 1, 1
                             )
                         elif reload_source and source_capture_kind == "webcam":
-                            source_decoder = EffectCaptureDecoder(int(image_source.get("capture_device_index", 0)))
+                            source_decoder = EffectCaptureDecoder(
+                                int(image_source.get("capture_device_index", 0)),
+                                int(image_source.get("capture_width", 0)),
+                                int(image_source.get("capture_height", 0)),
+                            )
                         elif reload_source and source_path:
                             source_decoder = EffectMediaDecoder(source_path)
                         if source_decoder is not None:
@@ -6454,13 +6906,14 @@ class VideoProcessorController:
         )
         _set_native_effects_input_transform(self.processor, payload)
         layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
-        for layer_index in range(1, 9):
-            layer = (
-                layers_by_index.get(layer_index, {"layer_index": layer_index, "enabled": False})
-                if enabled
-                else {"layer_index": layer_index, "enabled": False}
-            )
+        if max(layers_by_index, default=0) > 8 and not hasattr(self.processor, 'set_effect_layer_composition'):
+            raise RuntimeError('Rebuild the native module to enable more than eight layers')
+        previous_indices = getattr(self, '_configured_effect_layer_indices', set())
+        updates, next_layer_indices = effect_layer_updates(layers, enabled, previous_indices)
+        self._configured_effect_layer_indices = previous_indices | next_layer_indices
+        for layer in updates:
             _set_native_effect_layer_config(self.processor, layer)
+        self._configured_effect_layer_indices = next_layer_indices
         _set_native_color_stages(self.processor, payload)
         self._loaded_effect_source_signature = source_signature
 
@@ -7974,6 +8427,10 @@ class ProcessVideoProcessorController:
         self._wait_for_ack("set_effects_config", timeout_seconds=5.0)
         self._effect_source_configured = True
 
+    def show_capture_settings(self, device_index: int) -> None:
+        self._send_control({"cmd": "show_capture_settings", "device_index": int(device_index)})
+        self._wait_for_ack("show_capture_settings", timeout_seconds=300.0)
+
     def set_max_auto_basic_scaling(self, scale: int) -> None:
         self.max_auto_basic_scaling = scale
         self._send_control({"cmd": "set_max_auto_basic_scaling", "scale": int(scale)})
@@ -8066,6 +8523,11 @@ class ProcessVideoProcessorController:
                     effects_error = str(raw_effects_error).strip() if raw_effects_error is not None else ""
                     if effects_error:
                         raise RuntimeError(effects_error)
+                if expected_cmd == "show_capture_settings":
+                    raw_settings_error = message.get("capture_settings_error")
+                    settings_error = str(raw_settings_error).strip() if raw_settings_error is not None else ""
+                    if settings_error:
+                        raise RuntimeError(settings_error)
                 if expected_cmd in {"set_ai_sr_enabled", "set_ai_sr_model_path", "set_ai_sr_settings"}:
                     self.ai_sr_enabled = bool(message.get("ai_sr_enabled", self.ai_sr_enabled))
                     self.ai_sr_active = bool(message.get("ai_sr_active", self.ai_sr_active))
@@ -8962,6 +9424,9 @@ class MainWindow(QMainWindow):
         self._apply_worker_process_priority_to_controller(notify=False)
         self._apply_manual_drag_tuning_to_controller()
         self._apply_interlaced_phase_tuning_to_controller()
+        effects_payload = self.effects_graph.native_effects_payload()
+        self._controller.set_effects_config(effects_payload)
+        self._last_effects_payload = dict(effects_payload)
         LOGGER.info("Worker controller recreated after unexpected worker exit")
 
     def _apply_controller_color_settings_from_ui(self) -> None:
@@ -10001,6 +10466,8 @@ class MainWindow(QMainWindow):
         self.effects_graph = EffectsGraphEditor()
         self.effects_graph.set_frame_rate(float(self.fps_spin.value()))
         self.effects_graph.graphChanged.connect(self._on_effects_graph_changed)
+        self.effects_graph.captureStartRequested.connect(self._start_capture_device_from_effect)
+        self.effects_graph.captureSettingsRequested.connect(self._open_capture_device_settings)
 
         deinterlace_box = QGroupBox("De-interlacing")
         deinterlace_form = QFormLayout(deinterlace_box)
@@ -10068,8 +10535,8 @@ class MainWindow(QMainWindow):
         self.perf_guard_checkbox.toggled.connect(self._on_perf_guard_toggled)
         settings_form.addRow(self.perf_guard_checkbox)
 
-        decklink_box = QGroupBox("Blackmagic I/O")
-        decklink_form = QFormLayout(decklink_box)
+        self.decklink_box = QGroupBox("Blackmagic I/O")
+        decklink_form = QFormLayout(self.decklink_box)
 
         self.source_mode_combo = QComboBox()
         self.source_mode_combo.addItems(["Synthetic", "Blackmagic DeckLink"])
@@ -10410,7 +10877,7 @@ class MainWindow(QMainWindow):
         controls_hint.setWordWrap(True)
 
         layout.addWidget(roi_box)
-        layout.addWidget(decklink_box)
+        layout.addWidget(self.decklink_box)
         layout.addWidget(deinterlace_box)
         layout.addWidget(self.effects_graph)
         layout.addWidget(upscaling_box)
@@ -12784,6 +13251,50 @@ class MainWindow(QMainWindow):
                 self._update_status(f"Effects graph update failed: {exc}")
         self._schedule_settings_save()
 
+    def _select_effect_capture_device(self, capture_device: object) -> bool:
+        if isinstance(capture_device, str) and capture_device.startswith("webcam:"):
+            self._update_status("Windows camera capture cannot drive the DeckLink input session")
+            return False
+        self.decklink_auto_detect_devices.blockSignals(True)
+        self.decklink_auto_detect_devices.setChecked(False)
+        self.decklink_auto_detect_devices.blockSignals(False)
+        for index in range(self.decklink_input_device_combo.count()):
+            if self.decklink_input_device_combo.itemData(index) == capture_device:
+                self.decklink_input_device_combo.blockSignals(True)
+                self.decklink_input_device_combo.setCurrentIndex(index)
+                self.decklink_input_device_combo.blockSignals(False)
+                self._populate_mode_combos()
+                return True
+        self._refresh_decklink_catalog()
+        for index in range(self.decklink_input_device_combo.count()):
+            if self.decklink_input_device_combo.itemData(index) == capture_device:
+                self.decklink_input_device_combo.setCurrentIndex(index)
+                return True
+        self._update_status(f"Capture device {capture_device!r} is not available")
+        return False
+
+    def _start_capture_device_from_effect(self, capture_device: object) -> None:
+        if isinstance(capture_device, str) and capture_device.startswith("webcam:"):
+            self._update_status("Windows camera loading asynchronously from the recalled effect")
+            return
+        if not self._select_effect_capture_device(capture_device):
+            return
+        self.source_mode_combo.setCurrentText("Blackmagic DeckLink")
+        self._on_apply_decklink_settings()
+
+    def _open_capture_device_settings(self, capture_device: object) -> None:
+        if isinstance(capture_device, str) and capture_device.startswith("webcam:"):
+            try:
+                device_index = int(capture_device.partition(":")[2])
+                self._controller.show_capture_settings(device_index)
+                self._update_status(f"Closed Windows camera {device_index} settings")
+            except Exception as exc:
+                self._update_status(f"Windows camera settings failed: {exc}")
+            return
+        self._select_effect_capture_device(capture_device)
+        self._controls_scroll.ensureWidgetVisible(self.decklink_box, 0, 24)
+        self.decklink_input_device_combo.setFocus(Qt.OtherFocusReason)
+
     def _on_perf_guard_toggled(self, checked: bool) -> None:
         self._perf_guard_enabled = checked
         self._perf_guard_low_fps_seconds = 0
@@ -13206,6 +13717,18 @@ class MainWindow(QMainWindow):
         buffered_count = int(output_buffer_health.get("last_buffered_count", -1))
         target_buffer = int(output_buffer_health.get("target_buffer_frames", int(self._decklink_output_buffer_frames)))
         last_reprime_reason = str(output_buffer_health.get("last_reprime_reason", ""))
+
+        cadence = pipeline_timing_health.get('cadence')
+        if isinstance(cadence, dict):
+            signature = (cadence.get('generation'), cadence.get('event_count'), cadence.get('capture_queue_drops'))
+            previous = getattr(self, '_last_cadence_log_signature', None)
+            if signature != previous:
+                report = dict(cadence)
+                previous_event = previous[1] if previous and previous[0] == signature[0] else 0
+                report['recent_events'] = [event for event in cadence.get('recent_events', []) if event['event'] > (previous_event or 0)]
+                report.update(buffered_frames=buffered_count, target_buffer_frames=target_buffer, path=timing_last_path)
+                LOGGER.info('CADENCE | %s', json.dumps(report, separators=(',', ':')))
+                self._last_cadence_log_signature = signature
 
         starvation_delta = max(0, starvation_events - self._health_last_buffer_starvation)
         overflow_delta = max(0, overflow_events - self._health_last_buffer_overflow)

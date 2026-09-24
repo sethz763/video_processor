@@ -613,6 +613,9 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("rotate_z") = 0.0f,
             "Configure the native CUDA transform for the base Effects Input layer."
         )
+        .def("set_effect_layer_composition", &vp::VideoProcessor::SetEffectLayerComposition)
+        .def("set_effect_layer_composition_source", &vp::VideoProcessor::SetEffectLayerCompositionSource)
+        .def("get_effects_rgba_output", [](vp::VideoProcessor& self) { return py::bytes(self.GetEffectsRgbaOutput()); })
         .def(
             "set_effect_layer_config",
             &vp::VideoProcessor::SetEffectLayerConfig,

@@ -347,6 +347,9 @@ public:
         const AlphaMixOperandConfig& base_operand,
         const std::vector<AlphaMixOpConfig>& ops
     );
+    void SetEffectLayerComposition(int layer_index, int target, int source);
+    void SetEffectLayerCompositionSource(int layer_index, int slot, int source);
+    std::string GetEffectsRgbaOutput();
     void SetEffectLayerColorStages(int layer_index, const std::vector<ColorStageConfig>& stages);
     void SetEffectLayerAlphaMix(
         int layer_index,
@@ -363,7 +366,7 @@ public:
 
 private:
     static constexpr int kFirstEffectLayer = 1;
-    static constexpr int kLastEffectLayer = 8;
+    static constexpr int kLastEffectLayer = 64;
     static constexpr size_t kEffectLayerCount = kLastEffectLayer - kFirstEffectLayer + 1;
 
     struct EffectLayerState {
@@ -504,6 +507,8 @@ private:
     float effects_layer1_opacity_;
     bool effects_output_connected_;
     bool effects_explicit_compositor_layers_;
+    // Lower-level setters remain usable until a caller explicitly bypasses the graph.
+    bool effects_bypassed_ = false;
     float effects_input_transform_x_;
     float effects_input_transform_y_;
     float effects_input_transform_z_;
@@ -534,6 +539,13 @@ private:
     uint8_t* d_effect_alpha_b_;
     uint8_t* d_effect_channel_a_;
     uint8_t* d_effect_channel_b_;
+    struct CompositionBuffer { uchar3* color = nullptr; uint8_t* alpha = nullptr; };
+    std::array<CompositionBuffer, 65> composition_buffers_{};
+    std::array<int, 64> composition_targets_{};
+    std::array<int, 64> composition_sources_{};
+    std::array<std::array<int, 8>, 64> composition_image_sources_{};
+    const uchar3* last_effects_color_ = nullptr;
+    const uint8_t* last_effects_alpha_ = nullptr;
     uchar3* d_effect_composite_;
     uchar3* d_effect_composite_b_;
     uint8_t* d_effect_composite_alpha_a_;

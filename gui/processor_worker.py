@@ -14,11 +14,21 @@ import ctypes
 import shutil
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+if __package__:
+    from .cadence_monitor import CadenceMonitor, session_counter
+    from .effect_updates import effect_layer_updates, bypassed_effects_payload
+    from .frame_contracts import ClockTime, FrameMetadata, VideoFormat, snapshot_timecode
+    from .frame_pipeline import StageFrame as _StageFrame, StageFrameQueue as _StageFrameQueue, freeze_frame_bytes as _freeze_frame_bytes
+else:
+    from cadence_monitor import CadenceMonitor, session_counter
+    from effect_updates import effect_layer_updates, bypassed_effects_payload
+    from frame_contracts import ClockTime, FrameMetadata, VideoFormat, snapshot_timecode
+    from frame_pipeline import StageFrame as _StageFrame, StageFrameQueue as _StageFrameQueue, freeze_frame_bytes as _freeze_frame_bytes
 
 _EFFECT_IMAGE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
@@ -33,7 +43,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
         layers = [
             dict(layer)
             for layer in raw_layers
-            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 8
+            if isinstance(layer, dict) and 1 <= int(layer.get("layer_index", 0)) <= 64
         ]
         if layers:
             return sorted(layers, key=lambda layer: int(layer.get("layer_index", 2)))
@@ -87,6 +97,13 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
 
 
 def _set_native_effect_layer_config(processor: object, layer: dict[str, object]) -> None:
+    if hasattr(processor, 'set_effect_layer_composition'):
+        processor.set_effect_layer_composition(int(layer.get('layer_index', 2)), int(layer.get('composite_target', 0)), int(layer.get('composite_source', 0)))
+        sources = {int(image['slot']): int(image.get('composite_source', 0)) for image in layer.get('image_sources', [])}
+        for slot in range(1, 8):
+            processor.set_effect_layer_composition_source(int(layer.get('layer_index', 2)), slot, sources.get(slot, 0))
+    elif layer.get('composite_target') or int(layer.get('layer_index', 2)) > 8:
+        raise RuntimeError('Rebuild the native module to enable composition passes and additional layers')
     key = layer.get("key", {})
     if not isinstance(key, dict):
         key = {}
@@ -368,11 +385,17 @@ class EffectMediaDecoder:
 
 
 class EffectCaptureDecoder:
-    def __init__(self, device_index: int) -> None:
+    def __init__(self, device_index: int, width: int = 0, height: int = 0) -> None:
         if cv2 is None:
             raise RuntimeError("OpenCV is required for Windows camera capture")
         self.device_index = int(device_index)
+        self.width = max(0, int(width))
+        self.height = max(0, int(height))
+        if bool(self.width) != bool(self.height):
+            raise ValueError("Camera width and height must both be set or both use the device default")
         self._capture = None
+        self._capture_lock = threading.RLock()
+        self._backend_name = ""
         self.frame_interval_s = 0.0
         attempted_backends: list[tuple[int, str]] = []
         for backend_name in ("CAP_DSHOW", "CAP_MSMF", "CAP_ANY"):
@@ -381,8 +404,21 @@ class EffectCaptureDecoder:
                 continue
             capture = cv2.VideoCapture(self.device_index, backend)
             if capture.isOpened():
+                if self.width and self.height:
+                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                    actual_width = round(float(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                    actual_height = round(float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                    if actual_width != self.width or actual_height != self.height:
+                        capture.release()
+                        attempted_backends.append((backend, backend_name))
+                        continue
                 capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                capture_fps = float(capture.get(cv2.CAP_PROP_FPS))
+                if math.isfinite(capture_fps) and 1.0 <= capture_fps <= 240.0:
+                    self.frame_interval_s = 1.0 / capture_fps
                 self._capture = capture
+                self._backend_name = backend_name
                 return
             capture.release()
             attempted_backends.append((backend, backend_name))
@@ -391,15 +427,30 @@ class EffectCaptureDecoder:
 
     def next_rgba(self, loop: bool = True) -> np.ndarray:
         del loop
-        ok, frame = self._capture.read()
+        with self._capture_lock:
+            ok, frame = self._capture.read()
         if not ok or frame is None:
             raise RuntimeError(f"Windows camera {self.device_index} did not return a video frame")
         return np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA), dtype=np.uint8)
 
+    def show_settings(self) -> None:
+        if self._backend_name != "CAP_DSHOW":
+            raise RuntimeError(
+                f"Windows camera {self.device_index} is using {self._backend_name}; native settings require DirectShow"
+            )
+        settings_property = getattr(cv2, "CAP_PROP_SETTINGS", None)
+        if settings_property is None:
+            raise RuntimeError("This OpenCV build does not expose Windows camera settings")
+        with self._capture_lock:
+            if self._capture is None or not self._capture.isOpened():
+                raise RuntimeError(f"Windows camera {self.device_index} is not open")
+            self._capture.set(settings_property, 0)
+
     def close(self) -> None:
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
+        with self._capture_lock:
+            if self._capture is not None:
+                self._capture.release()
+                self._capture = None
 
 
 _SUPPORTED_SOURCE_CADENCES = (1, 2, 3, 6, 8)
@@ -1187,17 +1238,6 @@ def _looks_zeroed_uyvy_frame(frame_bytes: bytes) -> bool:
     # Sample sparsely to keep per-frame validation cheap in live mode.
     sample = np.frombuffer(frame_bytes, dtype=np.uint8)[::4096]
     return sample.size > 0 and int(np.count_nonzero(sample)) == 0
-
-
-def _freeze_frame_bytes(frame_bytes: bytes | bytearray | memoryview) -> bytes:
-    """Own pixels before retaining them or handing them to another consumer.
-
-    Even a read-only memoryview can refer to a reusable, mutable native buffer.
-    Already-owned immutable bytes can cross boundaries without another copy.
-    """
-    if isinstance(frame_bytes, bytes):
-        return frame_bytes
-    return bytes(frame_bytes)
 
 
 def _has_effective_subpixel_shift(shift_x: float, shift_y: float) -> bool:
@@ -2384,22 +2424,111 @@ def _create_processor(module: Any, cfg: dict[str, Any]):
     return processor, basic_scaling_method_supported
 
 
+def _video_format_from_mode(entry: object | None) -> VideoFormat:
+    """Describe the current packed worker format, not future format support.
+
+    Missing SDK cadence/scan data stays unknown. In particular, do not derive
+    an exact rate from a rounded mode-name string such as '59.94'.
+    """
+    width = int(getattr(entry, "width", FRAME_W))
+    height = int(getattr(entry, "height", FRAME_H))
+    if (width, height) != (FRAME_W, FRAME_H):
+        raise RuntimeError(
+            f"The current processing path requires {FRAME_W}x{FRAME_H}; "
+            f"received {width}x{height}. Format conversion is not implemented."
+        )
+    duration = int(getattr(entry, "frame_duration", 0))
+    scale = int(getattr(entry, "time_scale", 0))
+    if duration <= 0 or scale <= 0:
+        duration = scale = None
+    dominance = str(getattr(entry, "field_dominance_name", "")).lower()
+    scan, order = "unknown", "unknown"
+    if "progressive" in dominance:
+        scan = "progressive"
+    elif "upper" in dominance:
+        scan, order = "interlaced", "upper_first"
+    elif "lower" in dominance:
+        scan, order = "interlaced", "lower_first"
+    elif "interlac" in dominance:
+        scan = "interlaced"
+    if scan == "unknown":
+        # SDK BMDFieldDominance FourCCs from DeckLinkAPIModes.idl. The current
+        # native wrapper exposes this number, not field_dominance_name.
+        # PsF ('psf ') stays unknown until transport segmentation is modeled.
+        field_modes = {
+            0x6C6F7772: ("interlaced", "lower_first"),
+            0x75707072: ("interlaced", "upper_first"),
+            0x70726F67: ("progressive", "unknown"),
+        }
+        try:
+            scan, order = field_modes.get(int(getattr(entry, "field_dominance", 0)), ("unknown", "unknown"))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return VideoFormat(width, height, width * 2, frame_duration=duration,
+                       time_scale=scale, scan_mode=scan, field_order=order)
+
+
+def _capture_frame_metadata(
+    frame: object,
+    video_format: VideoFormat,
+    capture_sequence: int,
+    source_generation: int,
+    received_monotonic_s: float,
+    pixels_ready_monotonic_s: float,
+    timecode_info: dict[str, object],
+) -> FrameMetadata:
+    def optional_clock(prefix: str, domain: str) -> ClockTime | None:
+        # This wrapper requests both SDK clocks at 1,000,000 ticks/second.
+        # A positive duration distinguishes a valid zero timestamp from the
+        # wrapper's default zeros when the SDK timestamp query failed.
+        try:
+            if int(getattr(frame, prefix + "_duration", 0)) > 0:
+                return ClockTime(int(getattr(frame, prefix + "_time")), 1_000_000, domain)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
+        return None
+
+    try:
+        device_sequence = int(getattr(frame, "sequence"))
+        if device_sequence < 0:
+            device_sequence = None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        device_sequence = None
+    return FrameMetadata(
+        video_format=video_format,
+        capture_sequence=capture_sequence,
+        source_generation=source_generation,
+        received_monotonic_s=received_monotonic_s,
+        pixels_ready_monotonic_s=pixels_ready_monotonic_s,
+        device_sequence=device_sequence,
+        stream_time=optional_clock("stream", "decklink_stream"),
+        hardware_time=optional_clock("hardware", "decklink_hardware"),
+        timecode_info=snapshot_timecode(timecode_info),
+    )
+
+
 def _tight_uyvy_bytes(frame: object) -> bytes:
-    row_bytes = int(frame.row_bytes)
-    if row_bytes < UYVY_ROW_BYTES:
-        raise RuntimeError(f"Captured row_bytes {row_bytes} is smaller than expected {UYVY_ROW_BYTES}")
-
-    raw = memoryview(frame)
-    if row_bytes == UYVY_ROW_BYTES:
-        return raw.tobytes()
-
-    # Vectorized row-tightening avoids Python per-row copy overhead at 1080i60.
-    raw_np = np.frombuffer(raw, dtype=np.uint8)
-    expected_total = row_bytes * FRAME_H
-    if raw_np.size < expected_total:
-        raise RuntimeError(f"Captured frame buffer is smaller than expected ({raw_np.size} < {expected_total})")
-
-    return raw_np[:expected_total].reshape(FRAME_H, row_bytes)[:, :UYVY_ROW_BYTES].tobytes()
+    width = int(getattr(frame, "width", FRAME_W))
+    height = int(getattr(frame, "height", FRAME_H))
+    if (width, height) != (FRAME_W, FRAME_H):
+        raise RuntimeError(f"Unsupported capture dimensions {width}x{height}; expected {FRAME_W}x{FRAME_H}")
+    pixel_format = getattr(frame, "pixel_format", None)
+    expected_pixel_format = getattr(d, "PIXEL_FORMAT_8BIT_YUV", None)
+    if pixel_format is not None and expected_pixel_format is not None and pixel_format != expected_pixel_format:
+        raise RuntimeError("Captured pixel format is not 8-bit UYVY")
+    try:
+        captured_format = VideoFormat(width, height, int(frame.row_bytes))
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid capture layout: {exc}") from exc
+    raw = memoryview(frame).cast("B")
+    expected_total = captured_format.buffer_size
+    if raw.nbytes < expected_total:
+        raise RuntimeError(f"Captured frame buffer is smaller than expected ({raw.nbytes} < {expected_total})")
+    # Ignore extra allocation beyond this frame, for both tight/padded layouts.
+    if captured_format.row_bytes == captured_format.tight_row_bytes:
+        return raw[:expected_total].tobytes()
+    raw_np = np.frombuffer(raw, dtype=np.uint8, count=expected_total)
+    return raw_np.reshape(height, captured_format.row_bytes)[:, :captured_format.tight_row_bytes].tobytes()
 
 
 def _estimate_output_schedule_buffered_frames(state: dict[str, object], now_ts: float | None = None) -> int:
@@ -2425,7 +2554,40 @@ def _estimate_output_schedule_buffered_frames(state: dict[str, object], now_ts: 
     return max(0, int(math.ceil(queued_ticks / float(frame_duration))))
 
 
+def _recover_late_output_schedule(state: dict[str, object], buffered_frames: int, now_ts: float) -> None:
+    """Advance an empty, overdue schedule without stopping device playback.
+
+    The wrapper does not expose the device's scheduled stream clock, so use
+    the host playback epoch conservatively: require a real SDK empty-buffer
+    reading AND at least a whole frame of lateness. Never retime queued frames.
+    """
+    if not state.get("started") or not state.get("can_query_buffered") or buffered_frames != 0:
+        return
+    duration = int(state.get("frame_duration", 0))
+    scale = int(state.get("time_scale", 0))
+    epoch = float(state.get("schedule_epoch_perf_ts", 0.0))
+    if duration <= 0 or scale <= 0 or epoch <= 0:
+        return
+    elapsed_ticks = max(0.0, (now_ts - epoch) * scale)
+    next_time = int(state.get("display_time", 0))
+    if elapsed_ticks - next_time < duration:
+        return
+    # Leave a future presentation slot even at the zero-buffer setting.
+    lead_frames = max(1, min(10, int(state.get("target_buffer_frames", 2))))
+    recovered_time = (math.ceil(elapsed_ticks / duration) + lead_frames) * duration
+    state["display_time"] = recovered_time
+    state["clock_correction_events"] = int(state.get("clock_correction_events", 0)) + 1
+    state["skipped_schedule_slots"] = int(state.get("skipped_schedule_slots", 0)) + (recovered_time - next_time) // duration
+    state["last_clock_resync_ts"] = now_ts
+
+
 def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
+    if len(frame_bytes) != UYVY_ROW_BYTES * FRAME_H:
+        raise RuntimeError(f"Output payload must contain exactly {UYVY_ROW_BYTES * FRAME_H} UYVY bytes")
+    if (int(getattr(out, "width", FRAME_W)), int(getattr(out, "height", FRAME_H))) != (FRAME_W, FRAME_H):
+        raise RuntimeError(f"Output dimensions must match the current {FRAME_W}x{FRAME_H} processing path")
+    if int(out.row_bytes) < UYVY_ROW_BYTES:
+        raise RuntimeError(f"Output row_bytes {out.row_bytes} is smaller than expected {UYVY_ROW_BYTES}")
     out_id = id(out)
     state = _OUTPUT_SCHEDULE_STATE.get(out_id)
     if state is None:
@@ -2526,6 +2688,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                     _reprime_output_schedule(out, reason="local_starvation")
                     state = _OUTPUT_SCHEDULE_STATE.get(out_id, state)
 
+                _recover_late_output_schedule(state, buffered_before, now_ts)
                 display_time = int(state.get("display_time", 0))
                 out.schedule_frame_copy(
                     payload,
@@ -2555,12 +2718,13 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                         should_start = int(state.get("queued_before_start", 0)) >= required_preroll_frames
 
                     if should_start:
+                        playback_epoch = time.perf_counter()
                         out.start_scheduled_playback(0, time_scale, 1.0)
                         state["started"] = True
                         state["queued_before_start"] = 0
-                        state["schedule_epoch_perf_ts"] = now_ts
-                        state["last_clock_resync_ts"] = now_ts
-                        state["last_buffered_count"] = _estimate_output_schedule_buffered_frames(state, now_ts)
+                        state["schedule_epoch_perf_ts"] = playback_epoch
+                        state["last_clock_resync_ts"] = playback_epoch
+                        state["last_buffered_count"] = _estimate_output_schedule_buffered_frames(state, playback_epoch)
                         if frame_period_s > 0.0:
                             state["sync_next_emit_ts"] = 0.0
 
@@ -2678,51 +2842,6 @@ def _normalize_worker_roi(x: int, y: int, w: int, h: int) -> tuple[int, int, int
         roi_x = max(0, max_x & ~1)
 
     return roi_x, roi_y, roi_w, roi_h
-
-
-@dataclass
-class _StageFrame:
-    frame_id: int
-    captured_ts: float
-    input_bytes: bytes | bytearray | memoryview
-    process_start_ts: float = 0.0
-    process_end_ts: float = 0.0
-    output_queue_put_ts: float = 0.0
-    output_dequeue_ts: float = 0.0
-    preprocess_bytes: bytes | bytearray | memoryview | None = None
-    output_bytes: bytes | bytearray | memoryview | None = None
-    shift_x: float = 0.0
-    shift_y: float = 0.0
-    roi_x: int = 0
-    roi_y: int = 0
-    roi_w: int = FRAME_W
-    roi_h: int = FRAME_H
-    basic_scaling_auto_mode: bool = True
-    basic_scaling_manual_scale: int = 4
-    effective_sr_scale: int = 1
-    ai_applied: bool = False
-    rtx_applied: bool = False
-    native_shift_applied: bool = False
-    interlaced_field_phase: dict[str, object] | None = None
-    interlaced_phase_rendered: bool = False
-    roi_motion_trace: dict[str, object] | None = None
-
-
-class _StageFrameQueue(queue.Queue):
-    """Transfer stage frames with owned, immutable pixel payloads.
-
-    A producer may reuse native buffers after put() returns, but must relinquish
-    the frame envelope itself. Freeze in _put so both blocking and nonblocking
-    insertion are safe, and frames rejected by a full queue are not copied.
-    """
-
-    def _put(self, item: _StageFrame) -> None:
-        item.input_bytes = _freeze_frame_bytes(item.input_bytes)
-        if item.preprocess_bytes is not None:
-            item.preprocess_bytes = _freeze_frame_bytes(item.preprocess_bytes)
-        if item.output_bytes is not None:
-            item.output_bytes = _freeze_frame_bytes(item.output_bytes)
-        super()._put(item)
 
 
 def run_processor_worker(
@@ -2938,6 +3057,11 @@ def run_processor_worker(
     upscale_drop_count = 0
     latest_input_frame: bytes | None = None
     latest_output_frame: bytes | None = None
+    latest_input_metadata: FrameMetadata | None = None
+    latest_output_processing_metadata: FrameMetadata | None = None
+    source_generation = 0
+    current_input_format = _video_format_from_mode(None)
+    current_output_format = _video_format_from_mode(None)
     latest_timecode_info: dict[str, object] = {
         "present": False,
         "text": "",
@@ -2973,6 +3097,7 @@ def run_processor_worker(
         except Exception:
             roi_motion_trace_file = None
     output_nominal_fps = 0.0
+    cadence_monitor = CadenceMonitor()
     output_frame_period_s = 0.0
     input_mode_is_interlaced = False
     output_mode_is_interlaced = False
@@ -3150,6 +3275,7 @@ def run_processor_worker(
     current_denoise_method = str(startup_config.get("denoise_method", "off"))
     current_denoise_strength = max(0.0, min(1.0, float(startup_config.get("denoise_strength", 0.35))))
     current_effects_enabled = False
+    configured_effect_layer_indices: set[int] = set()
     effect_media_states: dict[tuple[int, int], dict[str, object]] = {}
     current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 0))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
@@ -3166,23 +3292,22 @@ def run_processor_worker(
         state = effect_media_states.pop(source_key, None)
         if state is None:
             return
-        decoder = state.get("decoder")
         stop_event = state.get("stop")
         decode_thread = state.get("thread")
         if isinstance(stop_event, threading.Event):
             stop_event.set()
         if isinstance(decode_thread, threading.Thread) and decode_thread is not threading.current_thread():
-            decode_thread.join(timeout=0.25)
-            if decode_thread.is_alive() and decoder is not None:
-                decoder.close()
-                decode_thread.join(timeout=1.0)
-        if decoder is not None:
+            decode_thread.join(timeout=1.0)
+        decoder = state.get("decoder")
+        if decoder is not None and not isinstance(decode_thread, threading.Thread):
             decoder.close()
+            state["decoder"] = None
 
     def _start_effect_media_decoder() -> None:
         for source_key, state in effect_media_states.items():
             decoder = state.get("decoder")
-            if decoder is None or not bool(state.get("playing", False)):
+            decoder_factory = state.get("decoder_factory")
+            if (decoder is None and not callable(decoder_factory)) or not bool(state.get("playing", False)):
                 continue
             stop_event = state["stop"]
             frame_ring = state["ring"]
@@ -3195,24 +3320,25 @@ def run_processor_worker(
                     break
             with frame_lock:
                 state["error"] = None
-            state["next_present_ts"] = time.perf_counter() + max(0.0, float(decoder.frame_interval_s))
+            state["next_present_ts"] = time.perf_counter()
 
             def _decode_worker(
                 worker_state: dict[str, object] = state,
-                worker_decoder: EffectMediaDecoder | EffectCaptureDecoder = decoder,
+                worker_decoder: EffectMediaDecoder | EffectCaptureDecoder | None = decoder,
             ) -> None:
                 worker_stop = worker_state["stop"]
                 worker_ring = worker_state["ring"]
                 worker_lock = worker_state["lock"]
-                while not worker_stop.is_set():
-                    try:
-                        rgba = worker_decoder.next_rgba(loop=bool(worker_state.get("loop", True)))
-                    except Exception as exc:
+                try:
+                    if worker_decoder is None:
+                        factory = worker_state.get("decoder_factory")
+                        worker_decoder = factory() if callable(factory) else None
                         with worker_lock:
-                            worker_state["error"] = exc
+                            worker_state["decoder"] = worker_decoder
+                    if worker_decoder is None:
                         return
-                    frame_interval_s = max(0.0, float(worker_decoder.frame_interval_s))
-                    if frame_interval_s <= 0.0:
+                    while not worker_stop.is_set():
+                        rgba = worker_decoder.next_rgba(loop=bool(worker_state.get("loop", True)))
                         if worker_ring.full():
                             try:
                                 worker_ring.get_nowait()
@@ -3222,13 +3348,15 @@ def run_processor_worker(
                             worker_ring.put_nowait(rgba)
                         except queue.Full:
                             pass
-                        continue
-                    while not worker_stop.is_set():
-                        try:
-                            worker_ring.put(rgba, timeout=0.05)
-                            break
-                        except queue.Full:
-                            continue
+                except Exception as exc:
+                    if not worker_stop.is_set():
+                        with worker_lock:
+                            worker_state["error"] = exc
+                finally:
+                    if worker_decoder is not None:
+                        worker_decoder.close()
+                    with worker_lock:
+                        worker_state["decoder"] = None
 
             decode_thread = threading.Thread(
                 target=_decode_worker,
@@ -3243,15 +3371,17 @@ def run_processor_worker(
             return
         for source_key, state in list(effect_media_states.items()):
             layer_index, source_slot = source_key
-            decoder = state.get("decoder")
-            if decoder is None or not bool(state.get("playing", False)):
+            if not bool(state.get("playing", False)):
                 continue
             with state["lock"]:
                 decode_error = state.get("error")
+                decoder = state.get("decoder")
             if decode_error is not None:
                 _stop_effect_media_layer(source_key)
                 processor.set_effect_layer_config(layer_index, False)
                 _safe_put({"type": "warning", "warning": f"Effects layer {layer_index} source stopped: {decode_error}"})
+                continue
+            if decoder is None:
                 continue
             frame_interval_s = max(0.0, float(decoder.frame_interval_s))
             now = time.perf_counter()
@@ -5378,6 +5508,7 @@ def run_processor_worker(
 
     def _start_live_pipeline() -> None:
         nonlocal pipeline_running
+        nonlocal source_generation, latest_input_metadata, latest_output_processing_metadata
         nonlocal q_capture_to_preprocess, q_preprocess_to_upscale, q_upscale_to_output
         nonlocal frame_id_counter, capture_drop_count, preprocess_drop_count, upscale_drop_count
         nonlocal capture_thread, preprocess_thread, upscale_thread, output_thread
@@ -5385,6 +5516,7 @@ def run_processor_worker(
         nonlocal latest_input_frame, latest_output_frame, latest_timecode_info, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
         nonlocal output_nominal_fps, output_frame_period_s, output_mode_is_interlaced, output_transition_units_per_frame
+        nonlocal cadence_monitor
         nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
         nonlocal rtx_effect_sample_counter
         nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
@@ -5405,6 +5537,11 @@ def run_processor_worker(
 
         _stop_live_pipeline()
         pipeline_stop_event.clear()
+        source_generation += 1
+        pipeline_generation = source_generation
+        pipeline_input_format = current_input_format
+        latest_input_metadata = None
+        latest_output_processing_metadata = None
         parallel_basic_processors = []
         parallel_basic_worker_count = 1
         # Effect media/config belongs to the shared processor, not pool clones.
@@ -5455,6 +5592,7 @@ def run_processor_worker(
         else:
             output_frame_period_s = 0.0
             output_nominal_fps = 0.0
+        cadence_monitor = CadenceMonitor(output_frame_period_s, pipeline_generation)
         # Canonical transition cadence is one ROI frame-step per emitted output
         # frame for both progressive and interlaced output. Interlaced field0/
         # field1 in-between timing is synthesized via phase fraction.
@@ -5520,6 +5658,9 @@ def run_processor_worker(
 
             if not emitted:
                 return
+
+            cadence_monitor.submitted(emit_end_ts, (process_end_ts - process_start_ts) * 1000.0,
+                                      (emit_end_ts - emit_start_ts) * 1000.0)
 
             with state_lock:
                 alpha = 0.16
@@ -5672,6 +5813,7 @@ def run_processor_worker(
 
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
+            nonlocal latest_input_metadata, latest_output_processing_metadata
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
             nonlocal latest_timecode_info
@@ -5679,6 +5821,7 @@ def run_processor_worker(
             nonlocal last_stage_preprocess_applied, last_stage_basic_applied, last_stage_ai_applied, last_stage_rtx_applied
             nonlocal last_stage_stack
             assert q_capture_to_preprocess is not None
+            capture_sequence = 0
             while not pipeline_stop_event.is_set():
                 try:
                     frame = capture_session.acquire(timeout_ms=2) if capture_session is not None else None
@@ -5686,6 +5829,8 @@ def run_processor_worker(
                     frame = None
                 if frame is None:
                     continue
+                received_monotonic_s = time.perf_counter()
+                capture_sequence += 1
                 frame_timecode_info = _extract_frame_timecode_info(frame)
                 try:
                     input_bytes = _tight_uyvy_bytes(frame)
@@ -5694,6 +5839,13 @@ def run_processor_worker(
                     continue
                 frame_captured_ts = time.perf_counter()
 
+                # Snapshot source labels before ROI evaluation adds derived
+                # mutable control data (desired_roi) to the legacy UI payload.
+                frame_metadata = _capture_frame_metadata(
+                    frame, pipeline_input_format, capture_sequence, pipeline_generation,
+                    received_monotonic_s, frame_captured_ts, frame_timecode_info,
+                )
+                cadence_monitor.capture(frame_metadata)
                 _apply_timecode_roi_for_capture(frame_timecode_info)
 
                 # Advance transition phase before processing this frame so each
@@ -5708,6 +5860,7 @@ def run_processor_worker(
                 # Keep input preview live even when processing is backlogged.
                 with state_lock:
                     latest_input_frame = input_bytes
+                    latest_input_metadata = frame_metadata
                     latest_timecode_info = dict(frame_timecode_info)
 
                 if _is_live_passthrough_mode():
@@ -5769,6 +5922,8 @@ def run_processor_worker(
                     with state_lock:
                         latest_input_frame = input_bytes
                         latest_output_frame = preview_output
+                        latest_input_metadata = frame_metadata
+                        latest_output_processing_metadata = frame_metadata
                         latest_effective_sr_scale = 1
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
@@ -5800,6 +5955,7 @@ def run_processor_worker(
                             frame_id=next_frame_id,
                             captured_ts=frame_captured_ts,
                             input_bytes=input_bytes,
+                            metadata=frame_metadata,
                             shift_x=float(shift_x),
                             shift_y=float(shift_y),
                             roi_x=int(current_roi_x),
@@ -5913,6 +6069,8 @@ def run_processor_worker(
                     with state_lock:
                         latest_input_frame = input_bytes
                         latest_output_frame = preview_output
+                        latest_input_metadata = frame_metadata
+                        latest_output_processing_metadata = frame_metadata
                         latest_effective_sr_scale = int(processor.get_effective_sr_scale())
                         latest_rtx_vsr_applied = False
                         latest_rtx_effect_mean_abs_luma = 0.0
@@ -5941,6 +6099,7 @@ def run_processor_worker(
                     frame_id=frame_id_counter,
                     captured_ts=frame_captured_ts,
                     input_bytes=input_bytes,
+                    metadata=frame_metadata,
                     shift_x=float(shift_x),
                     shift_y=float(shift_y),
                     roi_x=int(current_roi_x),
@@ -6167,6 +6326,7 @@ def run_processor_worker(
 
         def _output_worker() -> None:
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
+            nonlocal latest_input_metadata, latest_output_processing_metadata
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
             nonlocal rtx_effect_sample_counter
             assert q_upscale_to_output is not None
@@ -6179,6 +6339,7 @@ def run_processor_worker(
 
             def _emit_output_item(item: _StageFrame) -> None:
                 nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
+                nonlocal latest_input_metadata, latest_output_processing_metadata
                 nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
                 nonlocal rtx_effect_sample_counter
 
@@ -6255,6 +6416,8 @@ def run_processor_worker(
                 with state_lock:
                     latest_input_frame = item.input_bytes
                     latest_output_frame = preview_output
+                    latest_input_metadata = item.metadata
+                    latest_output_processing_metadata = item.metadata
                     latest_effective_sr_scale = int(item.effective_sr_scale)
                     latest_rtx_vsr_applied = bool(item.rtx_applied)
                     latest_rtx_effect_mean_abs_luma = sampled_delta
@@ -6697,6 +6860,7 @@ def run_processor_worker(
 
     def _start_sessions(message: dict[str, Any]) -> None:
         nonlocal capture_session, output_session, current_output_buffer_frames, output_mode_is_interlaced
+        nonlocal current_input_format, current_output_format
         nonlocal output_field_dominance_code
         nonlocal output_mode_name, output_mode_value, output_field_dominance_name
         if d is None:
@@ -6781,6 +6945,11 @@ def run_processor_worker(
 
         resolved_in_entry = _resolve_display_mode_entry(int(message["in_device"]), requested_in_mode, input_side=True)
         resolved_out_entry = _resolve_display_mode_entry(int(message["out_device"]), requested_out_mode, input_side=False)
+        # Resolve/validate before replacing running sessions. Automatic input
+        # detection does not expose its negotiated cadence through this wrapper;
+        # do not stamp the requested mode's rate onto an automatically changed feed.
+        requested_input_format = _video_format_from_mode(resolved_in_entry)
+        requested_output_format = _video_format_from_mode(resolved_out_entry)
         resolved_in_mode = getattr(resolved_in_entry, "mode", None)
         resolved_out_mode = getattr(resolved_out_entry, "mode", None)
         if resolved_in_mode is None or resolved_out_mode is None:
@@ -6839,6 +7008,7 @@ def run_processor_worker(
 
         def _open_sessions(enable_format_detection: bool) -> None:
             nonlocal capture_session, output_session
+            nonlocal current_input_format, current_output_format
             _stop_sessions()
 
             selected_timecode_format = int(
@@ -6866,6 +7036,8 @@ def run_processor_worker(
                 capture_session.start()
                 output_session.start()
                 _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
+                current_input_format = _video_format_from_mode(None) if enable_format_detection else requested_input_format
+                current_output_format = requested_output_format
                 _start_live_pipeline()
             except Exception:
                 _stop_sessions()
@@ -7106,6 +7278,8 @@ def run_processor_worker(
                 with state_lock:
                     current_input = latest_input_frame
                     current_output = latest_output_frame
+                    current_input_metadata = latest_input_metadata
+                    current_output_processing_metadata = latest_output_processing_metadata
                     current_scale = int(latest_effective_sr_scale)
                     current_counter = int(processed_frame_counter)
                     current_rtx_applied = bool(latest_rtx_vsr_applied)
@@ -7166,6 +7340,8 @@ def run_processor_worker(
                             "starvation_events": int(out_state.get("starvation_events", 0)),
                             "overflow_events": int(out_state.get("overflow_events", 0)),
                             "auto_reprime_events": int(out_state.get("auto_reprime_events", 0)),
+                            "clock_correction_events": int(out_state.get("clock_correction_events", 0)),
+                            "skipped_schedule_slots": int(out_state.get("skipped_schedule_slots", 0)),
                             "last_reprime_reason": str(out_state.get("last_reprime_reason", "")),
                             "last_reprime_age_ms": (
                                 max(0.0, (time.perf_counter() - float(out_state.get("last_reprime_ts", 0.0))) * 1000.0)
@@ -7180,6 +7356,13 @@ def run_processor_worker(
                 )
                 output_budget_ms = (1000.0 / output_nominal_fps) if output_nominal_fps > 0.0 else 0.0
                 pipeline_timing_health: dict[str, object] = {
+                    # Legacy e2e_* keys remain for GUI compatibility. Their
+                    # interval ends at submission return, NOT display completion.
+                    "measurement_interval": "host_pixels_ready_to_output_submit_return",
+                    "presentation_timing_available": False,
+                    "submission_ms_last": float(timing_e2e_ms_last_snapshot),
+                    "submission_ms_ema": float(timing_e2e_ms_ema_snapshot),
+                    "submission_ms_peak": float(timing_e2e_ms_peak_snapshot),
                     "frames_emitted": int(timing_frames_emitted_snapshot),
                     "output_budget_ms": float(output_budget_ms),
                     "deadline_miss_events": int(timing_deadline_miss_events_snapshot),
@@ -7202,6 +7385,12 @@ def run_processor_worker(
                     "emit_call_ms_ema": float(timing_emit_call_ms_ema_snapshot),
                     "emit_call_ms_peak": float(timing_emit_call_ms_peak_snapshot),
                     "last_path": str(timing_last_path_snapshot),
+                    "cadence": {
+                        **cadence_monitor.snapshot(),
+                        "capture_queue_drops": session_counter(capture_session, 'dropped_frames'),
+                        "output_completion_callbacks": session_counter(output_session, 'completed_frames'),
+                        "effects_enabled": bool(current_effects_enabled),
+                    },
                 }
                 roi_transition_payload: dict[str, object]
                 if isinstance(roi_transition_state_snapshot, dict):
@@ -7318,6 +7507,12 @@ def run_processor_worker(
                     "output_buffer_health": output_schedule_stats,
                     "pipeline_timing_health": pipeline_timing_health,
                     "timecode_info": current_timecode_info,
+                    "input_frame_metadata": current_input_metadata.to_payload() if current_input_metadata is not None else None,
+                    "output_processing_metadata": current_output_processing_metadata.to_payload() if current_output_processing_metadata is not None else None,
+                    # AI holds and temporal effects can use older pixels. This
+                    # identifies the processing input, not all pixel contributors.
+                    "metadata_scope": "processing_input_not_pixel_provenance",
+                    "video_output_format": current_output_format.to_payload(),
                 }
                 if include_frames:
                     payload["input_frame_bytes"] = _freeze_frame_bytes(current_input)
@@ -7711,6 +7906,38 @@ def run_processor_worker(
                 )
                 continue
 
+            if command == "show_capture_settings":
+                device_index = int(message.get("device_index", 0))
+                settings_error: str | None = None
+                temporary_decoder = None
+                decoder = next(
+                    (
+                        state.get("decoder")
+                        for state in effect_media_states.values()
+                        if isinstance(state.get("decoder"), EffectCaptureDecoder)
+                        and int(state["decoder"].device_index) == device_index
+                    ),
+                    None,
+                )
+                try:
+                    if decoder is None:
+                        temporary_decoder = EffectCaptureDecoder(device_index)
+                        decoder = temporary_decoder
+                    decoder.show_settings()
+                except Exception as exc:
+                    settings_error = str(exc)
+                finally:
+                    if temporary_decoder is not None:
+                        temporary_decoder.close()
+                _safe_put(
+                    {
+                        "type": "ack",
+                        "cmd": "show_capture_settings",
+                        "capture_settings_error": settings_error,
+                    }
+                )
+                continue
+
             if command == "set_effects_config":
                 requested_enabled = bool(message.get("enabled", False))
                 reload_source = bool(message.get("reload_source", True))
@@ -7740,7 +7967,23 @@ def run_processor_worker(
                                 ).reshape(1, 1, 4)
                                 processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
                             elif reload_source and capture_kind == "webcam":
-                                decoder = EffectCaptureDecoder(int(layer.get("capture_device_index", 0)))
+                                capture_device_index = int(layer.get("capture_device_index", 0))
+                                capture_width = int(layer.get("capture_width", 0))
+                                capture_height = int(layer.get("capture_height", 0))
+                                effect_media_states[(layer_index, 0)] = {
+                                    "decoder": None,
+                                    "decoder_factory": lambda index=capture_device_index, width=capture_width, height=capture_height: EffectCaptureDecoder(
+                                        index, width, height
+                                    ),
+                                    "playing": True,
+                                    "loop": True,
+                                    "thread": None,
+                                    "stop": threading.Event(),
+                                    "lock": threading.Lock(),
+                                    "ring": queue.Queue(maxsize=1),
+                                    "error": None,
+                                    "next_present_ts": 0.0,
+                                }
                             elif reload_source and media_path:
                                 decoder = EffectMediaDecoder(media_path)
                             if decoder is not None:
@@ -7778,9 +8021,23 @@ def run_processor_worker(
                                         layer_index, source_slot, auxiliary_rgba, 1, 1
                                     )
                                 elif reload_source and auxiliary_capture_kind == "webcam":
-                                    auxiliary_decoder = EffectCaptureDecoder(
-                                        int(image_source.get("capture_device_index", 0))
-                                    )
+                                    auxiliary_device_index = int(image_source.get("capture_device_index", 0))
+                                    auxiliary_width = int(image_source.get("capture_width", 0))
+                                    auxiliary_height = int(image_source.get("capture_height", 0))
+                                    effect_media_states[(layer_index, source_slot)] = {
+                                        "decoder": None,
+                                        "decoder_factory": lambda index=auxiliary_device_index, width=auxiliary_width, height=auxiliary_height: EffectCaptureDecoder(
+                                            index, width, height
+                                        ),
+                                        "playing": True,
+                                        "loop": True,
+                                        "thread": None,
+                                        "stop": threading.Event(),
+                                        "lock": threading.Lock(),
+                                        "ring": queue.Queue(maxsize=1),
+                                        "error": None,
+                                        "next_present_ts": 0.0,
+                                    }
                                 elif reload_source and auxiliary_path:
                                     auxiliary_decoder = EffectMediaDecoder(auxiliary_path)
                                 if auxiliary_decoder is not None:
@@ -7834,15 +8091,16 @@ def run_processor_worker(
                     )
                     _set_native_effects_input_transform(processor, message)
                     layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
-                    for layer_index in range(1, 9):
-                        layer = (
-                            layers_by_index.get(
-                                layer_index, {"layer_index": layer_index, "enabled": False}
-                            )
-                            if requested_enabled
-                            else {"layer_index": layer_index, "enabled": False}
-                        )
+                    if max(layers_by_index, default=0) > 8 and not hasattr(processor, 'set_effect_layer_composition'):
+                        raise RuntimeError('Rebuild the native module to enable more than eight layers')
+                    updates, next_layer_indices = effect_layer_updates(
+                        layers, requested_enabled, configured_effect_layer_indices
+                    )
+                    # Keep cleanup coverage even if a setter fails partway through.
+                    configured_effect_layer_indices.update(next_layer_indices)
+                    for layer in updates:
                         _set_native_effect_layer_config(processor, layer)
+                    configured_effect_layer_indices = next_layer_indices
                     _set_native_color_stages(processor, message)
                     current_effects_enabled = requested_enabled
                     if reload_source:
