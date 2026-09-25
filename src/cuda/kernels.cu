@@ -609,6 +609,52 @@ __device__ inline float CubicWeight(float x) {
     return 0.0f;
 }
 
+// Sample the packed Y, U and V planes directly: bypass zoom must not clip
+// legal YUV values through an 8-bit RGB intermediate at its endpoints.
+__device__ float SamplePackedPlane(const uint8_t* src, int width, int height,
+    float fx, float fy, int channel, bool cubic) {
+    const int pw = channel == 1 ? width : width / 2;
+    const int stride = channel == 1 ? 2 : 4;
+    const int ix = static_cast<int>(floorf(fx)), iy = static_cast<int>(floorf(fy));
+    float sum = 0, total = 0;
+    const int lo = cubic ? -1 : 0, hi = cubic ? 2 : 1;
+    for (int j = lo; j <= hi; ++j) for (int i = lo; i <= hi; ++i) {
+        const float dx = fx - (ix+i), dy = fy - (iy+j);
+        const float weight = cubic ? CubicWeight(dx)*CubicWeight(dy)
+            : fmaxf(0, 1-fabsf(dx))*fmaxf(0, 1-fabsf(dy));
+        const int x = max(0,min(pw-1,ix+i)), y = max(0,min(height-1,iy+j));
+        sum += src[y*width*2 + x*stride + channel]*weight;
+        total += weight;
+    }
+    return sum / fmaxf(total, 1e-6f);
+}
+
+__global__ void UyvyCropZoomFilteredKernel(const uint8_t* src, uint8_t* dst,
+    int width, int height, int rx, int ry, int rw, int rh, int method) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width/2 || y >= height) return;
+    const float fy = ry + (y+.5f)*rh/height - .5f;
+    const bool cubic = method >= 2;
+    const float cx = rx*.5f + (x+.5f)*rw/width - .5f;
+    const int offset = (y*width/2+x)*4;
+    dst[offset] = ClampToU8(roundf(SamplePackedPlane(src,width,height,cx,fy,0,cubic)));
+    dst[offset+2] = ClampToU8(roundf(SamplePackedPlane(src,width,height,cx,fy,2,cubic)));
+    for (int k=0;k<2;++k) {
+        const float fx = rx + (2*x+k+.5f)*rw/width - .5f;
+        float value = SamplePackedPlane(src,width,height,fx,fy,1,cubic);
+        if (method == 1 || method == 3) {
+            const float neighbors = .25f*(SamplePackedPlane(src,width,height,fx-1,fy,1,cubic)
+                + SamplePackedPlane(src,width,height,fx+1,fy,1,cubic)
+                + SamplePackedPlane(src,width,height,fx,fy-1,1,cubic)
+                + SamplePackedPlane(src,width,height,fx,fy+1,1,cubic));
+            const float amount = .6f*fminf(1.0f,fmaxf(0.0f,(float(width)/rw-1.0f)*8.0f));
+            value += amount*(value-neighbors);
+        }
+        dst[offset+1+2*k] = ClampToU8(roundf(value));
+    }
+}
+
 __device__ inline uchar3 SampleBicubic(const uchar3* src, int width, int height, float fx, float fy) {
     const int x = static_cast<int>(floorf(fx));
     const int y = static_cast<int>(floorf(fy));
@@ -1461,7 +1507,9 @@ __global__ void TransformAlpha3DKernel(
     float translate_z,
     float rotate_x,
     float rotate_y,
-    float rotate_z
+    float rotate_z,
+    float aspect_x,
+    float aspect_y
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1489,7 +1537,7 @@ __global__ void TransformAlpha3DKernel(
     const float ty = translate_y / 50.0f;
     // Preserve the original depth curve through +90; extend smoothly to 10x.
     const float tz = translate_z <= 90.0f ? translate_z / 100.0f
-        : 0.9f + (fminf(1000.0f, translate_z) - 90.0f) * (1.8f / 910.0f);
+        : 0.9f + (translate_z - 90.0f) * (1.8f / 910.0f);
     constexpr float camera_distance = 3.0f;
     const float screen_x = ((static_cast<float>(x) + 0.5f) / (0.5f * width)) - 1.0f;
     const float screen_y = ((static_cast<float>(y) + 0.5f) / (0.5f * height)) - 1.0f;
@@ -1506,8 +1554,8 @@ __global__ void TransformAlpha3DKernel(
     const float point_x = ray_t * screen_x - tx;
     const float point_y = ray_t * screen_y - ty;
     const float point_z = camera_distance * (1.0f - ray_t) - tz;
-    const float source_u = r00 * point_x + r10 * point_y + r20 * point_z;
-    const float source_v = r01 * point_x + r11 * point_y + r21 * point_z;
+    const float source_u = (r00 * point_x + r10 * point_y + r20 * point_z) / aspect_x;
+    const float source_v = (r01 * point_x + r11 * point_y + r21 * point_z) / aspect_y;
     const float source_x = (source_u + 1.0f) * 0.5f * width - 0.5f;
     const float source_y = (source_v + 1.0f) * 0.5f * height - 0.5f;
     if (source_x < -0.5f || source_x > static_cast<float>(width) - 0.5f ||
@@ -1532,7 +1580,9 @@ __global__ void TransformColorAlpha3DKernel(
     float translate_z,
     float rotate_x,
     float rotate_y,
-    float rotate_z
+    float rotate_z,
+    float aspect_x,
+    float aspect_y
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1560,7 +1610,7 @@ __global__ void TransformColorAlpha3DKernel(
     const float ty = translate_y / 50.0f;
     // Preserve the original depth curve through +90; extend smoothly to 10x.
     const float tz = translate_z <= 90.0f ? translate_z / 100.0f
-        : 0.9f + (fminf(1000.0f, translate_z) - 90.0f) * (1.8f / 910.0f);
+        : 0.9f + (translate_z - 90.0f) * (1.8f / 910.0f);
     constexpr float camera_distance = 3.0f;
     const float screen_x = ((static_cast<float>(x) + 0.5f) / (0.5f * width)) - 1.0f;
     const float screen_y = ((static_cast<float>(y) + 0.5f) / (0.5f * height)) - 1.0f;
@@ -1579,8 +1629,8 @@ __global__ void TransformColorAlpha3DKernel(
     const float point_x = ray_t * screen_x - tx;
     const float point_y = ray_t * screen_y - ty;
     const float point_z = camera_distance * (1.0f - ray_t) - tz;
-    const float source_u = r00 * point_x + r10 * point_y + r20 * point_z;
-    const float source_v = r01 * point_x + r11 * point_y + r21 * point_z;
+    const float source_u = (r00 * point_x + r10 * point_y + r20 * point_z) / aspect_x;
+    const float source_v = (r01 * point_x + r11 * point_y + r21 * point_z) / aspect_y;
     const float source_x = (source_u + 1.0f) * 0.5f * width - 0.5f;
     const float source_y = (source_v + 1.0f) * 0.5f * height - 0.5f;
     if (source_x < -0.5f || source_x > static_cast<float>(width) - 0.5f ||
@@ -1616,7 +1666,8 @@ __global__ void ApplyProceduralAlphaMaskKernel(
     bool invert,
     float size,
     float position_x,
-    float position_y
+    float position_y,
+    float rotation
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1624,21 +1675,57 @@ __global__ void ApplyProceduralAlphaMaskKernel(
         return;
     }
 
+    if (pattern >= 4 && pattern <= 10) {
+        // Blender-style gradient evaluation on a 2D UV plane (Z = 0).
+        const float aspect_scale = sqrtf(aspect);
+        const float u = ((x + 0.5f) / width - position_x / 100.0f) / (size * aspect_scale);
+        const float v = (1.0f - (y + 0.5f) / height - position_y / 100.0f) * aspect_scale / size;
+        const float linear = fminf(1.0f, fmaxf(0.0f, u));
+        float value = linear;
+        if (pattern == 5) value = linear * linear;
+        else if (pattern == 6) value = linear * linear * (3.0f - 2.0f * linear);
+        else if (pattern == 7) {
+            // Diagonal rotates about the image center without rotating/clipping a texture.
+            const float angle = softness * 6.28318530718f;
+            const float dx = u - 0.5f, dy = v - 0.5f;
+            value = fminf(1.0f, fmaxf(0.0f, 0.5f + 0.5f *
+                (dx * (cosf(angle) - sinf(angle)) + dy * (sinf(angle) + cosf(angle)))));
+        }
+        else if (pattern == 8) {
+            // Circular center-to-edge falloff, corrected for the frame aspect ratio.
+            const float radius = 0.5f * min(width, height);
+            const float dx = (u - 0.5f / (size * aspect_scale)) * width / radius;
+            const float dy = (v - 0.5f * aspect_scale / size) * height / radius;
+            value = fminf(1.0f, sqrtf(dx * dx + dy * dy));
+        }
+        else if (pattern == 9 || pattern == 10) {
+            value = fmaxf(0.0f, 0.999999f - sqrtf(u * u + v * v));
+            if (pattern == 10) value *= value;
+        }
+        if (invert) value = 1.0f - value;
+        const int index = y * width + x;
+        alpha[index] = ClampToU8(static_cast<float>(alpha[index]) * value);
+        return;
+    }
+
     const float base_radius = 0.5f * static_cast<float>(min(width, height)) * size;
     const float aspect_scale = sqrtf(aspect);
     const float center_x = (0.5f + position_x / 100.0f) * width;
     const float center_y = (0.5f + position_y / 100.0f) * height;
-    const float normalized_x = fabsf((static_cast<float>(x) + 0.5f - center_x) / (base_radius * aspect_scale));
-    const float normalized_y = fabsf((static_cast<float>(y) + 0.5f - center_y) * aspect_scale / base_radius);
-
+    const float angle = rotation * 0.01745329251994329577f;
+    const float dx = static_cast<float>(x) + 0.5f - center_x;
+    const float dy = static_cast<float>(y) + 0.5f - center_y;
+    const float local_x = dx * cosf(angle) + dy * sinf(angle);
+    const float local_y = -dx * sinf(angle) + dy * cosf(angle);
+    const float normalized_x = fabsf(local_x / (base_radius * aspect_scale));
+    const float normalized_y = fabsf(local_y * aspect_scale / base_radius);
     float distance = 0.0f;
-    if (pattern == 1) {
-        distance = fmaxf(normalized_x, normalized_y);
-    } else if (pattern == 2) {
-        distance = sqrtf(normalized_x * normalized_x + normalized_y * normalized_y);
-    } else {
-        distance = normalized_x + normalized_y;
-    }
+    if (pattern == 1) distance = fmaxf(normalized_x, normalized_y);
+    else if (pattern == 2) distance = sqrtf(normalized_x * normalized_x + normalized_y * normalized_y);
+    else if (pattern == 11) distance = normalized_x;
+    else if (pattern == 12) distance = normalized_y;
+    else if (pattern == 13) distance = 1.0f - local_y * aspect_scale / base_radius;
+    else distance = normalized_x + normalized_y;
 
     float mask_alpha = distance <= 1.0f ? 1.0f : 0.0f;
     if (softness > 0.0f) {
@@ -1688,6 +1775,9 @@ __global__ void GenerateKeyAlphaKernel(
         const float edge_width = fmaxf(key_softness, 1.0e-6f);
         const float t = fminf(1.0f, fmaxf(0.0f, (distance - key_similarity) / edge_width));
         key_alpha = t * t * (3.0f - 2.0f * t);
+    } else if (key_mode == 3) {
+        const float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
+        key_alpha = fminf(1.0f, fmaxf(0.0f, (luminance - key_similarity) * key_softness));
     } else if (key_mode == 2) {
         const float luminance = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
         const float low_width = fmaxf(luma_softness, 1.0e-6f);
@@ -1701,6 +1791,47 @@ __global__ void GenerateKeyAlphaKernel(
         key_alpha = 1.0f - key_alpha;
     }
     alpha[index] = ClampToU8(static_cast<float>(alpha[index]) * key_alpha);
+}
+
+// Strong blurs run on an area-filtered pyramid level. Both reduced planes
+// fit inside the caller's existing full-size temporary buffer (scale >= 2).
+// This keeps allocations off the frame path and supports input == output.
+template<int Channels>
+__global__ void ReduceBlurKernel(const uint8_t* input, uint8_t* output,
+    int width, int height, int small_width, int small_height, int scale) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= small_width || y >= small_height) return;
+    const int right = min(width, (x + 1) * scale);
+    const int bottom = min(height, (y + 1) * scale);
+    const int count = (right - x * scale) * (bottom - y * scale);
+    for (int c = 0; c < Channels; ++c) {
+        float sum = 0;
+        for (int sy = y * scale; sy < bottom; ++sy)
+            for (int sx = x * scale; sx < right; ++sx)
+                sum += input[(sy * width + sx) * Channels + c];
+        output[(y * small_width + x) * Channels + c] = ClampToU8(sum / count);
+    }
+}
+
+template<int Channels>
+__global__ void ExpandBlurKernel(const uint8_t* input, uint8_t* output,
+    int width, int height, int small_width, int small_height, int scale) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float fx = fmaxf(0, fminf(small_width - 1.0f, (x + 0.5f) / scale - 0.5f));
+    const float fy = fmaxf(0, fminf(small_height - 1.0f, (y + 0.5f) / scale - 0.5f));
+    const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
+    const int x1 = min(x0 + 1, small_width - 1), y1 = min(y0 + 1, small_height - 1);
+    const float tx = fx - x0, ty = fy - y0;
+    for (int c = 0; c < Channels; ++c) {
+        const float top = input[(y0 * small_width + x0) * Channels + c] * (1-tx)
+                        + input[(y0 * small_width + x1) * Channels + c] * tx;
+        const float bottom = input[(y1 * small_width + x0) * Channels + c] * (1-tx)
+                           + input[(y1 * small_width + x1) * Channels + c] * tx;
+        output[(y * width + x) * Channels + c] = ClampToU8(top * (1-ty) + bottom * ty);
+    }
 }
 
 __device__ inline float BlurSampleWeight(int offset, float radius, int method) {
@@ -2619,13 +2750,15 @@ void LaunchTransformAlpha3D(
     float rotate_x,
     float rotate_y,
     float rotate_z,
+    float aspect_x,
+    float aspect_y,
     cudaStream_t stream
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     TransformAlpha3DKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_input, d_output, width, height, translate_x, translate_y, translate_z,
-        rotate_x, rotate_y, rotate_z
+        rotate_x, rotate_y, rotate_z, aspect_x, aspect_y
     );
     CheckKernelLaunch("TransformAlpha3DKernel launch");
 }
@@ -2643,13 +2776,15 @@ void LaunchTransformColorAlpha3D(
     float rotate_x,
     float rotate_y,
     float rotate_z,
+    float aspect_x,
+    float aspect_y,
     cudaStream_t stream
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     TransformColorAlpha3DKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_input_color, d_input_alpha, d_output_color, d_output_alpha, width, height,
-        translate_x, translate_y, translate_z, rotate_x, rotate_y, rotate_z
+        translate_x, translate_y, translate_z, rotate_x, rotate_y, rotate_z, aspect_x, aspect_y
     );
     CheckKernelLaunch("TransformColorAlpha3DKernel launch");
 }
@@ -2670,6 +2805,7 @@ void LaunchApplyProceduralAlphaMask(
     float size,
     float position_x,
     float position_y,
+    float rotation,
     cudaStream_t stream
 ) {
     constexpr int kBlockX = 16;
@@ -2678,7 +2814,7 @@ void LaunchApplyProceduralAlphaMask(
         d_alpha, width, height, pattern, softness, aspect, invert,
         fmaxf(0.1f, fminf(4.0f, size)),
         fmaxf(-100.0f, fminf(100.0f, position_x)),
-        fmaxf(-100.0f, fminf(100.0f, position_y))
+        fmaxf(-100.0f, fminf(100.0f, position_y)), rotation
     );
     CheckKernelLaunch("ApplyProceduralAlphaMaskKernel launch");
 }
@@ -2707,6 +2843,13 @@ void LaunchGenerateKeyAlpha(
     CheckKernelLaunch("GenerateKeyAlphaKernel launch");
 }
 
+void LaunchUyvyCropZoomFiltered(const uint8_t* input, uint8_t* output,
+    int width, int height, int x, int y, int w, int h, int method, cudaStream_t stream) {
+    UyvyCropZoomFilteredKernel<<<Grid2D(width/2,height,16,16),dim3(16,16),0,stream>>>(
+        input,output,width,height,x,y,w,h,method);
+    CheckKernelLaunch("UyvyCropZoomFiltered launch");
+}
+
 void LaunchBlurColor(
     const uchar3* d_input,
     uchar3* d_temp,
@@ -2719,7 +2862,28 @@ void LaunchBlurColor(
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
-    const float clamped_radius = fmaxf(0.01f, fminf(16.0f, radius));
+    const float clamped_radius = fmaxf(0.01f, fminf(128.0f, radius));
+    if (clamped_radius > 16.0f) {
+        const int scale = static_cast<int>(ceilf(clamped_radius / 16.0f));
+        const int sw = (width + scale - 1) / scale, sh = (height + scale - 1) / scale;
+        if (2 * sw * sh <= width * height) {
+            uchar3* reduced = d_temp;
+            uchar3* scratch = d_temp + sw * sh;
+            ReduceBlurKernel<3><<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(d_input), reinterpret_cast<uint8_t*>(reduced), width, height, sw, sh, scale);
+            CheckKernelLaunch("ReduceBlurColor launch");
+            BlurColorHorizontalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                reduced, scratch, sw, sh, clamped_radius / scale, method);
+            CheckKernelLaunch("ReducedBlurColorHorizontal launch");
+            BlurColorVerticalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                scratch, reduced, sw, sh, clamped_radius / scale, method);
+            CheckKernelLaunch("ReducedBlurColorVertical launch");
+            ExpandBlurKernel<3><<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(reduced), reinterpret_cast<uint8_t*>(d_output), width, height, sw, sh, scale);
+            CheckKernelLaunch("ExpandBlurColor launch");
+            return;
+        }
+    }
     BlurColorHorizontalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_input, d_temp, width, height, clamped_radius, method
     );
@@ -2742,7 +2906,28 @@ void LaunchBlurAlpha(
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
-    const float clamped_radius = fmaxf(0.01f, fminf(16.0f, radius));
+    const float clamped_radius = fmaxf(0.01f, fminf(128.0f, radius));
+    if (clamped_radius > 16.0f) {
+        const int scale = static_cast<int>(ceilf(clamped_radius / 16.0f));
+        const int sw = (width + scale - 1) / scale, sh = (height + scale - 1) / scale;
+        if (2 * sw * sh <= width * height) {
+            uint8_t* reduced = d_temp;
+            uint8_t* scratch = d_temp + sw * sh;
+            ReduceBlurKernel<1><<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(d_input), reinterpret_cast<uint8_t*>(reduced), width, height, sw, sh, scale);
+            CheckKernelLaunch("ReduceBlurAlpha launch");
+            BlurAlphaHorizontalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                reduced, scratch, sw, sh, clamped_radius / scale, method);
+            CheckKernelLaunch("ReducedBlurAlphaHorizontal launch");
+            BlurAlphaVerticalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                scratch, reduced, sw, sh, clamped_radius / scale, method);
+            CheckKernelLaunch("ReducedBlurAlphaVertical launch");
+            ExpandBlurKernel<1><<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
+                reinterpret_cast<const uint8_t*>(reduced), reinterpret_cast<uint8_t*>(d_output), width, height, sw, sh, scale);
+            CheckKernelLaunch("ExpandBlurAlpha launch");
+            return;
+        }
+    }
     BlurAlphaHorizontalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_input, d_temp, width, height, clamped_radius, method
     );

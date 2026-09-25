@@ -1,4 +1,8 @@
 {
+  "active_input_sources": [
+    1,
+    2
+  ],
   "ai_sr_detail_preserve_percent": 100.0,
   "ai_sr_enabled": false,
   "ai_sr_inference_divisor": 1,
@@ -24,16 +28,16 @@
   "basic_scaling_mode": "Auto",
   "color_range": "Limited (Video)",
   "color_space": "Rec.2020 HLG (HDR)",
-  "decklink_auto_detect": true,
-  "decklink_enable_format_detection": false,
-  "decklink_fps_priority_guard": false,
+  "decklink_auto_detect": false,
+  "decklink_enable_format_detection": true,
+  "decklink_fps_priority_guard": true,
   "decklink_input_device": 1,
-  "decklink_input_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
-  "decklink_output_buffer_frames": 1,
+  "decklink_input_mode_text": "1080i59.94 (1920x1080, 29.97fps)",
+  "decklink_output_buffer_frames": 3,
   "decklink_output_device": 0,
   "decklink_output_mode_text": "1080p59.94 (1920x1080, 59.94fps)",
   "decklink_timecode_format": "RP188 LTC",
-  "decklink_timecode_phase_mode": "source_cadence",
+  "decklink_timecode_phase_mode": "strict",
   "deinterlace_enabled": false,
   "deinterlace_method": "Bob (Fast)",
   "denoise_method": "Off",
@@ -43,7 +47,7 @@
     366
   ],
   "effects_graph": {
-    "clock_source": "External Timecode",
+    "clock_source": "Internal",
     "duration": 1,
     "editor_version": 2,
     "frame_rate": 60.0,
@@ -62,6 +66,12 @@
           "layer8_alpha"
         ],
         [
+          "media_1",
+          "output",
+          "keying_1",
+          "layer2_color"
+        ],
+        [
           "mask_2",
           "alpha_output",
           "keying_1",
@@ -74,57 +84,33 @@
           "input"
         ],
         [
+          "effects_input",
+          "output",
+          "proc_amp_1",
+          "input"
+        ],
+        [
           "proc_amp_1",
           "output",
           "keying_1",
           "layer1_color"
-        ],
-        [
-          "effects_input",
-          "output",
-          "transform_3d_1",
-          "input"
-        ],
-        [
-          "media_1",
-          "output",
-          "color_splitter_3",
-          "input"
-        ],
-        [
-          "color_splitter_3",
-          "green_output",
-          "keying_1",
-          "layer4_alpha"
-        ],
-        [
-          "transform_3d_1",
-          "output",
-          "keying_1",
-          "layer4_color"
-        ],
-        [
-          "effects_input",
-          "output",
-          "proc_amp_1",
-          "input"
         ]
       ],
-      "enabled": true,
+      "enabled": false,
       "nodes": [
         {
           "id": "effects_input",
           "settings": {},
           "type": "effects_input",
-          "x": 13,
+          "x": 12,
           "y": 0
         },
         {
           "id": "effects_output",
           "settings": {},
           "type": "effects_output",
-          "x": 2122,
-          "y": 224
+          "x": 1332,
+          "y": 288
         },
         {
           "id": "keying_1",
@@ -136,7 +122,7 @@
             "layer3_blend_mode": "normal",
             "layer3_opacity": 0,
             "layer4_blend_mode": "normal",
-            "layer4_opacity": 1,
+            "layer4_opacity": 0,
             "layer5_blend_mode": "normal",
             "layer5_opacity": 0,
             "layer6_blend_mode": "normal",
@@ -149,8 +135,8 @@
             "runtime_supported": true
           },
           "type": "keying",
-          "x": 1364,
-          "y": 106
+          "x": 888,
+          "y": 132
         },
         {
           "id": "mask_1",
@@ -158,14 +144,16 @@
             "aspect": 1.66,
             "invert": true,
             "pattern": "circle",
+            "rotation": 0.0,
             "size": 1.37,
             "softness": 0.4,
+            "transparency": 0.0,
             "x": 0,
             "y": 0
           },
           "type": "mask",
           "x": 0,
-          "y": 586
+          "y": 445
         },
         {
           "id": "matte_1",
@@ -177,33 +165,33 @@
           },
           "type": "matte",
           "x": 0,
-          "y": 436
+          "y": 310
         },
         {
           "id": "proc_amp_1",
           "settings": {
-            "brightness": 0.72,
-            "contrast": 2.79,
-            "hue": 64.0,
+            "brightness": 0.4,
+            "contrast": 1.97,
+            "hue": 0,
             "invert": false,
-            "saturation": 0.0
+            "saturation": 1.17
           },
           "type": "proc_amp",
-          "x": 485,
-          "y": 237
+          "x": 490,
+          "y": 44
         },
         {
           "id": "media_1",
           "settings": {
             "loop": true,
             "opacity": 1,
-            "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
+            "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
             "playing": true,
             "runtime_supported": true
           },
           "type": "media",
-          "x": 0,
-          "y": 221
+          "x": 4,
+          "y": 142
         },
         {
           "id": "mask_2",
@@ -211,133 +199,28 @@
             "aspect": 2.42,
             "invert": true,
             "pattern": "circle",
+            "rotation": 0.0,
             "size": 0.98,
             "softness": 0.57,
+            "transparency": 0.0,
             "x": 0,
             "y": 0
           },
           "type": "mask",
-          "x": 860,
-          "y": 56
-        },
-        {
-          "id": "transform_3d_1",
-          "settings": {
-            "rotate_x": 0,
-            "rotate_y": 0,
-            "rotate_z": 0,
-            "x": -0.4,
-            "y": 0,
-            "z": 27
-          },
-          "type": "transform_3d",
-          "x": 490,
-          "y": 47
-        },
-        {
-          "id": "matte_2",
-          "settings": {
-            "alpha": 1,
-            "blue": 255,
-            "green": 255,
-            "red": 255
-          },
-          "type": "matte",
-          "x": 78,
-          "y": 173
-        },
-        {
-          "id": "color_splitter_3",
-          "settings": {},
-          "type": "color_splitter",
-          "x": 549,
-          "y": 379
+          "x": 392,
+          "y": 282
         }
       ],
       "version": 6
     },
     "keyframes": {
-      "color_splitter_3": {
-        "0": {}
-      },
-      "effects_input": {
-        "0": {}
-      },
-      "keying_1": {
-        "0": {
-          "layer1_blend_mode": "normal",
-          "layer1_opacity": 1,
-          "layer2_blend_mode": "screen",
-          "layer2_opacity": 0.7,
-          "layer3_blend_mode": "normal",
-          "layer3_opacity": 0,
-          "layer4_blend_mode": "normal",
-          "layer4_opacity": 1,
-          "layer5_blend_mode": "normal",
-          "layer5_opacity": 0,
-          "layer6_blend_mode": "normal",
-          "layer6_opacity": 0,
-          "layer7_blend_mode": "normal",
-          "layer7_opacity": 0,
-          "layer8_blend_mode": "normal",
-          "layer8_opacity": 0.72,
-          "layer_count": 8,
-          "runtime_supported": true
-        }
-      },
-      "mask_2": {
-        "0": {
-          "aspect": 2.42,
-          "invert": true,
-          "pattern": "circle",
-          "size": 0.98,
-          "softness": 0.57,
-          "x": 0,
-          "y": 0
-        }
-      },
-      "matte_1": {
-        "0": {
-          "alpha": 1,
-          "blue": 0,
-          "green": 0,
-          "red": 0
-        }
-      },
-      "matte_2": {
-        "0": {
-          "alpha": 1,
-          "blue": 255,
-          "green": 255,
-          "red": 255
-        }
-      },
-      "media_1": {
-        "0": {
-          "loop": true,
-          "opacity": 1,
-          "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
-          "playing": true,
-          "runtime_supported": true
-        }
-      },
       "proc_amp_1": {
         "0": {
-          "brightness": 0.72,
-          "contrast": 2.79,
+          "brightness": 0.4,
+          "contrast": 1.97,
           "hue": 0,
           "invert": false,
-          "saturation": 0
-        }
-      },
-      "transform_3d_1": {
-        "0": {
-          "rotate_x": 0,
-          "rotate_y": 0,
-          "rotate_z": 0,
-          "x": -0.4,
-          "y": 0,
-          "z": 27
+          "saturation": 1.17
         }
       }
     },
@@ -3190,7 +3073,7 @@
               "settings": {
                 "capture_height": 1080,
                 "capture_width": 1920,
-                "device_index": "webcam:0",
+                "device_index": "source:2",
                 "device_name": "Windows Camera: HP Wide Vision 5MP Camera"
               },
               "type": "capture",
@@ -3217,6 +3100,910 @@
         "keyframes": {},
         "name": "webcam test",
         "thumbnail": "iVBORw0KGgoAAAANSUhEUgAAAKAAAAAkCAIAAACBjKa0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAADZUlEQVR4nO2ayVMTQRTGv+7pCSYhgSxMCJsG0LIsyypKcTl49391uXnyAAcPeolVXigXCGsCJmESBUJm6fYwVYjSKhPJCE3/bsmbb2Y6X0/P65dHKKWUUpwazjmAUBIhhBAiAgnn3DCMvkoA+L5/gSRsfGIym81SStvtryP5bLlc/vNZKKVCCEIIgGza/CW63/G7LpcKA0koQkmCg/stCY6/QBJmWdb4xBSAgtM9eb5SaXryaokx1mw2Z2dKz589PQpZmdiDx0+6Xaderxeskfl7cwDKbxdevnoT6rbOCiHEf7nuOYe17N1cNgNgeWU1nRDF4o8Y58hljHQ65Xl+KpUCd9NpcA7fhxAwTcRMEzCmrpYGYmZz96vBGPCXSffg4aNgqjGDbm1tViqVvg5Pw9bW1tbX16UxSpGONw6cSrEw0mrZwtn1fQBgDIwhX+CHe19aTiKeH2vvta/PDp/mepY1SgihhuG6jm3bZzgSjRRmmmYsFgs+eJ7nOM5RjHMsr7cZW/r8cQkA59zzIAQSCQwPi+ommb8/nXYNMpi5QiTuUgrLAqXgHEJACJ8Q8r78ur3PS9emAGxvb0cyxksNm7s7n0ymKKVdp2tSLC4uHA9Pz8yOjk1SQhqNxs0bsy9ePIvHMTSEjQ1SyJLC6PjRmtxqtZc+fEqSVrEIzjkhRAiysxNYCyFAaZDg1QG8s5tRD/Sywg47na7jcd8/6HRmJgePv4MBjI+yocxQIp4wDBpj7tgYXFdUqzi5f0mlBu/cvrX03q7VAITY3pwVhBCdZ52EffvWzufyruCp5MDqRqtW+ylMeM1MHI7kcvVGc2cL1SqEIIDkdzQMI5lMsJBbN02/YZWVldXfp7LVHRuw1yorUd5Tb+jHVwrrWel6wu80fvmye3jwb/ejOWMIYyxUxSSyumMEEgCc87CSi1Wq/A/ZkCZK1DG4h1r3ZUAdgzVStMGKow1WHHUM1vtgKeoYrJGijsE6i5bCfN/voScrFD1Igm6pcysJO5kik+DERGdhm+6CP236LQnaviKQIGQDYUBYSQ8ltt4kkkrWZV7Zemhsu3Dod7DiqGOw3iZJUcdgjRR1DNZLtBR1DNZI0QYrjjZYcdQxWGfRUtQxWCNFHYN1Fi1FHYP1Ei1FHYP1EyxFHYM1Ur4D6V+ZzR8OI0oAAAAASUVORK5CYII="
+      },
+      {
+        "duration": 1,
+        "graph": {
+          "connections": [
+            [
+              "keying_2",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "effects_input",
+              "output",
+              "keying_2",
+              "layer1_color"
+            ],
+            [
+              "mask_1",
+              "alpha_output",
+              "mix_2",
+              "b_input"
+            ],
+            [
+              "media_3",
+              "output",
+              "mix_2",
+              "a_input"
+            ],
+            [
+              "mix_2",
+              "alpha_output",
+              "keying_2",
+              "layer3_alpha"
+            ],
+            [
+              "media_3",
+              "output",
+              "keying_2",
+              "layer3_color"
+            ],
+            [
+              "effects_input",
+              "output",
+              "blur_3",
+              "input"
+            ],
+            [
+              "blur_3",
+              "output",
+              "keying_2",
+              "layer2_color"
+            ],
+            [
+              "blur_3",
+              "output",
+              "keying_2",
+              "layer2_alpha"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 12,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 1226,
+              "y": 286
+            },
+            {
+              "id": "keying_2",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1.0,
+                "layer2_blend_mode": "normal",
+                "layer2_opacity": 0.63,
+                "layer3_blend_mode": "normal",
+                "layer3_opacity": 0.59,
+                "layer_count": 3,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 770,
+              "y": 94
+            },
+            {
+              "id": "media_3",
+              "settings": {
+                "loop": true,
+                "opacity": 1.0,
+                "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+                "playing": true,
+                "runtime_supported": true
+              },
+              "type": "media",
+              "x": 0,
+              "y": 236
+            },
+            {
+              "id": "mask_1",
+              "settings": {
+                "aspect": 1.71,
+                "invert": false,
+                "pattern": "circle",
+                "size": 1.49,
+                "softness": 0.54,
+                "transparency": 0.0,
+                "x": 0.0,
+                "y": 0.0
+              },
+              "type": "mask",
+              "x": 62,
+              "y": 411
+            },
+            {
+              "id": "mix_2",
+              "settings": {
+                "factor": 0.868,
+                "mode": "subtract"
+              },
+              "type": "mix",
+              "x": 388,
+              "y": 380
+            },
+            {
+              "id": "blur_3",
+              "settings": {
+                "method": "gaussian",
+                "radius": 16.0,
+                "target": "both"
+              },
+              "type": "blur",
+              "x": 362,
+              "y": 148
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {
+          "blur_3": {
+            "0": {
+              "method": "gaussian",
+              "radius": 16.0,
+              "target": "both"
+            }
+          },
+          "effects_input": {
+            "0": {}
+          },
+          "keying_2": {
+            "0": {
+              "layer1_blend_mode": "normal",
+              "layer1_opacity": 1.0,
+              "layer2_blend_mode": "normal",
+              "layer2_opacity": 0.63,
+              "layer3_blend_mode": "normal",
+              "layer3_opacity": 0.59,
+              "layer_count": 3,
+              "runtime_supported": true
+            }
+          },
+          "mask_1": {
+            "0": {
+              "aspect": 1.71,
+              "invert": false,
+              "pattern": "circle",
+              "size": 1.49,
+              "softness": 0.54,
+              "transparency": 0.0,
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "media_3": {
+            "0": {
+              "loop": true,
+              "opacity": 1.0,
+              "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+              "playing": true,
+              "runtime_supported": true
+            }
+          },
+          "mix_2": {
+            "0": {
+              "factor": 0.868,
+              "mode": "subtract"
+            }
+          }
+        },
+        "name": "flare_3d",
+        "thumbnail": "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"
+      },
+      {
+        "duration": 234,
+        "graph": {
+          "connections": [
+            [
+              "matte_1",
+              "output",
+              "keying_1",
+              "layer8_color"
+            ],
+            [
+              "keying_1",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "mask_1",
+              "alpha_output",
+              "keying_1",
+              "layer8_alpha"
+            ],
+            [
+              "media_1",
+              "output",
+              "keying_1",
+              "layer2_color"
+            ],
+            [
+              "mask_2",
+              "alpha_output",
+              "keying_1",
+              "layer2_alpha"
+            ],
+            [
+              "effects_input",
+              "output",
+              "keying_1",
+              "layer1_color"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 0,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 1225,
+              "y": 285
+            },
+            {
+              "id": "keying_1",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1,
+                "layer2_blend_mode": "soft_light",
+                "layer2_opacity": 0.4,
+                "layer3_blend_mode": "additive_alpha",
+                "layer3_opacity": 1,
+                "layer4_blend_mode": "normal",
+                "layer4_opacity": 0,
+                "layer5_blend_mode": "normal",
+                "layer5_opacity": 0.79,
+                "layer6_blend_mode": "normal",
+                "layer6_opacity": 1,
+                "layer7_blend_mode": "normal",
+                "layer7_opacity": 0,
+                "layer8_blend_mode": "normal",
+                "layer8_opacity": 1,
+                "layer_count": 8,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 645,
+              "y": 33
+            },
+            {
+              "id": "mask_1",
+              "settings": {
+                "aspect": 1.66,
+                "invert": true,
+                "pattern": "circle",
+                "size": 1.37,
+                "softness": 0.4,
+                "transparency": 0.0,
+                "x": 0,
+                "y": 0
+              },
+              "type": "mask",
+              "x": 35,
+              "y": 473
+            },
+            {
+              "id": "matte_1",
+              "settings": {
+                "alpha": 1,
+                "blue": 0,
+                "green": 0,
+                "red": 0
+              },
+              "type": "matte",
+              "x": 25,
+              "y": 324
+            },
+            {
+              "id": "media_1",
+              "settings": {
+                "loop": true,
+                "opacity": 1,
+                "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+                "playing": true,
+                "runtime_supported": true
+              },
+              "type": "media",
+              "x": 0,
+              "y": 136
+            },
+            {
+              "id": "mask_2",
+              "settings": {
+                "aspect": 1.76,
+                "invert": true,
+                "pattern": "circle",
+                "size": 1.22,
+                "softness": 0.33,
+                "transparency": 54.2,
+                "x": 0,
+                "y": 0
+              },
+              "type": "mask",
+              "x": 331,
+              "y": 178
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {
+          "effects_input": {
+            "0": {}
+          },
+          "effects_output": {
+            "0": {}
+          },
+          "keying_1": {
+            "0": {
+              "layer1_blend_mode": "normal",
+              "layer1_opacity": 1,
+              "layer2_blend_mode": "soft_light",
+              "layer2_opacity": 0.4,
+              "layer3_blend_mode": "additive_alpha",
+              "layer3_opacity": 1,
+              "layer4_blend_mode": "normal",
+              "layer4_opacity": 0,
+              "layer5_blend_mode": "normal",
+              "layer5_opacity": 0.79,
+              "layer6_blend_mode": "normal",
+              "layer6_opacity": 1,
+              "layer7_blend_mode": "normal",
+              "layer7_opacity": 0,
+              "layer8_blend_mode": "normal",
+              "layer8_opacity": 1,
+              "layer_count": 8,
+              "runtime_supported": true
+            },
+            "130": {
+              "layer1_blend_mode": "soft_light",
+              "layer1_opacity": 1,
+              "layer2_blend_mode": "screen",
+              "layer2_opacity": 0.4,
+              "layer3_blend_mode": "normal",
+              "layer3_opacity": 1,
+              "layer4_blend_mode": "normal",
+              "layer4_opacity": 0,
+              "layer5_blend_mode": "normal",
+              "layer5_opacity": 0.79,
+              "layer6_blend_mode": "normal",
+              "layer6_opacity": 1,
+              "layer7_blend_mode": "normal",
+              "layer7_opacity": 0,
+              "layer8_blend_mode": "normal",
+              "layer8_opacity": 0,
+              "layer_count": 8,
+              "runtime_supported": true
+            },
+            "44": {
+              "layer1_blend_mode": "soft_light",
+              "layer1_opacity": 1,
+              "layer2_blend_mode": "screen",
+              "layer2_opacity": 0.4,
+              "layer3_blend_mode": "normal",
+              "layer3_opacity": 1,
+              "layer4_blend_mode": "normal",
+              "layer4_opacity": 0,
+              "layer5_blend_mode": "normal",
+              "layer5_opacity": 0.79,
+              "layer6_blend_mode": "normal",
+              "layer6_opacity": 1,
+              "layer7_blend_mode": "normal",
+              "layer7_opacity": 0,
+              "layer8_blend_mode": "normal",
+              "layer8_opacity": 1,
+              "layer_count": 8,
+              "runtime_supported": true
+            }
+          },
+          "mask_1": {
+            "0": {
+              "aspect": 1.66,
+              "invert": true,
+              "pattern": "circle",
+              "size": 1.37,
+              "softness": 0.4,
+              "transparency": 0.0,
+              "x": 0,
+              "y": 0
+            }
+          },
+          "mask_2": {
+            "0": {
+              "aspect": 1.76,
+              "invert": true,
+              "pattern": "circle",
+              "size": 1.22,
+              "softness": 0.33,
+              "transparency": 54.2,
+              "x": 0,
+              "y": 0
+            }
+          },
+          "matte_1": {
+            "0": {
+              "alpha": 1,
+              "blue": 0,
+              "green": 0,
+              "red": 0
+            },
+            "1": {
+              "alpha": 1,
+              "blue": 0,
+              "green": 0,
+              "red": 0
+            },
+            "10": {
+              "alpha": 1,
+              "blue": 0,
+              "green": 0,
+              "red": 0
+            },
+            "188": {
+              "alpha": 1,
+              "blue": 0,
+              "green": 0,
+              "red": 0
+            },
+            "233": {
+              "alpha": 1,
+              "blue": 0,
+              "green": 0,
+              "red": 0
+            },
+            "9": {
+              "alpha": 1,
+              "blue": 0,
+              "green": 0,
+              "red": 0
+            }
+          },
+          "media_1": {
+            "0": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": true,
+              "runtime_supported": true
+            },
+            "1": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "runtime_supported": true
+            },
+            "10": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "runtime_supported": true
+            },
+            "16": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": true,
+              "runtime_supported": true
+            },
+            "18": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": true,
+              "runtime_supported": true
+            },
+            "188": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": false,
+              "runtime_supported": true
+            },
+            "20": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": true,
+              "runtime_supported": true
+            },
+            "22": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "runtime_supported": true
+            },
+            "233": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "runtime_supported": true
+            },
+            "27": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": false,
+              "runtime_supported": true
+            },
+            "32": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": true,
+              "runtime_supported": true
+            },
+            "9": {
+              "loop": true,
+              "opacity": 1,
+              "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+              "playing": true,
+              "runtime_supported": true
+            }
+          }
+        },
+        "name": "flares",
+        "thumbnail": "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"
+      },
+      {
+        "duration": 1,
+        "graph": {
+          "connections": [
+            [
+              "keying_2",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "effects_input",
+              "output",
+              "keying_2",
+              "layer1_color"
+            ],
+            [
+              "mask_1",
+              "alpha_output",
+              "mix_2",
+              "b_input"
+            ],
+            [
+              "media_3",
+              "output",
+              "mix_2",
+              "a_input"
+            ],
+            [
+              "mix_2",
+              "alpha_output",
+              "keying_2",
+              "layer3_alpha"
+            ],
+            [
+              "media_3",
+              "output",
+              "keying_2",
+              "layer3_color"
+            ],
+            [
+              "effects_input",
+              "output",
+              "blur_3",
+              "input"
+            ],
+            [
+              "blur_3",
+              "output",
+              "proc_amp_1",
+              "input"
+            ],
+            [
+              "proc_amp_1",
+              "output",
+              "keying_2",
+              "layer2_alpha"
+            ],
+            [
+              "blur_3",
+              "output",
+              "keying_2",
+              "layer2_color"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 12,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 1823,
+              "y": 314
+            },
+            {
+              "id": "keying_2",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 0.99,
+                "layer2_blend_mode": "normal",
+                "layer2_opacity": 1.0,
+                "layer3_blend_mode": "normal",
+                "layer3_opacity": 0.59,
+                "layer_count": 3,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 1381,
+              "y": 55
+            },
+            {
+              "id": "media_3",
+              "settings": {
+                "loop": true,
+                "opacity": 1.0,
+                "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+                "playing": true,
+                "runtime_supported": true
+              },
+              "type": "media",
+              "x": 0,
+              "y": 236
+            },
+            {
+              "id": "mask_1",
+              "settings": {
+                "aspect": 1.71,
+                "invert": false,
+                "pattern": "circle",
+                "size": 1.49,
+                "softness": 0.54,
+                "transparency": 0.0,
+                "x": 0.0,
+                "y": 0.0
+              },
+              "type": "mask",
+              "x": 62,
+              "y": 411
+            },
+            {
+              "id": "mix_2",
+              "settings": {
+                "factor": 0.868,
+                "mode": "subtract"
+              },
+              "type": "mix",
+              "x": 388,
+              "y": 380
+            },
+            {
+              "id": "blur_3",
+              "settings": {
+                "method": "gaussian",
+                "radius": 94.25,
+                "target": "both"
+              },
+              "type": "blur",
+              "x": 325,
+              "y": 95
+            },
+            {
+              "id": "proc_amp_1",
+              "settings": {
+                "brightness": -0.11,
+                "contrast": 4.0,
+                "hue": -66.0,
+                "invert": false,
+                "saturation": 0.0
+              },
+              "type": "proc_amp",
+              "x": 693,
+              "y": 142
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {
+          "blur_3": {
+            "0": {
+              "method": "gaussian",
+              "radius": 94.25,
+              "target": "both"
+            }
+          },
+          "effects_input": {
+            "0": {}
+          },
+          "effects_output": {
+            "0": {}
+          },
+          "keying_2": {
+            "0": {
+              "layer1_blend_mode": "normal",
+              "layer1_opacity": 0.99,
+              "layer2_blend_mode": "normal",
+              "layer2_opacity": 1.0,
+              "layer3_blend_mode": "normal",
+              "layer3_opacity": 0.59,
+              "layer_count": 3,
+              "runtime_supported": true
+            }
+          },
+          "mask_1": {
+            "0": {
+              "aspect": 1.71,
+              "invert": false,
+              "pattern": "circle",
+              "size": 1.49,
+              "softness": 0.54,
+              "transparency": 0.0,
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "media_3": {
+            "0": {
+              "loop": true,
+              "opacity": 1.0,
+              "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+              "playing": true,
+              "runtime_supported": true
+            }
+          },
+          "mix_2": {
+            "0": {
+              "factor": 0.868,
+              "mode": "subtract"
+            }
+          },
+          "proc_amp_1": {
+            "0": {
+              "brightness": -0.11,
+              "contrast": 4.0,
+              "hue": -66.0,
+              "invert": false,
+              "saturation": 0.0
+            }
+          }
+        },
+        "name": "glow",
+        "thumbnail": "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"
+      },
+      {
+        "duration": 1,
+        "graph": {
+          "connections": [
+            [
+              "effects_input",
+              "output",
+              "transform_3d_1",
+              "input"
+            ],
+            [
+              "transform_3d_1",
+              "output",
+              "keying_1",
+              "layer1_color"
+            ],
+            [
+              "keying_1",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "mask_1",
+              "alpha_output",
+              "keying_1",
+              "layer2_alpha"
+            ],
+            [
+              "matte_2",
+              "output",
+              "keying_1",
+              "layer2_color"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 11,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 1226,
+              "y": 286
+            },
+            {
+              "id": "transform_3d_1",
+              "settings": {
+                "aspect_x": 1.0,
+                "aspect_y": 1.0,
+                "rotate_x": 0.0,
+                "rotate_y": 0.0,
+                "rotate_z": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "type": "transform_3d",
+              "x": 330,
+              "y": 71
+            },
+            {
+              "id": "mask_1",
+              "settings": {
+                "aspect": 1.0,
+                "invert": true,
+                "pattern": "barndoor_horizontal",
+                "rotation": 0.0,
+                "size": 0.81,
+                "softness": 0.0,
+                "transparency": 0.0,
+                "x": 0.0,
+                "y": 0.0
+              },
+              "type": "mask",
+              "x": 134,
+              "y": 369
+            },
+            {
+              "id": "keying_1",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1.0,
+                "layer2_blend_mode": "normal",
+                "layer2_opacity": 1.0,
+                "layer_count": 2,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 726,
+              "y": 100
+            },
+            {
+              "id": "matte_2",
+              "settings": {
+                "alpha": 1.0,
+                "blue": 0.0,
+                "green": 0.0,
+                "red": 0.0
+              },
+              "type": "matte",
+              "x": 63,
+              "y": 224
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {},
+        "name": "letterbox",
+        "thumbnail": "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"
       }
     ]
   },
@@ -3224,14 +4011,77 @@
   "fullscreen_scale_presets": [
     250,
     300,
-    400
+    600
   ],
-  "fullscreen_selected_scale_index": 1,
+  "fullscreen_selected_scale_index": 0,
+  "input_sources": [
+    {
+      "device": "decklink:1",
+      "device_name": "UltraStudio Recorder 3G [UltraStudio Recorder 3G]",
+      "format_detection": true,
+      "logical_id": 1,
+      "mode": "1215313209",
+      "mode_text": "1080p59.94",
+      "name": "decklink",
+      "timecode_format": 1919970420,
+      "timecode_phase": "strict"
+    },
+    {
+      "device": "webcam:0",
+      "device_name": "Windows Camera: HP Wide Vision 5MP Camera",
+      "fps": 30,
+      "height": 1080,
+      "logical_id": 2,
+      "name": "webcam",
+      "width": 1920
+    },
+    {
+      "device": "",
+      "logical_id": 3,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 4,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 5,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 6,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 7,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 8,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 9,
+      "name": ""
+    },
+    {
+      "device": "",
+      "logical_id": 10,
+      "name": ""
+    }
+  ],
   "interlaced_field2_phase_fraction": 0.25,
   "main_splitter_sizes": [
     326,
     1070
   ],
+  "output_active": true,
   "perf_guard_enabled": false,
   "preview_downsample": "Full (1:1)",
   "preview_poll_fps": 30,
@@ -3245,10 +4095,10 @@
       "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        710,
-        521,
-        480,
-        270
+        648,
+        354,
+        640,
+        360
       ]
     },
     "2": {
@@ -3262,13 +4112,13 @@
       ]
     },
     "3": {
-      "duration_frames": 22,
+      "duration_frames": 40,
       "interpolation_mode": "ease_in_out",
       "roi": [
-        1220,
-        22,
-        410,
-        231
+        16,
+        10,
+        1884,
+        1060
       ]
     },
     "4": {
@@ -3283,10 +4133,10 @@
     }
   },
   "roi_keyframing_mode": "manual",
-  "roi_manual_drag_hold_s": 0.4,
+  "roi_manual_drag_hold_s": 0.05,
   "roi_timecode_keyframes": [],
   "roi_timecode_playback_enabled": false,
-  "roi_transition_duration_frames": 40,
+  "roi_transition_duration_frames": 44,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,
@@ -3299,5 +4149,5 @@
   "scaling_mode": "Standard CUDA Scaling",
   "source_mode": "Blackmagic DeckLink",
   "version": 1,
-  "worker_process_priority": "Normal"
+  "worker_process_priority": "High"
 }

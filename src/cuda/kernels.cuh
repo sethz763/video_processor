@@ -314,6 +314,8 @@ void LaunchTransformAlpha3D(
     float rotate_x,
     float rotate_y,
     float rotate_z,
+    float aspect_x,
+    float aspect_y,
     cudaStream_t stream
 );
 
@@ -330,6 +332,8 @@ void LaunchTransformColorAlpha3D(
     float rotate_x,
     float rotate_y,
     float rotate_z,
+    float aspect_x,
+    float aspect_y,
     cudaStream_t stream
 );
 
@@ -347,6 +351,7 @@ void LaunchApplyProceduralAlphaMask(
     float size,
     float position_x,
     float position_y,
+    float rotation,
     cudaStream_t stream
 );
 
@@ -365,6 +370,9 @@ void LaunchGenerateKeyAlpha(
     bool key_invert,
     cudaStream_t stream
 );
+
+void LaunchUyvyCropZoomFiltered(const uint8_t* input, uint8_t* output,
+    int width, int height, int x, int y, int w, int h, int method, cudaStream_t stream);
 
 void LaunchBlurColor(
     const uchar3* d_input,

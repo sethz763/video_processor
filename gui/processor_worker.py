@@ -20,13 +20,25 @@ from typing import Any
 import numpy as np
 
 if __package__:
-    from .cadence_monitor import CadenceMonitor, session_counter
+    from .preview_mailbox import PreviewMailbox
+    from .input_sources import SourcePool
+    from .roi_source import RoiSourceSession, rgb_to_uyvy
+    from .roi_warmup import warmup_roi_scaling
+    from .capture_adapters import create_input_adapter
+    from .cadence_monitor import CadenceMonitor, CounterRate, session_counter
     from .effect_updates import effect_layer_updates, bypassed_effects_payload
+    from .effect_decode_queue import enqueue_effect_frame
     from .frame_contracts import ClockTime, FrameMetadata, VideoFormat, snapshot_timecode
     from .frame_pipeline import StageFrame as _StageFrame, StageFrameQueue as _StageFrameQueue, freeze_frame_bytes as _freeze_frame_bytes
 else:
-    from cadence_monitor import CadenceMonitor, session_counter
+    from preview_mailbox import PreviewMailbox
+    from input_sources import SourcePool
+    from roi_source import RoiSourceSession, rgb_to_uyvy
+    from roi_warmup import warmup_roi_scaling
+    from capture_adapters import create_input_adapter
+    from cadence_monitor import CadenceMonitor, CounterRate, session_counter
     from effect_updates import effect_layer_updates, bypassed_effects_payload
+    from effect_decode_queue import enqueue_effect_frame
     from frame_contracts import ClockTime, FrameMetadata, VideoFormat, snapshot_timecode
     from frame_pipeline import StageFrame as _StageFrame, StageFrameQueue as _StageFrameQueue, freeze_frame_bytes as _freeze_frame_bytes
 
@@ -86,12 +98,15 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "mask_size": float(payload.get("mask_size", 1.0)),
             "mask_x": float(payload.get("mask_x", 0.0)),
             "mask_y": float(payload.get("mask_y", 0.0)),
+            "mask_rotation": float(payload.get("mask_rotation", 0.0)),
             "transform_x": float(payload.get("transform_x", 0.0)),
             "transform_y": float(payload.get("transform_y", 0.0)),
             "transform_z": float(payload.get("transform_z", 0.0)),
             "rotate_x": float(payload.get("rotate_x", 0.0)),
             "rotate_y": float(payload.get("rotate_y", 0.0)),
             "rotate_z": float(payload.get("rotate_z", 0.0)),
+            "aspect_x": float(payload.get("aspect_x", 1.0)),
+            "aspect_y": float(payload.get("aspect_y", 1.0)),
         }
     ]
 
@@ -142,12 +157,15 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
         mask_size=float(layer.get("mask_size", 1.0)),
         mask_x=float(layer.get("mask_x", 0.0)),
         mask_y=float(layer.get("mask_y", 0.0)),
+        mask_rotation=float(layer.get("mask_rotation", 0.0)),
         transform_x=float(layer.get("transform_x", 0.0)),
         transform_y=float(layer.get("transform_y", 0.0)),
         transform_z=float(layer.get("transform_z", 0.0)),
         rotate_x=float(layer.get("rotate_x", 0.0)),
         rotate_y=float(layer.get("rotate_y", 0.0)),
         rotate_z=float(layer.get("rotate_z", 0.0)),
+        aspect_x=float(layer.get("aspect_x", 1.0)),
+        aspect_y=float(layer.get("aspect_y", 1.0)),
         materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
     )
     layer_index = int(layer.get("layer_index", 2))
@@ -184,6 +202,8 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
                 rotate_x=float(route.get("rotate_x", 0.0)),
                 rotate_y=float(route.get("rotate_y", 0.0)),
                 rotate_z=float(route.get("rotate_z", 0.0)),
+                aspect_x=float(route.get("aspect_x", 1.0)),
+                aspect_y=float(route.get("aspect_y", 1.0)),
                 generator_type=str(route.get("generator_type", "off")),
                 key_color_r=int(generator_settings.get("key_color_r", 0)),
                 key_color_g=int(generator_settings.get("key_color_g", 255)),
@@ -198,6 +218,7 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
                 mask_size=float(generator_settings.get("size", 1.0)),
                 mask_x=float(generator_settings.get("x", 0.0)),
                 mask_y=float(generator_settings.get("y", 0.0)),
+                mask_rotation=float(generator_settings.get("rotation", 0.0)),
             )
             route_alpha_mix_setter = getattr(processor, "set_effect_layer_channel_alpha_mix", None)
             route_alpha_mix_base = route.get("alpha_mix_base")
@@ -241,6 +262,8 @@ def _set_native_effects_input_transform(processor: object, payload: dict[str, ob
         float(payload.get("input_rotate_x", 0.0)),
         float(payload.get("input_rotate_y", 0.0)),
         float(payload.get("input_rotate_z", 0.0)),
+        float(payload.get("input_aspect_x", 1.0)),
+        float(payload.get("input_aspect_y", 1.0)),
     )
     setter = getattr(processor, "set_effects_input_transform", None)
     if not callable(setter):
@@ -429,6 +452,7 @@ class EffectCaptureDecoder:
         del loop
         with self._capture_lock:
             ok, frame = self._capture.read()
+        self.last_received_monotonic_s = time.perf_counter()
         if not ok or frame is None:
             raise RuntimeError(f"Windows camera {self.device_index} did not return a video frame")
         return np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA), dtype=np.uint8)
@@ -1108,7 +1132,11 @@ except Exception:
     ort = None
 
 try:
-    import decklink_wrapper as d
+    if __package__:
+        from .decklink_backend import load_decklink_backend
+    else:
+        from decklink_backend import load_decklink_backend
+    d = load_decklink_backend()
 except Exception:
     d = None
 
@@ -2554,14 +2582,45 @@ def _estimate_output_schedule_buffered_frames(state: dict[str, object], now_ts: 
     return max(0, int(math.ceil(queued_ticks / float(frame_duration))))
 
 
-def _recover_late_output_schedule(state: dict[str, object], buffered_frames: int, now_ts: float) -> None:
-    """Advance an empty, overdue schedule without stopping device playback.
+def _refresh_output_schedule_clock(out: object, state: dict[str, object]) -> None:
+    """Map the SDK's playback clock to perf_counter, not StartPlayback return.
 
-    The wrapper does not expose the device's scheduled stream clock, so use
-    the host playback epoch conservatively: require a real SDK empty-buffer
-    reading AND at least a whole frame of lateness. Never retime queued frames.
+    Device startup and host scheduling delays make a fixed host epoch drift
+    from the real output slots. Keep each sample's query duration visible.
     """
-    if not state.get("started") or not state.get("can_query_buffered") or buffered_frames != 0:
+    query = getattr(out, "scheduled_stream_time", None)
+    scale = int(state.get("time_scale", 0))
+    if not state.get("started") or not callable(query) or scale <= 0:
+        state.setdefault("clock_source", "host_estimate")
+        return
+    before = time.perf_counter()
+    try:
+        stream_ticks = int(query(scale))
+    except Exception as exc:
+        state["clock_query_errors"] = int(state.get("clock_query_errors", 0)) + 1
+        state["clock_last_error"] = str(exc)
+        state["clock_source"] = "device_sample_stale" if str(state.get("clock_source", "")).startswith("device") else "host_estimate"
+        return
+    after = time.perf_counter()
+    midpoint = (before + after) * 0.5
+    measured_epoch = midpoint - stream_ticks / scale
+    previous = float(state.get("schedule_epoch_perf_ts", measured_epoch))
+    state["clock_epoch_adjustment_ms_last"] = (measured_epoch - previous) * 1000.0
+    state["schedule_epoch_perf_ts"] = measured_epoch
+    state["clock_source"] = "device"
+    state["clock_stream_ticks"] = stream_ticks
+    state["clock_query_ms_last"] = (after - before) * 1000.0
+    state["clock_query_ms_peak"] = max(float(state.get("clock_query_ms_peak", 0.0)), state["clock_query_ms_last"])
+
+
+def _recover_late_output_schedule(state: dict[str, object], buffered_frames: int, now_ts: float) -> None:
+    """Advance an overdue submission timestamp without stopping playback.
+
+    Buffered frames can still be pending completion after their scheduled time.
+    They must not prevent recovery of the next, as-yet-unscheduled frame.
+    Never retime queued frames or add a second latency allowance.
+    """
+    if not state.get("started") or not state.get("can_query_buffered"):
         return
     duration = int(state.get("frame_duration", 0))
     scale = int(state.get("time_scale", 0))
@@ -2570,7 +2629,18 @@ def _recover_late_output_schedule(state: dict[str, object], buffered_frames: int
         return
     elapsed_ticks = max(0.0, (now_ts - epoch) * scale)
     next_time = int(state.get("display_time", 0))
-    if elapsed_ticks - next_time < duration:
+    if int(state.get("target_buffer_frames", 2)) > 0:
+        # Ignore sub-microsecond floating-point noise at an exact boundary.
+        if elapsed_ticks <= next_time + scale * 0.000001:
+            return
+        # Recover into the next slot, never N additional safety frames.
+        recovered_time = max(next_time, math.ceil(elapsed_ticks / duration) * duration)
+        if recovered_time > next_time:
+            state["display_time"] = recovered_time
+            state["clock_correction_events"] = int(state.get("clock_correction_events", 0)) + 1
+            state["skipped_schedule_slots"] = int(state.get("skipped_schedule_slots", 0)) + (recovered_time - next_time) // duration
+        return
+    if buffered_frames != 0 or elapsed_ticks - next_time < duration:
         return
     # Leave a future presentation slot even at the zero-buffer setting.
     lead_frames = max(1, min(10, int(state.get("target_buffer_frames", 2))))
@@ -2581,7 +2651,53 @@ def _recover_late_output_schedule(state: dict[str, object], buffered_frames: int
     state["last_clock_resync_ts"] = now_ts
 
 
-def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
+def _wait_for_output_capacity(out: object, stop_event: threading.Event) -> bool:
+    """Apply backpressure before capture/ROI advancement in the direct path.
+
+    There is one producer for this path, so an available slot stays available
+    while it renders. Waiting here avoids spending an animation step on a frame
+    that the bounded output scheduler would subsequently discard.
+    """
+    state = _OUTPUT_SCHEDULE_STATE.get(id(out))
+    if not state or not state.get("enabled") or not state.get("started") or not state.get("can_query_buffered"):
+        return not stop_event.is_set()
+    target = int(state.get("target_buffer_frames", 2))
+    limit = max(1, target)
+    while not stop_event.is_set():
+        buffered = session_counter(out, "buffered_video_frame_count")
+        if buffered is None:
+            if target > 0:
+                raise RuntimeError("Absolute latency mode requires the DeckLink buffered frame count")
+            state["can_query_buffered"] = False
+            return True
+        state["last_buffered_count"] = int(buffered)
+        if buffered < limit:
+            _refresh_output_schedule_clock(out, state)
+            # A queue can contain fewer than N frames yet extend farther than
+            # N frame periods into the future (startup/recovery gaps). Admit
+            # capture only once the next presentation slot fits the same budget.
+            scale = int(state.get("time_scale", 0))
+            duration = int(state.get("frame_duration", 0))
+            epoch = float(state.get("schedule_epoch_perf_ts", 0.0))
+            if target <= 0 or scale <= 0 or duration <= 0 or epoch <= 0:
+                return True
+            next_slot_ts = epoch + int(state.get("display_time", 0)) / scale
+            if next_slot_ts <= time.perf_counter() + target * duration / scale + 1e-9:
+                return True
+        state["capacity_wait_polls"] = int(state.get("capacity_wait_polls", 0)) + 1
+        # Windows Event.wait uses a coarse timeout (~15.6 ms on this host),
+        # consuming almost the entire 59.94 Hz render budget after a slot opens.
+        # Python 3.12 sleep uses a high-resolution timer and releases the GIL.
+        # Check cancellation on each short poll instead of sleeping a frame.
+        wait_started = time.perf_counter()
+        time.sleep(0.001)
+        wait_ms = (time.perf_counter() - wait_started) * 1000.0
+        state["capacity_poll_ms_last"] = wait_ms
+        state["capacity_poll_ms_peak"] = max(float(state.get("capacity_poll_ms_peak", 0.0)), wait_ms)
+    return False
+
+
+def _write_frame_to_output(out: object, frame_bytes: bytes, *, captured_ts: float | None = None) -> bool:
     if len(frame_bytes) != UYVY_ROW_BYTES * FRAME_H:
         raise RuntimeError(f"Output payload must contain exactly {UYVY_ROW_BYTES * FRAME_H} UYVY bytes")
     if (int(getattr(out, "width", FRAME_W)), int(getattr(out, "height", FRAME_H))) != (FRAME_W, FRAME_H):
@@ -2593,14 +2709,14 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
     if state is None:
         schedule_fn = getattr(out, "schedule_frame_copy", None)
         start_fn = getattr(out, "start_scheduled_playback", None)
-        buffered_fn = getattr(out, "buffered_video_frame_count", None)
+        buffered_count = session_counter(out, "buffered_video_frame_count")
         frame_duration = int(getattr(out, "frame_duration", 0)) if hasattr(out, "frame_duration") else 0
         time_scale = int(getattr(out, "time_scale", 0)) if hasattr(out, "time_scale") else 0
         frame_period_s = (float(frame_duration) / float(time_scale)) if frame_duration > 0 and time_scale > 0 else 0.0
         target_buffer_frames = max(0, min(10, int(_OUTPUT_SCHEDULE_TARGET_BUFFER_FRAMES.get(out_id, 2))))
         state = {
             "enabled": callable(schedule_fn) and callable(start_fn),
-            "can_query_buffered": callable(buffered_fn),
+            "can_query_buffered": buffered_count is not None,
             "started": False,
             "queued_before_start": 0,
             "display_time": 0,
@@ -2624,6 +2740,11 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
             "scheduled_frames": 0,
         }
         _OUTPUT_SCHEDULE_STATE[out_id] = state
+
+    strict = int(state.get("target_buffer_frames", 2)) > 0
+    if strict and (not state.get("enabled") or not state.get("can_query_buffered")
+                   or float(state.get("frame_period_s", 0.0)) <= 0):
+        raise RuntimeError("Absolute latency mode requires scheduled output, its frame rate, and its buffered frame count")
 
     if out.row_bytes == UYVY_ROW_BYTES:
         payload = frame_bytes
@@ -2649,15 +2770,26 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
         frame_period_s = float(state.get("frame_period_s", 0.0))
         if frame_duration > 0 and time_scale > 0:
             try:
+                _refresh_output_schedule_clock(out, state)
                 now_ts = time.perf_counter()
                 target_start_frames = max(0, min(10, int(state.get("target_buffer_frames", 2))))
                 buffered_before = _estimate_output_schedule_buffered_frames(state, now_ts)
                 if bool(state.get("can_query_buffered", False)):
                     try:
-                        buffered_before = max(0, int(out.buffered_video_frame_count()))
+                        buffered_before = max(0, int(session_counter(out, "buffered_video_frame_count")))
                     except Exception:
+                        if strict:
+                            raise
                         state["can_query_buffered"] = False
                 state["last_buffered_count"] = buffered_before
+
+                # Bound latency when capture/processing runs ahead of playback.
+                # Do not keep allocating SDK frames into an already full queue;
+                # retain its ordered frames and resume with fresh input as it drains.
+                if ((state.get("started") or strict) and state.get("can_query_buffered")
+                        and buffered_before >= max(1, target_start_frames)):
+                    state["queue_throttle_events"] = int(state.get("queue_throttle_events", 0)) + 1
+                    return False
 
                 if bool(state.get("started", False)) and buffered_before <= 0:
                     state["starved_streak"] = int(state.get("starved_streak", 0)) + 1
@@ -2688,27 +2820,49 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                     _reprime_output_schedule(out, reason="local_starvation")
                     state = _OUTPUT_SCHEDULE_STATE.get(out_id, state)
 
-                _recover_late_output_schedule(state, buffered_before, now_ts)
+                # Buffer queries can block in the driver. Recover against the
+                # time after those calls, not the pre-query timestamp.
+                _recover_late_output_schedule(state, buffered_before, time.perf_counter())
                 display_time = int(state.get("display_time", 0))
+                budget_s = max(1, target_start_frames) * frame_period_s
+                if strict and not state.get("started"):
+                    # Start the device clock on the first frame; do not hold
+                    # an unstarted preroll queue waiting for later captures.
+                    # This lead is INSIDE the N-frame total budget.
+                    lead = target_start_frames - 1
+                    if captured_ts is not None:
+                        remaining = captured_ts + budget_s - time.perf_counter()
+                        lead = min(lead, max(0, math.floor(remaining / frame_period_s)))
+                    display_time = lead * frame_duration
+                if strict and captured_ts is not None:
+                    # Admission uses the mapped playback clock, not a measured
+                    # physical presentation time. Include planned schedule wait.
+                    ready_ts = time.perf_counter()
+                    planned_ts = (float(state["schedule_epoch_perf_ts"]) + display_time / time_scale
+                                  if state.get("started") else ready_ts + display_time / time_scale)
+                    age_ms = max(0.0, max(ready_ts, planned_ts) - captured_ts) * 1000.0
+                    state["strict_frame_age_ms_last"] = age_ms
+                    if age_ms > budget_s * 1000.0 + 1e-6:
+                        state["latency_drop_events"] = int(state.get("latency_drop_events", 0)) + 1
+                        return False
+                    state["accepted_frame_age_ms_last"] = age_ms
+                    state["accepted_frame_age_ms_peak"] = max(float(state.get("accepted_frame_age_ms_peak", 0.0)), age_ms)
                 out.schedule_frame_copy(
                     payload,
                     display_time,
                     frame_duration,
                     time_scale,
                 )
-                state["display_time"] = int(state.get("display_time", 0)) + frame_duration
+                state["display_time"] = display_time + frame_duration
                 state["scheduled_frames"] = int(state.get("scheduled_frames", 0)) + 1
 
                 if not bool(state.get("started", False)):
                     state["queued_before_start"] = int(state.get("queued_before_start", 0)) + 1
-                    # Playback begins at stream time zero, consuming the first
-                    # scheduled frame immediately. Queue that presentation frame
-                    # in addition to the requested retained buffer depth.
-                    required_preroll_frames = max(1, target_start_frames + 1)
+                    required_preroll_frames = 1
                     should_start = False
                     if bool(state.get("can_query_buffered", False)):
                         try:
-                            buffered_count = int(out.buffered_video_frame_count())
+                            buffered_count = int(session_counter(out, "buffered_video_frame_count"))
                             queued_before_start = int(state.get("queued_before_start", 0))
                             effective_buffered = max(buffered_count, queued_before_start)
                             should_start = effective_buffered >= required_preroll_frames
@@ -2734,7 +2888,7 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                             return True
 
                         if bool(state.get("can_query_buffered", False)):
-                            buffered_count = int(out.buffered_video_frame_count())
+                            buffered_count = int(session_counter(out, "buffered_video_frame_count"))
                         else:
                             buffered_count = _estimate_output_schedule_buffered_frames(state, time.perf_counter())
                         state["last_buffered_count"] = buffered_count
@@ -2777,6 +2931,10 @@ def _write_frame_to_output(out: object, frame_bytes: bytes) -> bool:
                         state["can_query_buffered"] = False
                 return True
             except Exception:
+                if strict:
+                    # Never silently replace the bounded policy with blocking
+                    # output when the SDK cannot uphold it.
+                    raise
                 # Fall back to blocking output if scheduling path errors at runtime.
                 state["enabled"] = False
 
@@ -2807,19 +2965,27 @@ def _reprime_output_schedule(out: object, reason: str = "manual") -> None:
         return
 
     stop_fn = getattr(out, "stop_scheduled_playback", None)
+    strict = int(state.get("target_buffer_frames", 2)) > 0
+    if strict and state.get("started") and not callable(stop_fn):
+        raise RuntimeError("Cannot change absolute latency without stopping the previous output schedule")
     if callable(stop_fn):
         try:
             stop_fn()
         except Exception:
+            if strict:
+                raise
             pass
 
     state["started"] = False
     state["queued_before_start"] = 0
     state["display_time"] = 0
     state["schedule_epoch_perf_ts"] = 0.0
+    state["clock_source"] = "host_estimate"
     state["sync_next_emit_ts"] = 0.0
     state["starved_streak"] = 0
     state["overflow_streak"] = 0
+    for key in ("latency_drop_events", "strict_frame_age_ms_last", "accepted_frame_age_ms_last", "accepted_frame_age_ms_peak"):
+        state[key] = 0
     state["last_reprime_reason"] = str(reason)
     state["last_reprime_ts"] = time.perf_counter()
 
@@ -2852,6 +3018,7 @@ def run_processor_worker(
     roi_telemetry_seq=None,
     manual_roi_mailbox_shared=None,
     manual_roi_mailbox_seq=None,
+    preview_mailbox=None,
 ) -> None:
     _FRAME_MESSAGE_TYPES = {"frame", "decklink_frame", "decklink_no_frame"}
     _CONTROL_MESSAGE_TYPES = {"ready", "ack", "warning", "error"}
@@ -2884,9 +3051,21 @@ def run_processor_worker(
         process_method_name: str,
         process_into_method_name: str,
         reusable_output: bytearray | None,
+        timing_details: dict[str, float] | None = None,
     ) -> bytes | bytearray:
         method = getattr(processor, process_method_name)
         if reusable_output is not None and hasattr(processor, process_into_method_name):
+            timed_method = getattr(processor, "process_frame_into_timed", None)
+            if timing_details is not None and callable(timed_method) and process_method_name in (
+                "process_frame", "process_frame_no_deinterlace"
+            ):
+                native_ms, gil_ms, copy_ms = timed_method(
+                    frame_bytes, reusable_output, process_method_name == "process_frame_no_deinterlace"
+                )
+                timing_details.update(native_work_ms=round(native_ms, 3),
+                                      gil_reacquire_ms=round(gil_ms, 3),
+                                      output_copy_ms=round(copy_ms, 3))
+                return reusable_output
             into_method = getattr(processor, process_into_method_name)
             into_method(frame_bytes, reusable_output)
             return reusable_output
@@ -3060,7 +3239,6 @@ def run_processor_worker(
     latest_input_metadata: FrameMetadata | None = None
     latest_output_processing_metadata: FrameMetadata | None = None
     source_generation = 0
-    current_input_format = _video_format_from_mode(None)
     current_output_format = _video_format_from_mode(None)
     latest_timecode_info: dict[str, object] = {
         "present": False,
@@ -3073,6 +3251,8 @@ def run_processor_worker(
     latest_rtx_effect_mean_abs_luma = 0.0
     rtx_effect_sample_counter = 0
     processed_frame_counter = 0
+    processed_rate = CounterRate()
+    presentation_rate = CounterRate()
     started_perf_ts = 0.0
     roi_motion_trace_enabled = os.environ.get("VP_ROI_MOTION_TRACE", "0") == "1"
     roi_motion_trace_file = None
@@ -3269,6 +3449,12 @@ def run_processor_worker(
         float(startup_config.get("interlaced_field2_phase_fraction", _INTERLACED_FIELD2_PHASE_FRACTION))
     )
     roi_microstep_transition: dict[str, object] | None = None
+    roi_prepare_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="roi-prepare")
+    # Start the preparation thread during worker initialization, not on the
+    # first live recall while holding the short transition publication lock.
+    roi_prepare_executor.submit(lambda: None)
+    roi_prepare_future: Future | None = None
+    roi_transition_lock = threading.RLock()
     current_deinterlace_enabled = bool(startup_config.get("deinterlace_enabled", True))
     current_reinterlace_enabled = bool(startup_config.get("reinterlace_enabled", False))
     current_deinterlace_method = str(startup_config.get("deinterlace_method", "bob"))
@@ -3277,6 +3463,7 @@ def run_processor_worker(
     current_effects_enabled = False
     configured_effect_layer_indices: set[int] = set()
     effect_media_states: dict[tuple[int, int], dict[str, object]] = {}
+    source_pool = SourcePool()
     current_output_buffer_frames = max(0, min(10, int(startup_config.get("decklink_output_buffer_frames", 0))))
     basic_scaling_enabled = bool(startup_config.get("enable_basic_scaling", startup_config.get("enable_placeholder_sr", True)))
     current_basic_scaling_auto_mode = bool(startup_config.get("basic_scaling_auto_mode", True))
@@ -3339,15 +3526,11 @@ def run_processor_worker(
                         return
                     while not worker_stop.is_set():
                         rgba = worker_decoder.next_rgba(loop=bool(worker_state.get("loop", True)))
-                        if worker_ring.full():
-                            try:
-                                worker_ring.get_nowait()
-                            except queue.Empty:
-                                pass
-                        try:
-                            worker_ring.put_nowait(rgba)
-                        except queue.Full:
-                            pass
+                        if not enqueue_effect_frame(
+                            worker_ring, rgba, worker_stop,
+                            live=not isinstance(worker_decoder, EffectMediaDecoder),
+                        ):
+                            break
                 except Exception as exc:
                     if not worker_stop.is_set():
                         with worker_lock:
@@ -4116,18 +4299,11 @@ def run_processor_worker(
         start_shift_y: float,
         field2_phase_fraction: float,
     ) -> np.ndarray:
-        schedule = np.empty((total_frames + 1, 19), dtype=np.float64)
+        # Prepare every step before publishing the transition. Playback only
+        # reads rows, keeping interpolation work out of the live frame path.
+        schedule = np.empty((total_frames, 19), dtype=np.float64)
         s_x, s_y, s_w, s_h = [float(value) for value in start_roi]
         t_x, t_y, t_w, t_h = [float(value) for value in target_roi]
-        schedule[0] = (
-            0.0,
-            s_x, s_y, s_w, s_h,
-            start_shift_x, start_shift_y,
-            s_x, s_y, s_w, s_h,
-            s_x, s_y, s_w, s_h,
-            start_shift_x, start_shift_y,
-            start_shift_x, start_shift_y,
-        )
 
         start_scale_x = FRAME_W / max(1.0, s_w)
         start_scale_y = FRAME_H / max(1.0, s_h)
@@ -4152,6 +4328,9 @@ def run_processor_worker(
             return int(round(scaled)) * quantum
 
         for frame_progress in range(1, total_frames + 1):
+            if frame_progress % 16 == 0:
+                # Let capture/output threads run during long preparations.
+                time.sleep(0)
             t = float(frame_progress) / float(total_frames)
             curved_t = _apply_roi_curve(t, interpolation_mode)
             previous_progress = float(frame_progress - 1)
@@ -4254,7 +4433,10 @@ def run_processor_worker(
                 )
                 field_values.extend((field_x, field_y, field_roi_w, field_roi_h, field_shift_x, field_shift_y))
 
-            schedule[frame_progress] = (
+            if frame_progress == total_frames:
+                roi_x, roi_y, roi_w, roi_h = target_roi
+                shift_x = shift_y = 0.0
+            schedule[frame_progress - 1] = (
                 frame_progress,
                 roi_x, roi_y, roi_w, roi_h,
                 shift_x, shift_y,
@@ -4262,8 +4444,7 @@ def run_processor_worker(
                 field_values[6], field_values[7], field_values[8], field_values[9],
                 field_values[4], field_values[5], field_values[10], field_values[11],
             )
-
-        schedule[-1, 1:7] = (t_x, t_y, t_w, t_h, 0.0, 0.0)
+        schedule.setflags(write=False)
         return schedule
 
     def _start_roi_microstep_transition(
@@ -4277,6 +4458,7 @@ def run_processor_worker(
         nonlocal roi_microstep_transition, roi_manual_frame_target
         nonlocal roi_manual_velocity_x, roi_manual_velocity_y
         nonlocal roi_shift_applied_x, roi_shift_applied_y
+        nonlocal roi_prepare_future
 
         roi_manual_frame_target = None
         roi_manual_velocity_x = 0.0
@@ -4312,7 +4494,10 @@ def run_processor_worker(
             mode_name = "linear"
 
         phase_fraction = _clamp_interlaced_field2_phase_fraction(float(interlaced_field2_phase_fraction))
-        schedule = _build_roi_microstep_schedule(
+        if roi_prepare_future is not None:
+            roi_prepare_future.cancel()
+        roi_prepare_future = roi_prepare_executor.submit(
+            _build_roi_microstep_schedule,
             (s_x, s_y, s_w, s_h),
             (t_x, t_y, t_w, t_h),
             total_frames,
@@ -4329,8 +4514,9 @@ def run_processor_worker(
             "total_frames": total_frames,
             "frame_progress": 0.0,
             "interpolation_mode": mode_name,
-            "schedule": schedule,
-            "schedule_index": 0,
+            "schedule": None,
+            "preparation": roi_prepare_future,
+            "schedule_index": 1,
             "phase_fraction_active": abs(phase_fraction) > 1e-4,
             "enforce_full_frame_scale_1x": bool(enforce_full_frame_scale_1x),
         }
@@ -4354,6 +4540,10 @@ def run_processor_worker(
     def _cancel_roi_microstep_transition(reset_shift: bool = True) -> None:
         nonlocal roi_microstep_transition, roi_manual_frame_target
         nonlocal roi_manual_velocity_x, roi_manual_velocity_y
+        nonlocal roi_prepare_future
+        if roi_prepare_future is not None:
+            roi_prepare_future.cancel()
+            roi_prepare_future = None
         roi_microstep_transition = None
         roi_manual_frame_target = None
         roi_manual_velocity_x = 0.0
@@ -4626,16 +4816,32 @@ def run_processor_worker(
         if state is None:
             return
 
+        preparation = state.get("preparation")
+        if preparation is not None:
+            # Never wait for calculation on the capture/render thread. Keep
+            # rendering live video at the current ROI until all rows are ready.
+            if not preparation.done():
+                return
+            try:
+                state["schedule"] = preparation.result()
+            except Exception as exc:
+                roi_microstep_transition = None
+                _safe_put({"type": "warning", "warning": f"ROI animation preparation failed: {exc}"})
+                return
+            state.pop("preparation", None)
+
         schedule = state.get("schedule")
-        if isinstance(schedule, np.ndarray) and schedule.ndim == 2 and schedule.shape[0] > 0 and schedule.shape[1] >= 19:
+        if schedule is not None:
             if bool(state.get("completion_pending", False)):
                 _set_roi_shift_immediate(0.0, 0.0)
                 roi_microstep_transition = None
                 return
 
-            schedule_index = max(0, min(int(state.get("schedule_index", 0)), schedule.shape[0] - 1))
-            row = schedule[schedule_index]
-            state["schedule_index"] = min(schedule_index + 1, schedule.shape[0] - 1)
+            # The start position is already on screen; the first output must
+            # advance to step one rather than inserting an unchanged frame.
+            schedule_index = int(state.get("schedule_index", 1))
+            row = schedule[schedule_index - 1]
+            state["schedule_index"] = schedule_index + 1
             state["frame_progress"] = float(row[0])
 
             next_x, next_y, next_w, next_h = (int(row[1]), int(row[2]), int(row[3]), int(row[4]))
@@ -4681,7 +4887,7 @@ def run_processor_worker(
                             _schedule_rtx_roi_rebuild()
 
             target_roi = tuple(state["target"])
-            is_final_frame = schedule_index >= schedule.shape[0] - 1
+            is_final_frame = schedule_index >= int(state["total_frames"])
             transition_complete = (
                 is_final_frame
                 and abs(current_roi_x - int(target_roi[0])) <= 2
@@ -5009,6 +5215,19 @@ def run_processor_worker(
         # interlaced_field2_phase_fraction (0.5 = true half-step).
         _advance_roi_microstep_transition_one_frame(progress_units=1.0)
 
+    # Serialize only short control/publication operations, never calculation.
+    # This also prevents a completed older request from being activated while
+    # a newer request or manual cancellation is being installed.
+    def _serialize_roi_control(function):
+        def locked(*args, **kwargs):
+            with roi_transition_lock:
+                return function(*args, **kwargs)
+        return locked
+
+    _start_roi_microstep_transition = _serialize_roi_control(_start_roi_microstep_transition)
+    _cancel_roi_microstep_transition = _serialize_roi_control(_cancel_roi_microstep_transition)
+    _advance_roi_microstep_transition_for_output_frame = _serialize_roi_control(_advance_roi_microstep_transition_for_output_frame)
+
     def _cleanup_ai_async() -> None:
         nonlocal ai_sr_executor, ai_sr_futures
         if ai_sr_futures:
@@ -5325,6 +5544,7 @@ def run_processor_worker(
         preprocess_already_applied: bool,
         shift_x: float,
         shift_y: float,
+        timing_details: dict[str, float] | None = None,
     ) -> tuple[bytes, bool, bool, float]:
         nonlocal zeroed_output_warning_emitted
         basic_scaling_active = _basic_scaling_enabled()
@@ -5342,6 +5562,7 @@ def run_processor_worker(
                 "process_frame_no_deinterlace",
                 "process_frame_no_deinterlace_into",
                 reusable_process_frame_no_deinterlace_out,
+                timing_details=timing_details,
             )
         else:
             scaled = _run_native_uyvy_process(
@@ -5349,6 +5570,7 @@ def run_processor_worker(
                 "process_frame",
                 "process_frame_into",
                 reusable_process_frame_out,
+                timing_details=timing_details,
             )
         basic_stage_ms = max(0.0, (time.perf_counter() - basic_stage_start_ts) * 1000.0)
 
@@ -5480,7 +5702,7 @@ def run_processor_worker(
 
         return working, preprocess_applied, basic_applied, ai_applied, rtx_applied, native_shift_applied
 
-    def _stop_live_pipeline() -> None:
+    def _stop_live_pipeline(require_stopped: bool = False) -> None:
         nonlocal pipeline_running, capture_thread, preprocess_thread, upscale_thread, output_thread
         nonlocal upscale_extra_threads, parallel_basic_processors, parallel_basic_worker_count
         nonlocal latest_timecode_info
@@ -5491,6 +5713,11 @@ def run_processor_worker(
         for thread in threads_to_join:
             if thread is not None:
                 thread.join(timeout=1.0)
+        if require_stopped and any(thread is not None and thread.is_alive() for thread in threads_to_join):
+            raise RuntimeError("Processing is still stopping; output buffer change was not applied")
+        gpu_ready_setter = getattr(processor, "set_gpu_ready_mode", None)
+        if callable(gpu_ready_setter):
+            gpu_ready_setter(False)
         capture_thread = None
         preprocess_thread = None
         upscale_thread = None
@@ -5516,7 +5743,7 @@ def run_processor_worker(
         nonlocal latest_input_frame, latest_output_frame, latest_timecode_info, latest_effective_sr_scale, processed_frame_counter, started_perf_ts
         nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
         nonlocal output_nominal_fps, output_frame_period_s, output_mode_is_interlaced, output_transition_units_per_frame
-        nonlocal cadence_monitor
+        nonlocal cadence_monitor, processed_rate, presentation_rate
         nonlocal zeroed_output_warning_emitted, preprocess_noop_warning_emitted, native_subpixel_warning_emitted
         nonlocal rtx_effect_sample_counter
         nonlocal stage_preprocess_applied_frames, stage_basic_applied_frames, stage_ai_applied_frames, stage_rtx_applied_frames, stage_passthrough_frames
@@ -5536,19 +5763,26 @@ def run_processor_worker(
             raise RuntimeError("Cannot start pipeline without active DeckLink sessions")
 
         _stop_live_pipeline()
+        gpu_ready_setter = getattr(processor, "set_gpu_ready_mode", None)
+        if callable(gpu_ready_setter):
+            gpu_ready_setter(True)
         pipeline_stop_event.clear()
         source_generation += 1
         pipeline_generation = source_generation
-        pipeline_input_format = current_input_format
         latest_input_metadata = None
         latest_output_processing_metadata = None
         parallel_basic_processors = []
         parallel_basic_worker_count = 1
         # Effect media/config belongs to the shared processor, not pool clones.
-        if parallel_basic_max_inflight > 1 and _is_live_basic_scaling_fast_mode() and not current_effects_enabled:
+        if current_output_buffer_frames == 0 and parallel_basic_max_inflight > 1 and _is_live_basic_scaling_fast_mode() and not current_effects_enabled:
             for _ in range(parallel_basic_max_inflight):
                 try:
                     parallel_proc, _ = _create_processor(module, startup_config)
+                    if hasattr(parallel_proc, "set_sr_flavor"):
+                        parallel_proc.set_sr_flavor(current_basic_scaling_method)
+                    warmup_roi_scaling(parallel_proc, FRAME_W, FRAME_H, basic_scaling_enabled,
+                                       current_basic_scaling_auto_mode, current_max_auto_basic_scaling,
+                                       current_basic_scaling_manual_scale)
                 except Exception:
                     parallel_basic_processors = []
                     parallel_basic_worker_count = 1
@@ -5563,7 +5797,7 @@ def run_processor_worker(
             if parallel_basic_processors:
                 parallel_basic_worker_count = len(parallel_basic_processors)
 
-        q_capture_to_preprocess = _StageFrameQueue(maxsize=max(2, parallel_basic_worker_count * 2))
+        q_capture_to_preprocess = _StageFrameQueue(maxsize=1 if current_output_buffer_frames > 0 else max(2, parallel_basic_worker_count * 2))
         q_preprocess_to_upscale = None
         q_upscale_to_output = _StageFrameQueue(maxsize=max(1, parallel_basic_worker_count))
         frame_id_counter = 0
@@ -5584,6 +5818,13 @@ def run_processor_worker(
         rtx_effect_sample_counter = 0
         processed_frame_counter = 0
         started_perf_ts = time.perf_counter()
+        processed_rate = CounterRate()
+        presentation_rate = CounterRate()
+        displayed = session_counter(output_session, 'displayed_frames')
+        late = session_counter(output_session, 'late_frames')
+        if displayed is not None and late is not None:
+            presentation_rate.sample(started_perf_ts, displayed + late)
+        processed_rate.sample(started_perf_ts, 0)
         frame_duration = int(getattr(output_session, "frame_duration", 0))
         time_scale = int(getattr(output_session, "time_scale", 0))
         if frame_duration > 0 and time_scale > 0:
@@ -5813,6 +6054,7 @@ def run_processor_worker(
 
         def _capture_worker() -> None:
             nonlocal frame_id_counter, capture_drop_count
+            nonlocal input_mode_is_interlaced
             nonlocal latest_input_metadata, latest_output_processing_metadata
             nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
             nonlocal latest_rtx_vsr_applied, latest_rtx_effect_mean_abs_luma
@@ -5823,13 +6065,21 @@ def run_processor_worker(
             assert q_capture_to_preprocess is not None
             capture_sequence = 0
             while not pipeline_stop_event.is_set():
+                # Direct capture/render/output has one producer. Reserve queue
+                # capacity before consuming a source frame or animation step.
+                if output_session is not None and (
+                    _is_live_passthrough_mode()
+                    or (_is_live_basic_scaling_fast_mode() and parallel_basic_worker_count <= 1)
+                ):
+                    if not _wait_for_output_capacity(output_session, pipeline_stop_event):
+                        break
                 try:
                     frame = capture_session.acquire(timeout_ms=2) if capture_session is not None else None
                 except Exception:
                     frame = None
                 if frame is None:
                     continue
-                received_monotonic_s = time.perf_counter()
+                received_monotonic_s = float(getattr(frame, "host_received_monotonic_s", time.perf_counter()))
                 capture_sequence += 1
                 frame_timecode_info = _extract_frame_timecode_info(frame)
                 try:
@@ -5841,8 +6091,12 @@ def run_processor_worker(
 
                 # Snapshot source labels before ROI evaluation adds derived
                 # mutable control data (desired_roi) to the legacy UI payload.
+                input_format = _video_format_from_mode(
+                    capture_session.mode_entry if not capture_session.format_detection and frame is not capture_session.black else None
+                )
+                input_mode_is_interlaced = input_format.scan_mode == "interlaced"
                 frame_metadata = _capture_frame_metadata(
-                    frame, pipeline_input_format, capture_sequence, pipeline_generation,
+                    frame, input_format, capture_sequence, pipeline_generation,
                     received_monotonic_s, frame_captured_ts, frame_timecode_info,
                 )
                 cadence_monitor.capture(frame_metadata)
@@ -5899,7 +6153,7 @@ def run_processor_worker(
                     emit_start_ts = time.perf_counter()
                     try:
                         if output_session is not None:
-                            emitted = _write_frame_to_output(output_session, output_bytes)
+                            emitted = _write_frame_to_output(output_session, output_bytes, captured_ts=received_monotonic_s)
                         else:
                             emitted = False
                     except Exception as exc:
@@ -5979,6 +6233,8 @@ def run_processor_worker(
                     shift_x, shift_y = _step_smoothed_roi_shift()
                     roi_motion_trace = _snapshot_roi_motion_trace(shift_x, shift_y)
                     interlaced_phase = interlaced_phase_snapshot
+                    render_start_ts = time.perf_counter()
+                    native_call_timing: dict[str, float] = {}
                     try:
                         _upload_next_effect_media()
                         if _reinterlace_enabled_for_output():
@@ -6007,11 +6263,13 @@ def run_processor_worker(
                                 False,
                                 shift_x,
                                 shift_y,
+                                timing_details=native_call_timing,
                             )
                     except Exception as exc:
                         _safe_put({"type": "warning", "warning": f"Basic scaling fast path failed: {exc}"})
                         continue
 
+                    render_end_ts = time.perf_counter()
                     if basic_applied:
                         _record_basic_scaling_timing(basic_stage_ms)
 
@@ -6031,11 +6289,23 @@ def run_processor_worker(
                         )
 
                     process_end_ts = time.perf_counter()
+                    cadence_monitor.processed(
+                        process_end_ts, (process_end_ts - process_start_ts) * 1000.0,
+                        prepare_ms=round((render_start_ts - process_start_ts) * 1000.0, 3),
+                        render_ms=round((render_end_ts - render_start_ts) * 1000.0, 3),
+                        native_stage_ms=round(basic_stage_ms, 3),
+                        native_call=native_call_timing,
+                        postprocess_ms=round((process_end_ts - render_end_ts) * 1000.0, 3),
+                        native_shift_applied=bool(native_shift_applied),
+                        dual_phase=interlaced_phase is not None,
+                        roi=[int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h)],
+                        shift=[round(shift_x, 4), round(shift_y, 4)],
+                    )
                     emit_start_ts = time.perf_counter()
 
                     try:
                         if output_session is not None:
-                            emitted = _write_frame_to_output(output_session, output_bytes)
+                            emitted = _write_frame_to_output(output_session, output_bytes, captured_ts=received_monotonic_s)
                         else:
                             emitted = False
                     except Exception as exc:
@@ -6335,7 +6605,7 @@ def run_processor_worker(
             reorder_pending: dict[int, _StageFrame] = {}
             next_frame_id = 1
             max_reorder_buffer = max(2, parallel_basic_worker_count * 2)
-            max_reorder_wait_s = 0.012
+            max_reorder_wait_s = 0.0 if current_output_buffer_frames > 0 else 0.012
 
             def _emit_output_item(item: _StageFrame) -> None:
                 nonlocal latest_input_frame, latest_output_frame, latest_effective_sr_scale, processed_frame_counter
@@ -6389,7 +6659,10 @@ def run_processor_worker(
                 output_wait_s = max(0.0, emit_start_ts - item.output_dequeue_ts) if item.output_dequeue_ts > 0.0 else 0.0
                 try:
                     if output_session is not None:
-                        emitted = _write_frame_to_output(output_session, output_bytes)
+                        emitted = _write_frame_to_output(
+                            output_session, output_bytes,
+                            captured_ts=item.metadata.received_monotonic_s if item.metadata is not None else item.captured_ts,
+                        )
                     else:
                         emitted = False
                 except Exception as exc:
@@ -6842,6 +7115,7 @@ def run_processor_worker(
         nonlocal capture_session, output_session
 
         _stop_live_pipeline()
+        _cancel_roi_microstep_transition(reset_shift=False)
 
         if output_session is not None:
             _clear_output_schedule_state(output_session)
@@ -6860,14 +7134,12 @@ def run_processor_worker(
 
     def _start_sessions(message: dict[str, Any]) -> None:
         nonlocal capture_session, output_session, current_output_buffer_frames, output_mode_is_interlaced
-        nonlocal current_input_format, current_output_format
+        nonlocal current_output_format
         nonlocal output_field_dominance_code
         nonlocal output_mode_name, output_mode_value, output_field_dominance_name
         if d is None:
             raise RuntimeError("decklink_wrapper is not available in worker process")
 
-        requested_format_detection = bool(message["enable_format_detection"])
-        requested_in_mode = message["in_mode"]
         requested_out_mode = message["out_mode"]
         current_output_buffer_frames = max(
             0,
@@ -6943,18 +7215,13 @@ def run_processor_worker(
                 f"requested={requested_mode!r} | available={available}"
             )
 
-        resolved_in_entry = _resolve_display_mode_entry(int(message["in_device"]), requested_in_mode, input_side=True)
         resolved_out_entry = _resolve_display_mode_entry(int(message["out_device"]), requested_out_mode, input_side=False)
-        # Resolve/validate before replacing running sessions. Automatic input
-        # detection does not expose its negotiated cadence through this wrapper;
-        # do not stamp the requested mode's rate onto an automatically changed feed.
-        requested_input_format = _video_format_from_mode(resolved_in_entry)
+        # Validate output before replacing sessions. Input configuration belongs
+        # to the logical source pool and is never a prerequisite for output.
         requested_output_format = _video_format_from_mode(resolved_out_entry)
-        resolved_in_mode = getattr(resolved_in_entry, "mode", None)
         resolved_out_mode = getattr(resolved_out_entry, "mode", None)
-        if resolved_in_mode is None or resolved_out_mode is None:
+        if resolved_out_mode is None:
             raise RuntimeError("DeckLink display mode resolution failed: missing mode value")
-        input_mode_is_interlaced = _mode_name_is_interlaced(str(getattr(resolved_in_entry, "name", "")))
         output_mode_name = str(getattr(resolved_out_entry, "name", ""))
         output_mode_value = str(getattr(resolved_out_entry, "mode", ""))
         output_field_dominance_name = str(getattr(resolved_out_entry, "field_dominance_name", ""))
@@ -7006,68 +7273,46 @@ def run_processor_worker(
         except Exception:
             pass
 
-        def _open_sessions(enable_format_detection: bool) -> None:
+        def _open_sessions() -> None:
             nonlocal capture_session, output_session
-            nonlocal current_input_format, current_output_format
+            nonlocal current_output_format
             _stop_sessions()
+            warmup_key = (id(processor), current_basic_scaling_method, current_basic_scaling_auto_mode,
+                          current_max_auto_basic_scaling, current_basic_scaling_manual_scale)
+            if warmup_key not in roi_warmup_keys:
+                warmup_roi_scaling(processor, FRAME_W, FRAME_H, basic_scaling_enabled,
+                                   current_basic_scaling_auto_mode, current_max_auto_basic_scaling,
+                                   current_basic_scaling_manual_scale)
+                roi_warmup_keys.add(warmup_key)
 
-            selected_timecode_format = int(
-                message.get(
-                    "timecode_format",
-                    getattr(d, "TIMECODE_FORMAT_RP188_VITC1", 0x72707631),
-                )
-            )
-
-            capture_session = d.CaptureSession(
-                device_index=int(message["in_device"]),
-                display_mode=resolved_in_mode,
-                pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-                max_queue_frames=8,
-                enable_format_detection=bool(enable_format_detection),
-                timecode_format=selected_timecode_format,
-            )
             output_session = d.OutputSession(
                 device_index=int(message["out_device"]),
                 display_mode=resolved_out_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
+            )
+            capture_session = RoiSourceSession(
+                source_pool, FRAME_W, FRAME_H,
+                float(getattr(output_session, "frame_duration", 1001)) / max(1, int(getattr(output_session, "time_scale", 60000))),
+                lambda rgb: rgb_to_uyvy(rgb, current_color_space, current_color_range),
+                latency_frames=current_output_buffer_frames,
             )
 
             try:
                 capture_session.start()
                 output_session.start()
                 _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
-                current_input_format = _video_format_from_mode(None) if enable_format_detection else requested_input_format
                 current_output_format = requested_output_format
                 _start_live_pipeline()
             except Exception:
                 _stop_sessions()
                 raise
 
-        try:
-            _open_sessions(requested_format_detection)
-        except Exception as first_exc:
-            first_text = str(first_exc)
-            should_retry_without_detection = (
-                requested_format_detection
-                and "EnableVideoInput" in first_text
-            )
-            if not should_retry_without_detection:
-                raise
-
-            _safe_put(
-                {
-                    "type": "warning",
-                    "warning": (
-                        "DeckLink start retry: EnableVideoInput failed with format detection enabled; "
-                        "retrying with format detection disabled"
-                    ),
-                }
-            )
-            _open_sessions(False)
+        _open_sessions()
     try:
         project_root = Path(startup_config["project_root"])
         module = _load_video_processor_module(project_root)
         processor, basic_scaling_method_supported = _create_processor(module, startup_config)
+        roi_warmup_keys = set()
         reusable_native_into_supported = (
             hasattr(processor, "process_frame_into")
             and hasattr(processor, "process_frame_no_deinterlace_into")
@@ -7198,7 +7443,23 @@ def run_processor_worker(
                         continue
                     last_roi_command_sequence = roi_sequence
 
+            if command in {"activate_source", "deactivate_source"}:
+                source_error = None
+                try:
+                    logical_id = int(message["logical_id"])
+                    if command == "activate_source":
+                        config = dict(message["config"])
+                        source_pool.activate(logical_id, config,
+                            lambda: create_input_adapter(config, d, EffectCaptureDecoder, EffectMediaDecoder))
+                    else:
+                        source_pool.deactivate(logical_id)
+                except Exception as exc:
+                    source_error = str(exc)
+                _safe_put({"type": "ack", "cmd": command, "source_error": source_error})
+                continue
+
             if command == "shutdown":
+                source_pool.close()
                 _stop_sessions()
                 _cleanup_ai_async()
                 _close_rtx_vsr_engine()
@@ -7239,8 +7500,15 @@ def run_processor_worker(
                     min(10, int(message.get("decklink_output_buffer_frames", current_output_buffer_frames))),
                 )
                 if output_session is not None:
+                    # Stop producers before changing limits or flushing the
+                    # device schedule; no old in-flight work crosses modes.
+                    _stop_live_pipeline(require_stopped=True)
+                    if capture_session is not None:
+                        capture_session.reader.latest_only = current_output_buffer_frames > 0
+                        capture_session.latency_frames = current_output_buffer_frames
                     _set_output_schedule_buffer_frames(output_session, current_output_buffer_frames)
                     _reprime_output_schedule(output_session, reason="manual_buffer_frames_change")
+                    _start_live_pipeline()
                 _safe_put(
                     {
                         "type": "ack",
@@ -7282,6 +7550,7 @@ def run_processor_worker(
                     current_output_processing_metadata = latest_output_processing_metadata
                     current_scale = int(latest_effective_sr_scale)
                     current_counter = int(processed_frame_counter)
+                    current_counter_ts = time.perf_counter()
                     current_rtx_applied = bool(latest_rtx_vsr_applied)
                     current_rtx_delta = float(latest_rtx_effect_mean_abs_luma)
                     current_timecode_info = dict(latest_timecode_info)
@@ -7319,8 +7588,15 @@ def run_processor_worker(
                     _safe_put({"type": "decklink_no_frame", "reason": "no_input_signal"})
                     continue
 
-                elapsed = max(0.0001, time.perf_counter() - started_perf_ts)
-                processed_fps = float(current_counter) / elapsed
+                processed_fps = processed_rate.sample(current_counter_ts, current_counter)
+                completion_counts = {
+                    name: session_counter(output_session, name)
+                    for name in ('displayed_frames', 'late_frames', 'dropped_output_frames', 'flushed_frames')
+                }
+                presentation_fps = None
+                if completion_counts['displayed_frames'] is not None and completion_counts['late_frames'] is not None:
+                    presentation_fps = presentation_rate.sample(
+                        current_counter_ts, completion_counts['displayed_frames'] + completion_counts['late_frames'])
                 if output_nominal_fps > 0.0:
                     processed_fps = min(processed_fps, output_nominal_fps)
                 stage_depths = {
@@ -7342,6 +7618,23 @@ def run_processor_worker(
                             "auto_reprime_events": int(out_state.get("auto_reprime_events", 0)),
                             "clock_correction_events": int(out_state.get("clock_correction_events", 0)),
                             "skipped_schedule_slots": int(out_state.get("skipped_schedule_slots", 0)),
+                            "capacity_wait_polls": int(out_state.get("capacity_wait_polls", 0)),
+                            "capacity_poll_ms_last": float(out_state.get("capacity_poll_ms_last", 0.0)),
+                            "capacity_poll_ms_peak": float(out_state.get("capacity_poll_ms_peak", 0.0)),
+                            "strict_one_frame": int(out_state.get("target_buffer_frames", 0)) == 1,
+                            "clock_source": str(out_state.get("clock_source", "host_estimate")),
+                            "clock_query_errors": int(out_state.get("clock_query_errors", 0)),
+                            "clock_query_ms_last": float(out_state.get("clock_query_ms_last", 0.0)),
+                            "clock_query_ms_peak": float(out_state.get("clock_query_ms_peak", 0.0)),
+                            "clock_epoch_adjustment_ms_last": float(out_state.get("clock_epoch_adjustment_ms_last", 0.0)),
+                            "minimum_preroll_frames": session_counter(output_session, 'minimum_preroll_frames'),
+                            "low_latency_output_enabled": getattr(output_session, 'low_latency_output_enabled', None),
+                            "latency_budget_frames": int(out_state.get("target_buffer_frames", 0)),
+                            "latency_budget_ms": int(out_state.get("target_buffer_frames", 0)) * float(out_state.get("frame_period_s", 0.0)) * 1000.0,
+                            "accepted_frame_age_ms_last": float(out_state.get("accepted_frame_age_ms_last", 0.0)),
+                            "accepted_frame_age_ms_peak": float(out_state.get("accepted_frame_age_ms_peak", 0.0)),
+                            "latency_drop_events": int(out_state.get("latency_drop_events", 0)),
+                            "strict_frame_age_ms_last": float(out_state.get("strict_frame_age_ms_last", 0.0)),
                             "last_reprime_reason": str(out_state.get("last_reprime_reason", "")),
                             "last_reprime_age_ms": (
                                 max(0.0, (time.perf_counter() - float(out_state.get("last_reprime_ts", 0.0))) * 1000.0)
@@ -7387,6 +7680,10 @@ def run_processor_worker(
                     "last_path": str(timing_last_path_snapshot),
                     "cadence": {
                         **cadence_monitor.snapshot(),
+                        "presentation_results_available": completion_counts['displayed_frames'] is not None,
+                        "output_completion_results": completion_counts,
+                        "presentation_fps": presentation_fps,
+                        "submission_fps": processed_fps,
                         "capture_queue_drops": session_counter(capture_session, 'dropped_frames'),
                         "output_completion_callbacks": session_counter(output_session, 'completed_frames'),
                         "effects_enabled": bool(current_effects_enabled),
@@ -7515,8 +7812,13 @@ def run_processor_worker(
                     "video_output_format": current_output_format.to_payload(),
                 }
                 if include_frames:
-                    payload["input_frame_bytes"] = _freeze_frame_bytes(current_input)
-                    payload["output_frame_bytes"] = _freeze_frame_bytes(current_output)
+                    if preview_mailbox is not None:
+                        payload["preview_sequence"] = preview_mailbox.publish(
+                            _freeze_frame_bytes(current_input), _freeze_frame_bytes(current_output)
+                        )
+                    else:
+                        payload["input_frame_bytes"] = _freeze_frame_bytes(current_input)
+                        payload["output_frame_bytes"] = _freeze_frame_bytes(current_output)
                 _safe_put(payload)
                 continue
 
@@ -7647,7 +7949,7 @@ def run_processor_worker(
                 timecode_phase_mode = _normalize_timecode_phase_synthesis_mode(str(message.get("phase_mode", "strict")))
                 if timecode_phase_mode != previous_timecode_phase_mode:
                     timecode_phase_tracker.clear()
-                roi_microstep_transition = None
+                _cancel_roi_microstep_transition(reset_shift=False)
                 roi_manual_frame_target = None
                 roi_manual_velocity_x = 0.0
                 roi_manual_velocity_y = 0.0
@@ -7708,7 +8010,7 @@ def run_processor_worker(
                 suspend_timecode = bool(message.get("suspend_timecode", False))
                 if timecode_roi_enabled and not suspend_timecode:
                     continue
-                roi_microstep_transition = None
+                _cancel_roi_microstep_transition(reset_shift=False)
                 if suspend_timecode:
                     timecode_roi_enabled = False
                 prev_roi_state = (int(current_roi_x), int(current_roi_y), int(current_roi_w), int(current_roi_h))
@@ -7966,6 +8268,13 @@ def run_processor_worker(
                                     layer.get("matte_rgba", [255, 255, 255, 255]), dtype=np.uint8
                                 ).reshape(1, 1, 4)
                                 processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
+                            elif reload_source and capture_kind == "logical":
+                                effect_media_states[(layer_index, 0)] = {
+                                    "decoder": source_pool.reader(int(layer["capture_device_index"])),
+                                    "playing": True, "loop": True, "thread": None,
+                                    "stop": threading.Event(), "lock": threading.Lock(),
+                                    "ring": queue.Queue(maxsize=1), "error": None, "next_present_ts": 0.0,
+                                }
                             elif reload_source and capture_kind == "webcam":
                                 capture_device_index = int(layer.get("capture_device_index", 0))
                                 capture_width = int(layer.get("capture_width", 0))
@@ -8020,6 +8329,13 @@ def run_processor_worker(
                                     processor.upload_effect_layer_source_rgba(
                                         layer_index, source_slot, auxiliary_rgba, 1, 1
                                     )
+                                elif reload_source and auxiliary_capture_kind == "logical":
+                                    effect_media_states[(layer_index, source_slot)] = {
+                                        "decoder": source_pool.reader(int(image_source["capture_device_index"])),
+                                        "playing": True, "loop": True, "thread": None,
+                                        "stop": threading.Event(), "lock": threading.Lock(),
+                                        "ring": queue.Queue(maxsize=1), "error": None, "next_present_ts": 0.0,
+                                    }
                                 elif reload_source and auxiliary_capture_kind == "webcam":
                                     auxiliary_device_index = int(image_source.get("capture_device_index", 0))
                                     auxiliary_width = int(image_source.get("capture_width", 0))
@@ -8312,6 +8628,7 @@ def run_processor_worker(
                 continue
 
     except BaseException as exc:
+        source_pool.close()
         _stop_sessions()
         _cleanup_ai_async()
         _close_rtx_vsr_engine()
@@ -8326,3 +8643,5 @@ def run_processor_worker(
             )
         except Exception:
             pass
+    finally:
+        roi_prepare_executor.shutdown(wait=False, cancel_futures=True)

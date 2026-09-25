@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 
 #include <cstdint>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -90,7 +91,7 @@ vp::AlphaMixOperandConfig ParseAlphaMixOperandPayload(const py::dict& operand_pa
         ? py::cast<std::string>(operand_payload["type"])
         : std::string("off");
     operand.type = type == "source_alpha" ? 1 : (
-        type == "chroma_key" ? 2 : (type == "mask" ? 3 : (type == "source_luma" ? 4 : 0))
+        type == "chroma_key" ? 2 : (type == "mask" ? 3 : (type == "source_luma" ? 4 : (type == "luma_key" ? 5 : 0)))
     );
     operand.source_from_effects_input = operand_payload.contains("source_from_effects_input")
         ? py::cast<bool>(operand_payload["source_from_effects_input"])
@@ -129,6 +130,8 @@ vp::AlphaMixOperandConfig ParseAlphaMixOperandPayload(const py::dict& operand_pa
     operand.rotate_x = operand_payload.contains("rotate_x") ? py::cast<float>(operand_payload["rotate_x"]) : 0.0f;
     operand.rotate_y = operand_payload.contains("rotate_y") ? py::cast<float>(operand_payload["rotate_y"]) : 0.0f;
     operand.rotate_z = operand_payload.contains("rotate_z") ? py::cast<float>(operand_payload["rotate_z"]) : 0.0f;
+    operand.aspect_x = operand_payload.contains("aspect_x") ? py::cast<float>(operand_payload["aspect_x"]) : 1.0f;
+    operand.aspect_y = operand_payload.contains("aspect_y") ? py::cast<float>(operand_payload["aspect_y"]) : 1.0f;
     operand.key_color = make_uchar3(
         static_cast<unsigned char>(operand_payload.contains("key_color_r") ? py::cast<int>(operand_payload["key_color_r"]) : 0),
         static_cast<unsigned char>(operand_payload.contains("key_color_g") ? py::cast<int>(operand_payload["key_color_g"]) : 255),
@@ -143,6 +146,14 @@ vp::AlphaMixOperandConfig ParseAlphaMixOperandPayload(const py::dict& operand_pa
         operand.mask_pattern_code = pattern_name == "square" || pattern_name == "rect"
             ? 1
             : (pattern_name == "circle" ? 2 : (pattern_name == "diamond" ? 3 : 0));
+        if (pattern_name == "barndoor_vertical") operand.mask_pattern_code = 11;
+        if (pattern_name == "barndoor_horizontal") operand.mask_pattern_code = 12;
+        if (pattern_name == "horizontal") operand.mask_pattern_code = 13;
+        const char* gradients[] = {"gradient_linear", "gradient_quadratic", "gradient_easing",
+            "gradient_diagonal", "gradient_radial", "gradient_spherical", "gradient_quadratic_sphere"};
+        for (int i = 0; i < 7; ++i) {
+            if (pattern_name == gradients[i]) operand.mask_pattern_code = 4 + i;
+        }
     }
     operand.mask_softness = operand_payload.contains("softness") ? py::cast<float>(operand_payload["softness"]) : 0.0f;
     operand.mask_aspect = operand_payload.contains("aspect") ? py::cast<float>(operand_payload["aspect"]) : 1.0f;
@@ -150,6 +161,7 @@ vp::AlphaMixOperandConfig ParseAlphaMixOperandPayload(const py::dict& operand_pa
     operand.mask_size = operand_payload.contains("size") ? py::cast<float>(operand_payload["size"]) : 1.0f;
     operand.mask_x = operand_payload.contains("x") ? py::cast<float>(operand_payload["x"]) : 0.0f;
     operand.mask_y = operand_payload.contains("y") ? py::cast<float>(operand_payload["y"]) : 0.0f;
+    operand.mask_rotation = operand_payload.contains("rotation") ? py::cast<float>(operand_payload["rotation"]) : 0.0f;
     return operand;
 }
 
@@ -228,6 +240,33 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("frame"),
             py::arg("output"),
             "Process one frame and write UYVY bytes into a caller-provided writable output buffer."
+        )
+        .def(
+            "process_frame_into_timed",
+            [](vp::VideoProcessor& self, const py::buffer& frame, const py::buffer& output, bool skip_deinterlace) {
+                using Clock = std::chrono::steady_clock;
+                const auto [frame_ptr, frame_size] = GetContiguousByteBuffer(frame);
+                const auto [out_ptr, out_size] = GetWritableContiguousByteBuffer(output, "output");
+                std::string processed;
+                Clock::time_point begin, native_done;
+                {
+                    py::gil_scoped_release release;
+                    begin = Clock::now();
+                    processed = skip_deinterlace
+                        ? self.ProcessFrameNoDeinterlaceBuffer(frame_ptr, frame_size)
+                        : self.ProcessFrameBuffer(frame_ptr, frame_size);
+                    native_done = Clock::now();
+                }
+                const auto gil_acquired = Clock::now();
+                CopyOutputToWritableBuffer(processed, out_ptr, out_size, "output");
+                const auto copied = Clock::now();
+                return py::make_tuple(
+                    std::chrono::duration<double, std::milli>(native_done - begin).count(),
+                    std::chrono::duration<double, std::milli>(gil_acquired - native_done).count(),
+                    std::chrono::duration<double, std::milli>(copied - gil_acquired).count());
+            },
+            py::arg("frame"), py::arg("output"), py::arg("skip_deinterlace") = false,
+            "Write a frame and return native work, GIL reacquisition, and output-copy milliseconds."
         )
         .def(
             "process_frame_field_phase_into",
@@ -611,6 +650,8 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("rotate_x") = 0.0f,
             py::arg("rotate_y") = 0.0f,
             py::arg("rotate_z") = 0.0f,
+            py::arg("aspect_x") = 1.0f,
+            py::arg("aspect_y") = 1.0f,
             "Configure the native CUDA transform for the base Effects Input layer."
         )
         .def("set_effect_layer_composition", &vp::VideoProcessor::SetEffectLayerComposition)
@@ -650,12 +691,15 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("mask_size") = 1.0f,
             py::arg("mask_x") = 0.0f,
             py::arg("mask_y") = 0.0f,
+            py::arg("mask_rotation") = 0.0f,
             py::arg("transform_x") = 0.0f,
             py::arg("transform_y") = 0.0f,
             py::arg("transform_z") = 0.0f,
             py::arg("rotate_x") = 0.0f,
             py::arg("rotate_y") = 0.0f,
             py::arg("rotate_z") = 0.0f,
+            py::arg("aspect_x") = 1.0f,
+            py::arg("aspect_y") = 1.0f,
             py::arg("materialize_key_alpha") = false,
             "Configure one native CUDA compositor overlay layer in [2, 8]."
         )
@@ -679,6 +723,8 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("rotate_x") = 0.0f,
             py::arg("rotate_y") = 0.0f,
             py::arg("rotate_z") = 0.0f,
+            py::arg("aspect_x") = 1.0f,
+            py::arg("aspect_y") = 1.0f,
             py::arg("generator_type") = "off",
             py::arg("key_color_r") = 0,
             py::arg("key_color_g") = 255,
@@ -693,6 +739,7 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("mask_size") = 1.0f,
             py::arg("mask_x") = 0.0f,
             py::arg("mask_y") = 0.0f,
+            py::arg("mask_rotation") = 0.0f,
             "Configure one scalar source-to-target channel route for a compositor layer."
         )
         .def(
@@ -837,6 +884,8 @@ PYBIND11_MODULE(video_processor, m) {
             &vp::VideoProcessor::ClearEffectMedia,
             "Disable all native effect layers and clear all active media dimensions."
         )
+        .def("set_gpu_ready_mode", &vp::VideoProcessor::SetGpuReadyMode, py::arg("enabled"),
+             "Keep at most one asynchronous GPU warm-up in flight during identity passthrough.")
         .def(
             "set_subpixel_shift",
             &vp::VideoProcessor::SetSubpixelShift,

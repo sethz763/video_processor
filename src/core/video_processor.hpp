@@ -64,6 +64,8 @@ struct AlphaMixOperandConfig {
     float rotate_x = 0.0f;
     float rotate_y = 0.0f;
     float rotate_z = 0.0f;
+    float aspect_x = 1.0f;
+    float aspect_y = 1.0f;
     uchar3 key_color = make_uchar3(0, 255, 0);
     float key_similarity = 0.25f;
     float key_softness = 0.10f;
@@ -76,6 +78,7 @@ struct AlphaMixOperandConfig {
     float mask_size = 1.0f;
     float mask_x = 0.0f;
     float mask_y = 0.0f;
+    float mask_rotation = 0.0f;
 };
 
 struct AlphaMixOpConfig {
@@ -214,6 +217,7 @@ public:
     void SetDenoiseStrength(float strength);
     float GetDenoiseStrength() const;
     void SetSubpixelShift(float shift_x, float shift_y);
+    void SetGpuReadyMode(bool enabled);
     void GetSubpixelShift(float& shift_x, float& shift_y) const;
     void SetColorSpace(ColorSpace color_space);
     void SetColorSpaceByName(const std::string& color_space_name);
@@ -255,7 +259,9 @@ public:
         float transform_z,
         float rotate_x,
         float rotate_y,
-        float rotate_z
+        float rotate_z,
+        float aspect_x = 1.0f,
+        float aspect_y = 1.0f
     );
     void SetEffectLayerConfig(
         int layer_index,
@@ -289,12 +295,15 @@ public:
         float mask_size = 1.0f,
         float mask_x = 0.0f,
         float mask_y = 0.0f,
+        float mask_rotation = 0.0f,
         float transform_x = 0.0f,
         float transform_y = 0.0f,
         float transform_z = 0.0f,
         float rotate_x = 0.0f,
         float rotate_y = 0.0f,
         float rotate_z = 0.0f,
+        float aspect_x = 1.0f,
+        float aspect_y = 1.0f,
         bool materialize_key_alpha = false
     );
     void UploadEffectLayerMediaRgba(
@@ -325,6 +334,8 @@ public:
         float rotate_x,
         float rotate_y,
         float rotate_z,
+        float aspect_x,
+        float aspect_y,
         const std::string& generator_type = "off",
         int key_color_r = 0,
         int key_color_g = 255,
@@ -338,7 +349,8 @@ public:
         bool mask_invert = false,
         float mask_size = 1.0f,
         float mask_x = 0.0f,
-        float mask_y = 0.0f
+        float mask_y = 0.0f,
+        float mask_rotation = 0.0f
     );
     void SetEffectLayerChannelAlphaMix(
         int layer_index,
@@ -390,6 +402,8 @@ private:
             float rotate_x = 0.0f;
             float rotate_y = 0.0f;
             float rotate_z = 0.0f;
+            float aspect_x = 1.0f;
+            float aspect_y = 1.0f;
             int generator_type = 0;
             uchar3 key_color = make_uchar3(0, 255, 0);
             float key_similarity = 0.25f;
@@ -402,6 +416,7 @@ private:
             float mask_size = 1.0f;
             float mask_x = 0.0f;
             float mask_y = 0.0f;
+            float mask_rotation = 0.0f;
             bool alpha_mix_enabled = false;
             AlphaMixOperandConfig alpha_mix_base{};
             std::vector<AlphaMixOpConfig> alpha_mix_ops{};
@@ -437,12 +452,15 @@ private:
         float mask_size = 1.0f;
         float mask_x = 0.0f;
         float mask_y = 0.0f;
+        float mask_rotation = 0.0f;
         float transform_x = 0.0f;
         float transform_y = 0.0f;
         float transform_z = 0.0f;
         float rotate_x = 0.0f;
         float rotate_y = 0.0f;
         float rotate_z = 0.0f;
+        float aspect_x = 1.0f;
+        float aspect_y = 1.0f;
         bool channel_routing_enabled = false;
         std::array<ChannelRouteState, 4> channel_routes{};
         std::vector<ColorStageConfig> color_stages{};
@@ -502,6 +520,7 @@ private:
     int auto_sr_settle_frames_;
     float subpixel_shift_x_;
     float subpixel_shift_y_;
+    bool gpu_ready_mode_ = false;
     ColorSpace color_space_;
     ColorRange color_range_;
     float effects_layer1_opacity_;
@@ -515,6 +534,8 @@ private:
     float effects_input_rotate_x_;
     float effects_input_rotate_y_;
     float effects_input_rotate_z_;
+    float effects_input_aspect_x_;
+    float effects_input_aspect_y_;
     std::array<EffectLayerState, kEffectLayerCount> effect_layers_;
     std::vector<ColorStageConfig> color_stages_;
 

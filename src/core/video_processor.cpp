@@ -112,6 +112,11 @@ inline ColorStageConfig ClampColorStageConfig(ColorStageConfig stage) {
 }
 
 inline int ParseEffectMaskPattern(const std::string& pattern_name) {
+    const char* gradients[] = {"gradient_linear", "gradient_quadratic", "gradient_easing",
+        "gradient_diagonal", "gradient_radial", "gradient_spherical", "gradient_quadratic_sphere"};
+    for (int i = 0; i < 7; ++i) {
+        if (pattern_name == gradients[i]) return 4 + i;
+    }
     if (pattern_name == "off") {
         return 0;
     }
@@ -124,6 +129,9 @@ inline int ParseEffectMaskPattern(const std::string& pattern_name) {
     if (pattern_name == "diamond") {
         return 3;
     }
+    if (pattern_name == "barndoor_vertical") return 11;
+    if (pattern_name == "barndoor_horizontal") return 12;
+    if (pattern_name == "horizontal") return 13;
     throw std::invalid_argument("Effect mask pattern must be one of [off, square, circle, diamond].");
 }
 
@@ -242,26 +250,25 @@ inline int ParseAlphaMixMode(const std::string& mode_name) {
 }
 
 inline AlphaMixOperandConfig ClampAlphaMixOperandConfig(AlphaMixOperandConfig operand) {
-    if (operand.type < 0 || operand.type > 4) {
+    if (operand.type < 0 || operand.type > 5) {
         operand.type = 0;
     }
     operand.source_slot = std::clamp(operand.source_slot, 0, 7);
     operand.source_channel = std::clamp(operand.source_channel, 0, 3);
     operand.blur_method = operand.blur_method == 2 ? 2 : (operand.blur_method == 1 ? 1 : 0);
-    operand.blur_radius = std::clamp(operand.blur_radius, 0.0f, 16.0f);
-    operand.transform_x = std::clamp(operand.transform_x, -10000.0f, 10000.0f);
-    operand.transform_y = std::clamp(operand.transform_y, -10000.0f, 10000.0f);
-    operand.transform_z = std::clamp(operand.transform_z, -100000000.0f, 1000.0f);
+    operand.blur_radius = std::clamp(operand.blur_radius, 0.0f, 128.0f);
     operand.rotate_x = std::clamp(operand.rotate_x, -180.0f, 180.0f);
     operand.rotate_y = std::clamp(operand.rotate_y, -180.0f, 180.0f);
     operand.rotate_z = std::clamp(operand.rotate_z, -180.0f, 180.0f);
+    operand.aspect_x = std::clamp(operand.aspect_x, 0.01f, 10000.0f);
+    operand.aspect_y = std::clamp(operand.aspect_y, 0.01f, 10000.0f);
     operand.key_color = make_uchar3(
         static_cast<uint8_t>(std::clamp(static_cast<int>(operand.key_color.x), 0, 255)),
         static_cast<uint8_t>(std::clamp(static_cast<int>(operand.key_color.y), 0, 255)),
         static_cast<uint8_t>(std::clamp(static_cast<int>(operand.key_color.z), 0, 255))
     );
     operand.key_similarity = std::clamp(operand.key_similarity, 0.0f, 1.0f);
-    operand.key_softness = std::clamp(operand.key_softness, 0.0f, 1.0f);
+    operand.key_softness = std::clamp(operand.key_softness, 0.0f, operand.type == 5 ? 100.0f : 1.0f);
     operand.key_edge_feather = std::clamp(operand.key_edge_feather, 0.0f, 16.0f);
     operand.mask_pattern_code = std::max(0, operand.mask_pattern_code);
     operand.mask_softness = std::clamp(operand.mask_softness, 0.0f, 1.0f);
@@ -269,6 +276,7 @@ inline AlphaMixOperandConfig ClampAlphaMixOperandConfig(AlphaMixOperandConfig op
     operand.mask_size = std::clamp(operand.mask_size, 0.1f, 4.0f);
     operand.mask_x = std::clamp(operand.mask_x, -100.0f, 100.0f);
     operand.mask_y = std::clamp(operand.mask_y, -100.0f, 100.0f);
+    operand.mask_rotation = std::clamp(operand.mask_rotation, -180.0f, 180.0f);
     return operand;
 }
 
@@ -572,6 +580,8 @@ VideoProcessor::VideoProcessor(
             effects_input_rotate_x_(0.0f),
             effects_input_rotate_y_(0.0f),
             effects_input_rotate_z_(0.0f),
+            effects_input_aspect_x_(1.0f),
+            effects_input_aspect_y_(1.0f),
       uyvy_bytes_(static_cast<size_t>(width) * static_cast<size_t>(height) * kUyvyBytesPerPixel),
       rgb_pixels_(static_cast<size_t>(width) * static_cast<size_t>(height)),
       stream_(nullptr),
@@ -649,6 +659,11 @@ void VideoProcessor::ClampRoi() {
     if (roi_w_ < 2) {
         roi_w_ = 2;
     }
+}
+
+void VideoProcessor::SetGpuReadyMode(bool enabled) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    gpu_ready_mode_ = enabled;
 }
 
 void VideoProcessor::SetRoi(int roi_x, int roi_y, int roi_w, int roi_h) {
@@ -1003,7 +1018,7 @@ bool VideoProcessor::EffectsActiveLocked() const {
         std::abs(effects_input_transform_z_) > 1.0e-4f ||
         std::abs(effects_input_rotate_x_) > 1.0e-4f ||
         std::abs(effects_input_rotate_y_) > 1.0e-4f ||
-        std::abs(effects_input_rotate_z_) > 1.0e-4f
+        (std::abs(effects_input_rotate_z_) > 1.0e-4f || std::abs(effects_input_aspect_x_ - 1.0f) > 1.0e-4f || std::abs(effects_input_aspect_y_ - 1.0f) > 1.0e-4f)
     ) {
         return true;
     }
@@ -1111,7 +1126,7 @@ void VideoProcessor::SetEffectsConfig(
     layer.color_from_alpha = effect_color_from_alpha;
     layer.alpha_from_color = effect_alpha_from_color;
     layer.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
-    layer.blur_radius = std::clamp(blur_radius, 0.0f, 16.0f);
+    layer.blur_radius = std::clamp(blur_radius, 0.0f, 128.0f);
     layer.blur_target = blur_target == "color" ? 1 : (blur_target == "alpha" ? 2 : (blur_target == "both" ? 3 : 0));
 }
 
@@ -1125,15 +1140,19 @@ void VideoProcessor::SetEffectsInputTransform(
     float transform_z,
     float rotate_x,
     float rotate_y,
-    float rotate_z
+    float rotate_z,
+    float aspect_x,
+    float aspect_y
 ) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
-    effects_input_transform_x_ = std::clamp(transform_x, -10000.0f, 10000.0f);
-    effects_input_transform_y_ = std::clamp(transform_y, -10000.0f, 10000.0f);
-    effects_input_transform_z_ = std::clamp(transform_z, -100000000.0f, 1000.0f);
+    effects_input_transform_x_ = transform_x;
+    effects_input_transform_y_ = transform_y;
+    effects_input_transform_z_ = transform_z;
     effects_input_rotate_x_ = std::clamp(rotate_x, -180.0f, 180.0f);
     effects_input_rotate_y_ = std::clamp(rotate_y, -180.0f, 180.0f);
     effects_input_rotate_z_ = std::clamp(rotate_z, -180.0f, 180.0f);
+    effects_input_aspect_x_ = std::max(0.01f, aspect_x);
+    effects_input_aspect_y_ = std::max(0.01f, aspect_y);
 }
 
 void VideoProcessor::SetEffectLayerComposition(int layer_index, int target, int source) {
@@ -1199,12 +1218,15 @@ void VideoProcessor::SetEffectLayerConfig(
     float mask_size,
     float mask_x,
     float mask_y,
+    float mask_rotation,
     float transform_x,
     float transform_y,
     float transform_z,
     float rotate_x,
     float rotate_y,
     float rotate_z,
+    float aspect_x,
+    float aspect_y,
     bool materialize_key_alpha
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
@@ -1236,7 +1258,7 @@ void VideoProcessor::SetEffectLayerConfig(
     layer.source_from_effects_input = source_from_effects_input;
     layer.key_alpha_from_effects_input = key_alpha_from_effects_input;
     layer.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
-    layer.blur_radius = std::clamp(blur_radius, 0.0f, 16.0f);
+    layer.blur_radius = std::clamp(blur_radius, 0.0f, 128.0f);
     layer.blur_target = blur_target == "color" ? 1 : (blur_target == "alpha" ? 2 : (blur_target == "both" ? 3 : 0));
     layer.mask_pattern_code = ParseEffectMaskPattern(mask_pattern);
     layer.mask_pattern = mask_pattern;
@@ -1246,12 +1268,15 @@ void VideoProcessor::SetEffectLayerConfig(
     layer.mask_size = std::clamp(mask_size, 0.1f, 4.0f);
     layer.mask_x = std::clamp(mask_x, -100.0f, 100.0f);
     layer.mask_y = std::clamp(mask_y, -100.0f, 100.0f);
-    layer.transform_x = std::clamp(transform_x, -10000.0f, 10000.0f);
-    layer.transform_y = std::clamp(transform_y, -10000.0f, 10000.0f);
-    layer.transform_z = std::clamp(transform_z, -100000000.0f, 1000.0f);
+    layer.mask_rotation = mask_rotation;
+    layer.transform_x = transform_x;
+    layer.transform_y = transform_y;
+    layer.transform_z = transform_z;
     layer.rotate_x = std::clamp(rotate_x, -180.0f, 180.0f);
     layer.rotate_y = std::clamp(rotate_y, -180.0f, 180.0f);
     layer.rotate_z = std::clamp(rotate_z, -180.0f, 180.0f);
+    layer.aspect_x = std::clamp(aspect_x, 0.01f, 10000.0f);
+    layer.aspect_y = std::clamp(aspect_y, 0.01f, 10000.0f);
 }
 
 void VideoProcessor::SetEffectLayerAlphaMix(
@@ -1417,6 +1442,8 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     float rotate_x,
     float rotate_y,
     float rotate_z,
+    float aspect_x,
+    float aspect_y,
     const std::string& generator_type,
     int key_color_r,
     int key_color_g,
@@ -1430,7 +1457,8 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     bool mask_invert,
     float mask_size,
     float mask_x,
-    float mask_y
+    float mask_y,
+    float mask_rotation
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
         throw std::out_of_range("Effect layer index must be in [1, 64].");
@@ -1444,13 +1472,15 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     layer.channel_routing_enabled = true;
     route.source_channel = source_channel;
     route.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
-    route.blur_radius = std::clamp(blur_radius, 0.0f, 16.0f);
-    route.transform_x = std::clamp(transform_x, -10000.0f, 10000.0f);
-    route.transform_y = std::clamp(transform_y, -10000.0f, 10000.0f);
-    route.transform_z = std::clamp(transform_z, -100000000.0f, 1000.0f);
+    route.blur_radius = std::clamp(blur_radius, 0.0f, 128.0f);
+    route.transform_x = transform_x;
+    route.transform_y = transform_y;
+    route.transform_z = transform_z;
     route.rotate_x = std::clamp(rotate_x, -180.0f, 180.0f);
     route.rotate_y = std::clamp(rotate_y, -180.0f, 180.0f);
     route.rotate_z = std::clamp(rotate_z, -180.0f, 180.0f);
+    route.aspect_x = std::clamp(aspect_x, 0.01f, 10000.0f);
+    route.aspect_y = std::clamp(aspect_y, 0.01f, 10000.0f);
     route.generator_type = generator_type == "chroma_key" ? 1 : (generator_type == "mask" ? 2 : 0);
     route.key_color = make_uchar3(
         static_cast<uint8_t>(std::clamp(key_color_r, 0, 255)),
@@ -1467,6 +1497,7 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     route.mask_size = std::clamp(mask_size, 0.1f, 4.0f);
     route.mask_x = std::clamp(mask_x, -100.0f, 100.0f);
     route.mask_y = std::clamp(mask_y, -100.0f, 100.0f);
+    route.mask_rotation = mask_rotation;
     route.alpha_mix_enabled = false;
     route.alpha_mix_base = {};
     route.alpha_mix_ops.clear();
@@ -2118,6 +2149,7 @@ std::string VideoProcessor::ProcessFrameInternal(
         throw std::invalid_argument("Invalid frame size; expected 1920*1080*2 bytes in UYVY.");
     }
 
+    bool gpu_ready = false;
     int roi_x = 0;
     int roi_y = 0;
     int roi_w = 0;
@@ -2156,6 +2188,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             }
         }
 
+        gpu_ready = gpu_ready_mode_;
         roi_x = roi_x_;
         roi_y = roi_y_;
         roi_w = roi_w_;
@@ -2183,13 +2216,25 @@ std::string VideoProcessor::ProcessFrameInternal(
 
     const bool effects_active = EffectsActiveLocked();
 
-    // Preserve byte-identical full-frame output without launching GPU work.
-    // Repeated warm-up kernels discard their result and consume the live frame
-    // budget even though no scaling, effects, or preprocessing are required.
+    // Preserve byte-identical full-frame output. In live ready mode keep CUDA
+    // active without waiting for a warm-up result or buffering video frames.
     if (!effects_active && !deinterlace_only && !deinterlace_enabled && denoise_method == DenoiseMethod::Off &&
         (!enable_placeholder_sr_ || sr_scale <= 1) &&
         roi_x == 0 && roi_y == 0 && roi_w == width_ && roi_h == height_ &&
         !HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+        if (gpu_ready) {
+            const auto ready = cudaStreamQuery(stream_);
+            if (ready == cudaSuccess) {
+                // Scratch pixels only; real rendering uploads its own input on
+                // this same stream. Never queue a second warm-up behind one
+                // still running, including during the initial cold ramp.
+                CheckCuda(cudaMemsetAsync(d_uyvy_in_, 128, uyvy_bytes_, stream_), "GPU ready input");
+                cuda_kernels::LaunchUyvyCropZoomFiltered(d_uyvy_in_, d_uyvy_out_, width_, height_,
+                    0, 0, width_, height_, 3, stream_);
+            } else if (ready != cudaErrorNotReady) {
+                CheckCuda(ready, "GPU ready stream query");
+            }
+        }
         return std::string(reinterpret_cast<const char*>(input_frame), uyvy_bytes_);
     }
 
@@ -2248,6 +2293,30 @@ std::string VideoProcessor::ProcessFrameInternal(
             "cudaMemcpyAsync D2H uyvy denoise fast path"
         );
         CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize uyvy denoise fast path");
+        return std::string(reinterpret_cast<const char*>(host_output_ptr), uyvy_bytes_);
+    }
+
+    if (!effects_active && !deinterlace_only && !deinterlace_enabled &&
+        field_phase_override < 0 && denoise_method == DenoiseMethod::Off &&
+        sr_flavor != SrFlavor::Bilinear) {
+        if (enable_placeholder_sr_ && sr_scale > 1 && full_frame_roi) {
+            roi_w = std::max(2, width_ / sr_scale) & ~1;
+            roi_h = std::max(2, height_ / sr_scale);
+            roi_x = ((width_ - roi_w) / 2) & ~1;
+            roi_y = (height_ - roi_h) / 2;
+        }
+        const int method = sr_flavor == SrFlavor::BilinearSharp ? 1
+            : (sr_flavor == SrFlavor::Bicubic ? 2 : 3);
+        cuda_kernels::LaunchUyvyCropZoomFiltered(d_uyvy_in_, d_uyvy_out_, width_, height_,
+            roi_x, roi_y, roi_w, roi_h, method, stream_);
+        const uint8_t* result = d_uyvy_out_;
+        if (HasSubpixelShift(subpixel_shift_x, subpixel_shift_y)) {
+            cuda_kernels::LaunchUyvySubpixelShift(d_uyvy_out_, d_uyvy_in_, width_, height_,
+                subpixel_shift_x, subpixel_shift_y, stream_);
+            result = d_uyvy_in_;
+        }
+        CheckCuda(cudaMemcpyAsync(host_output_ptr, result, uyvy_bytes_, cudaMemcpyDeviceToHost, stream_), "D2H YUV zoom");
+        CheckCuda(cudaStreamSynchronize(stream_), "synchronize YUV zoom");
         return std::string(reinterpret_cast<const char*>(host_output_ptr), uyvy_bytes_);
     }
 
@@ -2749,7 +2818,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             std::abs(effects_input_transform_z_) > 1.0e-4f ||
             std::abs(effects_input_rotate_x_) > 1.0e-4f ||
             std::abs(effects_input_rotate_y_) > 1.0e-4f ||
-            std::abs(effects_input_rotate_z_) > 1.0e-4f;
+            (std::abs(effects_input_rotate_z_) > 1.0e-4f || std::abs(effects_input_aspect_x_ - 1.0f) > 1.0e-4f || std::abs(effects_input_aspect_y_ - 1.0f) > 1.0e-4f);
         if (input_transform_active) {
             CheckCuda(
                 cudaMemsetAsync(d_effect_alpha_a_, 255, rgb_pixels_, stream_),
@@ -2759,7 +2828,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                 final_output, d_effect_alpha_a_, d_effect_composite_, d_effect_composite_alpha_a_,
                 width_, height_, effects_input_transform_x_, effects_input_transform_y_,
                 effects_input_transform_z_, effects_input_rotate_x_, effects_input_rotate_y_,
-                effects_input_rotate_z_, stream_
+                effects_input_rotate_z_, effects_input_aspect_x_, effects_input_aspect_y_, stream_
             );
             composite_color = d_effect_composite_;
             composite_alpha = d_effect_composite_alpha_a_;
@@ -2832,12 +2901,12 @@ std::string VideoProcessor::ProcessFrameInternal(
                 cuda_kernels::LaunchApplyProceduralAlphaMask(
                     current, width_, height_, operand.mask_pattern_code,
                     operand.mask_softness, operand.mask_aspect, operand.mask_invert, operand.mask_size,
-                    operand.mask_x, operand.mask_y, stream_
+                    operand.mask_x, operand.mask_y, operand.mask_rotation, stream_
                 );
-            } else if (operand.type == 2) {
+            } else if (operand.type == 2 || operand.type == 5) {
                 CheckCuda(cudaMemsetAsync(current, 255, rgb_pixels_, stream_), "cudaMemsetAsync alpha mix chroma");
                 cuda_kernels::LaunchGenerateKeyAlpha(
-                    operand_color, current, width_, height_, 1,
+                    operand_color, current, width_, height_, operand.type == 5 ? 3 : 1,
                     operand.key_color, operand.key_similarity, operand.key_softness,
                     0.0f, 1.0f, 0.10f, operand.key_invert, stream_
                 );
@@ -2867,13 +2936,13 @@ std::string VideoProcessor::ProcessFrameInternal(
             const bool transform_active =
                 std::abs(operand.transform_x) > 1.0e-4f || std::abs(operand.transform_y) > 1.0e-4f ||
                 std::abs(operand.transform_z) > 1.0e-4f || std::abs(operand.rotate_x) > 1.0e-4f ||
-                std::abs(operand.rotate_y) > 1.0e-4f || std::abs(operand.rotate_z) > 1.0e-4f;
+                std::abs(operand.rotate_y) > 1.0e-4f || (std::abs(operand.rotate_z) > 1.0e-4f || std::abs(operand.aspect_x - 1.0f) > 1.0e-4f || std::abs(operand.aspect_y - 1.0f) > 1.0e-4f);
             if (transform_active) {
                 uint8_t* transformed = current == primary_buffer ? secondary_buffer : primary_buffer;
                 cuda_kernels::LaunchTransformAlpha3D(
                     current, transformed, width_, height_,
                     operand.transform_x, operand.transform_y, operand.transform_z,
-                    operand.rotate_x, operand.rotate_y, operand.rotate_z, stream_
+                    operand.rotate_x, operand.rotate_y, operand.rotate_z, operand.aspect_x, operand.aspect_y, stream_
                 );
                 current = transformed;
             }
@@ -2977,7 +3046,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                 cuda_kernels::LaunchApplyProceduralAlphaMask(
                     d_effect_alpha_a_, width_, height_, layer.mask_pattern_code,
                     layer.mask_softness, layer.mask_aspect, layer.mask_invert, layer.mask_size,
-                    layer.mask_x, layer.mask_y, stream_
+                    layer.mask_x, layer.mask_y, layer.mask_rotation, stream_
                 );
             }
             if (layer.channel_routing_enabled) {
@@ -3050,7 +3119,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                         cuda_kernels::LaunchApplyProceduralAlphaMask(
                             d_effect_channel_a_, width_, height_, route.mask_pattern_code,
                             route.mask_softness, route.mask_aspect, route.mask_invert, route.mask_size,
-                            route.mask_x, route.mask_y, stream_
+                            route.mask_x, route.mask_y, route.mask_rotation, stream_
                         );
                     } else {
                         cuda_kernels::LaunchExtractColorAlphaChannel(
@@ -3069,12 +3138,12 @@ std::string VideoProcessor::ProcessFrameInternal(
                     const bool channel_transform_active =
                         std::abs(route.transform_x) > 1.0e-4f || std::abs(route.transform_y) > 1.0e-4f ||
                         std::abs(route.transform_z) > 1.0e-4f || std::abs(route.rotate_x) > 1.0e-4f ||
-                        std::abs(route.rotate_y) > 1.0e-4f || std::abs(route.rotate_z) > 1.0e-4f;
+                        std::abs(route.rotate_y) > 1.0e-4f || (std::abs(route.rotate_z) > 1.0e-4f || std::abs(route.aspect_x - 1.0f) > 1.0e-4f || std::abs(route.aspect_y - 1.0f) > 1.0e-4f);
                     if (channel_transform_active) {
                         cuda_kernels::LaunchTransformAlpha3D(
                             d_effect_channel_a_, d_effect_channel_b_, width_, height_,
                             route.transform_x, route.transform_y, route.transform_z,
-                            route.rotate_x, route.rotate_y, route.rotate_z, stream_
+                            route.rotate_x, route.rotate_y, route.rotate_z, route.aspect_x, route.aspect_y, stream_
                         );
                         channel_buffer = d_effect_channel_b_;
                     }
@@ -3146,7 +3215,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             const bool transform_active =
                 std::abs(layer.transform_x) > 1.0e-4f || std::abs(layer.transform_y) > 1.0e-4f ||
                 std::abs(layer.transform_z) > 1.0e-4f || std::abs(layer.rotate_x) > 1.0e-4f ||
-                std::abs(layer.rotate_y) > 1.0e-4f || std::abs(layer.rotate_z) > 1.0e-4f;
+                std::abs(layer.rotate_y) > 1.0e-4f || (std::abs(layer.rotate_z) > 1.0e-4f || std::abs(layer.aspect_x - 1.0f) > 1.0e-4f || std::abs(layer.aspect_y - 1.0f) > 1.0e-4f);
             if (transform_active) {
                 // Spatial sampling must not overwrite a buffer that other pixels still read.
                 uchar3* transformed_color = effect_color_buffer == d_effect_color_b_
@@ -3156,7 +3225,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                 cuda_kernels::LaunchTransformColorAlpha3D(
                     effect_color_buffer, effect_alpha_buffer, transformed_color, transformed_alpha,
                     width_, height_, layer.transform_x, layer.transform_y, layer.transform_z,
-                    layer.rotate_x, layer.rotate_y, layer.rotate_z, stream_
+                    layer.rotate_x, layer.rotate_y, layer.rotate_z, layer.aspect_x, layer.aspect_y, stream_
                 );
                 effect_color_buffer = transformed_color;
                 effect_alpha_buffer = transformed_alpha;
@@ -3187,7 +3256,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                 cuda_kernels::LaunchApplyProceduralAlphaMask(
                     effect_alpha_buffer, width_, height_, layer.mask_pattern_code,
                     layer.mask_softness, layer.mask_aspect, layer.mask_invert, layer.mask_size,
-                    layer.mask_x, layer.mask_y, stream_
+                    layer.mask_x, layer.mask_y, layer.mask_rotation, stream_
                 );
             }
             if (layer.color_from_alpha) {

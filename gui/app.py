@@ -60,6 +60,14 @@ except ImportError:
 
 FRAME_W = 1920
 FRAME_H = 1080
+NODE_CHECKBOX_INDICATOR_STYLE = (
+    "QCheckBox::indicator { width: 14px; height: 14px; "
+    "background: #171a1f; border: 1px solid #aeb8c4; border-radius: 2px; }"
+    "QCheckBox::indicator:checked { image: url(\""
+    + (Path(__file__).resolve().parent / "assets" / "checkbox-check-white.svg").as_posix()
+    + "\"); }"
+    "QCheckBox::indicator:unchecked { image: none; }"
+)
 UYVY_FRAME_BYTES = FRAME_W * FRAME_H * 2
 INPUT_MODE_QUERY_DEFAULT = "1080i59.94"
 OUTPUT_MODE_QUERY_DEFAULT = "1080i59.94"
@@ -347,7 +355,11 @@ def _extract_decklink_frame_timecode_info(frame: object) -> dict[str, object]:
     return payload
 
 try:
-    import decklink_wrapper as d
+    if __package__:
+        from .decklink_backend import load_decklink_backend
+    else:
+        from decklink_backend import load_decklink_backend
+    d = load_decklink_backend()
 except Exception:
     d = None
 
@@ -364,10 +376,10 @@ if _project_root_for_imports not in sys.path:
 
 _worker_import_error: Exception | None = None
 try:
-    from gui.processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker, effect_layer_updates, bypassed_effects_payload
+    from gui.processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker, effect_layer_updates, bypassed_effects_payload, PreviewMailbox
 except Exception as exc_gui_import:
     try:
-        from processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker, effect_layer_updates, bypassed_effects_payload
+        from processor_worker import EffectCaptureDecoder, EffectMediaDecoder, run_processor_worker, effect_layer_updates, bypassed_effects_payload, PreviewMailbox
     except Exception as exc_local_import:
         run_processor_worker = None
         _worker_import_error = exc_local_import
@@ -375,6 +387,24 @@ except Exception as exc_gui_import:
         _worker_import_error = None
 else:
     _worker_import_error = None
+
+
+from gui.cadence_monitor import session_counter
+from gui.input_sources import SourcePool
+from gui.capture_adapters import create_input_adapter
+from gui.roi_source import RoiSourceSession, rgb_to_uyvy
+from gui.roi_warmup import warmup_roi_scaling
+from gui.gradient_texture import GRADIENT_MODES
+from gui.input_source_panel import InputSourcePanel
+
+
+def _capture_backend(device_id: object) -> str:
+    if isinstance(device_id, str):
+        if device_id.startswith("source:"):
+            return "logical"
+        if device_id.startswith("webcam:"):
+            return "webcam"
+    return ""
 
 
 def _windows_video_capture_devices() -> list[tuple[str, str]]:
@@ -532,12 +562,15 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "mask_size": float(payload.get("mask_size", 1.0)),
             "mask_x": float(payload.get("mask_x", 0.0)),
             "mask_y": float(payload.get("mask_y", 0.0)),
+            "mask_rotation": float(payload.get("mask_rotation", 0.0)),
             "transform_x": float(payload.get("transform_x", 0.0)),
             "transform_y": float(payload.get("transform_y", 0.0)),
             "transform_z": float(payload.get("transform_z", 0.0)),
             "rotate_x": float(payload.get("rotate_x", 0.0)),
             "rotate_y": float(payload.get("rotate_y", 0.0)),
             "rotate_z": float(payload.get("rotate_z", 0.0)),
+            "aspect_x": float(payload.get("aspect_x", 1.0)),
+            "aspect_y": float(payload.get("aspect_y", 1.0)),
         }
     ]
 
@@ -588,12 +621,15 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
         mask_size=float(layer.get("mask_size", 1.0)),
         mask_x=float(layer.get("mask_x", 0.0)),
         mask_y=float(layer.get("mask_y", 0.0)),
+        mask_rotation=float(layer.get("mask_rotation", 0.0)),
         transform_x=float(layer.get("transform_x", 0.0)),
         transform_y=float(layer.get("transform_y", 0.0)),
         transform_z=float(layer.get("transform_z", 0.0)),
         rotate_x=float(layer.get("rotate_x", 0.0)),
         rotate_y=float(layer.get("rotate_y", 0.0)),
         rotate_z=float(layer.get("rotate_z", 0.0)),
+        aspect_x=float(layer.get("aspect_x", 1.0)),
+        aspect_y=float(layer.get("aspect_y", 1.0)),
         materialize_key_alpha=bool(layer.get("materialize_key_alpha", False)),
     )
     alpha_mix_setter = getattr(processor, "set_effect_layer_alpha_mix", None)
@@ -630,6 +666,8 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
                 rotate_x=float(route.get("rotate_x", 0.0)),
                 rotate_y=float(route.get("rotate_y", 0.0)),
                 rotate_z=float(route.get("rotate_z", 0.0)),
+                aspect_x=float(route.get("aspect_x", 1.0)),
+                aspect_y=float(route.get("aspect_y", 1.0)),
                 generator_type=str(route.get("generator_type", "off")),
                 key_color_r=int(generator_settings.get("key_color_r", 0)),
                 key_color_g=int(generator_settings.get("key_color_g", 255)),
@@ -644,6 +682,7 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
                 mask_size=float(generator_settings.get("size", 1.0)),
                 mask_x=float(generator_settings.get("x", 0.0)),
                 mask_y=float(generator_settings.get("y", 0.0)),
+                mask_rotation=float(generator_settings.get("rotation", 0.0)),
             )
             route_alpha_mix_setter = getattr(processor, "set_effect_layer_channel_alpha_mix", None)
             route_alpha_mix_base = route.get("alpha_mix_base")
@@ -687,6 +726,8 @@ def _set_native_effects_input_transform(processor: object, payload: dict[str, ob
         float(payload.get("input_rotate_x", 0.0)),
         float(payload.get("input_rotate_y", 0.0)),
         float(payload.get("input_rotate_z", 0.0)),
+        float(payload.get("input_aspect_x", 1.0)),
+        float(payload.get("input_aspect_y", 1.0)),
     )
     setter = getattr(processor, "set_effects_input_transform", None)
     if not callable(setter):
@@ -1509,10 +1550,10 @@ def write_frame_to_output(out: object, frame_bytes: bytes) -> None:
     if state is None:
         schedule_fn = getattr(out, "schedule_frame_copy", None)
         start_fn = getattr(out, "start_scheduled_playback", None)
-        buffered_fn = getattr(out, "buffered_video_frame_count", None)
+        buffered_count = session_counter(out, "buffered_video_frame_count")
         state = {
             "enabled": callable(schedule_fn) and callable(start_fn),
-            "can_query_buffered": callable(buffered_fn),
+            "can_query_buffered": buffered_count is not None,
             "started": False,
             "queued_before_start": 0,
             "display_time": 0,
@@ -1541,7 +1582,7 @@ def write_frame_to_output(out: object, frame_bytes: bytes) -> None:
                     should_start = False
                     if bool(state.get("can_query_buffered", False)):
                         try:
-                            buffered_count = int(out.buffered_video_frame_count())
+                            buffered_count = int(session_counter(out, "buffered_video_frame_count"))
                             effective_buffered = max(buffered_count, int(state["queued_before_start"]))
                             should_start = effective_buffered >= required_preroll_frames
                         except Exception:
@@ -2632,6 +2673,23 @@ class EffectsPortButton(QPushButton):
         super().mouseReleaseEvent(event)
 
 
+class ExpandingDoubleSpinBox(QDoubleSpinBox):
+    def validate(self, text, position):
+        from PySide6.QtGui import QValidator
+        raw = text.removesuffix(self.suffix()).strip()
+        value, valid = self.locale().toDouble(raw)
+        if valid and math.isfinite(value):
+            return QValidator.Acceptable, text, position
+        return super().validate(text, position)
+
+    def valueFromText(self, text):
+        value, valid = self.locale().toDouble(text.removesuffix(self.suffix()).strip())
+        if valid and math.isfinite(value):
+            self.setRange(min(self.minimum(), value), max(self.maximum(), value))
+            return value
+        return super().valueFromText(text)
+
+
 class EffectsNodeWidget(QWidget):
     portClicked = Signal(str, str)
     portDisconnectRequested = Signal(str, str)
@@ -2643,6 +2701,7 @@ class EffectsNodeWidget(QWidget):
     deleteRequested = Signal(str)
     blurLevelChanged = Signal(str, float)
     captureDeviceChanged = Signal(str, object, str)
+    gradientColorRequested = Signal(str, str)
     captureSettingsRequested = Signal(str)
     captureReloadRequested = Signal(str)
     mediaPathChanged = Signal(str, str)
@@ -2666,6 +2725,7 @@ class EffectsNodeWidget(QWidget):
             "media": (300, 154),
             "capture": (250, 154),
             "mix": (250, 154),
+            "gradient": (250, 154),
             "transform_3d": (250, 154),
             "color_splitter": (250, 154),
             "color_recombiner": (280, 184),
@@ -2674,8 +2734,11 @@ class EffectsNodeWidget(QWidget):
         self.setCursor(Qt.OpenHandCursor)
         self.setToolTip("Drag nodes to position. Drag output ports to inputs. Right-click a port to disconnect.")
 
+        reset_all = QPushButton("Reset all", self)
+        reset_all.setGeometry(self.width() - 78, 10, 68, 24)
+        reset_all.clicked.connect(lambda: parent._reset_node_settings(self.node_id))
         title_label = QLabel(title, self)
-        title_label.setGeometry(14, 10, 180, 24)
+        title_label.setGeometry(14, 10, self.width() - 96, 24)
         title_label.setStyleSheet("font-weight: 600; color: #f4f4f4;")
 
         self._status_label = QLabel(self)
@@ -2694,9 +2757,9 @@ class EffectsNodeWidget(QWidget):
         elif node_type == "mix":
             self._add_port("a_input", 0, 68, "Primary alpha input")
             self._add_port("b_input", 0, 128, "Secondary alpha input")
-        elif node_type == "chroma_key":
+        elif node_type in {"chroma_key", "luma_key"}:
             self._add_port("color_input", 0, 98, "Color input")
-        elif node_type not in {"effects_input", "keying", "capture", "media", "composition", "matte", "mask", "mix"}:
+        elif node_type not in {"effects_input", "keying", "capture", "media", "composition", "matte", "mask", "gradient", "mix"}:
             self._add_port("input", 0, 98, "Input")
         if node_type == "color_splitter":
             self._add_port("red_output", output_x, 68, "Red channel")
@@ -2711,7 +2774,9 @@ class EffectsNodeWidget(QWidget):
             self._add_port("alpha_output", output_x, 128, "Generated alpha")
         elif node_type == "mix":
             self._add_port("alpha_output", output_x, 98, "Mixed alpha")
-        elif node_type in {"mask", "chroma_key"}:
+        elif node_type == "gradient":
+            self._add_port("output", output_x, 98, "Gradient color")
+        elif node_type in {"mask", "chroma_key", "luma_key"}:
             self._add_port("alpha_output", output_x, 98, "Key alpha" if node_type == "chroma_key" else "Mask alpha")
         elif node_type not in {"effects_output", "keying"}:
             self._add_port("output", output_x, 128 if node_type == "media" else 98, "Color output")
@@ -2730,6 +2795,9 @@ class EffectsNodeWidget(QWidget):
             self.media_play.setToolTip("Play or pause media")
             self.media_play.toggled.connect(self._emit_media_playback)
             self.media_loop = QCheckBox("Loop", self)
+            self.media_loop.setStyleSheet(
+                "QCheckBox { color: #ffffff; background: transparent; }" + NODE_CHECKBOX_INDICATOR_STYLE
+            )
             self.media_loop.setGeometry(128, 72, 58, 24)
             self.media_loop.setChecked(True)
             self.media_loop.toggled.connect(self._emit_media_playback)
@@ -2759,8 +2827,17 @@ class EffectsNodeWidget(QWidget):
             self.matte_swatch.setGeometry(30, 72, 72, 24)
             self.matte_swatch.setToolTip("Choose matte color")
             self.matte_swatch.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
-        elif node_type == "mask":
+        elif node_type in {"mask", "gradient"}:
             self.mask_settings = QPushButton("Pattern...", self)
+            if node_type == "gradient":
+                self.mask_settings.setText("Gradient...")
+                self.gradient_swatches = {}
+                for index, key in enumerate(("color_a", "color_b")):
+                    swatch = QPushButton(self)
+                    swatch.setGeometry(30 + index * 54, 108, 46, 24)
+                    swatch.setToolTip("Choose gradient color " + ("A" if index == 0 else "B"))
+                    swatch.clicked.connect(lambda checked=False, key=key: self.gradientColorRequested.emit(self.node_id, key))
+                    self.gradient_swatches[key] = swatch
             self.mask_settings.setGeometry(30, 72, 92, 24)
             self.mask_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
         elif node_type == "blur":
@@ -2768,24 +2845,29 @@ class EffectsNodeWidget(QWidget):
             self._add_port("alpha_output", output_x, 68, "Blurred alpha")
             self.blur_level = QDoubleSpinBox(self)
             self.blur_level.setGeometry(55, 72, 100, 24)
-            self.blur_level.setRange(0.0, 16.0)
+            self.blur_level.setRange(0.0, 128.0)
             self.blur_level.setDecimals(2)
             self.blur_level.setSingleStep(0.25)
             self.blur_level.setSuffix(" px")
             self.blur_level.setKeyboardTracking(False)
             self.blur_level.setToolTip("GPU blur radius")
+            reset = QPushButton(self)
+            reset.setIcon(QIcon(str(Path(__file__).parent / "assets" / "reset.svg")))
+            reset.setToolTip("Reset radius")
+            reset.setGeometry(160, 72, 26, 24)
+            reset.clicked.connect(lambda: self.blur_level.setValue(3.0))
             self.blur_level.valueChanged.connect(
                 lambda value: self.blurLevelChanged.emit(self.node_id, float(value))
             )
         elif node_type == "capture":
             self._capture_devices: list[tuple[str, object]] = []
             self._selected_capture_device: object = None
-            self.capture_device_label = QLabel("No capture device selected", self)
+            self.capture_device_label = QLabel("No source selected", self)
             self.capture_device_label.setGeometry(14, 70, 206, 58)
             self.capture_device_label.setWordWrap(True)
             self.capture_device_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             self.capture_device_label.setStyleSheet("color: #f4f4f4; font-size: 11px;")
-        elif node_type in {"proc_amp", "color_corrector", "chroma_key", "transform_3d", "mix"}:
+        elif node_type in {"proc_amp", "color_corrector", "chroma_key", "luma_key", "transform_3d", "mix"}:
             self.adjust_settings = QPushButton("Adjust...", self)
             self.adjust_settings.setGeometry(76, 72, 98, 26)
             self.adjust_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
@@ -2939,6 +3021,9 @@ class EffectsNodeWidget(QWidget):
         self._compositor_state = state
 
     def set_matte_state(self, settings: dict[str, object]) -> None:
+        for key, button in getattr(self, "gradient_swatches", {}).items():
+            rgb = settings.get(key, [0, 0, 0] if key == "color_a" else [255, 255, 255])
+            button.setStyleSheet(f"background-color: rgb({int(rgb[0])}, {int(rgb[1])}, {int(rgb[2])}); border: 1px solid #d9dde2;")
         swatch = getattr(self, "matte_swatch", None)
         if swatch is None:
             return
@@ -2982,13 +3067,13 @@ class EffectsNodeWidget(QWidget):
         self._selected_capture_device = selected_index
         selected_name = next(
             (name for name, device_index in devices if device_index == selected_index),
-            "No capture device selected",
+            "No source selected",
         )
         label.setText(selected_name)
         label.setToolTip(selected_name)
 
     def _add_capture_device_menu(self, menu: QMenu) -> QMenu:
-        device_menu = menu.addMenu("Capture Device")
+        device_menu = menu.addMenu("Source")
         if self._capture_devices:
             for device_name, device_index in self._capture_devices:
                 device_action = device_menu.addAction(device_name)
@@ -3000,7 +3085,7 @@ class EffectsNodeWidget(QWidget):
                     )
                 )
         else:
-            no_devices_action = device_menu.addAction("No capture devices")
+            no_devices_action = device_menu.addAction("No sources configured")
             no_devices_action.setEnabled(False)
         return device_menu
 
@@ -3115,9 +3200,8 @@ class EffectsNodeWidget(QWidget):
         reload_action = None
         if self.node_type == "capture":
             device_menu = self._add_capture_device_menu(menu)
-            menu.addSeparator()
-            reload_action = menu.addAction("Reload Camera")
-        settings_action = menu.addAction("Settings...")
+
+        settings_action = menu.addAction("Settings...") if self.node_type != "capture" else None
         delete_action = None
         if self.node_type not in {"effects_input", "effects_output"}:
             menu.addSeparator()
@@ -3126,7 +3210,7 @@ class EffectsNodeWidget(QWidget):
         del device_menu
         if reload_action is not None and selected == reload_action:
             self.captureReloadRequested.emit(self.node_id)
-        elif selected == settings_action:
+        elif settings_action is not None and selected == settings_action:
             self.settingsRequested.emit(self.node_id)
         elif delete_action is not None and selected == delete_action:
             self.deleteRequested.emit(self.node_id)
@@ -3142,15 +3226,17 @@ class EffectsGraphCanvas(QWidget):
         "denoise": "Noise Reduction",
         "composition": "Composition Source",
         "media": "Video / Image / Sequence",
-        "capture": "Video Capture",
+        "capture": "Source",
         "keying": "Compositor",
         "blur": "Blur",
         "matte": "Matte Color",
         "mask": "Mask",
+        "gradient": "Gradient Texture",
         "mix": "Mix",
         "proc_amp": "Basic Proc Amp",
         "color_corrector": "Color Corrector",
         "chroma_key": "Chroma Key",
+        "luma_key": "Luma Key",
         "transform_3d": "3D Transform",
         "color_splitter": "Color Splitter",
         "color_recombiner": "Color Recombiner",
@@ -3274,13 +3360,8 @@ class EffectsGraphCanvas(QWidget):
         self.update()
         self.graphChanged.emit()
 
-    def _create_node(self, node_type: str, x: int, y: int, node_id: str | None = None) -> str:
-        if node_id is None:
-            node_id = f"{node_type}_{self._next_node_number}"
-            self._next_node_number += 1
-            while node_id in self._nodes:
-                node_id = f"{node_type}_{self._next_node_number}"
-                self._next_node_number += 1
+    @staticmethod
+    def _default_node_settings(node_type: str) -> dict:
         settings: dict[str, object] = {}
         if node_type == "denoise":
             settings = {"method": "luma_gaussian3x3", "strength": 0.35}
@@ -3298,22 +3379,25 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "capture":
             settings = {
                 "device_index": None,
-                "device_name": "No capture device selected",
+                "device_name": "No source selected",
                 "capture_width": 0,
                 "capture_height": 0,
             }
         elif node_type == "matte":
             settings = {"red": 255, "green": 255, "blue": 255, "alpha": 1.0}
+        elif node_type == "gradient":
+            settings = {"gradient_type": "linear", "color_a": [0, 0, 0], "color_b": [255, 255, 255], "rotation": 0.0, "aspect": 1.0,
+                        "size": 1.0, "x": 0.0, "y": 0.0, "invert": False}
         elif node_type == "mask":
             settings = {
-                "pattern": "circle", "softness": 0.0, "aspect": 1.0,
-                "size": 1.0, "x": 0.0, "y": 0.0, "invert": False,
+                "pattern": "circle", "softness": 0.0, "aspect": 1.0, "transparency": 0.0,
+                "size": 1.0, "x": 0.0, "y": 0.0, "invert": False, "rotation": 0.0,
             }
         elif node_type == "mix":
             settings = {"mode": "add", "factor": 1.0}
         elif node_type == "transform_3d":
             settings = {
-                "x": 0.0, "y": 0.0, "z": 0.0,
+                "x": 0.0, "y": 0.0, "z": 0.0, "aspect_x": 1.0, "aspect_y": 1.0,
                 "rotate_x": 0.0, "rotate_y": 0.0, "rotate_z": 0.0,
             }
         elif node_type == "proc_amp":
@@ -3330,6 +3414,26 @@ class EffectsGraphCanvas(QWidget):
                 "key_similarity": 0.25, "key_softness": 0.10,
                 "key_edge_feather": 0.0, "spill_suppression": 0.25, "key_invert": False,
             }
+        if node_type == "luma_key":
+            settings = {"clip": 0.0, "gain": 1.0, "invert": False}
+        return settings
+
+    def _reset_node_settings(self, node_id: str) -> None:
+        node = self._nodes[node_id]
+        node['settings'].clear()
+        node['settings'].update(self._default_node_settings(node['type']))
+        self._refresh_node_status(node_id)
+        self.graphChanged.emit()
+        self._record_history()
+
+    def _create_node(self, node_type: str, x: int, y: int, node_id: str | None = None) -> str:
+        if node_id is None:
+            node_id = f"{node_type}_{self._next_node_number}"
+            self._next_node_number += 1
+            while node_id in self._nodes:
+                node_id = f"{node_type}_{self._next_node_number}"
+                self._next_node_number += 1
+        settings = self._default_node_settings(node_type)
         self._nodes[node_id] = {"id": node_id, "type": node_type, "x": int(x), "y": int(y), "settings": settings}
         widget = EffectsNodeWidget(node_id, node_type, self.NODE_TITLES[node_type], self)
         widget.move(int(x), int(y))
@@ -3343,6 +3447,7 @@ class EffectsGraphCanvas(QWidget):
         widget.nodeDragStarted.connect(self._on_node_drag_started)
         widget.nodeDragFinished.connect(self._on_node_drag_finished)
         widget.settingsRequested.connect(self._edit_node_settings)
+        widget.gradientColorRequested.connect(self._choose_gradient_color)
         widget.deleteRequested.connect(self._delete_requested)
         widget.blurLevelChanged.connect(self._on_blur_level_changed)
         widget.captureDeviceChanged.connect(self._on_capture_device_changed)
@@ -3376,18 +3481,11 @@ class EffectsGraphCanvas(QWidget):
 
     def add_node(self, node_type: str) -> str | None:
         if node_type not in {
-            "denoise", "media", "capture", "keying", "blur", "matte", "mask", "mix",
-            "proc_amp", "color_corrector", "chroma_key", "transform_3d",
+            "denoise", "media", "capture", "keying", "blur", "matte", "mask", "gradient", "mix",
+            "proc_amp", "color_corrector", "chroma_key", "luma_key", "transform_3d",
             "color_splitter", "color_recombiner",
         }:
             return None
-        if node_type == "capture":
-            existing_capture = next(
-                (node_id for node_id, node in self._nodes.items() if node["type"] == "capture"),
-                None,
-            )
-            if existing_capture is not None:
-                return existing_capture
         node_x, node_y = self._next_free_node_position(node_type)
         node_id = self._create_node(node_type, node_x, node_y)
         self.update()
@@ -3554,11 +3652,9 @@ class EffectsGraphCanvas(QWidget):
         for node_id, node in self._nodes.items():
             if node["type"] == "capture" and isinstance(node["settings"], dict):
                 selected = node["settings"].get("device_index")
-                valid_indices = {device_index for _label, device_index in devices}
-                if selected not in valid_indices:
-                    selected = devices[0][1] if devices else None
-                    selected_name = devices[0][0] if devices else "No capture device selected"
-                    node["settings"].update({"device_index": selected, "device_name": selected_name})
+                selected_name = next((label for label, value in devices if value == selected), None)
+                if selected_name is not None:
+                    node["settings"]["device_name"] = selected_name
                 self._widgets[node_id].set_capture_devices(devices, selected)
                 self._refresh_node_status(node_id)
 
@@ -3658,7 +3754,7 @@ class EffectsGraphCanvas(QWidget):
         settings = self._nodes.get(node_id, {}).get("settings")
         if not isinstance(settings, dict):
             return
-        settings["radius"] = max(0.0, min(16.0, float(value)))
+        settings["radius"] = max(0.0, min(128.0, float(value)))
         self._refresh_node_status(node_id)
         self.graphChanged.emit()
 
@@ -3684,7 +3780,7 @@ class EffectsGraphCanvas(QWidget):
         if not isinstance(settings, dict):
             return
         device_index = settings.get("device_index")
-        if not isinstance(device_index, str) or not device_index.startswith("webcam:"):
+        if not isinstance(device_index, str) or not device_index.startswith(("webcam:", "source:")):
             return
         self._capture_reload_tokens[node_id] = self._capture_reload_tokens.get(node_id, 0) + 1
         self.graphChanged.emit()
@@ -3894,32 +3990,9 @@ class EffectsGraphCanvas(QWidget):
         settings = node["settings"]
         if not isinstance(settings, dict):
             return
-        if node_type == "denoise":
-            labels = list(DENOISE_METHOD_LABEL_TO_NAME.keys())
-            current_label = DENOISE_METHOD_NAME_TO_LABEL.get(str(settings.get("method", "off")), "Off")
-            selected, accepted = QInputDialog.getItem(self, "Noise Reduction", "Method", labels, labels.index(current_label), False)
-            if not accepted:
-                return
-            strength, accepted = QInputDialog.getDouble(
-                self, "Noise Reduction", "Strength", float(settings.get("strength", 0.35)), 0.0, 1.0, 2, 0.05
-            )
-            if not accepted:
-                return
-            settings.update({"method": DENOISE_METHOD_LABEL_TO_NAME[selected], "strength": strength})
-        elif node_type == "media":
-            path, _selected_filter = QFileDialog.getOpenFileName(
-                self,
-                "Choose Video, Image, or Image Sequence Frame",
-                str(settings.get("path", "")),
-                "Media (*.mov *.mp4 *.m4v *.mkv *.avi *.webm *.wmv *.mpg *.mpeg *.mxf *.flv *.vob *.ogv *.3gp *.ts *.mts *.m2ts *.hevc *.h265 *.h264 *.gif *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr);;All files (*)",
-            )
-            if path:
-                settings.update({"path": path, "playing": False})
-            opacity, accepted = QInputDialog.getDouble(
-                self, "Media Layer", "Opacity", float(settings.get("opacity", 1.0)), 0.0, 1.0, 2, 0.05
-            )
-            if accepted:
-                settings["opacity"] = opacity
+        if node_type in {"denoise", "media", "matte", "blur"}:
+            self._show_basic_node_settings(node_id)
+            return
         elif node_type == "capture":
             self._show_capture_settings(node_id)
             return
@@ -3929,112 +4002,80 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "transform_3d":
             self._show_transform_settings(node_id)
             return
+        elif node_type == "luma_key":
+            self._show_luma_key_settings(node_id)
+            return
         elif node_type == "chroma_key":
             self._show_chroma_key_settings(node_id)
             return
         elif node_type == "mix":
             self._show_mix_settings(node_id)
             return
-        elif node_type == "matte":
-            current = QColor(
-                int(settings.get("red", 255)),
-                int(settings.get("green", 255)),
-                int(settings.get("blue", 255)),
-            )
-            picker = QColorDialog(current, self)
-            picker.setWindowTitle("Matte Color")
-
-            def apply_color(color: QColor) -> None:
-                if not color.isValid():
-                    return
-                settings.update({"red": color.red(), "green": color.green(), "blue": color.blue()})
-                self._refresh_node_status(node_id)
-                self.graphChanged.emit()
-
-            picker.currentColorChanged.connect(apply_color)
-            if picker.exec() != QDialog.Accepted:
-                apply_color(current)
-                return
-            apply_color(picker.selectedColor())
-            alpha, accepted = QInputDialog.getDouble(
-                self, "Matte Color", "Alpha", float(settings.get("alpha", 1.0)), 0.0, 1.0, 2, 0.05
-            )
-            if accepted:
-                settings["alpha"] = alpha
         elif node_type == "mask":
             self._show_mask_settings(node_id)
+        elif node_type == "gradient":
+            self._show_gradient_settings(node_id)
             return
-        elif node_type == "blur":
-            methods = ["gaussian", "box"]
-            current_method = str(settings.get("method", "gaussian"))
-            selected, accepted = QInputDialog.getItem(
-                self, "Blur", "Method", methods, methods.index(current_method) if current_method in methods else 0, False
-            )
-            if not accepted:
-                return
-            settings["method"] = selected
-            targets = ["color", "alpha", "both"]
-            current_target = str(settings.get("target", "both"))
-            selected_target, accepted = QInputDialog.getItem(
-                self, "Blur", "Channels", targets, targets.index(current_target) if current_target in targets else 2, False
-            )
-            if accepted:
-                settings["target"] = selected_target
         else:
             return
         self._refresh_node_status(node_id)
         self.graphChanged.emit()
 
+    def _show_basic_node_settings(self, node_id):
+        node = self._nodes[node_id]
+        opened = self._open_settings_dialog(node_id, self.NODE_TITLES[node['type']])
+        if opened is None:
+            return
+        dialog, form = opened
+        kind = node['type']
+        def combo(label, name, values):
+            control = QComboBox(dialog)
+            control.addItems(values)
+            control.setProperty('setting_name', name)
+            control.setCurrentText(str(node['settings'].get(name, values[0])))
+            control.currentTextChanged.connect(lambda value: self._on_color_setting_changed(node_id, name, value))
+            form.addRow(label, control)
+        if kind == 'denoise':
+            combo('Method', 'method', list(DENOISE_METHOD_NAME_TO_LABEL))
+            self._add_live_slider(form, dialog, node_id, 'Strength', 'strength', 0, 1, 100)
+        elif kind == 'blur':
+            combo('Method', 'method', ['gaussian', 'box'])
+            combo('Channels', 'target', ['color', 'alpha', 'both'])
+            self._add_live_slider(form, dialog, node_id, 'Radius', 'radius', 0, 128, 100)
+        elif kind == 'matte':
+            for name in ('red', 'green', 'blue'):
+                self._add_live_slider(form, dialog, node_id, name.title(), name, 0, 255, 1, 0)
+            self._add_live_slider(form, dialog, node_id, 'Alpha', 'alpha', 0, 1, 100)
+        elif kind == 'media':
+            browse = QPushButton('Choose media...', dialog)
+            def choose():
+                path, _ = QFileDialog.getOpenFileName(dialog, 'Choose media', str(node['settings'].get('path', '')))
+                if path:
+                    self._on_color_setting_changed(node_id, 'path', path)
+            browse.clicked.connect(choose)
+            form.addRow(browse)
+            self._add_live_slider(form, dialog, node_id, 'Opacity', 'opacity', 0, 1, 100)
+        self._finish_settings_dialog(dialog, form)
+
+    def _show_luma_key_settings(self, node_id):
+        opened = self._open_settings_dialog(node_id, 'Luma Key')
+        if opened is None:
+            return
+        dialog, form = opened
+        self._add_live_slider(form, dialog, node_id, 'Clip', 'clip', 0, 1, 1000, 3)
+        self._add_live_slider(form, dialog, node_id, 'Gain', 'gain', 0, 100, 100, 2)
+        invert = QCheckBox('Invert', dialog)
+        invert.setProperty('setting_name', 'invert')
+        invert.setChecked(bool(self._nodes[node_id]['settings'].get('invert', False)))
+        invert.toggled.connect(lambda value: self._on_color_setting_changed(node_id, 'invert', value))
+        form.addRow(invert)
+        self._finish_settings_dialog(dialog, form)
+
     def _show_capture_settings(self, node_id: str) -> None:
         settings = self._nodes.get(node_id, {}).get("settings")
         if not isinstance(settings, dict):
             return
-        opened = self._open_settings_dialog(node_id, "Video Capture Settings")
-        if opened is None:
-            return
-        dialog, form = opened
-        resolution = QComboBox(dialog)
-        presets = (
-            ("Device default", (0, 0)),
-            ("640 x 480", (640, 480)),
-            ("1280 x 720", (1280, 720)),
-            ("1920 x 1080", (1920, 1080)),
-            ("2560 x 1440", (2560, 1440)),
-            ("3840 x 2160", (3840, 2160)),
-        )
-        selected = (
-            max(0, int(settings.get("capture_width", 0))),
-            max(0, int(settings.get("capture_height", 0))),
-        )
-        for label, dimensions in presets:
-            resolution.addItem(label, dimensions)
-        selected_index = resolution.findData(selected)
-        if selected_index < 0 and selected != (0, 0):
-            resolution.addItem(f"{selected[0]} x {selected[1]}", selected)
-            selected_index = resolution.count() - 1
-        resolution.setCurrentIndex(max(0, selected_index))
-
-        def resolution_changed(_index: int) -> None:
-            dimensions = resolution.currentData()
-            if not isinstance(dimensions, tuple) or len(dimensions) != 2:
-                return
-            settings.update(
-                {
-                    "capture_width": int(dimensions[0]),
-                    "capture_height": int(dimensions[1]),
-                }
-            )
-            self._refresh_node_status(node_id)
-            self.graphChanged.emit()
-
-        resolution.currentIndexChanged.connect(resolution_changed)
-        form.addRow("Resolution", resolution)
-        native_settings = QPushButton("Device property page...", dialog)
-        native_settings.clicked.connect(
-            lambda: self.captureSettingsRequested.emit(settings.get("device_index"))
-        )
-        form.addRow(native_settings)
-        self._finish_settings_dialog(dialog, form)
+        self.captureSettingsRequested.emit(settings.get("device_index"))
 
     def _add_live_slider(
         self,
@@ -4059,18 +4100,29 @@ class EffectsGraphCanvas(QWidget):
         slider.setRange(round(max(minimum, -1000.0) * scale), round(maximum * scale))
         slider.setProperty("setting_name", name)
         slider.setProperty("setting_scale", scale)
-        slider.setValue(round(float(settings.get(name, minimum)) * scale))
-        value_control = QDoubleSpinBox(row)
-        value_control.setRange(minimum, maximum)
+        adaptive = self._nodes[node_id]['type'] == 'transform_3d' and name in {'x', 'y', 'z'}
+        value_control = ExpandingDoubleSpinBox(row) if adaptive else QDoubleSpinBox(row)
+        current = float(settings.get(name, self._default_node_settings(self._nodes[node_id]['type']).get(name, minimum)))
+        if adaptive:
+            slider.setRange(max(-2147483647, round(min(minimum, current) * scale)), min(2147483647, round(max(maximum, current) * scale)))
+        slider.setValue(max(-2147483647, min(2147483647, round(current * scale))))
+        value_control.setRange(min(minimum, current) if adaptive else minimum, max(maximum, current) if adaptive else maximum)
+        slider.setProperty('adaptive', adaptive)
         value_control.setProperty("setting_name", name)
         value_control.setDecimals(decimals)
         value_control.setSingleStep(1.0 / float(scale))
         value_control.setSuffix(suffix)
-        value_control.setValue(float(settings.get(name, minimum)))
-        value_control.setKeyboardTracking(True)
+        value_control.setValue(current)
+        value_control.setKeyboardTracking(not adaptive)
         value_control.setMinimumWidth(120)
         row_layout.addWidget(slider, 1)
         row_layout.addWidget(value_control)
+        reset = QPushButton(row)
+        reset.setIcon(QIcon(str(Path(__file__).parent / 'assets' / 'reset.svg')))
+        reset.setFixedSize(26, 24)
+        reset.setToolTip('Reset ' + label)
+        reset.clicked.connect(lambda: value_control.setValue(float(self._default_node_settings(self._nodes[node_id]['type']).get(name, minimum))))
+        row_layout.addWidget(reset)
 
         def slider_changed(raw_value: int) -> None:
             value = float(raw_value) / float(scale)
@@ -4081,13 +4133,17 @@ class EffectsGraphCanvas(QWidget):
 
         def value_changed(value: float) -> None:
             slider.blockSignals(True)
-            slider.setValue(round(float(value) * scale))
+            if adaptive:
+                limit = 2147483647
+                slider.setRange(max(-limit, round(min(minimum, value) * scale)), min(limit, round(max(maximum, value) * scale)))
+            slider.setValue(max(-2147483647, min(2147483647, round(float(value) * scale))))
             slider.blockSignals(False)
             self._on_color_setting_changed(node_id, name, float(value))
 
         slider.valueChanged.connect(slider_changed)
         slider.sliderReleased.connect(self._record_history)
         value_control.valueChanged.connect(value_changed)
+        value_control.editingFinished.connect(self._record_history)
         form.addRow(label, row)
 
     def _open_settings_dialog(self, node_id: str, title: str) -> tuple[QDialog, QFormLayout] | None:
@@ -4099,13 +4155,14 @@ class EffectsGraphCanvas(QWidget):
             return None
         dialog = QDialog(self, Qt.Tool)
         dialog.setWindowTitle(title)
+        dialog.setProperty("node_id", node_id)
         dialog.setMinimumWidth(430)
         dialog.setStyleSheet(
             "QDialog { background: #20242a; color: #f4f4f4; }"
             "QLabel { color: #d9dde2; }"
+            "QPushButton, QAbstractSpinBox, QComboBox, QLineEdit { color: #f4f4f4; background: #292e35; }"
             "QCheckBox { background: #555555; color: #f4f4f4; border-radius: 4px; padding: 4px 6px; }"
-            "QCheckBox::indicator { width: 14px; height: 14px; background: #606870; border: 1px solid #d9dde2; }"
-            "QCheckBox::indicator:checked { background: #efb73e; border-color: #efb73e; }"
+            + NODE_CHECKBOX_INDICATOR_STYLE
         )
         form = QFormLayout(dialog)
         dialog.destroyed.connect(lambda: self._key_dialogs.pop(node_id, None))
@@ -4113,9 +4170,18 @@ class EffectsGraphCanvas(QWidget):
         return dialog, form
 
     def _finish_settings_dialog(self, dialog: QDialog, form: QFormLayout) -> None:
-        close_button = QPushButton("Close", dialog)
+        buttons = QWidget(dialog)
+        row = QHBoxLayout(buttons)
+        reset = QPushButton('Reset all', buttons)
+        reset.clicked.connect(lambda: self._reset_node_settings(dialog.property('node_id')))
+        row.addWidget(reset)
+        close_button = QPushButton("Close", buttons)
         close_button.clicked.connect(dialog.close)
-        form.addRow(close_button)
+        row.addWidget(close_button)
+        form.addRow(buttons)
+        for button in dialog.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         dialog.show()
 
     def _show_color_settings(self, node_id: str) -> None:
@@ -4179,9 +4245,11 @@ class EffectsGraphCanvas(QWidget):
             return
         dialog, form = opened
         for spec in (
-            ("X", "x", -10000.0, 10000.0, 10, 1, "%"),
-            ("Y", "y", -10000.0, 10000.0, 10, 1, "%"),
-            ("Z (1000 = 10×)", "z", -100000000.0, 1000.0, 10, 1, "%"),
+            ("X", "x", -100.0, 100.0, 10, 1, "%"),
+            ("Y", "y", -100.0, 100.0, 10, 1, "%"),
+            ("Z (1000 = 10x)", "z", -100.0, 100.0, 10, 1, "%"),
+            ("Horizontal aspect", "aspect_x", 0.01, 10.0, 100, 2, ""),
+            ("Vertical aspect", "aspect_y", 0.01, 10.0, 100, 2, ""),
             ("Rotate X", "rotate_x", -180.0, 180.0, 10, 1, " deg"),
             ("Rotate Y", "rotate_y", -180.0, 180.0, 10, 1, " deg"),
             ("Rotate Z", "rotate_z", -180.0, 180.0, 10, 1, " deg"),
@@ -4200,6 +4268,7 @@ class EffectsGraphCanvas(QWidget):
         modes = ["add", "multiply", "subtract", "overlay", "difference"]
         mode_combo = QComboBox(dialog)
         mode_combo.addItems(modes)
+        mode_combo.setProperty("setting_name", "mode")
         current_mode = str(settings.get("mode", "add"))
         mode_combo.setCurrentText(current_mode if current_mode in modes else "add")
         mode_combo.currentTextChanged.connect(
@@ -4207,6 +4276,53 @@ class EffectsGraphCanvas(QWidget):
         )
         form.addRow("Mode", mode_combo)
         self._add_live_slider(form, dialog, node_id, "Factor", "factor", 0.0, 1.0, 1000, 3)
+        self._finish_settings_dialog(dialog, form)
+
+    def _choose_gradient_color(self, node_id: str, key: str) -> None:
+        settings = self._nodes[node_id]["settings"]
+        original = list(settings.get(key, [0, 0, 0] if key == "color_a" else [255, 255, 255]))
+        picker = QColorDialog(QColor(*original), self)
+        picker.setWindowTitle("Gradient Color " + ("A" if key == "color_a" else "B"))
+        def update(color):
+            if color.isValid():
+                self._on_compositor_setting_changed(node_id, key, [color.red(), color.green(), color.blue()])
+        picker.currentColorChanged.connect(update)
+        if picker.exec() == QDialog.Accepted:
+            update(picker.selectedColor())
+        else:
+            self._on_compositor_setting_changed(node_id, key, original)
+
+    def _show_gradient_settings(self, node_id: str) -> None:
+        opened = self._open_settings_dialog(node_id, "Gradient Texture")
+        if opened is None:
+            return
+        dialog, form = opened
+        settings = self._nodes[node_id]["settings"]
+        mode = QComboBox(dialog)
+        for label, value in GRADIENT_MODES:
+            mode.addItem(label, value)
+        mode.setCurrentIndex(max(0, mode.findData(settings.get("gradient_type", "linear"))))
+        mode.setProperty("setting_name", "gradient_type")
+        mode.currentIndexChanged.connect(lambda _: self._on_compositor_setting_changed(node_id, "gradient_type", mode.currentData()))
+        form.addRow("Type", mode)
+        for label, key, lo, hi, factor, decimals in (
+            ("Position X (%)", "x", -100, 100, 10, 1),
+            ("Position Y (%)", "y", -100, 100, 10, 1),
+            ("Size", "size", .1, 4., 100, 2),
+            ("Aspect", "aspect", .25, 4., 100, 2),
+            ("Diagonal rotation (deg)", "rotation", -180, 180, 10, 1),
+        ):
+            self._add_live_slider(form, dialog, node_id, label, key, lo, hi, factor, decimals)
+        rotation_row = form.itemAt(form.rowCount() - 1, QFormLayout.FieldRole).widget()
+        def update_rotation_control():
+            rotation_row.setEnabled(mode.currentData() == "diagonal")
+        mode.currentIndexChanged.connect(update_rotation_control)
+        update_rotation_control()
+        invert = QCheckBox("Invert", dialog)
+        invert.setProperty("setting_name", "invert")
+        invert.setChecked(bool(settings.get("invert", False)))
+        invert.toggled.connect(lambda value: self._on_compositor_setting_changed(node_id, "invert", value))
+        form.addRow(invert)
         self._finish_settings_dialog(dialog, form)
 
     def _mask_icon(self, pattern: str) -> QIcon:
@@ -4218,6 +4334,12 @@ class EffectsGraphCanvas(QWidget):
         painter.setBrush(QColor("#f1f3f5"))
         if pattern == "circle":
             painter.drawEllipse(QRectF(9, 9, 38, 38))
+        elif pattern == 'barndoor_vertical':
+            painter.drawRect(QRectF(20, 0, 16, 56))
+        elif pattern == 'barndoor_horizontal':
+            painter.drawRect(QRectF(0, 20, 56, 16))
+        elif pattern == 'horizontal':
+            painter.drawRect(QRectF(0, 28, 56, 28))
         elif pattern == "diamond":
             painter.drawPolygon(QPolygonF([QPointF(28, 6), QPointF(50, 28), QPointF(28, 50), QPointF(6, 28)]))
         else:
@@ -4229,90 +4351,42 @@ class EffectsGraphCanvas(QWidget):
         settings = self._nodes[node_id]["settings"]
         if not isinstance(settings, dict):
             return
-        dialog = QDialog(self, Qt.Tool)
-        dialog.setWindowTitle("Mask")
-        dialog.destroyed.connect(lambda: self._key_dialogs.pop(node_id, None))
-        self._key_dialogs[node_id] = dialog
-        layout = QVBoxLayout(dialog)
-        pattern_grid = QGridLayout()
-        pattern_buttons: dict[str, QPushButton] = {}
-        for column, pattern in enumerate(("square", "circle", "diamond")):
-            button = QPushButton(pattern.title(), dialog)
+        opened = self._open_settings_dialog(node_id, 'Mask')
+        if opened is None:
+            return
+        dialog, form = opened
+        grid = QGridLayout()
+        patterns = ('square', 'circle', 'diamond', 'barndoor_vertical', 'barndoor_horizontal', 'horizontal')
+        for index, pattern in enumerate(patterns):
+            label = {'barndoor_vertical': 'Vertical\nBarndoor', 'barndoor_horizontal': 'Horizontal\nBarndoor'}.get(pattern, pattern.title())
+            button = QPushButton(label, dialog)
             button.setCheckable(True)
+            button.setProperty('mask_pattern', pattern)
+            button.setChecked(settings.get('pattern', 'circle') == pattern)
+            button.setStyleSheet('QPushButton:checked { background: #346fa8; color: white; border: 2px solid #8fcaff; }')
             button.setIcon(self._mask_icon(pattern))
-            button.setIconSize(QPixmap(56, 56).size())
-            button.setMinimumSize(86, 84)
-            button.setChecked(str(settings.get("pattern", "circle")) == pattern)
-            pattern_grid.addWidget(button, 0, column)
-            pattern_buttons[pattern] = button
-        layout.addLayout(pattern_grid)
-
-        form = QFormLayout()
-        softness = QSlider(Qt.Horizontal, dialog)
-        softness.setRange(0, 100)
-        softness.setValue(round(float(settings.get("softness", 0.0)) * 100.0))
-        softness.setProperty("setting_name", "softness")
-        softness.setProperty("setting_scale", 100)
-        aspect = QSlider(Qt.Horizontal, dialog)
-        aspect.setRange(25, 400)
-        aspect.setValue(round(float(settings.get("aspect", 1.0)) * 100.0))
-        aspect.setProperty("setting_name", "aspect")
-        aspect.setProperty("setting_scale", 100)
-        size = QSlider(Qt.Horizontal, dialog)
-        size.setRange(10, 400)
-        size.setValue(round(float(settings.get("size", 1.0)) * 100.0))
-        size.setProperty("setting_name", "size")
-        size.setProperty("setting_scale", 100)
-        position_x = QSlider(Qt.Horizontal, dialog)
-        position_x.setRange(-100, 100)
-        position_x.setValue(round(float(settings.get("x", 0.0))))
-        position_x.setProperty("setting_name", "x")
-        position_x.setProperty("setting_scale", 1)
-        position_y = QSlider(Qt.Horizontal, dialog)
-        position_y.setRange(-100, 100)
-        position_y.setValue(round(float(settings.get("y", 0.0))))
-        position_y.setProperty("setting_name", "y")
-        position_y.setProperty("setting_scale", 1)
-        invert = QCheckBox("Invert mask", dialog)
-        invert.setProperty("setting_name", "invert")
-        invert.setChecked(bool(settings.get("invert", False)))
-        form.addRow("Softness", softness)
-        form.addRow("Aspect", aspect)
-        form.addRow("Size", size)
-        form.addRow("X position (%)", position_x)
-        form.addRow("Y position (%)", position_y)
+            button.setIconSize(QSize(56, 56))
+            button.setMinimumHeight(70)
+            button.setMinimumWidth(150)
+            button.clicked.connect(lambda checked=False, value=pattern: self._on_color_setting_changed(node_id, 'pattern', value))
+            grid.addWidget(button, index // 3, index % 3)
+        form.addRow(grid)
+        for label, name, low, high, scale, decimals in (
+            ('Softness', 'softness', 0, 1, 100, 2),
+            ('Transparency (%)', 'transparency', 0, 100, 10, 1),
+            ('Aspect', 'aspect', .25, 4, 100, 2),
+            ('Size', 'size', .1, 4, 100, 2),
+            ('X position (%)', 'x', -100, 100, 10, 1),
+            ('Y position (%)', 'y', -100, 100, 10, 1),
+            ('Rotate (deg)', 'rotation', -180, 180, 10, 1),
+        ):
+            self._add_live_slider(form, dialog, node_id, label, name, low, high, scale, decimals)
+        invert = QCheckBox('Invert mask', dialog)
+        invert.setProperty('setting_name', 'invert')
+        invert.setChecked(bool(settings.get('invert', False)))
+        invert.toggled.connect(lambda value: self._on_color_setting_changed(node_id, 'invert', value))
         form.addRow(invert)
-        layout.addLayout(form)
-        close_button = QPushButton("Close", dialog)
-        layout.addWidget(close_button)
-
-        def select_pattern(selected_pattern: str) -> None:
-            for pattern, button in pattern_buttons.items():
-                button.setChecked(pattern == selected_pattern)
-            self._on_compositor_setting_changed(node_id, "pattern", selected_pattern)
-
-        for pattern, button in pattern_buttons.items():
-            button.clicked.connect(lambda _checked=False, value=pattern: select_pattern(value))
-        softness.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "softness", value / 100.0)
-        )
-        aspect.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "aspect", value / 100.0)
-        )
-        size.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "size", value / 100.0)
-        )
-        position_x.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "x", float(value))
-        )
-        position_y.valueChanged.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "y", float(value))
-        )
-        invert.toggled.connect(
-            lambda value: self._on_compositor_setting_changed(node_id, "invert", value)
-        )
-        close_button.clicked.connect(dialog.close)
-        dialog.show()
+        self._finish_settings_dialog(dialog, form)
 
     def _refresh_node_status(self, node_id: str) -> None:
         node = self._nodes[node_id]
@@ -4334,12 +4408,14 @@ class EffectsGraphCanvas(QWidget):
         elif node_type == "capture":
             width = max(0, int(settings.get("capture_width", 0)))
             height = max(0, int(settings.get("capture_height", 0)))
-            status = f"Resolution: {width} x {height}" if width and height else "Resolution: Device default"
+            status = "Select an input from the Source menu"
         elif node_type == "matte":
             status = "#{:02X}{:02X}{:02X}  alpha {:.2f}".format(
                 int(settings.get("red", 255)), int(settings.get("green", 255)),
                 int(settings.get("blue", 255)), float(settings.get("alpha", 1.0)),
             )
+        elif node_type == "gradient":
+            status = str(settings.get("gradient_type", "linear")).replace("_", " ").title()
         elif node_type == "mask":
             status = "{}{}  size {:.2f}\nX {:.0f}%  Y {:.0f}%".format(
                 str(settings.get("pattern", "circle")).title(),
@@ -4366,6 +4442,8 @@ class EffectsGraphCanvas(QWidget):
             )
         elif node_type == "color_corrector":
             status = "RGB lift / gamma / gain"
+        elif node_type == "luma_key":
+            status = f"Clip {settings.get('clip', 0):.3f}  Gain {settings.get('gain', 1):.2f}"
         elif node_type == "chroma_key":
             status = "#{:02X}{:02X}{:02X}  sim {:.3f}\nSoft {:.3f}  Feather {:.1f}px{}".format(
                 int(settings.get("key_color_r", 0)), int(settings.get("key_color_g", 255)),
@@ -4387,6 +4465,17 @@ class EffectsGraphCanvas(QWidget):
         )
         dialog = self._key_dialogs.get(node_id)
         if dialog is not None:
+            for button in dialog.findChildren(QPushButton):
+                pattern = button.property('mask_pattern')
+                if pattern:
+                    button.setChecked(pattern == settings.get('pattern', 'circle'))
+            for combo in dialog.findChildren(QComboBox):
+                name = combo.property('setting_name')
+                if name in settings:
+                    combo.blockSignals(True)
+                    index = combo.findData(settings[name])
+                    combo.setCurrentIndex(index if index >= 0 else combo.findText(str(settings[name])))
+                    combo.blockSignals(False)
             for checkbox in dialog.findChildren(QCheckBox):
                 setting_name = checkbox.property("setting_name")
                 if isinstance(setting_name, str) and setting_name in settings:
@@ -4397,6 +4486,8 @@ class EffectsGraphCanvas(QWidget):
                 setting_name = value_control.property("setting_name")
                 if isinstance(setting_name, str) and setting_name in settings:
                     value_control.blockSignals(True)
+                    if isinstance(value_control, ExpandingDoubleSpinBox):
+                        value_control.setRange(min(-100, float(settings[setting_name])), max(100, float(settings[setting_name])))
                     value_control.setValue(float(settings[setting_name]))
                     value_control.blockSignals(False)
             for slider in dialog.findChildren(QSlider):
@@ -4404,7 +4495,10 @@ class EffectsGraphCanvas(QWidget):
                 setting_scale = slider.property("setting_scale")
                 if isinstance(setting_name, str) and setting_name in settings and isinstance(setting_scale, int):
                     slider.blockSignals(True)
-                    slider.setValue(round(float(settings[setting_name]) * setting_scale))
+                    value = float(settings[setting_name])
+                    if slider.property('adaptive'):
+                        slider.setRange(max(-2147483647, round(min(-100, value) * setting_scale)), min(2147483647, round(max(100, value) * setting_scale)))
+                    slider.setValue(max(-2147483647, min(2147483647, round(value * setting_scale))))
                     slider.blockSignals(False)
         if node_type == "capture":
             self._widgets[node_id].set_capture_devices(self._capture_devices, settings.get("device_index"))
@@ -4424,7 +4518,7 @@ class EffectsGraphCanvas(QWidget):
                 current = edges[current]
                 if current == "effects_output":
                     device_index = node["settings"].get("device_index")
-                    if isinstance(device_index, str) and device_index.startswith("webcam:"):
+                    if isinstance(device_index, str) and device_index.startswith(("webcam:", "source:")):
                         return None
                     return int(device_index) if device_index is not None else None
         return None
@@ -4464,7 +4558,7 @@ class EffectsGraphCanvas(QWidget):
     def native_effects_payload(self) -> dict[str, object]:
         if not self._effects_enabled:
             return bypassed_effects_payload()
-        if any(n['type'] == 'composition' for n in self._nodes.values()) or sum(n['type'] == 'keying' for n in self._nodes.values()) > 1:
+        if any(n['type'] in {'composition', 'gradient', 'mask', 'luma_key'} for n in self._nodes.values()) or sum(n['type'] == 'keying' for n in self._nodes.values()) > 1:
             try:
                 from .composition_graph import compile_compositions
             except ImportError:
@@ -4488,7 +4582,7 @@ class EffectsGraphCanvas(QWidget):
                 settings = {}
             if source_type == "mask":
                 return source_id, "alpha_output", {"type": "mask", "settings": dict(settings)}
-            if source_type != "chroma_key":
+            if source_type not in {"chroma_key", "luma_key"}:
                 return source_id, source_port, {}
             incoming = next(
                 (candidate for candidate in self._connections if candidate[2:4] == (source_id, "color_input")),
@@ -4496,7 +4590,7 @@ class EffectsGraphCanvas(QWidget):
             )
             if incoming is None:
                 return None, "", {}
-            return incoming[0], "alpha_output", {"type": "chroma_key", "settings": dict(settings)}
+            return incoming[0], "alpha_output", {"type": source_type, "settings": dict(settings)}
 
         def resolve_transform_source(
             connection: tuple[str, str, str, str] | None,
@@ -4739,8 +4833,8 @@ class EffectsGraphCanvas(QWidget):
                     if not isinstance(settings, dict):
                         settings = {}
                     if source_type == "transform_3d":
-                        for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z"):
-                            route["transform_" + name if name in {"x", "y", "z"} else name] = float(settings.get(name, 0.0))
+                        for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z", "aspect_x", "aspect_y"):
+                            route["transform_" + name if name in {"x", "y", "z"} else name] = float(settings.get(name, 1.0 if name.startswith("aspect_") else 0.0))
                         preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
                         current = next(
                             (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
@@ -4852,6 +4946,8 @@ class EffectsGraphCanvas(QWidget):
                 "rotate_x": float(operand_transform_settings.get("rotate_x", 0.0)),
                 "rotate_y": float(operand_transform_settings.get("rotate_y", 0.0)),
                 "rotate_z": float(operand_transform_settings.get("rotate_z", 0.0)),
+                "aspect_x": float(operand_transform_settings.get("aspect_x", 1.0)),
+                "aspect_y": float(operand_transform_settings.get("aspect_y", 1.0)),
                 "color_stages": list(operand_color_stages),
             }
             operand_source_ids: set[str] = set()
@@ -4871,9 +4967,18 @@ class EffectsGraphCanvas(QWidget):
                             "size": float(generator_settings.get("size", 1.0)),
                             "x": float(generator_settings.get("x", 0.0)),
                             "y": float(generator_settings.get("y", 0.0)),
+                            "rotation": float(generator_settings.get("rotation", 0.0)),
                         }
                     )
                     return operand, operand_source_ids, True
+                if generator_type == 'luma_key':
+                    operand.update(type='luma_key', source_from_effects_input=resolved_operand_id == 'effects_input',
+                                   key_similarity=float(generator_settings.get('clip', 0.0)),
+                                   key_softness=float(generator_settings.get('gain', 1.0)),
+                                   key_invert=bool(generator_settings.get('invert', False)))
+                    if resolved_operand_id is not None:
+                        operand_source_ids.add(resolved_operand_id)
+                    return operand, operand_source_ids, False
                 if generator_type == "chroma_key":
                     operand.update(
                         {
@@ -5002,7 +5107,7 @@ class EffectsGraphCanvas(QWidget):
         )
         if not isinstance(base_transform_settings, dict):
             base_transform_settings = {}
-        base_transform_active = any(
+        base_transform_active = any(abs(float(base_transform_settings.get(name, 1.0)) - 1.0) > 1e-6 for name in ("aspect_x", "aspect_y")) or any(
             abs(float(base_transform_settings.get(name, 0.0))) > 1e-6
             for name in ("x", "y", "z", "rotate_x", "rotate_y", "rotate_z")
         )
@@ -5057,7 +5162,7 @@ class EffectsGraphCanvas(QWidget):
         if not isinstance(capture_settings, dict):
             capture_settings = {}
         capture_device_id = capture_settings.get("device_index")
-        capture_kind = "webcam" if isinstance(capture_device_id, str) and capture_device_id.startswith("webcam:") else ""
+        capture_kind = _capture_backend(capture_device_id)
         capture_device_index = int(capture_device_id.split(":", 1)[1]) if capture_kind else -1
         media_nodes = [node_id for node_id in active_nodes if self._nodes.get(node_id, {}).get("type") == "media"]
         if layer2_media_id is not None and layer2_media_id not in media_nodes:
@@ -5090,7 +5195,7 @@ class EffectsGraphCanvas(QWidget):
             candidate = self._nodes[selected_blur[-1]]["settings"]
             if isinstance(candidate, dict):
                 blur_settings = dict(candidate)
-        direct_uploaded_source = direct_source_id is not None or (capture_kind == "webcam" and compositor_id is None)
+        direct_uploaded_source = direct_source_id is not None or (capture_kind in {"webcam", "logical"} and compositor_id is None)
         uploaded_source_id = capture_source_id or media_id or matte_id
         effect_color_from_alpha = any(
             source == uploaded_source_id and source_port == "alpha_output"
@@ -5226,11 +5331,7 @@ class EffectsGraphCanvas(QWidget):
                 if not isinstance(source_settings, dict):
                     source_settings = {}
                 layer_capture_id = source_settings.get("device_index") if source_type == "capture" else None
-                layer_capture_kind = (
-                    "webcam"
-                    if isinstance(layer_capture_id, str) and layer_capture_id.startswith("webcam:")
-                    else ""
-                )
+                layer_capture_kind = _capture_backend(layer_capture_id)
                 layer_capture_index = int(layer_capture_id.split(":", 1)[1]) if layer_capture_kind else -1
                 layer_media_path = str(source_settings.get("path", "")) if source_type == "media" else ""
                 layer_matte_rgba = [
@@ -5294,7 +5395,7 @@ class EffectsGraphCanvas(QWidget):
                 layer_enabled = (
                     alpha_mix_base is not None
                     or source_type == "matte" or generated_mask_source or effects_input_source
-                    or bool(layer_media_path) or layer_capture_kind == "webcam"
+                    or bool(layer_media_path) or layer_capture_kind in {"webcam", "logical"}
                 )
                 preserve_color_from_alpha_opacity = bool(
                     color_connection is not None
@@ -5331,18 +5432,14 @@ class EffectsGraphCanvas(QWidget):
                             operand_settings = {}
                         operand_type = str(operand_node.get("type", "")) if isinstance(operand_node, dict) else ""
                         operand_capture_id = operand_settings.get("device_index") if operand_type == "capture" else None
-                        operand_capture_kind = (
-                            "webcam"
-                            if isinstance(operand_capture_id, str) and operand_capture_id.startswith("webcam:")
-                            else ""
-                        )
+                        operand_capture_kind = _capture_backend(operand_capture_id)
                         image_sources.append(
                             {
                                 "slot": source_slot,
                                 "source_node_id": operand_node_id,
-                                "source_kind": "matte" if operand_type == "matte" else ("webcam" if operand_capture_kind else "media"),
+                                "source_kind": "matte" if operand_type == "matte" else (operand_capture_kind if operand_capture_kind else "media"),
                                 "media_path": str(operand_settings.get("path", "")) if operand_type == "media" else "",
-                                "media_playing": operand_capture_kind == "webcam" or bool(operand_settings.get("playing", False)),
+                                "media_playing": operand_capture_kind in {"webcam", "logical"} or bool(operand_settings.get("playing", False)),
                                 "media_loop": bool(operand_settings.get("loop", True)),
                                 "capture_kind": operand_capture_kind,
                                 "capture_device_index": int(operand_capture_id.split(":", 1)[1]) if operand_capture_kind else -1,
@@ -5380,11 +5477,11 @@ class EffectsGraphCanvas(QWidget):
                         "source_kind": (
                             "effects_input" if effects_input_source
                             else "matte" if source_type == "matte" or generated_mask_source
-                            else "webcam" if layer_capture_kind
+                            else layer_capture_kind if layer_capture_kind
                             else "media"
                         ),
                         "media_path": layer_media_path,
-                        "media_playing": layer_capture_kind == "webcam" or bool(source_settings.get("playing", False)),
+                        "media_playing": layer_capture_kind in {"webcam", "logical"} or bool(source_settings.get("playing", False)),
                         "media_loop": bool(source_settings.get("loop", True)),
                         "capture_kind": layer_capture_kind,
                         "capture_device_index": layer_capture_index,
@@ -5427,12 +5524,15 @@ class EffectsGraphCanvas(QWidget):
                         "mask_size": float(layer_mask_settings.get("size", 1.0)),
                         "mask_x": float(layer_mask_settings.get("x", 0.0)),
                         "mask_y": float(layer_mask_settings.get("y", 0.0)),
+                        "mask_rotation": float(layer_mask_settings.get("rotation", 0.0)),
                         "transform_x": float(transform_settings.get("x", 0.0)),
                         "transform_y": float(transform_settings.get("y", 0.0)),
                         "transform_z": float(transform_settings.get("z", 0.0)),
                         "rotate_x": float(transform_settings.get("rotate_x", 0.0)),
                         "rotate_y": float(transform_settings.get("rotate_y", 0.0)),
                         "rotate_z": float(transform_settings.get("rotate_z", 0.0)),
+                        "aspect_x": float(transform_settings.get("aspect_x", 1.0)),
+                        "aspect_y": float(transform_settings.get("aspect_y", 1.0)),
                         "channel_routes": channel_routes,
                     }
                 )
@@ -5440,10 +5540,10 @@ class EffectsGraphCanvas(QWidget):
             layer_payloads.append(
                 {
                     "layer_index": 2,
-                    "enabled": bool(str(media_settings.get("path", "")).strip()) or capture_kind == "webcam" or matte_id is not None,
-                    "source_kind": "matte" if matte_id is not None else ("webcam" if capture_kind else "media"),
+                    "enabled": bool(str(media_settings.get("path", "")).strip()) or capture_kind in {"webcam", "logical"} or matte_id is not None,
+                    "source_kind": "matte" if matte_id is not None else (capture_kind if capture_kind else "media"),
                     "media_path": str(media_settings.get("path", "")),
-                    "media_playing": capture_kind == "webcam" or bool(media_settings.get("playing", False)),
+                    "media_playing": capture_kind in {"webcam", "logical"} or bool(media_settings.get("playing", False)),
                     "media_loop": bool(media_settings.get("loop", True)),
                     "capture_kind": capture_kind,
                     "capture_device_index": capture_device_index,
@@ -5469,12 +5569,15 @@ class EffectsGraphCanvas(QWidget):
                     "mask_size": float(mask_settings.get("size", 1.0)),
                     "mask_x": float(mask_settings.get("x", 0.0)),
                     "mask_y": float(mask_settings.get("y", 0.0)),
+                    "mask_rotation": float(mask_settings.get("rotation", 0.0)),
                     "transform_x": float(direct_transform_settings.get("x", 0.0)),
                     "transform_y": float(direct_transform_settings.get("y", 0.0)),
                     "transform_z": float(direct_transform_settings.get("z", 0.0)),
                     "rotate_x": float(direct_transform_settings.get("rotate_x", 0.0)),
                     "rotate_y": float(direct_transform_settings.get("rotate_y", 0.0)),
                     "rotate_z": float(direct_transform_settings.get("rotate_z", 0.0)),
+                    "aspect_x": float(direct_transform_settings.get("aspect_x", 1.0)),
+                    "aspect_y": float(direct_transform_settings.get("aspect_y", 1.0)),
                 }
             )
         legacy_layer = layer_payloads[0]
@@ -5511,6 +5614,8 @@ class EffectsGraphCanvas(QWidget):
             "input_rotate_x": float(base_transform_settings.get("rotate_x", 0.0)),
             "input_rotate_y": float(base_transform_settings.get("rotate_y", 0.0)),
             "input_rotate_z": float(base_transform_settings.get("rotate_z", 0.0)),
+            "input_aspect_x": float(base_transform_settings.get("aspect_x", 1.0)),
+            "input_aspect_y": float(base_transform_settings.get("aspect_y", 1.0)),
             "layers": layer_payloads,
             "color_stages": color_stages,
             "key_mode": str(legacy_key.get("mode", "off")),
@@ -5534,12 +5639,15 @@ class EffectsGraphCanvas(QWidget):
             "mask_size": float(legacy_layer.get("mask_size", 1.0)),
             "mask_x": float(legacy_layer.get("mask_x", 0.0)),
             "mask_y": float(legacy_layer.get("mask_y", 0.0)),
+            "mask_rotation": float(legacy_layer.get("mask_rotation", 0.0)),
             "transform_x": float(legacy_layer.get("transform_x", 0.0)),
             "transform_y": float(legacy_layer.get("transform_y", 0.0)),
             "transform_z": float(legacy_layer.get("transform_z", 0.0)),
             "rotate_x": float(legacy_layer.get("rotate_x", 0.0)),
             "rotate_y": float(legacy_layer.get("rotate_y", 0.0)),
             "rotate_z": float(legacy_layer.get("rotate_z", 0.0)),
+            "aspect_x": float(legacy_layer.get("aspect_x", 1.0)),
+            "aspect_y": float(legacy_layer.get("aspect_y", 1.0)),
         }
 
     def set_effects_enabled(self, enabled: bool) -> None:
@@ -5603,6 +5711,9 @@ class EffectsGraphCanvas(QWidget):
                         connection_parts[1] = "alpha_output"
                     if connection_parts[3] == "adjustment_input":
                         connection_parts[3] = "alpha_input"
+                    if (self._nodes.get(connection_parts[0], {}).get("type") == "gradient"
+                            and connection_parts[1] == "alpha_output"):
+                        connection_parts[1] = "output"
                     connection = tuple(connection_parts)
                     if connection[0] in self._nodes and connection[2] in self._nodes:
                         self._connections.append(connection)
@@ -5897,16 +6008,18 @@ class EffectsGraphEditor(QGroupBox):
     NODE_MENU = {
         "Noise Reduction": "denoise",
         "Video Clip / Image / Image Sequence": "media",
-        "Video Capture Device": "capture",
+        "Source": "capture",
         "Composition Source": "composition",
         "Compositor": "keying",
         "Blur": "blur",
         "Matte Color": "matte",
+        "Gradient Texture": "gradient",
         "Mask": "mask",
         "Mix": "mix",
         "Basic Proc Amp": "proc_amp",
         "Color Corrector": "color_corrector",
         "Chroma Key": "chroma_key",
+        "Luma Key": "luma_key",
         "3D Transform": "transform_3d",
         "Color Splitter": "color_splitter",
         "Color Recombiner": "color_recombiner",
@@ -6415,7 +6528,7 @@ class EffectsGraphEditor(QGroupBox):
                     return
         empty_graph = {
             "version": 6,
-            "enabled": True,
+            "enabled": not self.bypass_toggle.isChecked(),
             "nodes": [
                 {"id": "effects_input", "type": "effects_input", "x": 40, "y": 120, "settings": {}},
                 {"id": "effects_output", "type": "effects_output", "x": 620, "y": 120, "settings": {}},
@@ -6470,7 +6583,13 @@ class EffectsGraphEditor(QGroupBox):
         if index is None:
             return
         entry = self._palette_entries[index]
-        if self.canvas.restore(entry.get("graph")):
+        graph = deepcopy(entry.get("graph"))
+        if isinstance(graph, dict):
+            # Bypass is a live operator control, not a recalled preset setting.
+            # Set it before restore emits graphChanged so no enabled payload
+            # reaches the worker even briefly while loading a bypassed effect.
+            graph["enabled"] = not self.bypass_toggle.isChecked()
+        if self.canvas.restore(graph):
             self._restore_keyframes(entry.get("keyframes"))
             self._current_palette_index = index
             self._rebuild_palette_list(index)
@@ -6775,6 +6894,15 @@ class VideoProcessorController:
             if hasattr(self.processor, "set_denoise_strength"):
                 self.processor.set_denoise_strength(self.denoise_strength)
 
+    def activate_source(self, logical_id, config):
+        if not hasattr(self, "_source_pool"):
+            self._source_pool = SourcePool()
+        self._source_pool.activate(logical_id, config, lambda: create_input_adapter(config, d, EffectCaptureDecoder, EffectMediaDecoder))
+
+    def deactivate_source(self, logical_id):
+        if hasattr(self, "_source_pool"):
+            self._source_pool.deactivate(logical_id)
+
     def show_capture_settings(self, device_index: int) -> None:
         decoder = next(
             (
@@ -6821,6 +6949,10 @@ class VideoProcessorController:
                             layer.get("matte_rgba", [255, 255, 255, 255]), dtype=np.uint8
                         ).reshape(1, 1, 4)
                         self.processor.upload_effect_layer_media_rgba(layer_index, matte_rgba, 1, 1)
+                    elif reload_source and capture_kind == "logical":
+                        if not hasattr(self, "_source_pool"):
+                            self._source_pool = SourcePool()
+                        self._effect_media_decoders[(layer_index, 0)] = self._source_pool.reader(layer["capture_device_index"])
                     elif reload_source and capture_kind == "webcam":
                         decoder = EffectCaptureDecoder(
                             int(layer.get("capture_device_index", 0)),
@@ -6856,6 +6988,10 @@ class VideoProcessorController:
                             self.processor.upload_effect_layer_source_rgba(
                                 layer_index, source_slot, source_rgba, 1, 1
                             )
+                        elif reload_source and source_capture_kind == "logical":
+                            if not hasattr(self, "_source_pool"):
+                                self._source_pool = SourcePool()
+                            source_decoder = self._source_pool.reader(image_source["capture_device_index"])
                         elif reload_source and source_capture_kind == "webcam":
                             source_decoder = EffectCaptureDecoder(
                                 int(image_source.get("capture_device_index", 0)),
@@ -7003,12 +7139,12 @@ class VideoProcessorController:
             bool(self.effects_payload.get("enabled", False))
             and any(
                 bool(layer.get("media_playing", False))
-                or str(layer.get("capture_kind", "")) == "webcam"
+                or str(layer.get("capture_kind", "")) in {"webcam", "logical"}
                 or any(
                     isinstance(source, dict)
                     and (
                         bool(source.get("media_playing", False))
-                        or str(source.get("capture_kind", "")) == "webcam"
+                        or str(source.get("capture_kind", "")) in {"webcam", "logical"}
                     )
                     for source in (
                         layer.get("image_sources", [])
@@ -7037,7 +7173,7 @@ class VideoProcessorController:
                         ),
                         {},
                     ) if isinstance(raw_sources, list) else {}
-                if not bool(source_config.get("media_playing", False)) and str(source_config.get("capture_kind", "")) != "webcam":
+                if not bool(source_config.get("media_playing", False)) and str(source_config.get("capture_kind", "")) not in {"webcam", "logical"}:
                     continue
                 try:
                     rgba = decoder.next_rgba(loop=bool(source_config.get("media_loop", True)))
@@ -7063,6 +7199,8 @@ class VideoProcessorController:
         return output
 
     def close(self) -> None:
+        if hasattr(self, "_source_pool"):
+            self._source_pool.close()
         for decoder in self._effect_media_decoders.values():
             decoder.close()
         self._effect_media_decoders.clear()
@@ -7357,6 +7495,7 @@ class ProcessVideoProcessorController:
         self._effect_source_configured = False
 
         self._ctx = mp.get_context("spawn")
+        self._preview_mailbox = None
         self._request_queue = None
         self._response_queue = None
         self._process = None
@@ -7547,6 +7686,11 @@ class ProcessVideoProcessorController:
             self._decklink_roi_transition_state["interlaced_field_phase"] = dict(prev_interlaced_phase)
 
     def _apply_decklink_frame_message(self, message: dict[str, object]) -> None:
+        preview_mailbox = getattr(self, "_preview_mailbox", None)
+        if preview_mailbox is not None and message.get("preview_sequence") is not None:
+            preview = preview_mailbox.read(message["preview_sequence"])
+            if preview is not None:
+                message["input_frame_bytes"], message["output_frame_bytes"] = preview
         self._latest_effective_scale = int(message.get("effective_sr_scale", self._latest_effective_scale))
         if "input_frame_bytes" in message and "output_frame_bytes" in message:
             self._latest_decklink_frame = (
@@ -7557,29 +7701,13 @@ class ProcessVideoProcessorController:
 
         new_counter = int(message.get("processed_frame_counter", self._decklink_processed_counter))
         worker_reported_fps = float(message.get("processed_fps", self._decklink_processed_fps))
+        # GUI painting and ROI controls can delay/batch these messages. Their
+        # arrival spacing is not the processing (or hardware presentation) clock.
         now = time.perf_counter()
-        local_fps = None
-
-        if self._decklink_processed_counter_last_ts > 0.0 and new_counter >= self._decklink_processed_counter_last:
-            dt = now - self._decklink_processed_counter_last_ts
-            dc = new_counter - self._decklink_processed_counter_last
-            if dt > 1e-4:
-                local_fps = float(dc) / dt
-
         self._decklink_processed_counter = new_counter
         self._decklink_processed_counter_last = new_counter
         self._decklink_processed_counter_last_ts = now
-
-        if local_fps is None:
-            effective_fps = worker_reported_fps
-        elif self._decklink_processed_fps_smoothed <= 0.0:
-            effective_fps = local_fps
-        else:
-            # Smooth short-term jitter while preserving real output-rate changes.
-            alpha = 0.35
-            effective_fps = (1.0 - alpha) * self._decklink_processed_fps_smoothed + alpha * local_fps
-
-        self._decklink_processed_fps_smoothed = max(0.0, float(effective_fps))
+        self._decklink_processed_fps_smoothed = max(0.0, worker_reported_fps)
         self._decklink_processed_fps = self._decklink_processed_fps_smoothed
         self._decklink_output_nominal_fps = max(
             0.0,
@@ -7832,6 +7960,7 @@ class ProcessVideoProcessorController:
         # tick polling do not trip queue.Full in the GUI thread.
         self._request_queue = self._ctx.Queue(maxsize=32)
         self._response_queue = self._ctx.Queue(maxsize=64)
+        self._preview_mailbox = PreviewMailbox(self._ctx, FRAME_W * FRAME_H * 2)
         self._roi_telemetry_shared = self._ctx.Array("d", _ROI_TELEMETRY_SLOT_COUNT)
         self._roi_telemetry_seq = self._ctx.Value("i", 0)
         self._roi_telemetry_last_seq = -1
@@ -7847,6 +7976,7 @@ class ProcessVideoProcessorController:
                 self._roi_telemetry_seq,
                 self._manual_roi_mailbox_shared,
                 self._manual_roi_mailbox_seq,
+                self._preview_mailbox,
             ),
             daemon=True,
             name="video-processor-worker",
@@ -8427,6 +8557,14 @@ class ProcessVideoProcessorController:
         self._wait_for_ack("set_effects_config", timeout_seconds=5.0)
         self._effect_source_configured = True
 
+    def activate_source(self, logical_id, config):
+        self._send_control({"cmd": "activate_source", "logical_id": logical_id, "config": config})
+        self._wait_for_ack("activate_source", timeout_seconds=15.0)
+
+    def deactivate_source(self, logical_id):
+        self._send_control({"cmd": "deactivate_source", "logical_id": logical_id})
+        self._wait_for_ack("deactivate_source", timeout_seconds=5.0)
+
     def show_capture_settings(self, device_index: int) -> None:
         self._send_control({"cmd": "show_capture_settings", "device_index": int(device_index)})
         self._wait_for_ack("show_capture_settings", timeout_seconds=300.0)
@@ -8485,6 +8623,8 @@ class ProcessVideoProcessorController:
 
             message_type = message.get("type")
             if message_type == "ack" and str(message.get("cmd")) == expected_cmd:
+                if message.get("source_error"):
+                    raise RuntimeError(str(message["source_error"]))
                 if expected_cmd == "start_decklink":
                     started = bool(message.get("decklink_started", True))
                     if not started:
@@ -8613,7 +8753,7 @@ class ProcessVideoProcessorController:
         self._send_control(
             {
                 "cmd": "start_decklink",
-                "in_device": int(in_device),
+                "in_device": int(in_device) if in_device is not None else None,
                 "in_mode": in_mode,
                 "out_device": int(out_device),
                 "out_mode": out_mode,
@@ -8787,6 +8927,7 @@ class ProcessVideoProcessorController:
         self._process = None
         self._request_queue = None
         self._response_queue = None
+        self._preview_mailbox = None
         self._roi_telemetry_shared = None
         self._roi_telemetry_seq = None
         self._roi_telemetry_last_seq = -1
@@ -9304,6 +9445,7 @@ class MainWindow(QMainWindow):
         self._controls_scroll.setWidgetResizable(True)
         self._controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._controls_scroll.setWidget(self._controls_panel)
+        self._controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._controls_scroll.setMinimumWidth(420)
 
         self._main_splitter = QSplitter(Qt.Horizontal)
@@ -9374,12 +9516,14 @@ class MainWindow(QMainWindow):
         self._sync_roi_transition_unit_labels()
         self._sync_controls_from_roi(self._roi)
         self._load_settings()
+        self._input_sources_changed()
         self._apply_manual_drag_tuning_to_controller()
         self._apply_interlaced_phase_tuning_to_controller()
         self._apply_startup_ai_sr_settings()
         self._source_mode = self.source_mode_combo.currentText()
         self._sync_blackmagic_controls_enabled_state()
-        self._on_source_mode_changed()
+        self._refresh_decklink_catalog()
+        self._source_mode = "Synthetic"
         self._sync_roi_transition_unit_labels()
         self._refresh_ai_sr_runtime_panel()
         self._refresh_rtx_vsr_runtime_panel()
@@ -9391,6 +9535,46 @@ class MainWindow(QMainWindow):
             self._set_decklink_status("Worker backend not active; running in GUI process")
         LOGGER.info("GUI initialized; default source mode=%s", self._source_mode)
         QTimer.singleShot(0, self._apply_initial_viewer_layout)
+        QTimer.singleShot(0, self._restore_active_io)
+
+    def _restore_active_io(self) -> None:
+        saved = getattr(self, "_pending_io_restore", None)
+        self._pending_io_restore = None
+        if not saved or self._is_closing:
+            return
+        self._restoring_io = True
+        failures = []
+        try:
+            failures.extend(self.input_sources.restore_active(saved["inputs"]))
+            if saved["output"]:
+                try:
+                    device_index = self.decklink_output_device_combo.findData(saved["device"])
+                    if saved["device"] is None or device_index < 0:
+                        raise RuntimeError("Saved output device is unavailable")
+                    self.decklink_output_device_combo.setCurrentIndex(device_index)
+                    mode_index = self.decklink_output_mode_combo.findText(saved["mode"])
+                    if mode_index < 0:
+                        raise RuntimeError("Saved output mode is unavailable")
+                    self.decklink_output_mode_combo.setCurrentIndex(mode_index)
+                    # Restore the saved device, not auto-detection's first device.
+                    auto_detect = self.decklink_auto_detect_devices.isChecked()
+                    self.decklink_auto_detect_devices.blockSignals(True)
+                    self.decklink_auto_detect_devices.setChecked(False)
+                    try:
+                        self._on_apply_decklink_settings()
+                    finally:
+                        self.decklink_auto_detect_devices.setChecked(auto_detect)
+                        self.decklink_auto_detect_devices.blockSignals(False)
+                    if not self._decklink_sessions_running:
+                        failures.append("Output could not restart; see output status")
+                except Exception as exc:
+                    failures.append(f"Output: {exc}")
+        finally:
+            self._restoring_io = False
+        if failures:
+            self._update_status("I/O restore: " + "; ".join(failures))
+            LOGGER.warning("I/O restore: %s", "; ".join(failures))
+        self._schedule_settings_save()
 
     def _create_processor_controller(self, module):
         if run_processor_worker is not None:
@@ -9427,6 +9611,17 @@ class MainWindow(QMainWindow):
         effects_payload = self.effects_graph.native_effects_payload()
         self._controller.set_effects_config(effects_payload)
         self._last_effects_payload = dict(effects_payload)
+        for logical_id in list(self.input_sources.active):
+            try:
+                self._controller.activate_source(logical_id, self.input_sources.configs[logical_id - 1])
+            except Exception as exc:
+                self.input_sources.active.discard(logical_id)
+                combo, settings, _name, button = self.input_sources.rows[logical_id - 1]
+                combo.setEnabled(True)
+                settings.setEnabled(True)
+                button.setText("Activate")
+                self._update_status(f"Source {logical_id} could not restart: {exc}")
+        self._input_sources_changed()
         LOGGER.info("Worker controller recreated after unexpected worker exit")
 
     def _apply_controller_color_settings_from_ui(self) -> None:
@@ -9550,7 +9745,7 @@ class MainWindow(QMainWindow):
         self._main_splitter.splitterMoved.connect(lambda _pos, _index: self._schedule_settings_save())
 
     def _schedule_settings_save(self, *_args) -> None:
-        if self._updating_controls:
+        if self._updating_controls or getattr(self, "_restoring_io", False) or self._is_closing:
             return
         self._settings_save_timer.start()
 
@@ -9573,6 +9768,9 @@ class MainWindow(QMainWindow):
 
         return {
             "version": 1,
+            "input_sources": self.input_sources.serialize(),
+            "active_input_sources": sorted(self.input_sources.active),
+            "output_active": bool(self._decklink_sessions_running),
             "fps": int(self.fps_spin.value()),
             "preview_request_fps": int(self.preview_request_fps_spin.value()),
             "preview_poll_fps": int(self.preview_poll_fps_spin.value()),
@@ -9674,6 +9872,24 @@ class MainWindow(QMainWindow):
         if not isinstance(raw, dict):
             return
 
+        active_inputs = raw.get("active_input_sources", [])
+        self._pending_io_restore = {
+            "inputs": active_inputs if isinstance(active_inputs, list) else [],
+            "output": raw.get("output_active") is True,
+            "device": raw.get("decklink_output_device"),
+            "mode": str(raw.get("decklink_output_mode_text", "")),
+        }
+        self.input_sources.restore(raw.get("input_sources", []))
+        if "input_sources" not in raw and isinstance(raw.get("decklink_input_device"), int):
+            self.input_sources.configs[0].update(
+                device=f"decklink:{raw['decklink_input_device']}",
+                device_name=f"DeckLink {raw['decklink_input_device']}",
+                mode_text=raw.get("decklink_input_mode_text", ""),
+                timecode_format=self.decklink_timecode_format_combo.itemData(max(0,
+                    self.decklink_timecode_format_combo.findText(str(raw.get("decklink_timecode_format", "RP188 VITC1"))))),
+                timecode_phase=raw.get("decklink_timecode_phase_mode", "off"),
+                format_detection=raw.get("decklink_enable_format_detection", True),
+            )
         self._has_persisted_deinterlace_method = bool(str(raw.get("deinterlace_method", "")).strip())
 
         self._updating_controls = True
@@ -9740,7 +9956,8 @@ class MainWindow(QMainWindow):
             self.deinterlace_method_combo.setCurrentText(str(raw.get("deinterlace_method", self.deinterlace_method_combo.currentText())))
             self.denoise_method_combo.setCurrentText(str(raw.get("denoise_method", self.denoise_method_combo.currentText())))
             self.denoise_strength_spin.setValue(float(raw.get("denoise_strength", self.denoise_strength_spin.value())))
-            graph_restored = self.effects_graph.restore(_effects_graph_from_settings(raw, self._settings_path))
+            graph_restored = self.effects_graph.restore(self.input_sources.migrate_graph(
+                _effects_graph_from_settings(raw, self._settings_path)))
             if not graph_restored:
                 legacy_method = DENOISE_METHOD_LABEL_TO_NAME.get(self.denoise_method_combo.currentText(), "off")
                 self.effects_graph.migrate_legacy_denoise(legacy_method, float(self.denoise_strength_spin.value()))
@@ -10602,11 +10819,17 @@ class MainWindow(QMainWindow):
         decklink_form.addRow(self.decklink_enable_format_detection)
 
         self.decklink_output_buffer_spin = QSpinBox()
-        self.decklink_output_buffer_spin.setRange(0, 10)
+        self.decklink_output_buffer_spin.setRange(1, 10)
         self.decklink_output_buffer_spin.setValue(int(self._decklink_output_buffer_frames))
-        self.decklink_output_buffer_spin.setToolTip("DeckLink output startup/steady buffer in frames; larger values can smooth short stalls with added latency.")
+        self.decklink_output_buffer_spin.setToolTip(
+            "Absolute software latency limit in output frames. N includes processing and scheduled output wait; "
+            "the output queue never exceeds N frames. All settings use the newest capture and drop late updates. "
+            "At 59.94p: 1 = 16.68 ms, 2 = 33.37 ms, 3 = 50.05 ms. "
+            "Hardware/display delay is additional. A lower limit can cause late or dropped output; "
+            "it does not guarantee a stable frame rate."
+        )
         self.decklink_output_buffer_spin.valueChanged.connect(self._on_decklink_output_buffer_changed)
-        decklink_form.addRow("DeckLink output buffer (frames)", self.decklink_output_buffer_spin)
+        decklink_form.addRow("Software latency limit (frames)", self.decklink_output_buffer_spin)
 
         self.decklink_fps_priority_guard_checkbox = QCheckBox(
             "Warn when output timing becomes unstable"
@@ -10876,17 +11099,63 @@ class MainWindow(QMainWindow):
         )
         controls_hint.setWordWrap(True)
 
-        layout.addWidget(roi_box)
-        layout.addWidget(self.decklink_box)
-        layout.addWidget(deinterlace_box)
-        layout.addWidget(self.effects_graph)
-        layout.addWidget(upscaling_box)
-        layout.addWidget(self.rtx_vsr_box)
-        layout.addWidget(settings_box)
-        layout.addWidget(self.ai_sr_postprocess_box)
-        layout.addWidget(post_vsr_scaling_box)
-        layout.addWidget(controls_hint)
-        layout.addStretch(1)
+        self.controls_tabs = QTabWidget()
+        self.settings_tabs = QTabWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.controls_tabs)
+
+        def page(tabs, title, widgets):
+            content = QWidget()
+            box = QVBoxLayout(content)
+            for widget in widgets:
+                box.addWidget(widget)
+            box.addStretch(1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(content)
+            tabs.addTab(scroll, title)
+            return content
+
+        self.input_sources = InputSourcePanel(self)
+        self.input_sources.changed.connect(self._input_sources_changed)
+        page(self.controls_tabs, "ROI", [roi_box, controls_hint])
+        page(self.controls_tabs, "EFFECTS", [self.effects_graph])
+        self.controls_tabs.addTab(self.settings_tabs, "SETTINGS")
+        page(self.settings_tabs, "INPUTS", [self.input_sources])
+
+        # Keep the legacy binding widgets for the output pipeline, but expose
+        # input configuration exclusively through the source catalog dialogs.
+        self._input_bindings = QWidget(self)
+        bindings_form = QFormLayout(self._input_bindings)
+        for widget in (self.source_mode_combo, self.decklink_input_device_combo,
+                       self.decklink_auto_detect_devices, self.decklink_input_mode_combo,
+                       self.decklink_timecode_format_combo, self.decklink_timecode_phase_combo,
+                       self.decklink_enable_format_detection, self.decklink_pixel_format_combo):
+            row = decklink_form.takeRow(widget)
+            if row.labelItem is not None:
+                bindings_form.addRow(row.labelItem.widget(), row.fieldItem.widget())
+            else:
+                bindings_form.addRow(row.fieldItem.widget())
+        self._input_bindings.hide()
+        self.decklink_box.setTitle("Blackmagic Output")
+        self.decklink_apply_btn.setText("Apply Output Settings")
+        hdr_box = QGroupBox("HDR")
+        hdr_form = QFormLayout(hdr_box)
+        for widget in (self.rtx_thdr_enable_checkbox, self.rtx_thdr_contrast_spin,
+                       self.rtx_thdr_saturation_spin, self.rtx_thdr_middle_gray_spin,
+                       self.rtx_thdr_max_luminance_spin):
+            row = rtx_vsr_form.takeRow(widget)
+            if row.labelItem is not None:
+                hdr_form.addRow(row.labelItem.widget(), row.fieldItem.widget())
+            else:
+                hdr_form.addRow(row.fieldItem.widget())
+        hdr_apply = QPushButton("Apply HDR Settings")
+        hdr_apply.clicked.connect(self._on_rtx_vsr_settings_apply_clicked)
+        hdr_form.addRow(hdr_apply)
+        page(self.settings_tabs, "OUTPUTS", [self.decklink_box, hdr_box])
+        page(self.settings_tabs, "PREVIEW", [settings_box])
+        page(self.settings_tabs, "SCALING", [deinterlace_box, upscaling_box,
+             self.rtx_vsr_box, self.ai_sr_postprocess_box, post_vsr_scaling_box])
         self._apply_scaling_mode_visibility(self.scaling_mode_combo.currentText())
         return panel
 
@@ -11884,6 +12153,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._is_closing = True
+        self._settings_save_timer.stop()
         self._save_settings()
         self._controller_roi_target = None
         self._controller_roi_interp_timer.stop()
@@ -12195,7 +12465,7 @@ class MainWindow(QMainWindow):
             self._reapply_decklink_after_buffer_change()
         elif hasattr(self._controller, "set_decklink_output_buffer_frames"):
             self._controller.set_decklink_output_buffer_frames(buffer_frames)
-        self._update_status(f"DeckLink output buffer set to {buffer_frames} frame(s); applying")
+        self._update_status(f"Software latency limit set to {buffer_frames} frame(s); applying")
 
     def _on_worker_priority_changed(self) -> None:
         if self._updating_controls:
@@ -12246,7 +12516,7 @@ class MainWindow(QMainWindow):
             self._update_status(f"DeckLink buffer apply failed: {exc}")
             return
         self._update_status(
-            f"DeckLink output buffer applied: {int(self._decklink_output_buffer_frames)} frame(s)"
+            f"Software latency limit applied: {int(self._decklink_output_buffer_frames)} frame(s)"
         )
 
     def _maybe_auto_stabilize_decklink_buffer(
@@ -13274,26 +13544,55 @@ class MainWindow(QMainWindow):
         return False
 
     def _start_capture_device_from_effect(self, capture_device: object) -> None:
-        if isinstance(capture_device, str) and capture_device.startswith("webcam:"):
-            self._update_status("Windows camera loading asynchronously from the recalled effect")
-            return
-        if not self._select_effect_capture_device(capture_device):
-            return
-        self.source_mode_combo.setCurrentText("Blackmagic DeckLink")
-        self._on_apply_decklink_settings()
+        self._update_status("Activate inputs in Settings > Inputs")
 
     def _open_capture_device_settings(self, capture_device: object) -> None:
-        if isinstance(capture_device, str) and capture_device.startswith("webcam:"):
-            try:
-                device_index = int(capture_device.partition(":")[2])
-                self._controller.show_capture_settings(device_index)
-                self._update_status(f"Closed Windows camera {device_index} settings")
-            except Exception as exc:
-                self._update_status(f"Windows camera settings failed: {exc}")
-            return
-        self._select_effect_capture_device(capture_device)
-        self._controls_scroll.ensureWidgetVisible(self.decklink_box, 0, 24)
-        self.decklink_input_device_combo.setFocus(Qt.OtherFocusReason)
+        self.controls_tabs.setCurrentIndex(2)
+        self.settings_tabs.setCurrentIndex(0)
+        if isinstance(capture_device, str) and capture_device.startswith("source:"):
+            row = int(capture_device.split(":", 1)[1]) - 1
+            self.input_sources.table.selectRow(row)
+
+    def _set_input_source_catalog(self, devices):
+        normalized = [(label, f"decklink:{device}" if isinstance(device, int) else device)
+                      for label, device in devices]
+        self.input_sources.set_devices(normalized)
+
+    def _input_sources_changed(self):
+        self.effects_graph.set_capture_devices(self.input_sources.labels())
+        roi_config = self.input_sources.configs[0]
+        roi_settings = tuple(roi_config.get(key) for key in ("device", "mode", "mode_text", "timecode_format", "timecode_phase"))
+        if roi_settings != getattr(self, "_last_roi_source_settings", None):
+            self._last_roi_source_settings = roi_settings
+            for combo, key in ((self.decklink_timecode_format_combo, "timecode_format"),
+                               (self.decklink_timecode_phase_combo, "timecode_phase")):
+                index = combo.findData(roi_config.get(key))
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            self._apply_mode_aware_deinterlace_default_if_needed()
+            self._sync_roi_transition_unit_labels()
+        active = frozenset(self.input_sources.active)
+        if active != getattr(self, "_last_active_input_sources", frozenset()):
+            self._last_active_input_sources = active
+            canvas = self.effects_graph.canvas
+            for node_id, node in canvas._nodes.items():
+                if node.get("type") == "capture":
+                    canvas._capture_reload_tokens[node_id] = canvas._capture_reload_tokens.get(node_id, 0) + 1
+            self._on_effects_graph_changed()
+        if hasattr(self, "_settings_save_timer"):
+            self._schedule_settings_save()
+
+    def _input_source_modes(self, device):
+        return [(m.name, m.mode) for m in _call_decklink_api(
+            "list_input_display_modes", int(device.split(":", 1)[1]))]
+
+    def _activate_input_source(self, logical_id, config):
+        self._controller.activate_source(logical_id, config)
+        self._update_status(f"Source {logical_id} active")
+
+    def _deactivate_input_source(self, logical_id):
+        self._controller.deactivate_source(logical_id)
+        self._update_status(f"Source {logical_id} inactive")
 
     def _on_perf_guard_toggled(self, checked: bool) -> None:
         self._perf_guard_enabled = checked
@@ -13720,13 +14019,29 @@ class MainWindow(QMainWindow):
 
         cadence = pipeline_timing_health.get('cadence')
         if isinstance(cadence, dict):
-            signature = (cadence.get('generation'), cadence.get('event_count'), cadence.get('capture_queue_drops'))
+            signature = (cadence.get('generation'), cadence.get('event_count'), cadence.get('capture_queue_drops'),
+                         output_buffer_health.get('latency_drop_events', 0), target_buffer)
             previous = getattr(self, '_last_cadence_log_signature', None)
             if signature != previous:
                 report = dict(cadence)
                 previous_event = previous[1] if previous and previous[0] == signature[0] else 0
                 report['recent_events'] = [event for event in cadence.get('recent_events', []) if event['event'] > (previous_event or 0)]
                 report.update(buffered_frames=buffered_count, target_buffer_frames=target_buffer, path=timing_last_path)
+                report['output_capacity_wait'] = {
+                    key: output_buffer_health.get(key, 0)
+                    for key in ('capacity_wait_polls', 'capacity_poll_ms_last', 'capacity_poll_ms_peak')
+                }
+                report['low_latency'] = {
+                    key: output_buffer_health.get(key, 0)
+                    for key in ('latency_budget_frames', 'latency_budget_ms', 'latency_drop_events',
+                                'strict_frame_age_ms_last', 'accepted_frame_age_ms_last', 'accepted_frame_age_ms_peak')
+                }
+                report['output_clock'] = {
+                    key: output_buffer_health.get(key)
+                    for key in ('clock_source', 'clock_query_errors', 'clock_query_ms_last',
+                                'clock_query_ms_peak', 'clock_epoch_adjustment_ms_last',
+                                'minimum_preroll_frames', 'low_latency_output_enabled')
+                }
                 LOGGER.info('CADENCE | %s', json.dumps(report, separators=(',', ':')))
                 self._last_cadence_log_signature = signature
 
@@ -13750,6 +14065,19 @@ class MainWindow(QMainWindow):
 
         health_level = "ok"
         health_reasons: list[str] = []
+        if isinstance(cadence, dict) and cadence.get('presentation_results_available'):
+            completed = cadence.get('output_completion_results', {})
+            generation = cadence.get('generation')
+            late_count = int(completed.get('late_frames') or 0)
+            dropped_count = int(completed.get('dropped_output_frames') or 0)
+            previous = getattr(self, '_last_output_completion_health', None)
+            self._last_output_completion_health = (generation, late_count, dropped_count)
+            if previous is not None and previous[0] == generation:
+                late_delta = max(0, late_count - previous[1])
+                dropped_delta = max(0, dropped_count - previous[2])
+                if late_delta or dropped_delta:
+                    health_level = 'warn'
+                    health_reasons.append(f"device_output(+late={late_delta},+dropped={dropped_delta})")
 
         fps_drop = output_ratio < 0.92
         severe_drop = output_ratio < 0.80
@@ -13951,13 +14279,22 @@ class MainWindow(QMainWindow):
             self.decklink_apply_btn,
             self.decklink_refresh_btn,
         ]:
-            widget.setEnabled(blackmagic_selected)
+            widget.setEnabled(True)
 
     def _update_fps_control_lock(self) -> None:
-        blackmagic_selected = self.source_mode_combo.currentText() == "Blackmagic DeckLink"
+        blackmagic_selected = self._source_mode == "Blackmagic DeckLink"
         self.fps_spin.setEnabled(not blackmagic_selected)
 
     def _on_apply_decklink_settings(self) -> None:
+        selected = self.input_sources.configs[0]
+        self.source_mode_combo.blockSignals(True)
+        self.source_mode_combo.setCurrentText("Blackmagic DeckLink")
+        self.source_mode_combo.blockSignals(False)
+        for combo, key in ((self.decklink_timecode_format_combo, "timecode_format"),
+                           (self.decklink_timecode_phase_combo, "timecode_phase")):
+            i = combo.findData(selected.get(key))
+            if i >= 0:
+                combo.setCurrentIndex(i)
         selected_source_mode = self.source_mode_combo.currentText()
         self._source_mode = selected_source_mode
         self._sync_blackmagic_controls_enabled_state()
@@ -13982,7 +14319,7 @@ class MainWindow(QMainWindow):
             self._update_status("DeckLink unavailable: install or activate decklink_wrapper environment")
             return
 
-        if self.decklink_input_device_combo.count() == 0 or self.decklink_output_device_combo.count() == 0:
+        if self.decklink_output_device_combo.count() == 0:
             self._refresh_decklink_catalog()
 
         try:
@@ -13998,28 +14335,27 @@ class MainWindow(QMainWindow):
         if self.decklink_auto_detect_devices.isChecked():
             self._apply_auto_detect_device_selection()
 
-        in_device = self._selected_combo_data(self.decklink_input_device_combo)
+        in_device = None  # ROI reads logical source 1, independent of output setup.
         out_device = self._selected_combo_data(self.decklink_output_device_combo)
-        if in_device is None or out_device is None:
+        if out_device is None:
             # One retry after a full catalog refresh to recover from stale/placeholder
             # combo state when devices are present but selection data is null.
             self._refresh_decklink_catalog()
             if self.decklink_auto_detect_devices.isChecked():
                 self._apply_auto_detect_device_selection()
-            in_device = self._selected_combo_data(self.decklink_input_device_combo)
             out_device = self._selected_combo_data(self.decklink_output_device_combo)
-        if in_device is None or out_device is None:
-            raise RuntimeError("No compatible DeckLink input/output devices selected")
+        if out_device is None:
+            raise RuntimeError("No compatible DeckLink output device selected")
 
-        in_mode = self._selected_combo_data(self.decklink_input_mode_combo)
+        in_mode = None
         out_mode = self._selected_combo_data(self.decklink_output_mode_combo)
-        if in_mode is None or out_mode is None:
-            raise RuntimeError("No compatible DeckLink input/output modes selected")
+        if out_mode is None:
+            raise RuntimeError("No compatible DeckLink output mode selected")
         timecode_format = self._selected_combo_data(self.decklink_timecode_format_combo)
         if timecode_format is None:
-            raise RuntimeError("No DeckLink input timecode type selected")
+            timecode_format = 0x72707631
 
-        input_fps = self._resolve_mode_fps(in_device, in_mode, input_side=True)
+        input_fps = None
         output_fps = self._resolve_mode_fps(out_device, out_mode, input_side=False)
         if hasattr(self._controller, "decklink_output_buffer_frames"):
             self._controller.decklink_output_buffer_frames = int(self.decklink_output_buffer_spin.value())
@@ -14059,20 +14395,26 @@ class MainWindow(QMainWindow):
             self._capture_session = None
             self._output_session = None
         else:
-            self._capture_session = d.CaptureSession(
-                device_index=in_device,
-                display_mode=in_mode,
-                pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
-                max_queue_frames=1,
-                enable_format_detection=self.decklink_enable_format_detection.isChecked(),
-                timecode_format=int(timecode_format),
-            )
-
+            warmup_key = (id(self._controller.processor), self._controller.basic_scaling_method,
+                          self._controller.basic_scaling_auto_mode, self._controller.max_auto_basic_scaling,
+                          self._controller.basic_scaling_manual)
+            if warmup_key != getattr(self, "_roi_warmup_key", None):
+                warmup_roi_scaling(self._controller.processor, FRAME_W, FRAME_H,
+                                   self._controller.enable_basic_scaling, self._controller.basic_scaling_auto_mode,
+                                   self._controller.max_auto_basic_scaling, self._controller.basic_scaling_manual)
+                self._roi_warmup_key = warmup_key
+            if not hasattr(self._controller, "_source_pool"):
+                self._controller._source_pool = SourcePool()
+            pool = self._controller._source_pool
             self._output_session = d.OutputSession(
                 device_index=out_device,
                 display_mode=out_mode,
                 pixel_format=d.PIXEL_FORMAT_8BIT_YUV,
                 low_latency_output=True,
+            )
+            self._capture_session = RoiSourceSession(
+                pool, FRAME_W, FRAME_H, 1.0 / (output_fps or (60000 / 1001)),
+                lambda rgb: rgb_to_uyvy(rgb, self._controller.color_space, self._controller.color_range),
             )
 
             self._capture_session.start()
@@ -14089,29 +14431,31 @@ class MainWindow(QMainWindow):
         elif selected_fps is not None:
             fps_text = f"selected={selected_fps:.2f}"
 
-        input_name = f"device {in_device}"
+        roi_config = self.input_sources.configs[0]
+        input_name = "Logical source 1: " + (str(roi_config.get("name", "")).strip() or roi_config.get("device_name") or "Unassigned")
+        if 1 not in self.input_sources.active:
+            input_name += " (inactive; black)"
         output_name = f"device {out_device}"
-        in_mode_name = self.decklink_input_mode_combo.currentText()
+        in_mode_name = self._roi_source_mode_text()
         out_mode_name = self.decklink_output_mode_combo.currentText()
-        input_label = self.decklink_input_device_combo.currentText()
         output_label = self.decklink_output_device_combo.currentText()
-        if input_label:
-            input_name = input_label
         if output_label:
             output_name = output_label
 
         backend_text = "worker process" if self._controller_backend == "worker-process" else "GUI process"
         timecode_format_name = self.decklink_timecode_format_combo.currentText()
-        hfrtc_supported = getattr(self, "_decklink_hfrtc_support_by_index", {}).get(int(in_device))
+        roi_device = str(roi_config.get("device", ""))
+        hfrtc_supported = getattr(self, "_decklink_hfrtc_support_by_index", {}).get(int(roi_device.split(":", 1)[1])) if roi_device.startswith("decklink:") else None
         hfrtc_text = "unknown" if hfrtc_supported is None else ("supported" if hfrtc_supported else "unsupported")
         self._set_decklink_status(
             "DeckLink configured: "
-            f"in={input_name} mode='{in_mode_name}' ({in_mode}); "
+            f"ROI={input_name}; "
             f"out={output_name} mode='{out_mode_name}' ({out_mode}); "
             f"fps={fps_text}; timecode={timecode_format_name}; HFRTC={hfrtc_text}; backend={backend_text}"
         )
         self._set_decklink_timecode_display(None, placeholder="Timecode: waiting for DeckLink frames...")
         self._decklink_sessions_running = True
+        self._schedule_settings_save()
         self._sync_roi_transition_unit_labels()
         LOGGER.info(
             "DeckLink started: input=%s mode=%s output=%s mode=%s fps=%s timecode=%s HFRTC=%s",
@@ -14149,7 +14493,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_decklink_catalog(self) -> None:
         windows_cameras = _windows_video_capture_devices()
-        self.effects_graph.set_capture_devices(windows_cameras)
+        self._set_input_source_catalog(windows_cameras)
         if d is None:
             self._set_decklink_status("decklink_wrapper is not available in this environment")
             LOGGER.error("DeckLink catalog refresh failed: wrapper unavailable")
@@ -14191,7 +14535,7 @@ class MainWindow(QMainWindow):
                 self.decklink_output_device_combo.addItem(label, int(dev.index))
                 output_count += 1
 
-        self.effects_graph.set_capture_devices(
+        self._set_input_source_catalog(
             [
                 (f"{dev.display_name} [{dev.model_name}]", int(dev.index))
                 for dev in devices
@@ -14300,9 +14644,17 @@ class MainWindow(QMainWindow):
 
     def _default_deinterlace_method_name_for_source_mode(self) -> str:
         if self.source_mode_combo.currentText() == "Blackmagic DeckLink":
-            if _mode_name_is_interlaced(self.decklink_input_mode_combo.currentText()):
+            if _mode_name_is_interlaced(self._roi_source_mode_text()):
                 return INTERLACED_DEFAULT_DEINTERLACE_METHOD
         return PROGRESSIVE_DEFAULT_DEINTERLACE_METHOD
+
+    def _roi_source_mode_text(self) -> str:
+        if not hasattr(self, "input_sources"):
+            return self.decklink_input_mode_combo.currentText()
+        config = self.input_sources.configs[0]
+        if not str(config.get("device", "")).startswith("decklink:"):
+            return "Progressive"
+        return str(config.get("mode_text", ""))
 
     def _apply_mode_aware_deinterlace_default_if_needed(self) -> None:
         if self._has_persisted_deinterlace_method or self._deinterlace_method_user_selected:
@@ -14434,6 +14786,7 @@ class MainWindow(QMainWindow):
             self._capture_session = None
 
         self._decklink_sessions_running = False
+        self._schedule_settings_save()
         self._set_decklink_timecode_display(None, placeholder="Timecode: --")
 
         LOGGER.info("DeckLink sessions stopped")
@@ -14730,7 +15083,7 @@ class MainWindow(QMainWindow):
     def _timecode_input_delivery_phases(self) -> int:
         if self._source_mode != "Blackmagic DeckLink":
             return 1
-        return 2 if _mode_name_is_interlaced(self.decklink_input_mode_combo.currentText()) else 1
+        return 2 if _mode_name_is_interlaced(self._roi_source_mode_text()) else 1
 
     def _rebuild_timecode_roi_lookup(self, sync_worker: bool = True) -> None:
         effective_keyframes = dict(self._timecode_roi_keyframes)
