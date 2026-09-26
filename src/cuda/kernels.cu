@@ -22,6 +22,12 @@ __device__ inline uint8_t ClampToU8(float v) {
     return static_cast<uint8_t>(v);
 }
 
+// Quantize color-space boundaries without the dark/chroma bias of truncation.
+// Keep effect-kernel quantization separate to preserve existing blend semantics.
+__device__ inline uint8_t RoundColorToU8(float v) {
+    return ClampToU8(floorf(v + 0.5f));
+}
+
 __device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v, int color_matrix, int color_range) {
     // Limited-range conversion (Y:16-235, U/V:16-240).
     const float d = static_cast<float>(u) - 128.0f;
@@ -41,7 +47,7 @@ __device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v, int col
             g = yv - 0.187324f * d - 0.468124f * e;
             b = yv + 1.855600f * d;
         }
-        return make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
+        return make_uchar3(RoundColorToU8(r), RoundColorToU8(g), RoundColorToU8(b));
     }
 
     const float c = yv - 16.0f;
@@ -61,7 +67,7 @@ __device__ inline uchar3 MakeRgbFromYuv(uint8_t y, uint8_t u, uint8_t v, int col
         b = 1.164383f * c + 2.112402f * d;
     }
 
-    return make_uchar3(ClampToU8(r), ClampToU8(g), ClampToU8(b));
+    return make_uchar3(RoundColorToU8(r), RoundColorToU8(g), RoundColorToU8(b));
 }
 
 struct YuvF {
@@ -93,9 +99,9 @@ __device__ inline YuvF RgbToYuv(const uchar3& rgb, int color_matrix, int color_r
     if (color_matrix == 1) {
         // BT.2020 non-constant luminance matrix.
         return {
-            16.0f + 0.224735f * r + 0.580016f * g + 0.050730f * b,
-            128.0f - 0.122533f * r - 0.316560f * g + 0.439093f * b,
-            128.0f + 0.439093f * r - 0.402915f * g - 0.036178f * b,
+            16.0f + 0.225613f * r + 0.582282f * g + 0.050928f * b,
+            128.0f - 0.122655f * r - 0.316561f * g + 0.439216f * b,
+            128.0f + 0.439216f * r - 0.403890f * g - 0.035325f * b,
         };
     }
 
@@ -685,9 +691,9 @@ __device__ inline uchar3 SampleBicubic(const uchar3* src, int width, int height,
     }
 
     return make_uchar3(
-        ClampToU8(sum_r / sum_w),
-        ClampToU8(sum_g / sum_w),
-        ClampToU8(sum_b / sum_w)
+        RoundColorToU8(sum_r / sum_w),
+        RoundColorToU8(sum_g / sum_w),
+        RoundColorToU8(sum_b / sum_w)
     );
 }
 
@@ -741,9 +747,9 @@ __device__ inline uchar3 SampleBilinear(const uchar3* src, int width, int height
     const float b1 = p01.z + tx * (p11.z - p01.z);
 
     return make_uchar3(
-        ClampToU8(r0 + ty * (r1 - r0)),
-        ClampToU8(g0 + ty * (g1 - g0)),
-        ClampToU8(b0 + ty * (b1 - b0))
+        RoundColorToU8(r0 + ty * (r1 - r0)),
+        RoundColorToU8(g0 + ty * (g1 - g0)),
+        RoundColorToU8(b0 + ty * (b1 - b0))
     );
 }
 
@@ -1269,10 +1275,10 @@ __global__ void RgbToUyvyKernel(const uchar3* rgb, uint8_t* uyvy, int width, int
     const YuvF yuv0 = RgbToYuv(p0, color_matrix, color_range);
     const YuvF yuv1 = RgbToYuv(p1, color_matrix, color_range);
 
-    const uint8_t y0_u8 = ClampToU8(yuv0.y);
-    const uint8_t y1_u8 = ClampToU8(yuv1.y);
-    const uint8_t u_u8 = ClampToU8((yuv0.u + yuv1.u) * 0.5f);
-    const uint8_t v_u8 = ClampToU8((yuv0.v + yuv1.v) * 0.5f);
+    const uint8_t y0_u8 = RoundColorToU8(yuv0.y);
+    const uint8_t y1_u8 = RoundColorToU8(yuv1.y);
+    const uint8_t u_u8 = RoundColorToU8((yuv0.u + yuv1.u) * 0.5f);
+    const uint8_t v_u8 = RoundColorToU8((yuv0.v + yuv1.v) * 0.5f);
 
     const int base = (y * pairs_per_row + pair_x) * 4;
     uyvy[base + 0] = u_u8;
@@ -1798,17 +1804,17 @@ __global__ void GenerateKeyAlphaKernel(
 // This keeps allocations off the frame path and supports input == output.
 template<int Channels>
 __global__ void ReduceBlurKernel(const uint8_t* input, uint8_t* output,
-    int width, int height, int small_width, int small_height, int scale) {
+    int width, int height, int small_width, int small_height, int scale_x, int scale_y) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= small_width || y >= small_height) return;
-    const int right = min(width, (x + 1) * scale);
-    const int bottom = min(height, (y + 1) * scale);
-    const int count = (right - x * scale) * (bottom - y * scale);
+    const int right = min(width, (x + 1) * scale_x);
+    const int bottom = min(height, (y + 1) * scale_y);
+    const int count = (right - x * scale_x) * (bottom - y * scale_y);
     for (int c = 0; c < Channels; ++c) {
         float sum = 0;
-        for (int sy = y * scale; sy < bottom; ++sy)
-            for (int sx = x * scale; sx < right; ++sx)
+        for (int sy = y * scale_y; sy < bottom; ++sy)
+            for (int sx = x * scale_x; sx < right; ++sx)
                 sum += input[(sy * width + sx) * Channels + c];
         output[(y * small_width + x) * Channels + c] = ClampToU8(sum / count);
     }
@@ -1816,12 +1822,12 @@ __global__ void ReduceBlurKernel(const uint8_t* input, uint8_t* output,
 
 template<int Channels>
 __global__ void ExpandBlurKernel(const uint8_t* input, uint8_t* output,
-    int width, int height, int small_width, int small_height, int scale) {
+    int width, int height, int small_width, int small_height, int scale_x, int scale_y) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
-    const float fx = fmaxf(0, fminf(small_width - 1.0f, (x + 0.5f) / scale - 0.5f));
-    const float fy = fmaxf(0, fminf(small_height - 1.0f, (y + 0.5f) / scale - 0.5f));
+    const float fx = fmaxf(0, fminf(small_width - 1.0f, (x + 0.5f) / scale_x - 0.5f));
+    const float fy = fmaxf(0, fminf(small_height - 1.0f, (y + 0.5f) / scale_y - 0.5f));
     const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
     const int x1 = min(x0 + 1, small_width - 1), y1 = min(y0 + 1, small_height - 1);
     const float tx = fx - x0, ty = fy - y0;
@@ -2858,38 +2864,44 @@ void LaunchBlurColor(
     int height,
     float radius,
     int method,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float aspect
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     const float clamped_radius = fmaxf(0.01f, fminf(128.0f, radius));
-    if (clamped_radius > 16.0f) {
-        const int scale = static_cast<int>(ceilf(clamped_radius / 16.0f));
-        const int sw = (width + scale - 1) / scale, sh = (height + scale - 1) / scale;
+    // Independent pyramid scales keep a stretched blur from smearing its thin axis.
+    const float stretch = sqrtf(fmaxf(0.001f, aspect));
+    const float radius_x = fminf(static_cast<float>(width), clamped_radius * stretch);
+    const float radius_y = fminf(static_cast<float>(height), clamped_radius / stretch);
+    if (fmaxf(radius_x, radius_y) > 16.0f) {
+        const int scale_x = max(1, static_cast<int>(ceilf(radius_x / 16.0f)));
+        const int scale_y = max(1, static_cast<int>(ceilf(radius_y / 16.0f)));
+        const int sw = (width + scale_x - 1) / scale_x, sh = (height + scale_y - 1) / scale_y;
         if (2 * sw * sh <= width * height) {
             uchar3* reduced = d_temp;
             uchar3* scratch = d_temp + sw * sh;
             ReduceBlurKernel<3><<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                reinterpret_cast<const uint8_t*>(d_input), reinterpret_cast<uint8_t*>(reduced), width, height, sw, sh, scale);
+                reinterpret_cast<const uint8_t*>(d_input), reinterpret_cast<uint8_t*>(reduced), width, height, sw, sh, scale_x, scale_y);
             CheckKernelLaunch("ReduceBlurColor launch");
             BlurColorHorizontalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                reduced, scratch, sw, sh, clamped_radius / scale, method);
+                reduced, scratch, sw, sh, radius_x / scale_x, method);
             CheckKernelLaunch("ReducedBlurColorHorizontal launch");
             BlurColorVerticalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                scratch, reduced, sw, sh, clamped_radius / scale, method);
+                scratch, reduced, sw, sh, radius_y / scale_y, method);
             CheckKernelLaunch("ReducedBlurColorVertical launch");
             ExpandBlurKernel<3><<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                reinterpret_cast<const uint8_t*>(reduced), reinterpret_cast<uint8_t*>(d_output), width, height, sw, sh, scale);
+                reinterpret_cast<const uint8_t*>(reduced), reinterpret_cast<uint8_t*>(d_output), width, height, sw, sh, scale_x, scale_y);
             CheckKernelLaunch("ExpandBlurColor launch");
             return;
         }
     }
     BlurColorHorizontalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-        d_input, d_temp, width, height, clamped_radius, method
+        d_input, d_temp, width, height, radius_x, method
     );
     CheckKernelLaunch("BlurColorHorizontalKernel launch");
     BlurColorVerticalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-        d_temp, d_output, width, height, clamped_radius, method
+        d_temp, d_output, width, height, radius_y, method
     );
     CheckKernelLaunch("BlurColorVerticalKernel launch");
 }
@@ -2902,38 +2914,44 @@ void LaunchBlurAlpha(
     int height,
     float radius,
     int method,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float aspect
 ) {
     constexpr int kBlockX = 16;
     constexpr int kBlockY = 16;
     const float clamped_radius = fmaxf(0.01f, fminf(128.0f, radius));
-    if (clamped_radius > 16.0f) {
-        const int scale = static_cast<int>(ceilf(clamped_radius / 16.0f));
-        const int sw = (width + scale - 1) / scale, sh = (height + scale - 1) / scale;
+    // Independent pyramid scales keep a stretched blur from smearing its thin axis.
+    const float stretch = sqrtf(fmaxf(0.001f, aspect));
+    const float radius_x = fminf(static_cast<float>(width), clamped_radius * stretch);
+    const float radius_y = fminf(static_cast<float>(height), clamped_radius / stretch);
+    if (fmaxf(radius_x, radius_y) > 16.0f) {
+        const int scale_x = max(1, static_cast<int>(ceilf(radius_x / 16.0f)));
+        const int scale_y = max(1, static_cast<int>(ceilf(radius_y / 16.0f)));
+        const int sw = (width + scale_x - 1) / scale_x, sh = (height + scale_y - 1) / scale_y;
         if (2 * sw * sh <= width * height) {
             uint8_t* reduced = d_temp;
             uint8_t* scratch = d_temp + sw * sh;
             ReduceBlurKernel<1><<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                reinterpret_cast<const uint8_t*>(d_input), reinterpret_cast<uint8_t*>(reduced), width, height, sw, sh, scale);
+                reinterpret_cast<const uint8_t*>(d_input), reinterpret_cast<uint8_t*>(reduced), width, height, sw, sh, scale_x, scale_y);
             CheckKernelLaunch("ReduceBlurAlpha launch");
             BlurAlphaHorizontalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                reduced, scratch, sw, sh, clamped_radius / scale, method);
+                reduced, scratch, sw, sh, radius_x / scale_x, method);
             CheckKernelLaunch("ReducedBlurAlphaHorizontal launch");
             BlurAlphaVerticalKernel<<<Grid2D(sw, sh, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                scratch, reduced, sw, sh, clamped_radius / scale, method);
+                scratch, reduced, sw, sh, radius_y / scale_y, method);
             CheckKernelLaunch("ReducedBlurAlphaVertical launch");
             ExpandBlurKernel<1><<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-                reinterpret_cast<const uint8_t*>(reduced), reinterpret_cast<uint8_t*>(d_output), width, height, sw, sh, scale);
+                reinterpret_cast<const uint8_t*>(reduced), reinterpret_cast<uint8_t*>(d_output), width, height, sw, sh, scale_x, scale_y);
             CheckKernelLaunch("ExpandBlurAlpha launch");
             return;
         }
     }
     BlurAlphaHorizontalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-        d_input, d_temp, width, height, clamped_radius, method
+        d_input, d_temp, width, height, radius_x, method
     );
     CheckKernelLaunch("BlurAlphaHorizontalKernel launch");
     BlurAlphaVerticalKernel<<<Grid2D(width, height, kBlockX, kBlockY), dim3(kBlockX, kBlockY), 0, stream>>>(
-        d_temp, d_output, width, height, clamped_radius, method
+        d_temp, d_output, width, height, radius_y, method
     );
     CheckKernelLaunch("BlurAlphaVerticalKernel launch");
 }
@@ -3169,6 +3187,47 @@ void LaunchRgbToTensor(
     }
 
     CheckKernelLaunch("RgbToTensorKernel launch");
+}
+
+// Store the incoming premultiplied RGBA before blending so live frames never
+// overwrite the held image between pulses.
+__global__ void StrobeKernel(uchar3* color, uint8_t* alpha, float4* frozen, size_t pixels, float strength, bool capture, bool black_background) {
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    const uchar3 c = color[i];
+    const float a = alpha ? alpha[i] : 255.0f;
+    if (capture) frozen[i] = make_float4(c.x, c.y, c.z, a);
+    const float4 f = frozen[i];
+    const float background_weight = 1.0f - strength;
+    color[i] = make_uchar3(
+        static_cast<uint8_t>(strength * f.x + (black_background ? 0 : background_weight * c.x)),
+        static_cast<uint8_t>(strength * f.y + (black_background ? 0 : background_weight * c.y)),
+        static_cast<uint8_t>(strength * f.z + (black_background ? 0 : background_weight * c.z)));
+    if (alpha) alpha[i] = static_cast<uint8_t>(strength * f.w + background_weight * (black_background ? 255.0f : a));
+}
+
+void LaunchStrobe(uchar3* color, uint8_t* alpha, float4* frozen, size_t pixels, float strength, bool capture, bool black_background, cudaStream_t stream) {
+    StrobeKernel<<<static_cast<unsigned>((pixels + 255) / 256), 256, 0, stream>>>(color, alpha, frozen, pixels, strength, capture, black_background);
+    CheckKernelLaunch("StrobeKernel launch");
+}
+
+// Floating-point history avoids rounding errors that could keep faint trails forever.
+__global__ void TrailsKernel(uchar3* color, uint8_t* alpha, float4* history, size_t pixels, float decay, bool reset, float strength) {
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    const uchar3 c = color[i];
+    const float a = alpha ? alpha[i] : 255.0f;
+    float4 h = reset ? make_float4(0, 0, 0, 0) : history[i];
+    h = make_float4(fmaxf(c.x, h.x - decay), fmaxf(c.y, h.y - decay),
+                    fmaxf(c.z, h.z - decay), fmaxf(a, h.w - decay));
+    history[i] = h;
+    color[i] = make_uchar3(static_cast<uint8_t>(c.x + strength * (h.x - c.x)), static_cast<uint8_t>(c.y + strength * (h.y - c.y)), static_cast<uint8_t>(c.z + strength * (h.z - c.z)));
+    if (alpha) alpha[i] = static_cast<uint8_t>(a + strength * (h.w - a));
+}
+
+void LaunchTrails(uchar3* color, uint8_t* alpha, float4* history, size_t pixels, float decay, bool reset, float strength, cudaStream_t stream) {
+    TrailsKernel<<<static_cast<unsigned>((pixels + 255) / 256), 256, 0, stream>>>(color, alpha, history, pixels, decay, reset, strength);
+    CheckKernelLaunch("TrailsKernel launch");
 }
 
 } // namespace vp::cuda_kernels

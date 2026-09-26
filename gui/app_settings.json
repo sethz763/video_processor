@@ -1,7 +1,6 @@
 {
   "active_input_sources": [
-    1,
-    2
+    1
   ],
   "ai_sr_detail_preserve_percent": 100.0,
   "ai_sr_enabled": false,
@@ -66,12 +65,6 @@
           "layer8_alpha"
         ],
         [
-          "media_1",
-          "output",
-          "keying_1",
-          "layer2_color"
-        ],
-        [
           "mask_2",
           "alpha_output",
           "keying_1",
@@ -84,33 +77,63 @@
           "input"
         ],
         [
+          "proc_amp_1",
+          "output",
+          "keying_1",
+          "layer1_color"
+        ],
+        [
+          "effects_input",
+          "output",
+          "transform_3d_1",
+          "input"
+        ],
+        [
+          "media_1",
+          "output",
+          "color_splitter_3",
+          "input"
+        ],
+        [
+          "color_splitter_3",
+          "green_output",
+          "keying_1",
+          "layer4_alpha"
+        ],
+        [
           "effects_input",
           "output",
           "proc_amp_1",
           "input"
         ],
         [
-          "proc_amp_1",
+          "transform_3d_1",
+          "output",
+          "proc_amp_4",
+          "input"
+        ],
+        [
+          "proc_amp_4",
           "output",
           "keying_1",
-          "layer1_color"
+          "layer4_color"
         ]
       ],
-      "enabled": false,
+      "enabled": true,
       "nodes": [
         {
           "id": "effects_input",
           "settings": {},
           "type": "effects_input",
-          "x": 12,
+          "x": 13,
           "y": 0
         },
         {
           "id": "effects_output",
           "settings": {},
           "type": "effects_output",
-          "x": 1332,
-          "y": 288
+          "x": 2003,
+          "y": 307
         },
         {
           "id": "keying_1",
@@ -122,7 +145,7 @@
             "layer3_blend_mode": "normal",
             "layer3_opacity": 0,
             "layer4_blend_mode": "normal",
-            "layer4_opacity": 0,
+            "layer4_opacity": 1,
             "layer5_blend_mode": "normal",
             "layer5_opacity": 0,
             "layer6_blend_mode": "normal",
@@ -135,8 +158,8 @@
             "runtime_supported": true
           },
           "type": "keying",
-          "x": 888,
-          "y": 132
+          "x": 1488,
+          "y": 183
         },
         {
           "id": "mask_1",
@@ -153,7 +176,7 @@
           },
           "type": "mask",
           "x": 0,
-          "y": 445
+          "y": 586
         },
         {
           "id": "matte_1",
@@ -165,33 +188,33 @@
           },
           "type": "matte",
           "x": 0,
-          "y": 310
+          "y": 436
         },
         {
           "id": "proc_amp_1",
           "settings": {
-            "brightness": 0.4,
-            "contrast": 1.97,
-            "hue": 0,
+            "brightness": 0.72,
+            "contrast": 2.79,
+            "hue": -180.0,
             "invert": false,
-            "saturation": 1.17
+            "saturation": 0.0
           },
           "type": "proc_amp",
-          "x": 490,
-          "y": 44
+          "x": 476,
+          "y": 264
         },
         {
           "id": "media_1",
           "settings": {
             "loop": true,
             "opacity": 1,
-            "path": "C:\\Users\\Seth Zwiebel\\Documents\\sny_envato_stuff\\20 Light Leaks Overlays\\Light Leaks Overlays 6.mov",
+            "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
             "playing": true,
             "runtime_supported": true
           },
           "type": "media",
-          "x": 4,
-          "y": 142
+          "x": 0,
+          "y": 221
         },
         {
           "id": "mask_2",
@@ -207,20 +230,122 @@
             "y": 0
           },
           "type": "mask",
-          "x": 392,
-          "y": 282
+          "x": 933,
+          "y": 72
+        },
+        {
+          "id": "transform_3d_1",
+          "settings": {
+            "aspect_x": 1.0,
+            "aspect_y": 1.0,
+            "rotate_x": 0,
+            "rotate_y": 0,
+            "rotate_z": 0,
+            "x": -0.4,
+            "y": 0,
+            "z": 27
+          },
+          "type": "transform_3d",
+          "x": 485,
+          "y": 81
+        },
+        {
+          "id": "color_splitter_3",
+          "settings": {},
+          "type": "color_splitter",
+          "x": 395,
+          "y": 386
+        },
+        {
+          "id": "proc_amp_4",
+          "settings": {
+            "brightness": 0.3,
+            "contrast": 2.93,
+            "hue": -47.0,
+            "invert": false,
+            "saturation": 3.7
+          },
+          "type": "proc_amp",
+          "x": 808,
+          "y": 147
         }
       ],
       "version": 6
     },
     "keyframes": {
+      "color_splitter_3": {
+        "0": {}
+      },
+      "effects_input": {
+        "0": {}
+      },
+      "keying_1": {
+        "0": {
+          "layer1_blend_mode": "normal",
+          "layer1_opacity": 1,
+          "layer2_blend_mode": "screen",
+          "layer2_opacity": 0.7,
+          "layer3_blend_mode": "normal",
+          "layer3_opacity": 0,
+          "layer4_blend_mode": "normal",
+          "layer4_opacity": 1,
+          "layer5_blend_mode": "normal",
+          "layer5_opacity": 0,
+          "layer6_blend_mode": "normal",
+          "layer6_opacity": 0,
+          "layer7_blend_mode": "normal",
+          "layer7_opacity": 0,
+          "layer8_blend_mode": "normal",
+          "layer8_opacity": 0.72,
+          "layer_count": 8,
+          "runtime_supported": true
+        }
+      },
+      "mask_2": {
+        "0": {
+          "aspect": 2.42,
+          "invert": true,
+          "pattern": "circle",
+          "size": 0.98,
+          "softness": 0.57,
+          "x": 0,
+          "y": 0
+        }
+      },
+      "matte_1": {
+        "0": {
+          "alpha": 1,
+          "blue": 0,
+          "green": 0,
+          "red": 0
+        }
+      },
+      "media_1": {
+        "0": {
+          "loop": true,
+          "opacity": 1,
+          "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/glitch-overlay-A2GNML8/Glitch Overlay/Glitch Overlay 4.mov",
+          "playing": true,
+          "runtime_supported": true
+        }
+      },
       "proc_amp_1": {
         "0": {
-          "brightness": 0.4,
-          "contrast": 1.97,
+          "brightness": 0.72,
+          "contrast": 2.79,
           "hue": 0,
           "invert": false,
-          "saturation": 1.17
+          "saturation": 0
+        }
+      },
+      "transform_3d_1": {
+        "0": {
+          "rotate_x": 0,
+          "rotate_y": 0,
+          "rotate_z": 0,
+          "x": -0.4,
+          "y": 0,
+          "z": 27
         }
       }
     },
@@ -4004,6 +4129,654 @@
         "keyframes": {},
         "name": "letterbox",
         "thumbnail": "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"
+      },
+      {
+        "duration": 1,
+        "graph": {
+          "connections": [
+            [
+              "keying_2",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "effects_input",
+              "output",
+              "keying_2",
+              "layer1_color"
+            ],
+            [
+              "mask_1",
+              "alpha_output",
+              "mix_2",
+              "b_input"
+            ],
+            [
+              "media_3",
+              "output",
+              "mix_2",
+              "a_input"
+            ],
+            [
+              "mix_2",
+              "alpha_output",
+              "keying_2",
+              "layer3_alpha"
+            ],
+            [
+              "media_3",
+              "output",
+              "keying_2",
+              "layer3_color"
+            ],
+            [
+              "effects_input",
+              "output",
+              "blur_3",
+              "input"
+            ],
+            [
+              "blur_3",
+              "output",
+              "proc_amp_1",
+              "input"
+            ],
+            [
+              "luma_key_1",
+              "alpha_output",
+              "keying_2",
+              "layer2_alpha"
+            ],
+            [
+              "blur_3",
+              "output",
+              "luma_key_1",
+              "color_input"
+            ],
+            [
+              "proc_amp_1",
+              "output",
+              "keying_2",
+              "layer2_color"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 12,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 1823,
+              "y": 314
+            },
+            {
+              "id": "keying_2",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1.0,
+                "layer2_blend_mode": "screen",
+                "layer2_opacity": 0.47,
+                "layer3_blend_mode": "overlay",
+                "layer3_opacity": 0.75,
+                "layer_count": 3,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 1272,
+              "y": 149
+            },
+            {
+              "id": "media_3",
+              "settings": {
+                "loop": true,
+                "opacity": 1.0,
+                "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+                "playing": true,
+                "runtime_supported": true
+              },
+              "type": "media",
+              "x": 0,
+              "y": 236
+            },
+            {
+              "id": "mask_1",
+              "settings": {
+                "aspect": 1.71,
+                "invert": false,
+                "pattern": "circle",
+                "rotation": 0.0,
+                "size": 1.49,
+                "softness": 0.54,
+                "transparency": 0.0,
+                "x": 0.0,
+                "y": 0.0
+              },
+              "type": "mask",
+              "x": 62,
+              "y": 411
+            },
+            {
+              "id": "mix_2",
+              "settings": {
+                "factor": 0.868,
+                "mode": "subtract"
+              },
+              "type": "mix",
+              "x": 388,
+              "y": 380
+            },
+            {
+              "id": "blur_3",
+              "settings": {
+                "aspect": 50.0,
+                "method": "gaussian",
+                "radius": 94.25,
+                "target": "both"
+              },
+              "type": "blur",
+              "x": 325,
+              "y": 95
+            },
+            {
+              "id": "proc_amp_1",
+              "settings": {
+                "brightness": 0.36,
+                "contrast": 1.0,
+                "hue": 0.0,
+                "invert": false,
+                "saturation": 2.19
+              },
+              "type": "proc_amp",
+              "x": 639,
+              "y": 66
+            },
+            {
+              "id": "luma_key_1",
+              "settings": {
+                "clip": 0.451,
+                "gain": 8.33,
+                "invert": false
+              },
+              "type": "luma_key",
+              "x": 933,
+              "y": 168
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {
+          "blur_3": {
+            "0": {
+              "aspect": 50.0,
+              "method": "gaussian",
+              "radius": 94.25,
+              "target": "both"
+            }
+          },
+          "effects_input": {
+            "0": {}
+          },
+          "effects_output": {
+            "0": {}
+          },
+          "keying_2": {
+            "0": {
+              "layer1_blend_mode": "normal",
+              "layer1_opacity": 1.0,
+              "layer2_blend_mode": "screen",
+              "layer2_opacity": 0.47,
+              "layer3_blend_mode": "overlay",
+              "layer3_opacity": 0.75,
+              "layer_count": 3,
+              "runtime_supported": true
+            }
+          },
+          "luma_key_1": {
+            "0": {
+              "clip": 0.451,
+              "gain": 8.33,
+              "invert": false
+            }
+          },
+          "mask_1": {
+            "0": {
+              "aspect": 1.71,
+              "invert": false,
+              "pattern": "circle",
+              "rotation": 0.0,
+              "size": 1.49,
+              "softness": 0.54,
+              "transparency": 0.0,
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "media_3": {
+            "0": {
+              "loop": true,
+              "opacity": 1.0,
+              "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+              "playing": true,
+              "runtime_supported": true
+            }
+          },
+          "mix_2": {
+            "0": {
+              "factor": 0.868,
+              "mode": "subtract"
+            }
+          },
+          "proc_amp_1": {
+            "0": {
+              "brightness": 0.36,
+              "contrast": 1.0,
+              "hue": 0.0,
+              "invert": false,
+              "saturation": 2.19
+            }
+          }
+        },
+        "name": "flow",
+        "thumbnail": "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"
+      },
+      {
+        "duration": 1,
+        "graph": {
+          "connections": [
+            [
+              "keying_2",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "mask_1",
+              "alpha_output",
+              "mix_2",
+              "b_input"
+            ],
+            [
+              "media_3",
+              "output",
+              "mix_2",
+              "a_input"
+            ],
+            [
+              "mix_2",
+              "alpha_output",
+              "keying_2",
+              "layer3_alpha"
+            ],
+            [
+              "media_3",
+              "output",
+              "keying_2",
+              "layer3_color"
+            ],
+            [
+              "effects_input",
+              "output",
+              "blur_3",
+              "input"
+            ],
+            [
+              "blur_3",
+              "output",
+              "proc_amp_1",
+              "input"
+            ],
+            [
+              "luma_key_1",
+              "alpha_output",
+              "keying_2",
+              "layer2_alpha"
+            ],
+            [
+              "blur_3",
+              "output",
+              "luma_key_1",
+              "color_input"
+            ],
+            [
+              "proc_amp_1",
+              "output",
+              "keying_2",
+              "layer2_color"
+            ],
+            [
+              "effects_input",
+              "output",
+              "trails_2",
+              "input"
+            ],
+            [
+              "trails_2",
+              "output",
+              "strobe_1",
+              "input"
+            ],
+            [
+              "strobe_1",
+              "output",
+              "keying_2",
+              "layer1_color"
+            ]
+          ],
+          "enabled": false,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 12,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 1823,
+              "y": 314
+            },
+            {
+              "id": "keying_2",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1.0,
+                "layer2_blend_mode": "screen",
+                "layer2_opacity": 0.47,
+                "layer3_blend_mode": "overlay",
+                "layer3_opacity": 0.73,
+                "layer_count": 3,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 1272,
+              "y": 149
+            },
+            {
+              "id": "media_3",
+              "settings": {
+                "loop": true,
+                "opacity": 1.0,
+                "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+                "playing": true,
+                "runtime_supported": true
+              },
+              "type": "media",
+              "x": 0,
+              "y": 236
+            },
+            {
+              "id": "mask_1",
+              "settings": {
+                "aspect": 1.71,
+                "invert": false,
+                "pattern": "circle",
+                "rotation": 0.0,
+                "size": 1.49,
+                "softness": 0.54,
+                "transparency": 0.0,
+                "x": 0.0,
+                "y": 0.0
+              },
+              "type": "mask",
+              "x": 62,
+              "y": 411
+            },
+            {
+              "id": "mix_2",
+              "settings": {
+                "factor": 0.868,
+                "mode": "subtract"
+              },
+              "type": "mix",
+              "x": 388,
+              "y": 380
+            },
+            {
+              "id": "blur_3",
+              "settings": {
+                "aspect": 50.0,
+                "method": "gaussian",
+                "radius": 94.25,
+                "target": "both"
+              },
+              "type": "blur",
+              "x": 382,
+              "y": 195
+            },
+            {
+              "id": "proc_amp_1",
+              "settings": {
+                "brightness": 0.36,
+                "contrast": 1.0,
+                "hue": 0.0,
+                "invert": false,
+                "saturation": 2.19
+              },
+              "type": "proc_amp",
+              "x": 801,
+              "y": 51
+            },
+            {
+              "id": "luma_key_1",
+              "settings": {
+                "clip": 0.451,
+                "gain": 8.33,
+                "invert": false
+              },
+              "type": "luma_key",
+              "x": 832,
+              "y": 278
+            },
+            {
+              "id": "trails_2",
+              "settings": {
+                "decay": 0.68,
+                "duration": 1.82
+              },
+              "type": "trails",
+              "x": 304,
+              "y": 4
+            },
+            {
+              "id": "strobe_1",
+              "settings": {
+                "background": "live",
+                "decay": 1.36,
+                "rate": 8.86
+              },
+              "type": "strobe",
+              "x": 553,
+              "y": 10
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {
+          "blur_3": {
+            "0": {
+              "aspect": 50.0,
+              "method": "gaussian",
+              "radius": 94.25,
+              "target": "both"
+            }
+          },
+          "effects_input": {
+            "0": {}
+          },
+          "effects_output": {
+            "0": {}
+          },
+          "keying_2": {
+            "0": {
+              "layer1_blend_mode": "normal",
+              "layer1_opacity": 1.0,
+              "layer2_blend_mode": "screen",
+              "layer2_opacity": 0.47,
+              "layer3_blend_mode": "overlay",
+              "layer3_opacity": 0.75,
+              "layer_count": 3,
+              "runtime_supported": true
+            }
+          },
+          "luma_key_1": {
+            "0": {
+              "clip": 0.451,
+              "gain": 8.33,
+              "invert": false
+            }
+          },
+          "mask_1": {
+            "0": {
+              "aspect": 1.71,
+              "invert": false,
+              "pattern": "circle",
+              "rotation": 0.0,
+              "size": 1.49,
+              "softness": 0.54,
+              "transparency": 0.0,
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "media_3": {
+            "0": {
+              "loop": true,
+              "opacity": 1.0,
+              "path": "C:/Users/Seth Zwiebel/Documents/sny_envato_stuff/20 Light Leaks Overlays/Light Leaks Overlays 8.mov",
+              "playing": true,
+              "runtime_supported": true
+            }
+          },
+          "mix_2": {
+            "0": {
+              "factor": 0.868,
+              "mode": "subtract"
+            }
+          },
+          "proc_amp_1": {
+            "0": {
+              "brightness": 0.36,
+              "contrast": 1.0,
+              "hue": 0.0,
+              "invert": false,
+              "saturation": 2.19
+            }
+          }
+        },
+        "name": "strobde",
+        "thumbnail": "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"
+      },
+      {
+        "duration": 1,
+        "graph": {
+          "connections": [
+            [
+              "keying_1",
+              "output",
+              "effects_output",
+              "input"
+            ],
+            [
+              "effects_input",
+              "output",
+              "trails_3",
+              "input"
+            ],
+            [
+              "effects_input",
+              "output",
+              "strobe_2",
+              "input"
+            ],
+            [
+              "strobe_2",
+              "output",
+              "keying_1",
+              "layer3_color"
+            ],
+            [
+              "trails_3",
+              "output",
+              "keying_1",
+              "layer2_color"
+            ],
+            [
+              "effects_input",
+              "output",
+              "keying_1",
+              "layer1_color"
+            ]
+          ],
+          "enabled": true,
+          "nodes": [
+            {
+              "id": "effects_input",
+              "settings": {},
+              "type": "effects_input",
+              "x": 11,
+              "y": 0
+            },
+            {
+              "id": "effects_output",
+              "settings": {},
+              "type": "effects_output",
+              "x": 2548,
+              "y": 428
+            },
+            {
+              "id": "keying_1",
+              "settings": {
+                "layer1_blend_mode": "normal",
+                "layer1_opacity": 1.0,
+                "layer2_blend_mode": "normal",
+                "layer2_opacity": 0.72,
+                "layer3_blend_mode": "normal",
+                "layer3_opacity": 0.44,
+                "layer_count": 3,
+                "runtime_supported": true
+              },
+              "type": "keying",
+              "x": 1471,
+              "y": 255
+            },
+            {
+              "id": "strobe_2",
+              "settings": {
+                "background": "live",
+                "decay": 1.0,
+                "rate": 2.05
+              },
+              "type": "strobe",
+              "x": 472,
+              "y": 358
+            },
+            {
+              "id": "trails_3",
+              "settings": {
+                "decay": 0.0,
+                "duration": 4.89
+              },
+              "type": "trails",
+              "x": 479,
+              "y": 191
+            }
+          ],
+          "version": 6
+        },
+        "keyframes": {},
+        "name": "stobe trail",
+        "thumbnail": "iVBORw0KGgoAAAANSUhEUgAAAKAAAAAnCAIAAAAHGNQaAAAACXBIWXMAAA7EAAAOxAGVKw4bAAADpklEQVR4nO2aW08TQRTHz8zspQV6ozfAgAaqMShPxic/gFFf/LYmxBcjieFJReEJTAxUDJfdQluXdnfn+LBJXbbbAZe2lMn8Hgg7Z86c/+Rsd+eclrx89YYxrd1uZzOZb1uf6/U6IQQRCSGUUt/3IQ7GGOccEcODgSNjLPAKLsMTKKWI2BsMTyCEEEI45/0LBuEESq40Saykf8FI4rRquVgqlc/Om83m+YOlC8fxKaWuC40G9jv3QMRI4GAw+Nv7p39CeDOxE2Ivw16xa4pNEiuJnX/pLjEMo5eqmRlYWsKdHWIYkM8DpZRz7nlgWVHFyW7kyN0aJvZuvWE4pQQAtPDSrRa0WmR2FjjPrz59btt2LpdNmfTrl/cAYFngurELKiYXLXLdbIKuQ7FAyqVCOp12HCc7bSKC70MuB4xBpwONRsxCb1+/cDpwalmMsVKxWK1W1tfXD36fjWMTisFEE2zbUKng7o9W43xD1zXf9793OicnwBgUCoAImQwuLoJtY7cLiGDb4HkAANnCHDhkIVM1DWNurppOpUxTv4UNKS4TTTAAUErm5udXao+Pjo+np6dMXdv4+MH34eQksJP9fSiXgRCklNRqwBgAQOO0ftDQp0rzGcJz2cw496AQEJPgoyNYW/1jGtrivflmqzVldCuV6BxKgXOC+O/8dX8BEEFnlKF3zdgrtYfLK48IIZ7Xddrtzc1PyfehGIAWHJXDQ4iwtX26tf0udBgjETfGqO9fOvitrj5Z6KS09LSJbv3XoWVZs3mvdXHJkVLCOfZWqxQxn8sW8tlUKrW3txscGmNVjsIUO97zkkYJMU1zUPXWn3uB6dnaMqEsMHVd13PdvZ+HzoUn9orIGoqS65gEsWRSgohE1/UES0xmzaeU9Jto7IxeAIFVcScQJVjw6FDcFUQJVkgAFZ/ixilFMQqoeg7LjXoHS452ZaE9XJM4ljTthclRkjDBVyobNB58HT3ENRObxhzuVpQgotb/y5vwJEH/JYEJBv/sIRA03HACk7i9IJMS9Q6WHNXJkhxRHayQAFEdrB7REqBalZKj3sGSI6qDYdj1maAOFhf1o1AicJFJybg7WeJ9ji1cOOh/mcas5ObhJqjRMfRwEjQ6OOcjbHQoJEAlWHJUq1Jy1CdYclQdLDnqEyw5E9ToGHo4sRKBy4Q0OkBY7F4z3GQ1OsapJNlvS0bR6BhpCkSNDhh2vQ8T0+gQKwHV6Ej8JWOy0itZuFGUeXdOyV+xt3Uk9K41twAAAABJRU5ErkJggg=="
       }
     ]
   },
@@ -4013,7 +4786,7 @@
     300,
     600
   ],
-  "fullscreen_selected_scale_index": 0,
+  "fullscreen_selected_scale_index": 1,
   "input_sources": [
     {
       "device": "decklink:1",
@@ -4136,7 +4909,7 @@
   "roi_manual_drag_hold_s": 0.05,
   "roi_timecode_keyframes": [],
   "roi_timecode_playback_enabled": false,
-  "roi_transition_duration_frames": 44,
+  "roi_transition_duration_frames": 32,
   "rtx_thdr_contrast": 0,
   "rtx_thdr_enabled": false,
   "rtx_thdr_max_luminance": 1043,

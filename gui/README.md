@@ -115,3 +115,32 @@ last displayed frame may be held during recovery. Health telemetry exposes
 drop counts). The host clock is an estimate because this wrapper does not expose
 the device stream clock; this recovery does not eliminate processing stalls or
 guarantee synchronization between independently clocked input/output devices.
+
+
+### Trails and Strobe
+
+Add **Trails** or **Strobe** from the Effects node menu and connect it between
+an image source and Effects Output (or another effect). Click **Adjust...**:
+
+- **Trails ? Duration (seconds):** 0?10 seconds, default 1. Bright pixels leave
+  a fading trail using a GPU peak-hold history with linear decay. Duration is
+  the maximum time for a full-brightness trail to fade to black; dimmer trails
+  fade sooner. Zero bypasses the effect and clears its history.
+- **Strobe ? Rate (Hz):** 0?30 captures per second, default 5. Each pulse
+  captures the current image and holds it until the next pulse. Zero bypasses
+  Strobe and shows the live input.
+- **Strobe ? Decay (seconds):** 0?60 seconds. Each captured frame fades linearly
+  over this interval, restarting on every capture. Zero holds it at full strength
+  until the next pulse. If decay exceeds the capture interval, the next capture
+  replaces the frozen frame before its fade finishes.
+- **Strobe ? Fade background:** `live` (default) blends the frozen frame into
+  the incoming live video; `black` fades it to black. After decay completes,
+  the selected background remains visible until the next capture.
+- **Trails ? Decay (seconds):** 0?60 seconds. Fades the overall trail strength
+  back to the original input. Zero keeps trails running continuously. Changing
+  Decay or bypassing and re-enabling effects restarts this fade.
+
+Timing uses elapsed processing time and captures occur on processed frames.
+Each connected node has independent state; node order, composition nesting,
+saved settings, and keyframes are supported. Older saved Strobe nodes default
+to the live background. Restart the GUI after rebuilding the native module.

@@ -382,7 +382,8 @@ void LaunchBlurColor(
     int height,
     float radius,
     int method,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float aspect = 1.0f
 );
 
 void LaunchBlurAlpha(
@@ -393,7 +394,8 @@ void LaunchBlurAlpha(
     int height,
     float radius,
     int method,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float aspect = 1.0f
 );
 
 void LaunchCompositeColorAlpha(
@@ -474,5 +476,8 @@ void LaunchRgbToTensor(
     int height,
     cudaStream_t stream
 );
+
+void LaunchStrobe(uchar3* color, uint8_t* alpha, float4* frozen, size_t pixels, float strength, bool capture, bool black_background, cudaStream_t stream);
+void LaunchTrails(uchar3* color, uint8_t* alpha, float4* history, size_t pixels, float decay, bool reset, float strength, cudaStream_t stream);
 
 } // namespace vp::cuda_kernels

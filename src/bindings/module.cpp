@@ -124,6 +124,7 @@ vp::AlphaMixOperandConfig ParseAlphaMixOperandPayload(const py::dict& operand_pa
         operand.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
     }
     operand.blur_radius = operand_payload.contains("blur_radius") ? py::cast<float>(operand_payload["blur_radius"]) : 0.0f;
+    operand.blur_aspect = operand_payload.contains("blur_aspect") ? py::cast<float>(operand_payload["blur_aspect"]) : 1.0f;
     operand.transform_x = operand_payload.contains("transform_x") ? py::cast<float>(operand_payload["transform_x"]) : 0.0f;
     operand.transform_y = operand_payload.contains("transform_y") ? py::cast<float>(operand_payload["transform_y"]) : 0.0f;
     operand.transform_z = operand_payload.contains("transform_z") ? py::cast<float>(operand_payload["transform_z"]) : 0.0f;
@@ -627,6 +628,7 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("effect_color_from_alpha") = false,
             py::arg("effect_alpha_from_color") = false,
             py::arg("explicit_compositor_layers") = false,
+            py::arg("blur_aspect") = 1.0f,
             "Configure the native CUDA two-layer compositor, keying, and color/alpha blur."
         )
         .def(
@@ -654,6 +656,9 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("aspect_y") = 1.0f,
             "Configure the native CUDA transform for the base Effects Input layer."
         )
+        .def("set_effect_layer_temporal", &vp::VideoProcessor::SetEffectLayerTemporal,
+            py::arg("layer_index"), py::arg("id"), py::arg("mode"),
+            py::arg("duration"), py::arg("rate"), py::arg("decay") = 0.0f, py::arg("background") = "live")
         .def("set_effect_layer_composition", &vp::VideoProcessor::SetEffectLayerComposition)
         .def("set_effect_layer_composition_source", &vp::VideoProcessor::SetEffectLayerCompositionSource)
         .def("get_effects_rgba_output", [](vp::VideoProcessor& self) { return py::bytes(self.GetEffectsRgbaOutput()); })
@@ -701,6 +706,7 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("aspect_x") = 1.0f,
             py::arg("aspect_y") = 1.0f,
             py::arg("materialize_key_alpha") = false,
+            py::arg("blur_aspect") = 1.0f,
             "Configure one native CUDA compositor overlay layer in [2, 8]."
         )
         .def(
@@ -740,6 +746,7 @@ PYBIND11_MODULE(video_processor, m) {
             py::arg("mask_x") = 0.0f,
             py::arg("mask_y") = 0.0f,
             py::arg("mask_rotation") = 0.0f,
+            py::arg("blur_aspect") = 1.0f,
             "Configure one scalar source-to-target channel route for a compositor layer."
         )
         .def(

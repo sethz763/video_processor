@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -58,6 +59,7 @@ struct AlphaMixOperandConfig {
     std::vector<ColorStageConfig> color_stages{};
     int blur_method = 0;
     float blur_radius = 0.0f;
+    float blur_aspect = 1.0f;
     float transform_x = 0.0f;
     float transform_y = 0.0f;
     float transform_z = 0.0f;
@@ -250,7 +252,8 @@ public:
         bool output_connected = true,
         bool effect_color_from_alpha = false,
         bool effect_alpha_from_color = false,
-        bool explicit_compositor_layers = false
+        bool explicit_compositor_layers = false,
+        float blur_aspect = 1.0f
     );
     void UploadEffectMediaRgba(const uint8_t* rgba, size_t bytes, int width, int height);
     void SetEffectsInputTransform(
@@ -304,7 +307,8 @@ public:
         float rotate_z = 0.0f,
         float aspect_x = 1.0f,
         float aspect_y = 1.0f,
-        bool materialize_key_alpha = false
+        bool materialize_key_alpha = false,
+        float blur_aspect = 1.0f
     );
     void UploadEffectLayerMediaRgba(
         int layer_index,
@@ -350,7 +354,8 @@ public:
         float mask_size = 1.0f,
         float mask_x = 0.0f,
         float mask_y = 0.0f,
-        float mask_rotation = 0.0f
+        float mask_rotation = 0.0f,
+        float blur_aspect = 1.0f
     );
     void SetEffectLayerChannelAlphaMix(
         int layer_index,
@@ -359,6 +364,7 @@ public:
         const AlphaMixOperandConfig& base_operand,
         const std::vector<AlphaMixOpConfig>& ops
     );
+    void SetEffectLayerTemporal(int layer_index, const std::string& id, const std::string& mode, float duration, float rate, float decay = 0, const std::string& background = "live");
     void SetEffectLayerComposition(int layer_index, int target, int source);
     void SetEffectLayerCompositionSource(int layer_index, int slot, int source);
     std::string GetEffectsRgbaOutput();
@@ -396,6 +402,7 @@ private:
             int source_channel = -1;
             int blur_method = 0;
             float blur_radius = 0.0f;
+            float blur_aspect = 1.0f;
             float transform_x = 0.0f;
             float transform_y = 0.0f;
             float transform_z = 0.0f;
@@ -443,6 +450,7 @@ private:
         bool key_alpha_from_effects_input = false;
         int blur_method = 0;
         float blur_radius = 0.0f;
+        float blur_aspect = 1.0f;
         int blur_target = 0;
         std::string mask_pattern = "off";
         int mask_pattern_code = 0;
@@ -560,6 +568,19 @@ private:
     uint8_t* d_effect_alpha_b_;
     uint8_t* d_effect_channel_a_;
     uint8_t* d_effect_channel_b_;
+    struct TemporalConfig { std::string id; int mode = 0; float duration = 0; float rate = 0; float decay = 0; bool black_background = false; };
+    struct TemporalState {
+        float4* history = nullptr;
+        std::string id;
+        int mode = 0;
+        bool valid = false;
+        double phase = 0;
+        double elapsed = 0;
+        float decay = 0;
+        std::chrono::steady_clock::time_point last{};
+    };
+    std::array<TemporalConfig, 64> temporal_configs_{};
+    std::array<TemporalState, 65> temporal_states_{};
     struct CompositionBuffer { uchar3* color = nullptr; uint8_t* alpha = nullptr; };
     std::array<CompositionBuffer, 65> composition_buffers_{};
     std::array<int, 64> composition_targets_{};

@@ -257,6 +257,7 @@ inline AlphaMixOperandConfig ClampAlphaMixOperandConfig(AlphaMixOperandConfig op
     operand.source_channel = std::clamp(operand.source_channel, 0, 3);
     operand.blur_method = operand.blur_method == 2 ? 2 : (operand.blur_method == 1 ? 1 : 0);
     operand.blur_radius = std::clamp(operand.blur_radius, 0.0f, 128.0f);
+    operand.blur_aspect = std::isfinite(operand.blur_aspect) ? std::max(0.001f, operand.blur_aspect) : 1.0f;
     operand.rotate_x = std::clamp(operand.rotate_x, -180.0f, 180.0f);
     operand.rotate_y = std::clamp(operand.rotate_y, -180.0f, 180.0f);
     operand.rotate_z = std::clamp(operand.rotate_z, -180.0f, 180.0f);
@@ -1096,11 +1097,18 @@ void VideoProcessor::SetEffectsConfig(
     bool output_connected,
     bool effect_color_from_alpha,
     bool effect_alpha_from_color,
-    bool explicit_compositor_layers
+    bool explicit_compositor_layers,
+    float blur_aspect
 ) {
     std::lock_guard<std::mutex> process_lock(process_mutex_);
     EffectLayerState& layer = effect_layers_[static_cast<size_t>(2 - kFirstEffectLayer)];
     effects_bypassed_ = !enabled;
+    if (!enabled) {
+        for (auto& state : temporal_states_) {
+            state.valid = false;
+            state.phase = 0;
+        }
+    }
     layer.enabled = enabled;
     layer.opacity = std::clamp(opacity, 0.0f, 1.0f);
     effects_layer1_opacity_ = explicit_compositor_layers
@@ -1127,6 +1135,7 @@ void VideoProcessor::SetEffectsConfig(
     layer.alpha_from_color = effect_alpha_from_color;
     layer.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
     layer.blur_radius = std::clamp(blur_radius, 0.0f, 128.0f);
+    layer.blur_aspect = std::isfinite(blur_aspect) ? std::max(0.001f, blur_aspect) : 1.0f;
     layer.blur_target = blur_target == "color" ? 1 : (blur_target == "alpha" ? 2 : (blur_target == "both" ? 3 : 0));
 }
 
@@ -1153,6 +1162,15 @@ void VideoProcessor::SetEffectsInputTransform(
     effects_input_rotate_z_ = std::clamp(rotate_z, -180.0f, 180.0f);
     effects_input_aspect_x_ = std::max(0.01f, aspect_x);
     effects_input_aspect_y_ = std::max(0.01f, aspect_y);
+}
+
+void VideoProcessor::SetEffectLayerTemporal(int layer_index, const std::string& id, const std::string& mode, float duration, float rate, float decay, const std::string& background) {
+    std::lock_guard<std::mutex> process_lock(process_mutex_);
+    if (layer_index < 1 || layer_index > 64 || !std::isfinite(duration) || !std::isfinite(rate) ||
+        duration < 0 || duration > 10 || rate < 0 || rate > 30 || !std::isfinite(decay) || decay < 0 || decay > 60 ||
+        (mode != "off" && mode != "trails" && mode != "strobe") || (background != "live" && background != "black"))
+        throw std::invalid_argument("Invalid temporal effect settings");
+    temporal_configs_[layer_index - 1] = {id, mode == "trails" ? 1 : mode == "strobe" ? 2 : 0, duration, rate, decay, background == "black"};
 }
 
 void VideoProcessor::SetEffectLayerComposition(int layer_index, int target, int source) {
@@ -1227,7 +1245,8 @@ void VideoProcessor::SetEffectLayerConfig(
     float rotate_z,
     float aspect_x,
     float aspect_y,
-    bool materialize_key_alpha
+    bool materialize_key_alpha,
+    float blur_aspect
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
         throw std::out_of_range("Effect layer index must be in [1, 64].");
@@ -1259,6 +1278,7 @@ void VideoProcessor::SetEffectLayerConfig(
     layer.key_alpha_from_effects_input = key_alpha_from_effects_input;
     layer.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
     layer.blur_radius = std::clamp(blur_radius, 0.0f, 128.0f);
+    layer.blur_aspect = std::isfinite(blur_aspect) ? std::max(0.001f, blur_aspect) : 1.0f;
     layer.blur_target = blur_target == "color" ? 1 : (blur_target == "alpha" ? 2 : (blur_target == "both" ? 3 : 0));
     layer.mask_pattern_code = ParseEffectMaskPattern(mask_pattern);
     layer.mask_pattern = mask_pattern;
@@ -1458,7 +1478,8 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     float mask_size,
     float mask_x,
     float mask_y,
-    float mask_rotation
+    float mask_rotation,
+    float blur_aspect
 ) {
     if (layer_index < kFirstEffectLayer || layer_index > kLastEffectLayer) {
         throw std::out_of_range("Effect layer index must be in [1, 64].");
@@ -1473,6 +1494,7 @@ void VideoProcessor::SetEffectLayerChannelRoute(
     route.source_channel = source_channel;
     route.blur_method = blur_method == "gaussian" ? 1 : (blur_method == "box" ? 2 : 0);
     route.blur_radius = std::clamp(blur_radius, 0.0f, 128.0f);
+    route.blur_aspect = std::isfinite(blur_aspect) ? std::max(0.001f, blur_aspect) : 1.0f;
     route.transform_x = transform_x;
     route.transform_y = transform_y;
     route.transform_z = transform_z;
@@ -2950,14 +2972,54 @@ std::string VideoProcessor::ProcessFrameInternal(
                 uint8_t* blur_temp = current == primary_buffer ? secondary_buffer : primary_buffer;
                 cuda_kernels::LaunchBlurAlpha(
                     current, blur_temp, current, width_, height_,
-                    operand.blur_radius, operand.blur_method, stream_
+                    operand.blur_radius, operand.blur_method, stream_, operand.blur_aspect
                 );
             }
             return current;
         };
         int active_group = 0;
+        const auto temporal_now = std::chrono::steady_clock::now();
+        const TemporalConfig* active_temporal = nullptr;
+        auto apply_temporal = [&]() {
+            if (!active_group || !active_temporal) return;
+            auto& state = temporal_states_[active_group];
+            const auto& config = *active_temporal;
+            if (state.id != config.id || state.mode != config.mode || state.decay != config.decay) {
+                state.valid = false;
+                state.phase = 0;
+                state.id = config.id;
+                state.mode = config.mode;
+                state.decay = config.decay;
+            }
+            const double dt = state.valid ? std::chrono::duration<double>(temporal_now - state.last).count() : 0;
+            state.elapsed = state.valid ? state.elapsed + dt : 0;
+            const float strength = config.decay > 0
+                ? static_cast<float>(std::max(0.0, 1.0 - state.elapsed / config.decay)) : 1.0f;
+            state.last = temporal_now;
+            if (config.mode == 1 && config.duration > 0) {
+                if (!state.history) CheckCuda(cudaMalloc(reinterpret_cast<void**>(&state.history), rgb_pixels_ * sizeof(float4)), "allocate trails history");
+                cuda_kernels::LaunchTrails(const_cast<uchar3*>(composite_color), const_cast<uint8_t*>(composite_alpha), state.history, rgb_pixels_,
+                    static_cast<float>(255.0 * dt / config.duration), !state.valid, strength, stream_);
+                state.valid = true;
+            } else if (config.mode == 2 && config.rate > 0) {
+                const double next_phase = state.phase + dt * config.rate;
+                const bool capture = !state.valid || next_phase >= 1.0;
+                state.phase = std::fmod(next_phase, 1.0);
+                if (capture) state.elapsed = 0;
+                const float frozen_strength = config.decay > 0
+                    ? static_cast<float>(std::max(0.0, 1.0 - state.elapsed / config.decay)) : 1.0f;
+                if (!state.history) CheckCuda(cudaMalloc(reinterpret_cast<void**>(&state.history), rgb_pixels_ * sizeof(float4)), "allocate strobe frame");
+                cuda_kernels::LaunchStrobe(const_cast<uchar3*>(composite_color), const_cast<uint8_t*>(composite_alpha),
+                    state.history, rgb_pixels_, frozen_strength, capture, config.black_background, stream_);
+                state.valid = true;
+            } else {
+                state.valid = false;
+                state.phase = 0;
+            }
+        };
         auto save_group = [&]() {
             if (!active_group) return;
+            apply_temporal();
             auto& buffer = composition_buffers_[active_group];
             if (!buffer.color) CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffer.color), rgb_pixels_ * 3), "allocate composition color");
             if (!buffer.alpha) CheckCuda(cudaMalloc(reinterpret_cast<void**>(&buffer.alpha), rgb_pixels_), "allocate composition alpha");
@@ -2972,6 +3034,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             if (target && target != active_group) {
                 save_group();
                 active_group = target;
+                active_temporal = &temporal_configs_[slot];
                 CheckCuda(cudaMemsetAsync(d_effect_composite_, 0, rgb_pixels_ * 3, stream_), "clear composition color");
                 CheckCuda(cudaMemsetAsync(d_effect_composite_alpha_a_, 0, rgb_pixels_, stream_), "clear composition alpha");
                 composite_color = d_effect_composite_;
@@ -2987,7 +3050,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                 if (slot == 0 && layer.blur_method != 0 && layer.blur_radius > 0.0f && (layer.blur_target & 1) != 0) {
                     cuda_kernels::LaunchBlurColor(
                         composite_color, d_effect_color_a_, d_effect_composite_, width_, height_,
-                        layer.blur_radius, layer.blur_method, stream_
+                        layer.blur_radius, layer.blur_method, stream_, layer.blur_aspect
                     );
                     composite_color = d_effect_composite_;
                 }
@@ -3105,7 +3168,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                                 : d_effect_channel_a_;
                             cuda_kernels::LaunchBlurAlpha(
                                 channel_buffer, blur_temp, channel_buffer, width_, height_,
-                                route.blur_radius, route.blur_method, stream_
+                                route.blur_radius, route.blur_method, stream_, route.blur_aspect
                             );
                         }
                         cuda_kernels::LaunchWriteColorAlphaChannel(
@@ -3153,7 +3216,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                             : d_effect_channel_a_;
                         cuda_kernels::LaunchBlurAlpha(
                             channel_buffer, blur_temp, channel_buffer, width_, height_,
-                            route.blur_radius, route.blur_method, stream_
+                            route.blur_radius, route.blur_method, stream_, route.blur_aspect
                         );
                     }
                     cuda_kernels::LaunchWriteColorAlphaChannel(
@@ -3278,7 +3341,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                     uchar3* blur_temp = effect_color_buffer == d_effect_color_a_ ? d_effect_color_b_ : d_effect_color_a_;
                     cuda_kernels::LaunchBlurColor(
                         effect_color_buffer, blur_temp, effect_color_buffer, width_, height_,
-                        layer.blur_radius, layer.blur_method, stream_
+                        layer.blur_radius, layer.blur_method, stream_, layer.blur_aspect
                     );
                     effect_color = effect_color_buffer;
                 }
@@ -3286,7 +3349,7 @@ std::string VideoProcessor::ProcessFrameInternal(
                     uint8_t* blur_temp = effect_alpha_buffer == d_effect_alpha_a_ ? d_effect_alpha_b_ : d_effect_alpha_a_;
                     cuda_kernels::LaunchBlurAlpha(
                         effect_alpha_buffer, blur_temp, effect_alpha_buffer, width_, height_,
-                        layer.blur_radius, layer.blur_method, stream_
+                        layer.blur_radius, layer.blur_method, stream_, layer.blur_aspect
                     );
                     effect_alpha = effect_alpha_buffer;
                 }
@@ -3306,6 +3369,7 @@ std::string VideoProcessor::ProcessFrameInternal(
             composite_alpha = output_alpha;
             composite_pass_complete = true;
         }
+        apply_temporal();
         // Only intermediate groups need snapshots. The final output is already
         // in the composite buffers and is exposed through last_effects_* below.
         last_effects_alpha_ = composite_alpha;
@@ -3372,6 +3436,10 @@ std::string VideoProcessor::ProcessFrameInternal(
 void VideoProcessor::Cleanup() {
     last_effects_color_ = nullptr;
     last_effects_alpha_ = nullptr;
+    for (auto& state : temporal_states_) {
+        if (state.history) cudaFree(state.history);
+        state = {};
+    }
     for (auto& buffer : composition_buffers_) {
         if (buffer.color) cudaFree(buffer.color);
         if (buffer.alpha) cudaFree(buffer.alpha);

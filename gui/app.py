@@ -536,6 +536,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "blend_mode": str(payload.get("blend_mode", "normal")),
             "blur_method": str(payload.get("blur_method", "off")),
             "blur_radius": float(payload.get("blur_radius", 0.0)),
+            "blur_aspect": float(payload.get("blur_aspect", 1.0)),
             "blur_target": str(payload.get("blur_target", "both")),
             "key": {
                 "mode": str(payload.get("key_mode", "off")),
@@ -583,6 +584,14 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
             processor.set_effect_layer_composition_source(int(layer.get('layer_index', 2)), slot, sources.get(slot, 0))
     elif layer.get('composite_target') or int(layer.get('layer_index', 2)) > 8:
         raise RuntimeError('Rebuild the native module to enable composition passes and additional layers')
+    temporal = layer.get('temporal', {})
+    if hasattr(processor, 'set_effect_layer_temporal'):
+        processor.set_effect_layer_temporal(int(layer.get('layer_index', 2)),
+            str(temporal.get('id', '')), str(temporal.get('mode', 'off')),
+            float(temporal.get('duration', 0)), float(temporal.get('rate', 0)),
+            float(temporal.get('decay', 0)), str(temporal.get('background', 'live')))
+    elif temporal:
+        raise RuntimeError('Rebuild the native module to enable Trails and Strobe')
     key = layer.get("key", {})
     if not isinstance(key, dict):
         key = {}
@@ -596,6 +605,7 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
         blend_mode=str(layer.get("blend_mode", "normal")),
         blur_method=str(layer.get("blur_method", "off")),
         blur_radius=float(layer.get("blur_radius", 0.0)),
+        blur_aspect=float(layer.get("blur_aspect", 1.0)),
         blur_target=str(layer.get("blur_target", "both")),
         key_mode=str(key.get("mode", "off")),
         key_color_r=int(color[0]),
@@ -660,6 +670,7 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
                 int(route.get("source_channel", -1)),
                 blur_method=str(route.get("blur_method", "off")),
                 blur_radius=float(route.get("blur_radius", 0.0)),
+                blur_aspect=float(route.get("blur_aspect", 1.0)),
                 transform_x=float(route.get("transform_x", 0.0)),
                 transform_y=float(route.get("transform_y", 0.0)),
                 transform_z=float(route.get("transform_z", 0.0)),
@@ -2679,12 +2690,14 @@ class ExpandingDoubleSpinBox(QDoubleSpinBox):
         raw = text.removesuffix(self.suffix()).strip()
         value, valid = self.locale().toDouble(raw)
         if valid and math.isfinite(value):
+            if self.property("positive_only") and value < 0.001:
+                return QValidator.Intermediate, text, position
             return QValidator.Acceptable, text, position
         return super().validate(text, position)
 
     def valueFromText(self, text):
         value, valid = self.locale().toDouble(text.removesuffix(self.suffix()).strip())
-        if valid and math.isfinite(value):
+        if valid and math.isfinite(value) and (not self.property("positive_only") or value >= 0.001):
             self.setRange(min(self.minimum(), value), max(self.maximum(), value))
             return value
         return super().valueFromText(text)
@@ -2867,7 +2880,7 @@ class EffectsNodeWidget(QWidget):
             self.capture_device_label.setWordWrap(True)
             self.capture_device_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             self.capture_device_label.setStyleSheet("color: #f4f4f4; font-size: 11px;")
-        elif node_type in {"proc_amp", "color_corrector", "chroma_key", "luma_key", "transform_3d", "mix"}:
+        elif node_type in {"proc_amp", "color_corrector", "chroma_key", "luma_key", "transform_3d", "mix", "trails", "strobe"}:
             self.adjust_settings = QPushButton("Adjust...", self)
             self.adjust_settings.setGeometry(76, 72, 98, 26)
             self.adjust_settings.clicked.connect(lambda: self.settingsRequested.emit(self.node_id))
@@ -3229,6 +3242,8 @@ class EffectsGraphCanvas(QWidget):
         "capture": "Source",
         "keying": "Compositor",
         "blur": "Blur",
+        "trails": "Trails",
+        "strobe": "Strobe",
         "matte": "Matte Color",
         "mask": "Mask",
         "gradient": "Gradient Texture",
@@ -3259,6 +3274,9 @@ class EffectsGraphCanvas(QWidget):
         self._marquee_origin: QPointF | None = None
         self._marquee_rect: QRectF | None = None
         self._marquee_additive = False
+        self._pan_origin: QPointF | None = None
+        self._pan_scroll: QScrollArea | None = None
+        self._pan_scroll_origin = (0, 0)
         self._capture_devices: list[tuple[str, object]] = []
         self._capture_reload_tokens: dict[str, int] = {}
         self._media_keyframe_playback_arms: dict[str, str] = {}
@@ -3374,8 +3392,12 @@ class EffectsGraphCanvas(QWidget):
                 "layer2_blend_mode": "normal", "layer2_opacity": 1.0,
                 "runtime_supported": True,
             }
+        elif node_type == "trails":
+            settings = {"duration": 1.0, "decay": 0.0}
+        elif node_type == "strobe":
+            settings = {"rate": 5.0, "decay": 0.0, "background": "live"}
         elif node_type == "blur":
-            settings = {"method": "gaussian", "radius": 3.0, "target": "both"}
+            settings = {"method": "gaussian", "radius": 3.0, "target": "both", "aspect": 1.0}
         elif node_type == "capture":
             settings = {
                 "device_index": None,
@@ -3481,7 +3503,7 @@ class EffectsGraphCanvas(QWidget):
 
     def add_node(self, node_type: str) -> str | None:
         if node_type not in {
-            "denoise", "media", "capture", "keying", "blur", "matte", "mask", "gradient", "mix",
+            "denoise", "media", "capture", "keying", "blur", "trails", "strobe", "matte", "mask", "gradient", "mix",
             "proc_amp", "color_corrector", "chroma_key", "luma_key", "transform_3d",
             "color_splitter", "color_recombiner",
         }:
@@ -3990,7 +4012,7 @@ class EffectsGraphCanvas(QWidget):
         settings = node["settings"]
         if not isinstance(settings, dict):
             return
-        if node_type in {"denoise", "media", "matte", "blur"}:
+        if node_type in {"denoise", "media", "matte", "blur", "trails", "strobe"}:
             self._show_basic_node_settings(node_id)
             return
         elif node_type == "capture":
@@ -4038,10 +4060,18 @@ class EffectsGraphCanvas(QWidget):
         if kind == 'denoise':
             combo('Method', 'method', list(DENOISE_METHOD_NAME_TO_LABEL))
             self._add_live_slider(form, dialog, node_id, 'Strength', 'strength', 0, 1, 100)
+        elif kind == 'trails':
+            self._add_live_slider(form, dialog, node_id, 'Duration (seconds)', 'duration', 0, 10, 100)
+            self._add_live_slider(form, dialog, node_id, 'Decay (seconds; 0 = none)', 'decay', 0, 60, 100)
+        elif kind == 'strobe':
+            combo('Fade background', 'background', ['live', 'black'])
+            self._add_live_slider(form, dialog, node_id, 'Rate (Hz; 0 = off)', 'rate', 0, 30, 100)
+            self._add_live_slider(form, dialog, node_id, 'Decay (seconds; 0 = none)', 'decay', 0, 60, 100)
         elif kind == 'blur':
             combo('Method', 'method', ['gaussian', 'box'])
             combo('Channels', 'target', ['color', 'alpha', 'both'])
             self._add_live_slider(form, dialog, node_id, 'Radius', 'radius', 0, 128, 100)
+            self._add_live_slider(form, dialog, node_id, 'Aspect (V < 1 < H)', 'aspect', .1, 10, 1000, 3)
         elif kind == 'matte':
             for name in ('red', 'green', 'blue'):
                 self._add_live_slider(form, dialog, node_id, name.title(), name, 0, 255, 1, 0)
@@ -4100,7 +4130,7 @@ class EffectsGraphCanvas(QWidget):
         slider.setRange(round(max(minimum, -1000.0) * scale), round(maximum * scale))
         slider.setProperty("setting_name", name)
         slider.setProperty("setting_scale", scale)
-        adaptive = self._nodes[node_id]['type'] == 'transform_3d' and name in {'x', 'y', 'z'}
+        adaptive = (self._nodes[node_id]['type'] == 'transform_3d' and name in {'x', 'y', 'z'}) or (self._nodes[node_id]['type'] == 'blur' and name == 'aspect')
         value_control = ExpandingDoubleSpinBox(row) if adaptive else QDoubleSpinBox(row)
         current = float(settings.get(name, self._default_node_settings(self._nodes[node_id]['type']).get(name, minimum)))
         if adaptive:
@@ -4108,6 +4138,12 @@ class EffectsGraphCanvas(QWidget):
         slider.setValue(max(-2147483647, min(2147483647, round(current * scale))))
         value_control.setRange(min(minimum, current) if adaptive else minimum, max(maximum, current) if adaptive else maximum)
         slider.setProperty('adaptive', adaptive)
+        for control in (slider, value_control):
+            control.setProperty('initial_minimum', minimum)
+            control.setProperty('initial_maximum', maximum)
+        if self._nodes[node_id]['type'] == 'blur' and name == 'aspect':
+            value_control.setProperty('positive_only', True)
+            row.setToolTip('1 = round blur; above 1 stretches horizontally, below 1 vertically. Type a positive value to expand the slider range.')
         value_control.setProperty("setting_name", name)
         value_control.setDecimals(decimals)
         value_control.setSingleStep(1.0 / float(scale))
@@ -4414,6 +4450,10 @@ class EffectsGraphCanvas(QWidget):
                 int(settings.get("red", 255)), int(settings.get("green", 255)),
                 int(settings.get("blue", 255)), float(settings.get("alpha", 1.0)),
             )
+        elif node_type == "trails":
+            status = f"Duration {float(settings.get('duration', 1.0)):.2f} seconds\nDecay {float(settings.get('decay', 0.0)):.2f} seconds"
+        elif node_type == "strobe":
+            status = f"Rate {float(settings.get('rate', 5.0)):.2f} Hz\nDecay {float(settings.get('decay', 0.0)):.2f} seconds"
         elif node_type == "gradient":
             status = str(settings.get("gradient_type", "linear")).replace("_", " ").title()
         elif node_type == "mask":
@@ -4487,7 +4527,7 @@ class EffectsGraphCanvas(QWidget):
                 if isinstance(setting_name, str) and setting_name in settings:
                     value_control.blockSignals(True)
                     if isinstance(value_control, ExpandingDoubleSpinBox):
-                        value_control.setRange(min(-100, float(settings[setting_name])), max(100, float(settings[setting_name])))
+                        value_control.setRange(min(value_control.property("initial_minimum"), float(settings[setting_name])), max(value_control.property("initial_maximum"), float(settings[setting_name])))
                     value_control.setValue(float(settings[setting_name]))
                     value_control.blockSignals(False)
             for slider in dialog.findChildren(QSlider):
@@ -4497,7 +4537,7 @@ class EffectsGraphCanvas(QWidget):
                     slider.blockSignals(True)
                     value = float(settings[setting_name])
                     if slider.property('adaptive'):
-                        slider.setRange(max(-2147483647, round(min(-100, value) * setting_scale)), min(2147483647, round(max(100, value) * setting_scale)))
+                        slider.setRange(max(-2147483647, round(min(slider.property("initial_minimum"), value) * setting_scale)), min(2147483647, round(max(slider.property("initial_maximum"), value) * setting_scale)))
                     slider.setValue(max(-2147483647, min(2147483647, round(value * setting_scale))))
                     slider.blockSignals(False)
         if node_type == "capture":
@@ -4558,7 +4598,7 @@ class EffectsGraphCanvas(QWidget):
     def native_effects_payload(self) -> dict[str, object]:
         if not self._effects_enabled:
             return bypassed_effects_payload()
-        if any(n['type'] in {'composition', 'gradient', 'mask', 'luma_key'} for n in self._nodes.values()) or sum(n['type'] == 'keying' for n in self._nodes.values()) > 1:
+        if any(n['type'] in {'composition', 'gradient', 'mask', 'luma_key', 'trails', 'strobe'} for n in self._nodes.values()) or sum(n['type'] == 'keying' for n in self._nodes.values()) > 1:
             try:
                 from .composition_graph import compile_compositions
             except ImportError:
@@ -4844,6 +4884,7 @@ class EffectsGraphCanvas(QWidget):
                     if source_type == "blur":
                         route["blur_method"] = str(settings.get("method", "off"))
                         route["blur_radius"] = float(settings.get("radius", 0.0))
+                        route["blur_aspect"] = float(settings.get("aspect", 1.0))
                         preferred_input = "alpha_input" if source_port == "alpha_output" else "input"
                         current = next(
                             (candidate for candidate in self._connections if candidate[2:4] == (source_id, preferred_input)),
@@ -4940,6 +4981,7 @@ class EffectsGraphCanvas(QWidget):
             operand: dict[str, object] = {
                 "blur_method": str(operand_blur_settings.get("method", "off")),
                 "blur_radius": float(operand_blur_settings.get("radius", 0.0)),
+                "blur_aspect": float(operand_blur_settings.get("aspect", 1.0)),
                 "transform_x": float(operand_transform_settings.get("x", 0.0)),
                 "transform_y": float(operand_transform_settings.get("y", 0.0)),
                 "transform_z": float(operand_transform_settings.get("z", 0.0)),
@@ -5493,6 +5535,7 @@ class EffectsGraphCanvas(QWidget):
                         "blend_mode": str(compositor_settings.get(prefix + "blend_mode", "normal")),
                         "blur_method": str(layer_blur_settings.get("method", "off")),
                         "blur_radius": float(layer_blur_settings.get("radius", 0.0)),
+                        "blur_aspect": float(layer_blur_settings.get("aspect", 1.0)),
                         "blur_target": str(layer_blur_settings.get("target", "both")),
                         "color_stages": list(layer_color_stages),
                         "alpha_mix_base": alpha_mix_base,
@@ -5558,6 +5601,7 @@ class EffectsGraphCanvas(QWidget):
                     "blend_mode": blend_mode,
                     "blur_method": str(blur_settings.get("method", "off")),
                     "blur_radius": float(blur_settings.get("radius", 0.0)),
+                    "blur_aspect": float(blur_settings.get("aspect", 1.0)),
                     "blur_target": str(blur_settings.get("target", "both")),
                     "key": key_config,
                     "effect_color_from_alpha": effect_color_from_alpha,
@@ -5605,6 +5649,7 @@ class EffectsGraphCanvas(QWidget):
             "blend_mode": str(legacy_layer.get("blend_mode", "normal")),
             "blur_method": str(legacy_layer.get("blur_method", "off")),
             "blur_radius": float(legacy_layer.get("blur_radius", 0.0)),
+            "blur_aspect": float(legacy_layer.get("blur_aspect", 1.0)),
             "blur_target": str(legacy_layer.get("blur_target", "both")),
             "layer1_opacity": layer1_opacity,
             "layer1_blend_mode": str(compositor_settings.get("layer1_blend_mode", "normal")),
@@ -5886,11 +5931,29 @@ class EffectsGraphCanvas(QWidget):
             return
         if event.button() == Qt.LeftButton:
             self._set_selected_nodes(set())
+            parent = self.parentWidget()
+            while parent is not None and not isinstance(parent, QScrollArea):
+                parent = parent.parentWidget()
+            if isinstance(parent, QScrollArea):
+                self._pan_scroll = parent
+                self._pan_origin = event.globalPosition()
+                self._pan_scroll_origin = (
+                    parent.horizontalScrollBar().value(),
+                    parent.verticalScrollBar().value(),
+                )
+                self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._pan_origin is not None and self._pan_scroll is not None and bool(event.buttons() & Qt.LeftButton):
+            # Global coordinates stay stable as scrolling moves the canvas.
+            delta = event.globalPosition() - self._pan_origin
+            self._pan_scroll.horizontalScrollBar().setValue(self._pan_scroll_origin[0] - round(delta.x()))
+            self._pan_scroll.verticalScrollBar().setValue(self._pan_scroll_origin[1] - round(delta.y()))
+            event.accept()
+            return
         if self._marquee_origin is not None and bool(event.buttons() & Qt.LeftButton):
             self._marquee_rect = QRectF(self._marquee_origin, event.position()).normalized()
             self.update()
@@ -5899,6 +5962,12 @@ class EffectsGraphCanvas(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self._pan_origin is not None:
+            self._pan_origin = None
+            self._pan_scroll = None
+            self.unsetCursor()
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._marquee_origin is not None:
             selection_rect = self._marquee_rect or QRectF(self._marquee_origin, event.position()).normalized()
             selected = set(self._selected_nodes) if self._marquee_additive else set()
@@ -6012,6 +6081,8 @@ class EffectsGraphEditor(QGroupBox):
         "Composition Source": "composition",
         "Compositor": "keying",
         "Blur": "blur",
+        "Trails": "trails",
+        "Strobe": "strobe",
         "Matte Color": "matte",
         "Gradient Texture": "gradient",
         "Mask": "mask",
@@ -7039,6 +7110,7 @@ class VideoProcessorController:
             bool(payload.get("effect_color_from_alpha", False)),
             bool(payload.get("effect_alpha_from_color", False)),
             bool(payload.get("explicit_compositor_layers", False)),
+            blur_aspect=float(payload.get("blur_aspect", 1.0)),
         )
         _set_native_effects_input_transform(self.processor, payload)
         layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}

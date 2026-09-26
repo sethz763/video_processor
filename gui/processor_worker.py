@@ -74,6 +74,7 @@ def _effect_layers_from_payload(payload: dict[str, object]) -> list[dict[str, ob
             "blend_mode": str(payload.get("blend_mode", "normal")),
             "blur_method": str(payload.get("blur_method", "off")),
             "blur_radius": float(payload.get("blur_radius", 0.0)),
+            "blur_aspect": float(payload.get("blur_aspect", 1.0)),
             "blur_target": str(payload.get("blur_target", "both")),
             "key": {
                 "mode": str(payload.get("key_mode", "off")),
@@ -119,6 +120,14 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
             processor.set_effect_layer_composition_source(int(layer.get('layer_index', 2)), slot, sources.get(slot, 0))
     elif layer.get('composite_target') or int(layer.get('layer_index', 2)) > 8:
         raise RuntimeError('Rebuild the native module to enable composition passes and additional layers')
+    temporal = layer.get('temporal', {})
+    if hasattr(processor, 'set_effect_layer_temporal'):
+        processor.set_effect_layer_temporal(int(layer.get('layer_index', 2)),
+            str(temporal.get('id', '')), str(temporal.get('mode', 'off')),
+            float(temporal.get('duration', 0)), float(temporal.get('rate', 0)),
+            float(temporal.get('decay', 0)), str(temporal.get('background', 'live')))
+    elif temporal:
+        raise RuntimeError('Rebuild the native module to enable Trails and Strobe')
     key = layer.get("key", {})
     if not isinstance(key, dict):
         key = {}
@@ -132,6 +141,7 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
         blend_mode=str(layer.get("blend_mode", "normal")),
         blur_method=str(layer.get("blur_method", "off")),
         blur_radius=float(layer.get("blur_radius", 0.0)),
+        blur_aspect=float(layer.get("blur_aspect", 1.0)),
         blur_target=str(layer.get("blur_target", "both")),
         key_mode=str(key.get("mode", "off")),
         key_color_r=int(color[0]),
@@ -196,6 +206,7 @@ def _set_native_effect_layer_config(processor: object, layer: dict[str, object])
                 int(route.get("source_channel", -1)),
                 blur_method=str(route.get("blur_method", "off")),
                 blur_radius=float(route.get("blur_radius", 0.0)),
+                blur_aspect=float(route.get("blur_aspect", 1.0)),
                 transform_x=float(route.get("transform_x", 0.0)),
                 transform_y=float(route.get("transform_y", 0.0)),
                 transform_z=float(route.get("transform_z", 0.0)),
@@ -8404,6 +8415,7 @@ def run_processor_worker(
                         bool(message.get("effect_color_from_alpha", False)),
                         bool(message.get("effect_alpha_from_color", False)),
                         bool(message.get("explicit_compositor_layers", False)),
+                        blur_aspect=float(message.get("blur_aspect", 1.0)),
                     )
                     _set_native_effects_input_transform(processor, message)
                     layers_by_index = {int(layer.get("layer_index", 2)): layer for layer in layers}
